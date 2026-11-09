@@ -225,6 +225,10 @@ reprovisioning and all live updates still require separate approval.
 Fetch or installer failures are errors, never permission to reinstall stale
 code. Deferred installers report a pending update with an installer PID and
 `update-install.log`; that is not proof the upgrade completed.
+An existing malformed legacy `identity.json` is retained and rejected, never
+silently replaced with a fresh key. Restore its known backup or request a
+separately approved identity/re-enrollment recovery; a diagnostic read is not
+permission to rotate identity.
 
 **Legacy offline queue evidence:** responses distinguish confirmed Service Bus
 publication from storage in the broker's local file queue. The file fallback

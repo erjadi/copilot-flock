@@ -644,6 +644,21 @@ test("actual offline reprovision producer reports bootstrap fallback without cla
     assert.doesNotMatch(queued.note, /will execute automatically/);
   }
 });
+
+test("existing malformed legacy identity is retained rather than silently rotated", (t) => {
+  const root = temporary(t);
+  for (const [index, api] of [flock, bridge].entries()) {
+    process.env.COPILOT_HOME = path.join(root, String(index));
+    const home = path.join(process.env.COPILOT_HOME, "flock");
+    fs.mkdirSync(home, { recursive: true });
+    const identity = path.join(home, "identity.json");
+    const original = "{synthetic corrupt identity must not be replaced";
+    fs.writeFileSync(identity, original);
+    assert.throws(() => api.ensureMachineIdentityKeypair());
+    assert.equal(fs.readFileSync(identity, "utf8"), original);
+  }
+});
+
 test("scope and address inputs reject retired private aliases and invalid values", () => {
   for (const normalize of [flock.normalizeScope, bridge.normalizeScope, broker.normalizeV3Scope]) {
     assert.equal(normalize("personal"), "personal");

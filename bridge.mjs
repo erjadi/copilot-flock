@@ -290,14 +290,13 @@ export function ensureMachineIdentityKeypair() {
     return cachedIdentityKeypair;
   }
   if (fs.existsSync(keyPath)) {
-    try {
-      const parsed = JSON.parse(fs.readFileSync(keyPath, "utf8"));
-      if (parsed?.publicKey && parsed?.privateKey && parsed?.fingerprint) {
-        cachedIdentityKeypair = parsed;
-        cachedIdentityKeyPath = keyPath;
-        return parsed;
-      }
-    } catch {}
+    const parsed = readExistingRpcIdentity();
+    if (typeof parsed.fingerprint !== "string" || !parsed.fingerprint.trim()) {
+      throw rpcSecurityError("RPC_LOCAL_IDENTITY_INVALID", "Existing machine identity metadata is invalid; no automatic replacement was performed.");
+    }
+    cachedIdentityKeypair = parsed;
+    cachedIdentityKeyPath = keyPath;
+    return parsed;
   }
 
   const { publicKey, privateKey } = crypto.generateKeyPairSync("ed25519", {
