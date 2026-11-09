@@ -375,6 +375,21 @@ after recovery, not an automatic retry of uncertain work. This candidate
 implementation is not execution consent, a release ballot or permission for
 live initialization, recovery, deployment or re-enrollment.
 
+**File-transfer/runtime boundary:** an authenticated owner file transfer is not
+permission to replace installed executable code. Writes resolve existing
+ancestors and aliases before checking runtime/private roots, imports, policy
+and control state. Ordinary managed transfer data and unrelated permitted
+destinations remain available; multiply linked write targets and device/stream
+paths are refused. The writer opens without truncation, rechecks the actual
+descriptor/path identity, then writes. Before any local admission-helper
+invocation, including completion after a possible effect, startup-pinned
+module/import bytes are rechecked. If an effect may already have occurred,
+failure preserves the existing UNKNOWN claim; changed code is never auto-repinned
+and replay state is never cleared. A legitimate code update may therefore
+require its separately approved coherent restart. These checks are a runtime
+integrity boundary, not an OS sandbox or a claim that arbitrary local
+filesystem administrators are contained.
+
 ## Try it out hubless; deploy the components for the real potential
 
 **The Hubless LAN-Direct Trial is a "Try It Out" onboarding sandbox, not the

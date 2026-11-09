@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import crypto from "node:crypto";
 import vm from "node:vm";
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { DatabaseSync } from "node:sqlite";
 import * as flock from "../flock.mjs";
@@ -227,15 +227,25 @@ test("legacy admissions survive callback restart and concurrent online/offline d
     });
     assert.equal((await restarted(request)).code, "RPC_REQUEST_REPLAY");
     const statePath = path.join(root, `offline-${index}.json`);
-    let handling = 0;
+    let handling = 0, decodedRequest = null, decodedConfig = null;
     const options = {
       statePath, drainFn: async () => ({ messages: [{ requestId: request.requestId, rpcPayload: request }] }),
       ackFn: async () => ({ ok: false }),
-      handleFn: async (req) => { handling++; return await api.handleRpcAction(f.cfg, req, { ...f.receiving, source: "offline" }); },
+      handleFn: async (cfg, req) => {
+        handling++;
+        decodedConfig = cfg;
+        decodedRequest = req;
+        assert.deepEqual(req, request);
+        assert.equal(req.action, "release_lock");
+        assert.deepEqual(req.params, { resource, force: true });
+        return await api.handleRpcAction(cfg, req, { ...f.receiving, source: "offline" });
+      },
     };
     await api.drainAndProcessOfflineQueue(f.cfg, options);
     await api.drainAndProcessOfflineQueue(f.cfg, options);
     assert.equal(handling, 1);
+    assert.equal(decodedConfig, f.cfg);
+    assert.deepEqual(decodedRequest, request);
     assert.ok(api.loadProcessedOfflineState(statePath).ambiguousIds.includes(request.requestId));
     assert.ok(api.loadProcessedOfflineState(statePath).pendingAckIds.includes(request.requestId));
     await api.drainAndProcessOfflineQueue(f.cfg, { ...options, ackFn: async () => ({ ok: true }) });
@@ -407,6 +417,128 @@ test("receiver incarnation proof is signed, context matched and persisted for of
   assert.equal(await flock.getLegacyReceiverBinding(origin, f.sending, "VICTIM"), binding);
 });
 
+test("actual file-transfer handler rejects canonical and aliased runtime destinations before bytes or completion", async (t) => {
+  const root = isolatedProfile(t, "flock-runtime-transfer-");
+  const outside = fs.mkdtempSync(path.join(os.tmpdir(), "flock-approved-transfer-"));
+  const alias = path.join(outside, "profile-alias");
+  fs.symlinkSync(root, alias, process.platform === "win32" ? "junction" : "dir");
+  t.after(() => {
+    if (process.platform === "win32") fs.rmdirSync(alias);
+    else fs.unlinkSync(alias);
+    fs.rmSync(outside, { recursive: true, force: true });
+  });
+  process.env.COPILOT_HOME = alias;
+  for (const [index, api] of [flock, bridge].entries()) {
+    const f = await fixture(api);
+    f.initializeAdmissions();
+    const home = api.getBridgeHome();
+    const physicalHome = fs.realpathSync(home);
+    const names = ["legacy-rpc-admissions.mjs", "zero-broker-roster.mjs", "release-policy.mjs", "new-runtime-import.cjs"];
+    const original = "Synthetic protected module bytes; never executed";
+    for (const name of names) fs.writeFileSync(path.join(home, name), original);
+    const state = path.join(outside, `relocated-state-${index}`);
+    fs.mkdirSync(state);
+    fs.writeFileSync(path.join(state, "transfer-metadata.json"), "Synthetic private control state");
+    fs.symlinkSync(state, path.join(home, `private-transfer-state-${index}`), process.platform === "win32" ? "junction" : "dir");
+    const linked = path.join(outside, `linked-${index}.data`);
+    fs.linkSync(path.join(home, names[0]), linked);
+    const receiverKey = crypto.createHash("sha256").update(crypto.createPublicKey(f.receiverKey.publicKey)
+      .export({ type: "spki", format: "der" })).digest("hex");
+    const ledgerFile = path.join(home, "legacy-rpc-admissions", receiverKey, "state.sqlite");
+    const targets = [...names.map((name) => path.join(home, name)),
+      path.join(physicalHome, names[0]), path.join(home, "not-created", "future-import.mjs"), linked,
+      path.join(home, "legacy-rpc-admissions", receiverKey, "state.sqlite"),
+      path.join(state, "transfer-metadata.json"), path.join(state, "not-created", "new-state.json")];
+    if (process.platform === "win32") {
+      targets.push(path.join(physicalHome, names[0]).toUpperCase());
+      const device = `\\\\.\\${path.join(physicalHome, names[0]).replace(/^\\\\\?\\/, "")}`;
+      targets.push(device, device.replaceAll("\\", "/"), `${path.join(home, names[0])}:stream`);
+      const short = execFileSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command",
+        "$ErrorActionPreference='Stop'; Add-Type -Namespace FlockFixture -Name Native -MemberDefinition '[System.Runtime.InteropServices.DllImport(\"kernel32.dll\", CharSet=System.Runtime.InteropServices.CharSet.Unicode, SetLastError=true)] public static extern uint GetShortPathName(string source, System.Text.StringBuilder target, uint capacity);'; $b=New-Object System.Text.StringBuilder 32768; $n=[FlockFixture.Native]::GetShortPathName($env:FLOCK_OWNED_ALIAS_FILE,$b,[uint32]$b.Capacity); if($n -eq 0){throw 'Owned short-path metadata query failed'}; [Console]::Write($b.ToString())"], {
+        encoding: "utf8", windowsHide: true, timeout: 10000,
+        env: { ...process.env, FLOCK_OWNED_ALIAS_FILE: path.join(physicalHome, names[0]) },
+      }).trim();
+      assert.ok(short && fs.existsSync(short), "Short-name query must identify a real owned fixture path");
+      targets.push(short);
+      const key = (value) => value.replace(/^\\\\\?\\/, "").toLowerCase();
+      t.diagnostic(`Physical Windows short-name alias distinct: ${key(short) !== key(path.join(physicalHome, names[0]))}`);
+    }
+    for (const remotePath of targets) {
+      const request = f.request("send_file_chunk", { remotePath, chunkIndex: 0, totalChunks: 1,
+        dataBase64: Buffer.from("Synthetic untrusted replacement; never executed").toString("base64") });
+      assert.equal((await f.callback(request)).status, "rejected", remotePath);
+      for (const name of names) assert.equal(fs.readFileSync(path.join(home, name), "utf8"), original);
+      assert.equal(fs.readFileSync(path.join(state, "transfer-metadata.json"), "utf8"), "Synthetic private control state");
+      const inspected = new DatabaseSync(ledgerFile);
+      try { assert.equal(inspected.prepare("SELECT COUNT(*) AS count FROM admissions").get().count, 0,
+        "Protected paths must reject before admission helper or completion dispatch"); }
+      finally { inspected.close(); }
+    }
+    assert.equal(fs.existsSync(path.join(home, "not-created")), false);
+    for (const remotePath of ["review-module.mjs", path.join(outside, `approved-${index}.txt`)]) {
+      const data = Buffer.from(`Synthetic approved data ${index}`);
+      const result = await f.callback(f.request("send_file_chunk", { remotePath, chunkIndex: 0, totalChunks: 1,
+        dataBase64: data.toString("base64"), expectedSha256: crypto.createHash("sha256").update(data).digest("hex") }));
+      assert.equal(result.status, "accepted");
+      assert.deepEqual(fs.readFileSync(result.result.remotePath), data);
+    }
+    fs.unlinkSync(linked);
+  }
+});
+
+test("completion refuses changed startup-pinned helper or imports before invoking Node", (t) => {
+  const root = isolatedProfile(t, "flock-runtime-integrity-");
+  const source = fs.readFileSync(new URL("../flock.mjs", import.meta.url), "utf8");
+  for (const name of ["legacy-rpc-admissions.mjs", "zero-broker-roster.mjs", "release-policy.mjs"]) {
+    fs.writeFileSync(path.join(root, name), "export const synthetic = true;");
+  }
+  const claim = primitiveAdmission(root);
+  legacyAdmissionOperation({ ...claim, operation: "claim" });
+  const snapshot = flock.captureRuntimeModuleIntegrity(root);
+  let invoked = 0;
+  const context = vm.createContext({
+    fs, path, process, __dirname: root, RUNTIME_MODULE_INTEGRITY: snapshot,
+    assertRuntimeModuleIntegrity: flock.assertRuntimeModuleIntegrity,
+    zeroBrokerNodeFlags: flock.zeroBrokerNodeFlags,
+    rpcSecurityError: (code, message) => Object.assign(new Error(message), { code }),
+    execFileSync: (_program, _args, options) => {
+      invoked++;
+      return JSON.stringify({ ok: true, ...legacyAdmissionOperation(JSON.parse(options.input)) });
+    },
+  });
+  vm.runInContext(`${functionSource(source, "localLegacyAdmissionOperation")}\nthis.complete = localLegacyAdmissionOperation;`, context);
+  assert.equal(context.complete({ home: root, receiverKey: claim.receiverKey, operation: "inspect" }).ok, true);
+  for (const name of ["legacy-rpc-admissions.mjs", "zero-broker-roster.mjs", "release-policy.mjs"]) {
+    const filename = path.join(root, name);
+    fs.writeFileSync(filename, "Synthetic changed executable bytes; never executed");
+    assert.throws(() => context.complete({ ...claim, operation: "complete", outcome: "COMPLETED" }), { code: "RPC_RUNTIME_INTEGRITY_CHANGED" });
+    assert.equal(invoked, 1, "Changed code must never be auto-repinned or invoked");
+    const inspected = new DatabaseSync(path.join(root, "legacy-rpc-admissions", claim.receiverKey, "state.sqlite"));
+    try { assert.equal(inspected.prepare("SELECT outcome FROM admissions").get().outcome, "UNKNOWN"); }
+    finally { inspected.close(); }
+    fs.writeFileSync(filename, "export const synthetic = true;");
+  }
+});
+
+test("transfer descriptor recheck precedes truncation when an opened file differs from its checked path", (t) => {
+  const root = isolatedProfile(t, "flock-transfer-descriptor-");
+  const data = path.join(root, "approved.data"), protectedFile = path.join(root, "protected-module.mjs");
+  fs.writeFileSync(data, "Synthetic approved original");
+  fs.writeFileSync(protectedFile, "Synthetic protected original");
+  const source = fs.readFileSync(new URL("../flock.mjs", import.meta.url), "utf8");
+  const context = vm.createContext({
+    path, process,
+    assertSafeTransferFilePath: (filename) => filename,
+    fs: { ...fs, openSync: (_filename, flags) => fs.openSync(protectedFile, flags) },
+  });
+  for (const name of ["assertTransferDescriptor", "writeVerifiedTransferChunk"]) {
+    vm.runInContext(functionSource(source, name), context);
+  }
+  assert.throws(() => context.writeVerifiedTransferChunk(data, Buffer.from("Synthetic replacement")), /identity changed/);
+  assert.equal(fs.readFileSync(protectedFile, "utf8"), "Synthetic protected original");
+  assert.equal(fs.readFileSync(data, "utf8"), "Synthetic approved original");
+});
+
 test("expired/wrong-target context and absent authority fail closed; guest grants are exact static summaries", async () => {
   for (const api of [flock, bridge]) {
     for (const options of [{ expired: true }, { target: "OTHER" }]) {
@@ -431,8 +563,7 @@ test("expired/wrong-target context and absent authority fail closed; guest grant
 });
 
 function functionSource(source, name) {
-  const normal = source.indexOf(`export function ${name}(`);
-  const start = normal >= 0 ? normal : source.indexOf(`export async function ${name}(`);
+  const start = source.search(new RegExp(`(?:export )?(?:async )?function ${name}\\(`));
   assert.ok(start >= 0, name);
   const next = source.slice(start + 1).search(/\n(?:export )?(?:async )?function [A-Za-z]/);
   return source.slice(start, next < 0 ? source.length : start + 1 + next).replace(/^export /, "");

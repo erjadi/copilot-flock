@@ -76,6 +76,7 @@ function ipv4Lookup(hostname, options, callback) {
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+const RUNTIME_MODULE_INTEGRITY = captureRuntimeModuleIntegrity(__dirname);
 
 export const BRIDGE_VERSION = "3.3.0";
 export const LEGACY_MUTATION_PROTOCOL = "copilot-flock/legacy-mutation-admission/v1";
@@ -931,6 +932,7 @@ function legacyIdentityHash(identity) {
 
 function localLegacyAdmissionOperation(input) {
   const helper = path.join(__dirname, "legacy-rpc-admissions.mjs");
+  assertRuntimeModuleIntegrity(RUNTIME_MODULE_INTEGRITY, [helper, path.join(__dirname, "zero-broker-roster.mjs")]);
   if (!fs.existsSync(helper)) throw rpcSecurityError("RPC_ADMISSION_HELPER_MISSING", "Complete candidate installation is required; no mutation was dispatched");
   const output = execFileSync(process.execPath, [...zeroBrokerNodeFlags(), helper], {
     input: JSON.stringify(input), encoding: "utf8", stdio: ["pipe", "pipe", "pipe"], windowsHide: true,
@@ -5781,21 +5783,165 @@ export function getCachedBootstrapMembersMap(cfg, { forceRefresh = false } = {})
   return cachedBootstrapMembersMap;
 }
 
-export function assertSafeTransferFilePath(targetPath) {
+function transferPathKey(value) {
+  let normalized = String(value).replace(/^\\\\\?\\UNC\\/i, "\\\\").replace(/^\\\\\?\\/, "");
+  normalized = path.resolve(normalized);
+  return process.platform === "win32" ? normalized.toLowerCase() : normalized;
+}
+
+function transferPathWithin(value, root) {
+  const relative = path.relative(transferPathKey(root), transferPathKey(value));
+  return relative === "" || relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
+}
+
+export function resolveCanonicalTransferPath(value, depth = 0) {
+  if (depth > 40) throw new Error("Security policy: transfer path has cyclic aliases");
+  let current = path.resolve(value);
+  const missing = [];
+  while (true) {
+    try {
+      const stat = fs.lstatSync(current);
+      if (stat.isSymbolicLink()) {
+        return resolveCanonicalTransferPath(path.resolve(path.dirname(current), fs.readlinkSync(current), ...missing), depth + 1);
+      }
+      return path.join(fs.realpathSync.native(current), ...missing);
+    } catch (error) {
+      if (!["ENOENT", "ENOTDIR"].includes(error.code)) throw error;
+      const parent = path.dirname(current);
+      if (parent === current) throw new Error("Security policy: transfer path cannot be resolved safely");
+      missing.unshift(path.basename(current));
+      current = parent;
+    }
+  }
+}
+
+export function captureRuntimeModuleIntegrity(directory) {
+  const snapshot = new Map();
+  for (const name of fs.readdirSync(directory)) {
+    if (!/\.(?:mjs|cjs|js|node)$/i.test(name) && name !== "package.json") continue;
+    const filename = path.resolve(directory, name);
+    if (!fs.statSync(filename).isFile()) continue;
+    snapshot.set(filename, {
+      canonical: transferPathKey(resolveCanonicalTransferPath(filename)),
+      digest: crypto.createHash("sha256").update(fs.readFileSync(filename)).digest("hex"),
+    });
+  }
+  return snapshot;
+}
+
+export function assertRuntimeModuleIntegrity(snapshot, required = []) {
+  if (required.some((filename) => !snapshot.has(path.resolve(filename)))) {
+    throw rpcSecurityError("RPC_RUNTIME_INTEGRITY_CHANGED", "Required runtime modules were absent at startup; approved coherent reload is required");
+  }
+  for (const [filename, expected] of snapshot) {
+    if (!fs.existsSync(filename) || transferPathKey(resolveCanonicalTransferPath(filename)) !== expected.canonical ||
+        crypto.createHash("sha256").update(fs.readFileSync(filename)).digest("hex") !== expected.digest) {
+      throw rpcSecurityError("RPC_RUNTIME_INTEGRITY_CHANGED", "Runtime module bytes or aliases changed; automatic helper execution was refused");
+    }
+  }
+}
+
+export function assertSafeTransferFilePath(targetPath, { write = true } = {}) {
   const raw = String(targetPath || "").trim();
   if (!raw) throw new Error("Missing file path for transfer");
+  if (raw.split(/[\\/]+/).includes("..")) throw new Error("Security policy: path traversal segments are forbidden in file transfer");
   const norm = path.normalize(raw);
+  if (process.platform === "win32" && (norm.startsWith("\\\\.\\") ||
+      norm.startsWith("\\\\?\\") && !/^\\\\\?\\(?:[a-z]:[\\/]|UNC[\\/])/i.test(norm) ||
+      norm.slice(path.parse(norm).root.length).includes(":") ||
+      norm.split(/[\\/]+/).some((part) => /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(part.trim())))) {
+    throw new Error("Security policy: device paths and alternate streams are forbidden in file transfer");
+  }
   if (norm.split(/[\\/]+/).includes("..")) {
     throw new Error(`Security policy: path traversal ('..') is forbidden in file transfer: ${raw}`);
   }
   const forbiddenPattern =
     /(?:^|[\\/])(?:\.git|\.ssh|legacy-rpc-admissions|legacy-rpc-admission-anchors|legacy-rpc-bindings)(?:[\\/]|$)|(?:signalr-bridge|flock)[\\/](?:config\.json|identity\.json|flock\.mjs|bridge\.mjs|daemon\.pid)|Start Menu[\\/]Programs[\\/]Startup|LaunchAgents|systemd[\\/]user|mcp-config\.json|hosts\.yml|(?:^|[\\/])\.env(?:\.|$)/i;
-  if (forbiddenPattern.test(norm)) {
+  const canonical = resolveCanonicalTransferPath(norm);
+  if (forbiddenPattern.test(norm) || forbiddenPattern.test(canonical)) {
     throw new Error(
       `Security policy: file transfer to/from protected config, credential, or startup path is forbidden: ${raw}`
     );
   }
-  return norm;
+  if (write) {
+    const bridge = resolveCanonicalTransferPath(getBridgeHome());
+    const expectedTransfers = path.join(bridge, "transfers");
+    const managedTransfer = transferPathWithin(canonical, expectedTransfers) &&
+      transferPathKey(resolveCanonicalTransferPath(expectedTransfers)) === transferPathKey(expectedTransfers);
+    const roots = [getCopilotDir(), getBridgeHome(), getLegacyBridgeHome(), path.dirname(process.execPath)];
+    const referencedFiles = [];
+    const referencedState = [];
+    for (const home of [getBridgeHome(), getLegacyBridgeHome()]) {
+      if (!fs.existsSync(home)) continue;
+      for (const name of fs.readdirSync(home)) {
+        if (name === "transfers") continue;
+        const entry = resolveCanonicalTransferPath(path.join(home, name));
+        if (fs.statSync(entry).isDirectory()) referencedState.push(entry);
+        else referencedFiles.push(transferPathKey(entry));
+      }
+    }
+    referencedFiles.push(transferPathKey(resolveCanonicalTransferPath(path.join(getCopilotDir(), "mcp-config.json"))));
+    const installedModule = referencedFiles.includes(transferPathKey(canonical)) ||
+      [...RUNTIME_MODULE_INTEGRITY.values()].some((entry) => entry.canonical === transferPathKey(canonical));
+    const sourceModule = !managedTransfer && transferPathWithin(canonical, __dirname) &&
+      /\.(?:mjs|cjs|js|node|json|wasm|exe|dll|ps1|sh|py|vbs|cmd|bat)$/i.test(canonical);
+    if (installedModule || sourceModule || referencedState.some((root) => transferPathWithin(canonical, root)) || !managedTransfer &&
+        roots.some((root) => transferPathWithin(canonical, resolveCanonicalTransferPath(root)))) {
+      throw new Error("Security policy: installed runtime, imports and private state cannot be transfer destinations");
+    }
+    if (fs.existsSync(canonical)) {
+      const stat = fs.statSync(canonical, { bigint: true });
+      if (!stat.isFile() || stat.nlink > 1n) throw new Error("Security policy: non-regular or multiply-linked write destinations are forbidden");
+    }
+  }
+  return canonical;
+}
+
+function incomingTransferDestination(remotePath) {
+  const raw = String(remotePath || "").trim();
+  if (!raw || raw.split(/[\\/]+/).includes("..")) throw new Error("Security policy: invalid incoming transfer destination");
+  return assertSafeTransferFilePath(path.isAbsolute(raw) ? raw : path.join(getBridgeHome(), "transfers", path.basename(raw)));
+}
+
+function assertTransferDescriptor(filename, fd) {
+  const canonical = assertSafeTransferFilePath(filename);
+  const opened = fs.fstatSync(fd, { bigint: true });
+  const current = fs.statSync(canonical, { bigint: true });
+  if (!opened.isFile() || opened.nlink > 1n || opened.dev !== current.dev || opened.ino !== current.ino) {
+    throw new Error("Security policy: transfer destination identity changed before writing");
+  }
+}
+
+function writeVerifiedTransferChunk(filename, bytes, { append = false } = {}) {
+  const canonical = assertSafeTransferFilePath(filename);
+  fs.mkdirSync(path.dirname(canonical), { recursive: true });
+  assertSafeTransferFilePath(canonical);
+  const flags = fs.constants.O_RDWR | (append ? fs.constants.O_APPEND : 0) |
+    (process.platform === "win32" ? 0 : fs.constants.O_NOFOLLOW);
+  let fd, created = false, writing = false, opened = null;
+  try {
+    try { fd = fs.openSync(canonical, flags); }
+    catch (error) {
+      if (error.code !== "ENOENT" || append) throw error;
+      fd = fs.openSync(canonical, flags | fs.constants.O_CREAT | fs.constants.O_EXCL, 0o600);
+      created = true;
+    }
+    opened = fs.fstatSync(fd, { bigint: true });
+    assertTransferDescriptor(canonical, fd);
+    writing = true;
+    if (!append) fs.ftruncateSync(fd, 0);
+    fs.writeFileSync(fd, bytes);
+    fs.fsyncSync(fd);
+    assertTransferDescriptor(canonical, fd);
+  } catch (error) {
+    if (fd !== undefined) { fs.closeSync(fd); fd = undefined; }
+    if (created && !writing && opened && fs.existsSync(canonical)) {
+      const current = fs.statSync(canonical, { bigint: true });
+      if (current.dev === opened.dev && current.ino === opened.ino && current.size === 0n) fs.unlinkSync(canonical);
+    }
+    throw error;
+  } finally { if (fd !== undefined) fs.closeSync(fd); }
+  return canonical;
 }
 
 export function resolveVerifiedSenderIdentity(cfg, req, context = null) {
@@ -6045,6 +6191,7 @@ export async function handleRpcAction(cfg, req, context = null) {
   const sender = resolveVerifiedSenderIdentity(cfg, req, context);
   enforceCrossUserInformationalPolicy(cfg, req, sender);
   enforceFlockPolicyAndWalls(cfg, context.policy, req, sender);
+  if (req.action === "send_file_chunk") incomingTransferDestination(req.params?.remotePath);
   if (context.source === "local" || !isLegacyRpcMutation(req)) return await dispatchAuthorizedRpcAction(cfg, req, context);
   const ticket = claimLegacyRpcAdmission(req, context);
   const result = await dispatchAuthorizedRpcAction(cfg, req, context);
@@ -6419,23 +6566,14 @@ async function dispatchAuthorizedRpcAction(cfg, req, context) {
 
   if (action === "send_file_chunk") {
     ensureBridgeDir();
-    const relOrAbs = String(params.remotePath || "").trim();
-    if (!relOrAbs) throw new Error("Missing remotePath for send_file_chunk");
-    assertSafeTransferFilePath(relOrAbs);
-    const resolvedDest = path.isAbsolute(relOrAbs)
-      ? assertSafeTransferFilePath(relOrAbs)
-      : path.join(getBridgeHome(), "transfers", path.basename(relOrAbs));
-    fs.mkdirSync(path.dirname(resolvedDest), { recursive: true });
+    const resolvedDest = incomingTransferDestination(params.remotePath);
     const chunkIndex = Number(params.chunkIndex) || 0;
     const totalChunks = Number(params.totalChunks) || 1;
     const buf = Buffer.from(String(params.dataBase64 || ""), "base64");
-    if (chunkIndex === 0) {
-      fs.writeFileSync(resolvedDest, buf);
-    } else {
-      fs.appendFileSync(resolvedDest, buf);
-    }
+    writeVerifiedTransferChunk(resolvedDest, buf, { append: chunkIndex !== 0 });
     let verifiedSha256 = null;
     if (chunkIndex + 1 >= totalChunks) {
+      assertSafeTransferFilePath(resolvedDest);
       const fullBytes = fs.readFileSync(resolvedDest);
       verifiedSha256 = crypto.createHash("sha256").update(fullBytes).digest("hex");
       if (params.expectedSha256 && verifiedSha256 !== params.expectedSha256) {
@@ -6456,8 +6594,7 @@ async function dispatchAuthorizedRpcAction(cfg, req, context) {
   }
 
   if (action === "pull_file_chunk") {
-    const targetPath = String(params.remotePath || "").trim();
-    assertSafeTransferFilePath(targetPath);
+    const targetPath = assertSafeTransferFilePath(String(params.remotePath || "").trim(), { write: false });
     if (!targetPath || !fs.existsSync(targetPath)) {
       throw new Error(`Remote file not found on ${cfg.machineId}: ${targetPath}`);
     }
@@ -9612,7 +9749,7 @@ export async function sendRemoteFile(
   { toMachine, localPath, remotePath, chunkSize = 256 * 1024 }
 ) {
   const targetMachine = await resolveTargetMachine(cfg, toMachine, { allowLoopback: true });
-  const absLocal = path.resolve(String(localPath || ""));
+  const absLocal = assertSafeTransferFilePath(path.resolve(String(localPath || "")), { write: false });
   if (!fs.existsSync(absLocal)) {
     throw new Error(`Local file does not exist: ${absLocal}`);
   }
@@ -9658,8 +9795,7 @@ export async function pullRemoteFile(
   { fromMachine, remotePath, localPath, chunkSize = 256 * 1024 }
 ) {
   const sourceMachine = await resolveTargetMachine(cfg, fromMachine, { allowLoopback: true });
-  const absLocal = path.resolve(String(localPath || path.basename(String(remotePath || "pulled.bin"))));
-  fs.mkdirSync(path.dirname(absLocal), { recursive: true });
+  const absLocal = assertSafeTransferFilePath(path.resolve(String(localPath || path.basename(String(remotePath || "pulled.bin")))));
 
   let offset = 0;
   let expectedSha256 = null;
@@ -9688,7 +9824,7 @@ export async function pullRemoteFile(
   if (expectedSha256 && actualSha256 !== expectedSha256) {
     throw new Error(`Pulled file SHA-256 mismatch: expected ${expectedSha256}, got ${actualSha256}`);
   }
-  fs.writeFileSync(absLocal, fullBuf);
+  writeVerifiedTransferChunk(absLocal, fullBuf);
   return {
     status: "pulled",
     fromMachine: sourceMachine,
