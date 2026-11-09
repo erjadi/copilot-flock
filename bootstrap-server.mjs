@@ -1490,7 +1490,10 @@ export async function listV3UserFlocks(
   for (const f of Object.values(store.flocks || {})) {
     if (f.expiresAtMs && f.expiresAtMs <= now) continue;
     const activeMembers = Object.values(f.members || {}).filter(
-      (m) => !m.membershipExpiresAtMs || m.membershipExpiresAtMs > now
+      (m) => (!m.membershipExpiresAtMs || m.membershipExpiresAtMs > now) &&
+        !f.revokedPrincipals?.[`user:${m.githubUserId}`] &&
+        !f.revokedPrincipals?.[`device:${m.deviceId}`] &&
+        !f.revokedPrincipals?.[m.peerId]
     );
     const summary = {
       flockId: f.flockId,
@@ -1498,18 +1501,24 @@ export async function listV3UserFlocks(
       hubName: f.hubName,
       flockType: f.flockType,
       ownerGitHubUser: f.ownerGitHubUser,
+      ownerGitHubUserId: f.ownerGitHubUserId,
       allowedScopes: f.allowedScopes,
       targetMachineId: f.targetMachineId || null,
       rosterEpoch: f.rosterEpoch,
+      expiresAtMs: f.expiresAtMs || null,
       memberCount: activeMembers.length,
       members: activeMembers.map((m) => ({
         peerId: m.peerId,
         githubUser: m.githubUser,
+        githubUserId: m.githubUserId,
+        deviceId: m.deviceId,
         machineId: m.machineId,
         scope: m.scope,
         trustTier: m.trustTier,
         publicKey: m.publicKey,
         keyFingerprint: m.keyFingerprint,
+        active: true,
+        membershipExpiresAtMs: m.membershipExpiresAtMs || null,
         membershipExpiresAt: m.membershipExpiresAt || null,
       })),
     };
@@ -1532,6 +1541,8 @@ export async function listV3UserFlocks(
   return {
     ok: true,
     githubUser: cleanUser,
+    githubUserId: githubUserId ? Number(githubUserId) : null,
+    legacyHubName: DEFAULT_HUB,
     ownedFlocks,
     joinedFlocks,
   };

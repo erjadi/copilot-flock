@@ -21,7 +21,7 @@
     "sessions": "node --experimental-sqlite flock.mjs sessions",
     "viewer": "node viewer/viewer-server.mjs",
     "self-test": "node --experimental-sqlite flock.mjs self-test",
-    "test": "node --experimental-sqlite --test --test-concurrency=1 test/flock.test.mjs test/bridge.test.mjs test/setup.test.mjs test/contracts.test.mjs test/zero-broker-roster.test.mjs test/zero-broker-lifecycle.test.mjs",
+    "test": "node --experimental-sqlite --test --test-concurrency=1 test/flock.test.mjs test/bridge.test.mjs test/setup.test.mjs test/contracts.test.mjs test/rpc-security.test.mjs test/zero-broker-roster.test.mjs test/zero-broker-lifecycle.test.mjs",
     "test:zero-broker": "node --experimental-sqlite --test --test-concurrency=1 test/zero-broker-roster.test.mjs test/zero-broker-lifecycle.test.mjs"
   },
   "engines": {

@@ -41,6 +41,14 @@ hour; available issuers renew and rotate expiry epochs. Pages propagation,
 accurate clocks, Azure RBAC and independently verified local grants remain
 requirements, not latency guarantees. Keep the LAN trial separate.
 
+Retained legacy broker flows require an independently verified HTTPS origin
+before resolving or transmitting a reusable GitHub token. Use the user's
+confirmed `--bootstrap-origin-pin` / `COPILOT_FLOCK_ALLOWED_BOOTSTRAP_ORIGIN`;
+an imported invitation URL/key or old unpinned config is not independent trust.
+Do not invent a pin, silently re-sign old queued authority, or weaken active
+enrolled-key/flock-context checks for compatibility. Legacy sender/receiver and
+broker upgrades must be coherent; direct credentials/presence are not enrollment.
+
 ---
 
 ## Isolated LAN Trial (Only When Explicitly Requested)

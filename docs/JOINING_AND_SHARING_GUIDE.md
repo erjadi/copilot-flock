@@ -22,6 +22,14 @@ Zero-Broker enrollment and must not be used to migrate an existing installation
 silently. See [the Zero-Broker setup and authority guide](./BOOTSTRAP_NEW_FLOCK_BYO_AZURE.md)
 for candidate/live-acceptance limits. The LAN trial remains separate.
 
+For retained legacy broker invites, Copilot must obtain independent local-user
+confirmation of the HTTPS issuer origin before any reusable GitHub token is
+resolved or transmitted. Pass the confirmed origin as `--bootstrap-origin-pin`
+or `COPILOT_FLOCK_ALLOWED_BOOTSTRAP_ORIGIN`; never derive trust from the same
+invitation URL/key. Existing unpinned legacy config also requires confirmation.
+This is distinct from the independent root-key pin of the separate Zero-Broker
+journey and authorizes neither a deployment nor fleet re-enrollment.
+
 ---
 
 ## 1. How Case 1 Works: Why Invitees Need Zero Azure Setup

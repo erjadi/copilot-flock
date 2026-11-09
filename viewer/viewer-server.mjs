@@ -369,7 +369,9 @@ async function refreshFleetState() {
           timeoutMs: 2600,
           collectAll: true,
         }).catch(() => []),
-        Promise.resolve().then(() => fetchBootstrapMembers()).catch(() => []),
+        Promise.resolve().then(() => fetchBootstrapMembers({
+          bootstrapUrl: cfg.bootstrapUrl, bootstrapOriginPin: cfg.bootstrapOriginPin,
+        })).catch(() => []),
       ]);
 
       const onlineMachines = [];

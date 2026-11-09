@@ -21,7 +21,7 @@ import {
   createIncrementalEventReader,
   isMatchingDispatchedUserEvent,
   injectLocalSessionMessage,
-  handleRpcAction,
+  handleRpcAction as handleRpcActionWithContext,
   computeMessageDedupKey,
   recentDeliveryCache,
   resolveCliMessage,
@@ -31,7 +31,8 @@ import {
   ensureMachineIdentityKeypair,
   signRpcRequest,
   verifyRpcSignature,
-  resolveVerifiedSenderIdentity,
+  resolveVerifiedSenderIdentity as resolveVerifiedSenderWithContext,
+  createLocalRpcContext,
   assertSafeTransferFilePath,
   waitForSessionReply,
   acquireLocalResourceLock,
@@ -58,6 +59,13 @@ import {
   recordSandboxManifestResource,
   teardownLocalSandbox,
 } from "../flock.mjs";
+
+import { localRpcFixture } from "./local-rpc-fixture.mjs";
+const { handleRpcAction, resolveVerifiedSenderIdentity } = localRpcFixture({
+  handleRpcAction: handleRpcActionWithContext,
+  resolveVerifiedSenderIdentity: resolveVerifiedSenderWithContext,
+  createLocalRpcContext, loadLocalFlocksConfig,
+});
 
 import {
   verifyGitHubRepoAccess,
@@ -2298,7 +2306,8 @@ test("v3.0.0 multi-flock platform: universal <owner>/<flock>[/<machineId>] addre
       (err) => err.code === "UNTRUSTED_BOOTSTRAP_ORIGIN"
     );
     assert.equal(
-      validatePinnedBootstrapOrigin("https://your-flock-bootstrap.azurewebsites.net/api/v3"),
+      validatePinnedBootstrapOrigin("https://your-flock-bootstrap.azurewebsites.net/api/v3",
+        "https://your-flock-bootstrap.azurewebsites.net"),
       "https://your-flock-bootstrap.azurewebsites.net"
     );
 

@@ -46,6 +46,27 @@ inactive views discard late read responses. Overview refreshes reuse an
 in-flight transcript read for the same API source, machine and session, so
 the ten-second overview cadence does not starve slower reads.
 
+### Retained legacy broker/RPC compatibility
+
+Legacy broker-backed operation now requires an **independently verified HTTPS
+broker-origin pin** before resolving or sending a reusable GitHub token.
+Ask Copilot to confirm the issuer origin through a trusted channel, then use
+`--bootstrap-origin-pin` (or `COPILOT_FLOCK_ALLOWED_BOOTSTRAP_ORIGIN`). An
+invitation's URL/key, a device signature, or an old unpinned `bootstrapUrl` is
+not independent issuer trust. Existing legacy configurations need explicit
+origin confirmation; this does not automatically deploy or migrate anything.
+
+Legacy RPC senders, receivers and broker must be upgraded coherently. Requests
+and responses bind the receiving flock UUID/epoch, enrolled peer, recipient,
+reply audience and payload. Active keys/membership come from the authenticated
+broker directory, never caller-provided registries/policies or presence.
+Unbound v2 packets and old queued authority are rejected rather than silently
+reinterpreted. Direct credentials without trusted enrollment are not an RPC
+enrollment substitute. Guest/collaborator legacy access is limited to explicit
+approved static snapshots, not owner-session prompt injection. These application
+checks do **not** make existing static-hub JWTs cryptographically revoked;
+their documented reconnect window remains a separately accepted legacy limit.
+
 ## Managed Azure setup: one approved Copilot-led flow
 
 Tell Copilot: *"Set up a new full Flock using the managed ARM template. Confirm

@@ -363,6 +363,7 @@ curl -fsSL "https://$WEBAPP.azurewebsites.net/health"
 node flock.mjs install `
   --scope personal `
   --bootstrap-url "https://$WEBAPP.azurewebsites.net/api/bootstrap" `
+  --bootstrap-origin-pin "https://$WEBAPP.azurewebsites.net" `
   --connection-string "$SIGNALR_CONN" `
   --servicebus-connection-string "$SB_CONN"
 ```
@@ -372,6 +373,7 @@ node flock.mjs install `
 node ./flock.mjs install \
   --scope personal \
   --bootstrap-url "https://$WEBAPP.azurewebsites.net/api/bootstrap" \
+  --bootstrap-origin-pin "https://$WEBAPP.azurewebsites.net" \
   --connection-string "$SIGNALR_CONN" \
   --servicebus-connection-string "$SB_CONN"
 ```

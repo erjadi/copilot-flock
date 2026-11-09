@@ -13,6 +13,7 @@ SCOPE="${COPILOT_FLOCK_SCOPE:-${COPILOT_BRIDGE_SCOPE:-}}"
 MACHINE_ID="${COPILOT_FLOCK_MACHINE_ID:-${COPILOT_BRIDGE_MACHINE_ID:-}}"
 INVITE_FILE="${COPILOT_FLOCK_INVITE_FILE:-}"
 BOOTSTRAP_URL="${COPILOT_FLOCK_BOOTSTRAP_URL:-}"
+BOOTSTRAP_ORIGIN_PIN="${COPILOT_FLOCK_ALLOWED_BOOTSTRAP_ORIGIN:-}"
 CONNECTION_STRING="${SIGNALR_CONNECTION_STRING:-}"
 SERVICEBUS_CONNECTION_STRING="${SERVICEBUS_CONNECTION_STRING:-}"
 
@@ -35,6 +36,7 @@ while [[ $# -gt 0 ]]; do
     --machine-id) require_value "$@"; MACHINE_ID="$2"; shift 2 ;;
     --invite-file) require_value "$@"; INVITE_FILE="$2"; shift 2 ;;
     --bootstrap-url) require_value "$@"; BOOTSTRAP_URL="$2"; shift 2 ;;
+    --bootstrap-origin-pin) require_value "$@"; BOOTSTRAP_ORIGIN_PIN="$2"; shift 2 ;;
     --connection-string) require_value "$@"; CONNECTION_STRING="$2"; shift 2 ;;
     --servicebus-connection-string) require_value "$@"; SERVICEBUS_CONNECTION_STRING="$2"; shift 2 ;;
     *) fail "Unknown setup option: $1" ;;
@@ -125,6 +127,7 @@ fi
 [[ -z "$MACHINE_ID" ]] || ARGS+=("--machine-id" "$MACHINE_ID")
 [[ -z "$INVITE_FILE" ]] || ARGS+=("--invite-file" "$INVITE_FILE")
 [[ -z "$BOOTSTRAP_URL" ]] || ARGS+=("--bootstrap-url" "$BOOTSTRAP_URL")
+[[ -z "$BOOTSTRAP_ORIGIN_PIN" ]] || ARGS+=("--bootstrap-origin-pin" "$BOOTSTRAP_ORIGIN_PIN")
 [[ -z "$CONNECTION_STRING" ]] || ARGS+=("--connection-string" "$CONNECTION_STRING")
 [[ -z "$SERVICEBUS_CONNECTION_STRING" ]] || ARGS+=("--servicebus-connection-string" "$SERVICEBUS_CONNECTION_STRING")
 echo "Installing and starting Copilot Flock..."

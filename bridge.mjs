@@ -255,15 +255,10 @@ const DEFAULT_BOOTSTRAP_URL =
   process.env.COPILOT_FLOCK_BOOTSTRAP_URL ||
   process.env.COPILOT_BRIDGE_BOOTSTRAP_URL ||
   "";
-const DEFAULT_BOOTSTRAP_ORIGIN = DEFAULT_BOOTSTRAP_URL
-  ? (() => {
-      try {
-        return new URL(DEFAULT_BOOTSTRAP_URL).origin;
-      } catch {
-        return "";
-      }
-    })()
-  : "";
+const DEFAULT_BOOTSTRAP_ORIGIN =
+  process.env.COPILOT_FLOCK_ALLOWED_BOOTSTRAP_ORIGIN ||
+  process.env.COPILOT_BRIDGE_ALLOWED_BOOTSTRAP_ORIGIN ||
+  "";
 const RECORD_SEP = "\x1e";
 
 const HOME_DIR = os.homedir();
@@ -815,6 +810,280 @@ export function normalizeGitHubUser(val) {
   return cleaned || null;
 }
 
+function rpcSecurityError(code, message) {
+  const err = new Error(message);
+  err.code = code;
+  err.statusCode = 403;
+  return err;
+}
+
+function assertActiveRpcMember(member, nowMs = Date.now()) {
+  if (!member || member.active !== true || !member.peerId || !member.publicKey ||
+      !Number.isSafeInteger(member.githubUserId) || member.githubUserId <= 0 ||
+      !["owner", "collaborator", "guest"].includes(member.trustTier)) {
+    throw rpcSecurityError("RPC_MEMBER_NOT_ACTIVE", "RPC identity is not bound to an active enrolled peer.");
+  }
+  if (member.membershipExpiresAtMs !== null && member.membershipExpiresAtMs !== undefined &&
+      (!Number.isFinite(member.membershipExpiresAtMs) || member.membershipExpiresAtMs <= nowMs)) {
+    throw rpcSecurityError("RPC_MEMBERSHIP_EXPIRED", "RPC peer membership has expired.");
+  }
+  try {
+    if (crypto.createPublicKey(member.publicKey).asymmetricKeyType !== "ed25519") throw new Error("Wrong key type");
+  } catch {
+    throw rpcSecurityError("RPC_MEMBER_KEY_INVALID", "Enrolled RPC peer key is not a valid Ed25519 key.");
+  }
+  return member;
+}
+
+function readExistingRpcIdentity() {
+  let identity;
+  try { identity = JSON.parse(fs.readFileSync(getIdentityKeyPath(), "utf8")); } catch {
+    throw rpcSecurityError("RPC_LOCAL_ENROLLMENT_REQUIRED", "An existing enrolled machine identity is required; identity was not created or rotated.");
+  }
+  try {
+    const privateKey = crypto.createPrivateKey(identity.privateKey);
+    const publicKey = crypto.createPublicKey(privateKey).export({ type: "spki", format: "pem" }).trim();
+    if (privateKey.asymmetricKeyType !== "ed25519" || publicKey !== identity.publicKey.trim()) throw new Error("Mismatched key pair");
+  } catch {
+    throw rpcSecurityError("RPC_LOCAL_IDENTITY_INVALID", "Existing RPC identity is invalid; no automatic key replacement was performed.");
+  }
+  return identity;
+}
+
+export async function loadTrustedRpcContext(cfg, { authority = null, identity = null, localFlocks = null, source = "network" } = {}) {
+  if (!["network", "offline"].includes(source)) throw rpcSecurityError("RPC_CONTEXT_INVALID", "Invalid RPC receiver context source.");
+  validatePinnedBootstrapOrigin(cfg?.bootstrapUrl || DEFAULT_BOOTSTRAP_URL, cfg?.bootstrapOriginPin || DEFAULT_BOOTSTRAP_ORIGIN);
+  const localIdentity = identity || readExistingRpcIdentity();
+  const roster = authority || await Promise.resolve(callBootstrapV3Endpoint(cfg, "/my-flocks", {
+    method: "GET", query: { deviceId: localIdentity.fingerprint },
+  }));
+  if (roster?.ok !== true || !Array.isArray(roster.joinedFlocks) ||
+      !Number.isSafeInteger(roster.githubUserId) || roster.githubUserId <= 0) {
+    throw rpcSecurityError("RPC_AUTHORITY_UNAVAILABLE", "Authenticated active RPC enrollment authority is unavailable; no cached or caller-provided fallback was used.");
+  }
+  const nowMs = Date.now();
+  const candidates = roster.joinedFlocks.filter((flock) => Array.isArray(flock.members) &&
+    flock.members.some((member) => member.active === true &&
+      member.githubUserId === roster.githubUserId &&
+      String(member.machineId || "").toLowerCase() === String(cfg.machineId || "").toLowerCase() &&
+      String(member.publicKey || "").trim() === localIdentity.publicKey.trim()));
+  const named = candidates.filter((flock) => flock.hubName === cfg.hub);
+  const roots = candidates.filter((flock) => flock.flockType === "owner_root" &&
+    flock.ownerGitHubUserId === roster.githubUserId);
+  const flock = named.length === 1 ? named[0]
+    : named.length === 0 && roster.legacyHubName === cfg.hub && roots.length === 1 ? roots[0] : null;
+  if (!flock?.flockId || !flock.flockUuid || !Number.isSafeInteger(flock.rosterEpoch) || flock.rosterEpoch < 1 ||
+      !["owner_root", "owner_scope", "collaborator", "guest_pass"].includes(flock.flockType)) {
+    throw rpcSecurityError("RPC_FLOCK_CONTEXT_UNKNOWN", "The receiving transport is not bound to a known enrolled flock.");
+  }
+  if (flock.expiresAtMs !== null && flock.expiresAtMs !== undefined &&
+      (!Number.isFinite(flock.expiresAtMs) || flock.expiresAtMs <= nowMs)) {
+    throw rpcSecurityError("RPC_FLOCK_EXPIRED", "Receiving RPC flock has expired.");
+  }
+  const own = flock.members.filter((member) => member.githubUserId === roster.githubUserId &&
+    String(member.machineId || "").toLowerCase() === String(cfg.machineId || "").toLowerCase() &&
+    String(member.publicKey || "").trim() === localIdentity.publicKey.trim());
+  if (own.length !== 1) throw rpcSecurityError("RPC_LOCAL_ENROLLMENT_REQUIRED", "Local RPC identity has no unique active enrolled membership.");
+  const localMember = assertActiveRpcMember(own[0], nowMs);
+  const stored = (localFlocks || loadLocalFlocksConfig(cfg)).flocks?.[flock.flockId];
+  const grants = stored?.flockUuid === flock.flockUuid ? stored : null;
+  const ownerFlock = flock.flockType === "owner_root" || flock.flockType === "owner_scope";
+  const policy = {
+    flockId: flock.flockId, flockUuid: flock.flockUuid, rosterEpoch: flock.rosterEpoch,
+    flockType: flock.flockType, ownerGitHubUserId: flock.ownerGitHubUserId,
+    trustTier: ownerFlock ? "owner" : flock.flockType === "guest_pass" ? "guest" : "collaborator",
+    allowedScopes: flock.allowedScopes, targetMachineId: flock.targetMachineId || null,
+    membershipExpiresAtMs: flock.expiresAtMs || null,
+    sessionVisibility: ownerFlock ? "all" : "explicit_opt_in_only",
+    sharedSessionIds: grants?.sharedSessionIds || [], sharedSnapshots: grants?.sharedSnapshots || {},
+    shareSpecs: ownerFlock ? "full" : "summary",
+  };
+  if (!Array.isArray(policy.allowedScopes) || !policy.allowedScopes.includes(normalizeScope(cfg.scope, "work"))) {
+    throw rpcSecurityError("RPC_FLOCK_SCOPE_MISMATCH", "This machine's scope is not authorized in the receiving RPC flock.");
+  }
+  if (policy.targetMachineId &&
+      policy.targetMachineId.toLowerCase() !== cfg.machineId.toLowerCase()) {
+    throw rpcSecurityError("GUEST_TARGET_MISMATCH", "Guest RPC flock is bound to a different machine.");
+  }
+  return { source, policy, members: flock.members, localMember, identity: localIdentity };
+}
+
+export function createLocalRpcContext(cfg, { senderIdentity = null, policy = null, members = [], maxSkewMs = 300000 } = {}) {
+  return {
+    source: "local", members, maxSkewMs,
+    policy: policy || {
+      flockId: normalizeGitHubUser(cfg?.githubUser) || "local",
+      trustTier: "owner", allowedScopes: ["personal", "work"],
+    },
+    senderIdentity: senderIdentity || {
+      fromMachine: cfg.machineId, fromGitHubUser: cfg.githubUser || null,
+      fromScope: normalizeScope(cfg.scope, "work"), senderVerified: false,
+      isCrossUser: false, trustLevel: "same_user_local", verifiedVia: "local",
+    },
+  };
+}
+
+function rejectRpcAuthorityInputs(req) {
+  if (!req || typeof req !== "object" || Array.isArray(req) ||
+      ["registryMembers", "flockPolicy", "receiverContext", "senderIdentity", "enforceSignature", "maxSkewMs"]
+        .some((key) => Object.hasOwn(req, key))) {
+    throw rpcSecurityError("RPC_CALLER_AUTHORITY_REJECTED", "Caller-provided RPC authority or malformed request was rejected.");
+  }
+}
+
+function rpcRequestSigningPayload(req) {
+  return {
+    flockId: req.flockId, fromMachine: req.fromMachine, toMachine: req.toMachine,
+    replyUserId: req.replyUserId, sentAt: req.sentAt, params: req.params || {},
+  };
+}
+
+export function createSignedRpcRequest(cfg, context, { toMachine = "*", action, params = {}, requestId = crypto.randomUUID(),
+  replyUserId = `rpc-${requestId}`, lifetimeMs = 86400000 } = {}) {
+  if (!context?.policy?.flockId || !context.identity || !context.localMember) {
+    throw rpcSecurityError("RPC_CONTEXT_REQUIRED", "A trusted enrolled signing context is required.");
+  }
+  const own = assertActiveRpcMember(context.localMember);
+  let target = "*";
+  if (toMachine !== "*" && String(toMachine).toLowerCase() !== "all") {
+    const recipients = context.members.filter((member) =>
+      String(member.machineId || "").toLowerCase() === String(toMachine).toLowerCase());
+    if (recipients.length !== 1) throw rpcSecurityError("RPC_RECIPIENT_NOT_ENROLLED", "RPC recipient has no unique enrolled membership.");
+    target = assertActiveRpcMember(recipients[0]).peerId;
+  }
+  const nowMs = Date.now();
+  const expiresMs = Math.min(nowMs + Math.min(86400000, Math.max(300000, Number(lifetimeMs) || 86400000)),
+    own.membershipExpiresAtMs || Infinity, context.policy.membershipExpiresAtMs || Infinity);
+  const req = {
+    requestId, replyUserId, flockId: context.policy.flockId,
+    fromMachine: own.machineId, toMachine: toMachine === "all" ? "*" : toMachine,
+    action, params, sentAt: new Date(nowMs).toISOString(),
+  };
+  req.auth = signV3RpcEnvelope({
+    flockUuid: context.policy.flockUuid, rosterEpoch: context.policy.rosterEpoch,
+    requestId, timestamp: req.sentAt, expiresAt: new Date(expiresMs).toISOString(),
+    fromPeerId: own.peerId, toPeerId: target, actionOrStatus: action,
+    payload: rpcRequestSigningPayload(req), identity: context.identity,
+  });
+  return req;
+}
+
+function rpcResponseSigningPayload(response, replyUserId) {
+  return {
+    fromMachine: response.fromMachine, respondedAt: response.respondedAt, replyUserId,
+    ...(response.error ? { error: response.error, code: response.code || null } : { result: response.result }),
+  };
+}
+
+export function verifySignedRpcResponse(cfg, response, request, context) {
+  if (!response || response.requestId !== request.requestId || response.auth?.v !== 3 ||
+      response.auth.kind !== "res" || response.auth.flockUuid !== context.policy.flockUuid ||
+      response.auth.rosterEpoch !== context.policy.rosterEpoch ||
+      response.auth.toPeerId !== context.localMember.peerId ||
+      response.respondedAt !== response.auth.timestamp ||
+      (request.auth.toPeerId !== "*" && response.auth.fromPeerId !== request.auth.toPeerId)) {
+    throw rpcSecurityError("RPC_RESPONSE_CONTEXT_INVALID", "RPC response lacks the expected authenticated flock/recipient context.");
+  }
+  const peers = context.members.filter((member) => member.peerId === response.auth.fromPeerId);
+  if (peers.length !== 1) throw rpcSecurityError("RPC_RESPONSE_SIGNER_UNKNOWN", "RPC response signer is not uniquely enrolled.");
+  const peer = assertActiveRpcMember(peers[0]);
+  if (response.fromMachine !== peer.machineId ||
+      (response.auth.publicKey && response.auth.publicKey.trim() !== peer.publicKey.trim())) {
+    throw rpcSecurityError("RPC_RESPONSE_KEY_MISMATCH", "RPC response machine/key does not match enrolled authority.");
+  }
+  const verified = verifyV3RpcEnvelope({
+    envelope: response.auth, expectedFlockUuid: context.policy.flockUuid,
+    minRosterEpoch: context.policy.rosterEpoch, requestId: request.requestId,
+    actionOrStatus: response.error ? "error" : "ok",
+    payload: rpcResponseSigningPayload(response, request.replyUserId), publicKey: peer.publicKey,
+  });
+  if (!verified.valid) throw rpcSecurityError("RPC_RESPONSE_SIGNATURE_INVALID", "RPC response signature is invalid.");
+  return response;
+}
+
+function assertRpcDisclosureAuthority(cfg, req, original, current, { checkAction = true } = {}) {
+  if (current.policy.flockUuid !== original.policy.flockUuid ||
+      current.policy.trustTier !== original.policy.trustTier ||
+      current.localMember.peerId !== original.localMember.peerId ||
+      current.localMember.publicKey.trim() !== original.localMember.publicKey.trim()) {
+    throw rpcSecurityError("RPC_AUTHORITY_CHANGED", "RPC authority changed before response disclosure.");
+  }
+  const peer = assertActiveRpcMember(current.members.find((member) => member.peerId === req.auth.fromPeerId));
+  const oldPeer = original.members.find((member) => member.peerId === peer.peerId);
+  if (!oldPeer || peer.publicKey.trim() !== oldPeer.publicKey.trim() || peer.trustTier !== oldPeer.trustTier ||
+      Date.parse(req.auth.expiresAt) <= Date.now()) {
+    throw rpcSecurityError("RPC_AUTHORITY_CHANGED", "RPC signer/expiry authority changed before response disclosure.");
+  }
+  if (current.policy.trustTier === "owner" &&
+      (peer.trustTier !== "owner" || peer.githubUserId !== current.policy.ownerGitHubUserId)) {
+    throw rpcSecurityError("RPC_FLOCK_MEMBERSHIP_FORBIDDEN", "Response recipient is no longer an enrolled flock owner.");
+  }
+  if (checkAction) enforceFlockPolicyAndWalls(cfg, current.policy, req);
+  if (checkAction && current.policy.trustTier !== "owner" && req.action === "get_transcript" &&
+      JSON.stringify(current.policy.sharedSnapshots?.[req.params?.session]) !==
+      JSON.stringify(original.policy.sharedSnapshots?.[req.params?.session])) {
+    throw rpcSecurityError("RPC_GRANT_CHANGED", "Snapshot grant changed before response disclosure.");
+  }
+}
+
+export function createRpcInvocationHandler(cfg, {
+  contextProvider = loadTrustedRpcContext,
+  sendResponse = (userId, response) => sendSignalRToUser(cfg, userId, "bridgeRpcResponse", response),
+  logger = (code) => logDaemon(`RPC rejected: ${code}`),
+} = {}) {
+  return async (req) => {
+    let context, authenticated = false;
+    try {
+      rejectRpcAuthorityInputs(req);
+      if (typeof req.requestId !== "string" || !req.requestId || req.requestId.length > 128 ||
+          typeof req.replyUserId !== "string" || !/^rpc-[A-Za-z0-9._:-]{1,128}$/.test(req.replyUserId) ||
+          typeof req.action !== "string" || !req.action ||
+          !req.params || typeof req.params !== "object" || Array.isArray(req.params)) {
+        throw rpcSecurityError("RPC_REQUEST_INVALID", "Malformed RPC request was rejected before dispatch.");
+      }
+      context = await contextProvider(cfg);
+      if (context?.source !== "network") throw rpcSecurityError("RPC_CONTEXT_INVALID", "Network callback requires receiver-owned network context.");
+      resolveVerifiedSenderIdentity(cfg, req, context);
+      authenticated = true;
+      const result = await handleRpcAction(cfg, req, context);
+      const fresh = await contextProvider(cfg);
+      assertRpcDisclosureAuthority(cfg, req, context, fresh, { checkAction: false });
+      const response = {
+        requestId: req.requestId, fromMachine: fresh.localMember.machineId,
+        result, respondedAt: new Date().toISOString(),
+      };
+      response.auth = signV3RpcEnvelope({
+        kind: "res", flockUuid: fresh.policy.flockUuid, rosterEpoch: fresh.policy.rosterEpoch,
+        requestId: req.requestId, timestamp: response.respondedAt,
+        fromPeerId: fresh.localMember.peerId, toPeerId: req.auth.fromPeerId,
+        actionOrStatus: "ok", payload: rpcResponseSigningPayload(response, req.replyUserId), identity: fresh.identity,
+      });
+      await sendResponse(req.replyUserId, response);
+      return { status: "accepted", result };
+    } catch (err) {
+      logger(err.code || "RPC_ERROR");
+      if (authenticated && context) {
+        try {
+          const fresh = await contextProvider(cfg);
+          assertRpcDisclosureAuthority(cfg, req, context, fresh);
+          const response = {
+            requestId: req.requestId, fromMachine: fresh.localMember.machineId,
+            error: err.message, code: err.code || "RPC_ERROR", respondedAt: new Date().toISOString(),
+          };
+          response.auth = signV3RpcEnvelope({
+            kind: "res", flockUuid: fresh.policy.flockUuid, rosterEpoch: fresh.policy.rosterEpoch,
+            requestId: req.requestId, timestamp: response.respondedAt,
+            fromPeerId: fresh.localMember.peerId, toPeerId: req.auth.fromPeerId,
+            actionOrStatus: "error", payload: rpcResponseSigningPayload(response, req.replyUserId), identity: fresh.identity,
+          });
+          await sendResponse(req.replyUserId, response);
+        } catch (responseError) { logger(responseError.code || "RPC_RESPONSE_REJECTED"); }
+      }
+      return { status: "rejected", code: err.code || "RPC_ERROR" };
+    }
+  };
+}
+
 export function resolveLocalGitHubUser({ allowCli = false } = {}) {
   const envUser = normalizeGitHubUser(
     process.env.COPILOT_BRIDGE_GITHUB_USER || process.env.GITHUB_USER || ""
@@ -1244,6 +1513,13 @@ export function loadConfig({ autoFetchAz = true, refreshSpecs = false } = {}) {
 
   backupLegacyScopeConfig(cfg, activeConfigPath);
 
+  const bootstrapUrl =
+    process.env.COPILOT_BRIDGE_BOOTSTRAP_URL ||
+    cfg.bootstrapUrl ||
+    DEFAULT_BOOTSTRAP_URL;
+  const bootstrapOriginPin = cfg.bootstrapOriginPin || DEFAULT_BOOTSTRAP_ORIGIN;
+  if (bootstrapUrl) validatePinnedBootstrapOrigin(bootstrapUrl, bootstrapOriginPin);
+
   const machineId =
     process.env.COPILOT_BRIDGE_MACHINE_ID ||
     cfg.machineId ||
@@ -1266,11 +1542,6 @@ export function loadConfig({ autoFetchAz = true, refreshSpecs = false } = {}) {
     cfg.hub ||
     DEFAULT_HUB;
 
-  const bootstrapUrl =
-    process.env.COPILOT_BRIDGE_BOOTSTRAP_URL ||
-    cfg.bootstrapUrl ||
-    DEFAULT_BOOTSTRAP_URL;
-
   let specs = cfg.specs || null;
   const needsSpecsProbe = refreshSpecs || !specs || !specs.cpu;
   if (needsSpecsProbe) {
@@ -1285,6 +1556,7 @@ export function loadConfig({ autoFetchAz = true, refreshSpecs = false } = {}) {
   if (!connectionString && autoFetchAz) {
     const bootRes = fetchConnectionStringViaGitHubBootstrap({
       bootstrapUrl,
+      bootstrapOriginPin,
       machineId,
       scope: hasExplicitScope ? scope : null,
       githubUser,
@@ -1316,6 +1588,7 @@ export function loadConfig({ autoFetchAz = true, refreshSpecs = false } = {}) {
         specs,
         hub,
         bootstrapUrl,
+        bootstrapOriginPin,
         subscription: cfg.subscription || DEFAULT_AZURE_SUBSCRIPTION,
         resourceGroup: cfg.resourceGroup || DEFAULT_AZURE_RESOURCE_GROUP,
         signalrName: cfg.signalrName || DEFAULT_AZURE_SIGNALR_NAME,
@@ -1359,6 +1632,7 @@ export function loadConfig({ autoFetchAz = true, refreshSpecs = false } = {}) {
     githubUser,
     specs,
     bootstrapUrl,
+    bootstrapOriginPin,
     hub,
     connectionString,
     endpoint: parsed.endpoint,
@@ -1634,7 +1908,7 @@ export function validatePinnedBootstrapOrigin(bootstrapUrl, expectedOrigin = nul
     err.statusCode = 400;
     throw err;
   }
-  if (u.protocol !== "https:" || /evil-attacker|example\.com/i.test(u.hostname)) {
+  if (u.protocol !== "https:" || u.username || u.password) {
     const err = new Error(
       `Security policy: Enrollment JSON bootstrapUrl origin "${u.origin}" is untrusted or non-HTTPS`
     );
@@ -1647,16 +1921,25 @@ export function validatePinnedBootstrapOrigin(bootstrapUrl, expectedOrigin = nul
     process.env.COPILOT_FLOCK_ALLOWED_BOOTSTRAP_ORIGIN ||
     process.env.COPILOT_BRIDGE_ALLOWED_BOOTSTRAP_ORIGIN ||
     DEFAULT_BOOTSTRAP_ORIGIN;
-  if (configuredPin) {
-    const allowedOrigin = new URL(configuredPin).origin.toLowerCase();
-    if (u.origin.toLowerCase() !== allowedOrigin) {
-      const err = new Error(
-        `Security policy: Enrollment JSON bootstrapUrl origin "${u.origin}" does not match pinned "${allowedOrigin}"`
-      );
-      err.code = "UNTRUSTED_BOOTSTRAP_ORIGIN";
-      err.statusCode = 403;
-      throw err;
-    }
+  if (!configuredPin) {
+    const err = new Error("Untrusted bootstrap origin: an independently verified origin pin is required before GitHub authentication.");
+    err.code = "UNTRUSTED_BOOTSTRAP_ORIGIN";
+    err.statusCode = 403;
+    throw err;
+  }
+  let allowed;
+  try { allowed = new URL(configuredPin); } catch {
+    const err = new Error("Invalid independent bootstrap origin pin.");
+    err.code = "UNTRUSTED_BOOTSTRAP_ORIGIN";
+    err.statusCode = 403;
+    throw err;
+  }
+  if (allowed.protocol !== "https:" || allowed.username || allowed.password ||
+      u.origin.toLowerCase() !== allowed.origin.toLowerCase()) {
+    const err = new Error("Untrusted bootstrap origin: destination does not match the independent HTTPS origin pin.");
+    err.code = "UNTRUSTED_BOOTSTRAP_ORIGIN";
+    err.statusCode = 403;
+    throw err;
   }
   return u.origin;
 }
@@ -1824,12 +2107,15 @@ export function resolveLocalGitHubToken() {
 
 export function fetchConnectionStringViaGitHubBootstrap({
   bootstrapUrl = DEFAULT_BOOTSTRAP_URL,
+  bootstrapOriginPin = DEFAULT_BOOTSTRAP_ORIGIN,
   machineId = os.hostname(),
   scope = "work",
   githubUser = null,
 } = {}) {
+  if (!bootstrapUrl) return null;
+  validatePinnedBootstrapOrigin(bootstrapUrl, bootstrapOriginPin);
   const ghToken = resolveLocalGitHubToken();
-  if (!ghToken || !bootstrapUrl) return null;
+  if (!ghToken) return null;
 
   try {
     const u = new URL(bootstrapUrl);
@@ -1901,13 +2187,16 @@ export function fetchConnectionStringViaGitHubBootstrap({
 
 export function registerWithBootstrapServer({
   bootstrapUrl = DEFAULT_BOOTSTRAP_URL,
+  bootstrapOriginPin = DEFAULT_BOOTSTRAP_ORIGIN,
   machineId = os.hostname(),
   scope = "work",
   githubUser = null,
   specs = null,
 } = {}) {
+  if (!bootstrapUrl) return null;
+  validatePinnedBootstrapOrigin(bootstrapUrl, bootstrapOriginPin);
   const ghToken = resolveLocalGitHubToken();
-  if (!ghToken || !bootstrapUrl) return null;
+  if (!ghToken) return null;
 
   try {
     const registerUrl = new URL(bootstrapUrl);
@@ -1966,9 +2255,11 @@ export function registerWithBootstrapServer({
   return null;
 }
 
-export function fetchBootstrapMembers({ bootstrapUrl = DEFAULT_BOOTSTRAP_URL } = {}) {
+export function fetchBootstrapMembers({ bootstrapUrl = DEFAULT_BOOTSTRAP_URL, bootstrapOriginPin = DEFAULT_BOOTSTRAP_ORIGIN } = {}) {
+  if (!bootstrapUrl) return [];
+  validatePinnedBootstrapOrigin(bootstrapUrl, bootstrapOriginPin);
   const ghToken = resolveLocalGitHubToken();
-  if (!ghToken || !bootstrapUrl) return [];
+  if (!ghToken) return [];
 
   try {
     const membersUrl = new URL(bootstrapUrl);
@@ -2016,12 +2307,15 @@ export function fetchBootstrapMembers({ bootstrapUrl = DEFAULT_BOOTSTRAP_URL } =
 
 export function callBootstrapQueueApi({
   bootstrapUrl = DEFAULT_BOOTSTRAP_URL,
+  bootstrapOriginPin = DEFAULT_BOOTSTRAP_ORIGIN,
   endpointPath = "/api/queue/status",
   method = "GET",
   bodyObj = null,
 } = {}) {
+  if (!bootstrapUrl) return null;
+  validatePinnedBootstrapOrigin(bootstrapUrl, bootstrapOriginPin);
   const ghToken = resolveLocalGitHubToken();
-  if (!ghToken || !bootstrapUrl) return null;
+  if (!ghToken) return null;
 
   try {
     const apiUrl = new URL(bootstrapUrl);
@@ -2073,12 +2367,14 @@ export function callBootstrapQueueApi({
 
 export function enqueueOfflineMessage({
   bootstrapUrl = DEFAULT_BOOTSTRAP_URL,
+  bootstrapOriginPin = DEFAULT_BOOTSTRAP_ORIGIN,
   toMachine,
   rpcPayload,
   ttlSeconds = 86400,
 } = {}) {
   return callBootstrapQueueApi({
     bootstrapUrl,
+    bootstrapOriginPin,
     endpointPath: "/api/queue/enqueue",
     method: "POST",
     bodyObj: { toMachine, rpcPayload, ttlSeconds },
@@ -2087,11 +2383,13 @@ export function enqueueOfflineMessage({
 
 export function drainOfflineQueue({
   bootstrapUrl = DEFAULT_BOOTSTRAP_URL,
+  bootstrapOriginPin = DEFAULT_BOOTSTRAP_ORIGIN,
   machineId = os.hostname(),
   peekOnly = true,
 } = {}) {
   return callBootstrapQueueApi({
     bootstrapUrl,
+    bootstrapOriginPin,
     endpointPath: "/api/queue/drain",
     method: "POST",
     bodyObj: { machineId, peekOnly },
@@ -2100,10 +2398,12 @@ export function drainOfflineQueue({
 
 export function ackOfflineQueueMessages({
   bootstrapUrl = DEFAULT_BOOTSTRAP_URL,
+  bootstrapOriginPin = DEFAULT_BOOTSTRAP_ORIGIN,
   requestIds = [],
 } = {}) {
   return callBootstrapQueueApi({
     bootstrapUrl,
+    bootstrapOriginPin,
     endpointPath: "/api/queue/ack",
     method: "POST",
     bodyObj: { requestIds },
@@ -2112,6 +2412,7 @@ export function ackOfflineQueueMessages({
 
 export function getOfflineQueueStatus({
   bootstrapUrl = DEFAULT_BOOTSTRAP_URL,
+  bootstrapOriginPin = DEFAULT_BOOTSTRAP_ORIGIN,
   machineId = null,
 } = {}) {
   const u = new URL(bootstrapUrl);
@@ -2119,6 +2420,7 @@ export function getOfflineQueueStatus({
   if (machineId) u.searchParams.set("machineId", machineId);
   return callBootstrapQueueApi({
     bootstrapUrl: u.toString(),
+    bootstrapOriginPin,
     endpointPath: u.pathname + u.search,
     method: "GET",
   });
@@ -4575,53 +4877,40 @@ export async function invokeRemoteRpc(
     params = {},
     timeoutMs = 8000,
     collectAll = false,
+    contextProvider = loadTrustedRpcContext,
   }
 ) {
   const requestId = crypto.randomUUID();
   const replyUserId = `rpc-${requestId}`;
   const responses = [];
+  const context = await contextProvider(cfg);
+  const rpcPayload = createSignedRpcRequest(cfg, context, { toMachine, action, params, requestId, replyUserId });
 
-  let resolveFirst;
-  const firstPromise = new Promise((res) => {
+  let resolveFirst, rejectFirst;
+  const firstPromise = new Promise((res, rej) => {
     resolveFirst = res;
+    rejectFirst = rej;
   });
+  firstPromise.catch(() => {});
 
   const client = await connectSignalRClient(cfg, {
     userId: replyUserId,
-    onInvocation: (target, args) => {
+    onInvocation: async (target, args) => {
       if (target === "bridgeRpcResponse" && args[0]?.requestId === requestId) {
-        responses.push(args[0]);
-        if (!collectAll) {
-          resolveFirst(args[0]);
+        try {
+          const fresh = await contextProvider(cfg);
+          const response = verifySignedRpcResponse(cfg, args[0], rpcPayload, fresh);
+          responses.push(response);
+          if (!collectAll) resolveFirst(response);
+        } catch (err) {
+          logDaemon(`RPC response rejected: ${err.code || "RPC_RESPONSE_ERROR"}`);
+          if (!collectAll) rejectFirst(err);
         }
       }
     },
   });
 
   try {
-    const sentAt = new Date().toISOString();
-    let auth = null;
-    try {
-      auth = signRpcRequest({
-        requestId,
-        sentAt,
-        fromMachine: cfg.machineId,
-        toMachine: toMachine || "*",
-        action,
-        params,
-      });
-    } catch {}
-    const rpcPayload = {
-      requestId,
-      replyUserId,
-      fromMachine: cfg.machineId,
-      toMachine: toMachine || "*",
-      action,
-      params,
-      sentAt,
-      auth,
-    };
-
     if (!toMachine || toMachine === "*" || toMachine.toLowerCase() === "all") {
       await sendSignalRBroadcast(cfg, "bridgeRpcRequest", rpcPayload);
     } else {
@@ -4652,25 +4941,38 @@ export async function invokeRemoteRpc(
       throw new Error(`Remote machine "${winner.fromMachine}" returned error: ${winner.error}`);
     }
     return winner;
+  } catch (err) {
+    err.rpcPayload = rpcPayload;
+    throw err;
   } finally {
     client.close();
   }
 }
 
-export async function invokeRemoteRpcBatch(cfg, items, timeoutMs = 18000) {
+export async function invokeRemoteRpcBatch(cfg, items, timeoutMs = 18000, { contextProvider = loadTrustedRpcContext } = {}) {
   if (!items || items.length === 0) return [];
   const replyUserId = `rpc-batch-${crypto.randomUUID()}`;
   const pending = new Map();
+  const context = await contextProvider(cfg);
 
   const client = await connectSignalRClient(cfg, {
     userId: replyUserId,
-    onInvocation: (target, args) => {
+    onInvocation: async (target, args) => {
       if (target === "bridgeRpcResponse" && args[0]?.requestId) {
         const entry = pending.get(args[0].requestId);
         if (entry) {
-          clearTimeout(entry.timer);
-          pending.delete(args[0].requestId);
-          entry.resolve(args[0]);
+          try {
+            const fresh = await contextProvider(cfg);
+            const response = verifySignedRpcResponse(cfg, args[0], entry.request, fresh);
+            clearTimeout(entry.timer);
+            pending.delete(args[0].requestId);
+            entry.resolve(response);
+          } catch (err) {
+            clearTimeout(entry.timer);
+            pending.delete(args[0].requestId);
+            logDaemon(`RPC batch response rejected: ${err.code || "RPC_RESPONSE_ERROR"}`);
+            entry.reject(err);
+          }
         }
       }
     },
@@ -4679,6 +4981,9 @@ export async function invokeRemoteRpcBatch(cfg, items, timeoutMs = 18000) {
   try {
     const promises = items.map((item) => {
       const requestId = crypto.randomUUID();
+      const rpcPayload = createSignedRpcRequest(cfg, context, {
+        toMachine: item.toMachine, action: item.action, params: item.params || {}, requestId, replyUserId,
+      });
       const responsePromise = new Promise((resolve, reject) => {
         const timer = setTimeout(() => {
           pending.delete(requestId);
@@ -4688,42 +4993,21 @@ export async function invokeRemoteRpcBatch(cfg, items, timeoutMs = 18000) {
             )
           );
         }, timeoutMs);
-        pending.set(requestId, { resolve, reject, timer });
+        pending.set(requestId, { resolve, reject, timer, request: rpcPayload });
       });
 
-      const sentAt = new Date().toISOString();
-      const itemParams = item.params || {};
-      let auth = null;
-      try {
-        auth = signRpcRequest({
-          requestId,
-          sentAt,
-          fromMachine: cfg.machineId,
-          toMachine: item.toMachine || "*",
-          action: item.action,
-          params: itemParams,
-        });
-      } catch {}
-      const rpcPayload = {
-        requestId,
-        replyUserId,
-        fromMachine: cfg.machineId,
-        toMachine: item.toMachine || "*",
-        action: item.action,
-        params: itemParams,
-        sentAt,
-        auth,
-      };
-
-      return sendSignalRToUser(cfg, item.toMachine, "bridgeRpcRequest", rpcPayload)
-        .then(() => responsePromise)
-        .then((winner) => {
+      return Promise.all([sendSignalRToUser(cfg, item.toMachine, "bridgeRpcRequest", rpcPayload), responsePromise])
+        .then(([, winner]) => {
           if (winner.error) {
             throw new Error(`Remote machine "${winner.fromMachine}" returned error: ${winner.error}`);
           }
           return { ok: true, response: winner, item };
         })
-        .catch((err) => ({ ok: false, error: err.message, item }));
+        .catch((err) => {
+          const entry = pending.get(requestId);
+          if (entry) { clearTimeout(entry.timer); pending.delete(requestId); }
+          return { ok: false, error: err.message, item, request: rpcPayload };
+        });
     });
 
     return await Promise.all(promises);
@@ -5030,7 +5314,8 @@ export function getCachedBootstrapMembersMap(cfg, { forceRefresh = false } = {})
     return cachedBootstrapMembersMap;
   }
   try {
-    const list = fetchBootstrapMembers({ bootstrapUrl: cfg?.bootstrapUrl || DEFAULT_BOOTSTRAP_URL });
+    const list = fetchBootstrapMembers({ bootstrapUrl: cfg?.bootstrapUrl || DEFAULT_BOOTSTRAP_URL,
+      bootstrapOriginPin: cfg?.bootstrapOriginPin || DEFAULT_BOOTSTRAP_ORIGIN });
     if (Array.isArray(list) && list.length > 0) {
       const m = new Map();
       for (const item of list) {
@@ -5062,98 +5347,79 @@ export function assertSafeTransferFilePath(targetPath) {
   return norm;
 }
 
-export function resolveVerifiedSenderIdentity(cfg, req) {
-  const params = req.params || {};
-  const rawClaimedMachine = req.auth?.fromMachine || req.fromMachine || params.fromMachine || "unknown";
-  const rawClaimedUser = normalizeGitHubUser(params.fromGitHubUser);
-  const rawClaimedScope = normalizeScope(params.fromScope, "work");
-
-  let membersMap = null;
-  if (Array.isArray(req.registryMembers)) {
-    membersMap = new Map(
-      req.registryMembers
-        .filter((m) => m && m.machineId)
-        .map((m) => [String(m.machineId).toLowerCase(), m])
-    );
-  } else if (req.auth) {
-    membersMap = getCachedBootstrapMembersMap(cfg);
-    if (!membersMap.has(String(rawClaimedMachine).toLowerCase())) {
-      membersMap = getCachedBootstrapMembersMap(cfg, { forceRefresh: true });
-    }
+export function resolveVerifiedSenderIdentity(cfg, req, context = null) {
+  rejectRpcAuthorityInputs(req);
+  if (!context?.policy?.flockId || !["network", "offline", "local"].includes(context.source)) {
+    throw rpcSecurityError("RPC_CONTEXT_REQUIRED", "Receiver-owned RPC context is required.");
   }
-
-  let regEntry = membersMap ? membersMap.get(String(rawClaimedMachine).toLowerCase()) : null;
-  let regPubKey = regEntry?.publicKey || regEntry?.specs?.publicKey || null;
-
-  let senderVerified = false;
-  if (req.auth) {
-    // Auto-refresh `/api/members` cache once if a peer rotated its Ed25519 key (e.g. after reprovision)
-    if (
-      !Array.isArray(req.registryMembers) &&
-      (!regPubKey || (req.auth.publicKey && regPubKey.trim() !== String(req.auth.publicKey).trim()))
-    ) {
-      membersMap = getCachedBootstrapMembersMap(cfg, { forceRefresh: true });
-      regEntry = membersMap ? membersMap.get(String(rawClaimedMachine).toLowerCase()) : null;
-      regPubKey = regEntry?.publicKey || regEntry?.specs?.publicKey || null;
+  if (context.source === "local" && !req.auth) {
+    if (!context.senderIdentity?.fromMachine) throw rpcSecurityError("RPC_LOCAL_IDENTITY_REQUIRED", "Trusted local RPC identity is missing.");
+    return context.senderIdentity;
+  }
+  let member;
+  if (context.source === "local" && req.auth?.v === 2) {
+    const matches = context.members.filter((candidate) =>
+      String(candidate.machineId).toLowerCase() === String(req.auth.fromMachine).toLowerCase());
+    if (matches.length !== 1) throw rpcSecurityError("RPC_MEMBER_NOT_ACTIVE", "RPC signer is not uniquely enrolled.");
+    member = assertActiveRpcMember(matches[0]);
+    if (req.auth.publicKey && req.auth.publicKey.trim() !== member.publicKey.trim()) {
+      throw rpcSecurityError("RPC_KEY_MISMATCH", "RPC public key mismatch with enrolled identity.");
     }
-
-    if (regPubKey && req.auth.publicKey && regPubKey.trim() !== String(req.auth.publicKey).trim()) {
-      throw new Error(
-        `Security error: Ed25519 public key mismatch for machine "${rawClaimedMachine}" — spoofed sender rejected.`
-      );
-    }
-    const keyToVerify = regPubKey || req.auth.publicKey;
-    const effectiveMaxSkewMs = Math.max(300000, Number(req.maxSkewMs) || 300000);
-    const ver = verifyRpcSignature({
-      requestId: req.requestId,
-      sentAt: req.auth.sentAt || req.sentAt,
-      fromMachine: rawClaimedMachine,
-      toMachine: req.toMachine || cfg?.machineId || "*",
-      action: req.action,
-      params,
-      publicKey: keyToVerify,
-      signature: req.auth.signature,
-      maxSkewMs: effectiveMaxSkewMs,
+    const verified = verifyRpcSignature({
+      requestId: req.requestId, sentAt: req.auth.sentAt, fromMachine: member.machineId,
+      toMachine: req.toMachine || cfg.machineId, action: req.action, params: req.params || {},
+      publicKey: member.publicKey, signature: req.auth.signature, maxSkewMs: context.maxSkewMs,
     });
-    if (!ver.valid) {
-      throw new Error(
-        `Security error: Ed25519 signature verification failed for machine "${rawClaimedMachine}" (${ver.reason}) — spoofed sender rejected.`
-      );
+    if (!verified.valid) throw rpcSecurityError("RPC_SIGNATURE_INVALID", "RPC signature verification failed against the enrolled key.");
+  } else {
+    if (req.auth?.v !== 3 || req.auth.kind !== "req" || req.flockId !== context.policy.flockId ||
+        req.auth.flockUuid !== context.policy.flockUuid || req.auth.rosterEpoch !== context.policy.rosterEpoch) {
+      throw rpcSecurityError("RPC_FLOCK_CONTEXT_INVALID", "Signed RPC flock context is missing, stale or mismatched; legacy unbound packets are not accepted.");
     }
-    senderVerified = true;
-  } else if (regPubKey && req.enforceSignature) {
-    throw new Error(
-      `Security error: unsigned RPC claiming registered machine "${rawClaimedMachine}" rejected.`
-    );
+    const matches = context.members.filter((candidate) => candidate.peerId === req.auth.fromPeerId);
+    if (matches.length !== 1) throw rpcSecurityError("RPC_MEMBER_NOT_ACTIVE", "RPC signer is not uniquely enrolled.");
+    member = assertActiveRpcMember(matches[0]);
+    if (typeof req.fromMachine !== "string" ||
+        req.fromMachine.toLowerCase() !== member.machineId.toLowerCase() ||
+        (req.auth.publicKey && req.auth.publicKey.trim() !== member.publicKey.trim())) {
+      throw rpcSecurityError("RPC_KEY_MISMATCH", "RPC machine/key claims do not match the active enrolled peer.");
+    }
+    const broadcast = req.toMachine === "*" || String(req.toMachine).toLowerCase() === "all";
+    if ((broadcast && req.auth.toPeerId !== "*") ||
+        (!broadcast && (typeof req.toMachine !== "string" ||
+          req.toMachine.toLowerCase() !== cfg.machineId.toLowerCase() ||
+          req.auth.toPeerId !== context.localMember?.peerId))) {
+      throw rpcSecurityError("RPC_TARGET_MISMATCH", "RPC is not signed for this enrolled recipient.");
+    }
+    const sentMs = Date.parse(req.auth.timestamp);
+    const expiresMs = Date.parse(req.auth.expiresAt);
+    if (req.sentAt !== req.auth.timestamp || !Number.isFinite(sentMs) || !Number.isFinite(expiresMs) ||
+        expiresMs <= Date.now() || expiresMs <= sentMs || expiresMs - sentMs > 86400000 ||
+        expiresMs > (member.membershipExpiresAtMs || Infinity) ||
+        expiresMs > (context.policy.membershipExpiresAtMs || Infinity)) {
+      throw rpcSecurityError("RPC_EXPIRY_INVALID", "RPC expiry is invalid or exceeds active membership authority.");
+    }
+    const verified = verifyV3RpcEnvelope({
+      envelope: req.auth, expectedFlockUuid: context.policy.flockUuid,
+      minRosterEpoch: context.policy.rosterEpoch, requestId: req.requestId,
+      actionOrStatus: req.action, payload: rpcRequestSigningPayload(req),
+      publicKey: member.publicKey, maxSkewMs: context.source === "offline" ? 86400000 : 300000,
+    });
+    if (!verified.valid) throw rpcSecurityError("RPC_SIGNATURE_INVALID", "RPC signature verification failed against the active enrolled key.");
+    if (context.policy.trustTier === "owner" &&
+        (member.trustTier !== "owner" || member.githubUserId !== context.policy.ownerGitHubUserId)) {
+      throw rpcSecurityError("RPC_FLOCK_MEMBERSHIP_FORBIDDEN", "This peer is not an authorized owner in the receiving flock.");
+    }
   }
-
-  // Always prefer the GitHub-verified bootstrap registry identity for machineId and githubUser;
-  // for same-user verified machines, prefer the sender's own signed fromScope over a potentially stale registry scope.
-  const verifiedMachine = regEntry?.machineId || rawClaimedMachine;
-  const verifiedGitHubUser = normalizeGitHubUser(regEntry?.githubUser || rawClaimedUser);
-  const localGitHubUser = normalizeGitHubUser(cfg?.githubUser);
-
-  const isCrossUser = Boolean(
-    verifiedGitHubUser &&
-      localGitHubUser &&
-      verifiedGitHubUser.toLowerCase() !== localGitHubUser.toLowerCase()
-  );
-  const verifiedScope =
-    senderVerified && !isCrossUser && params.fromScope
-      ? normalizeScope(params.fromScope, regEntry?.scope || "work")
-      : normalizeScope(regEntry?.scope || rawClaimedScope, "work");
-
+  const localUser = normalizeGitHubUser(cfg.githubUser);
+  const peerUser = normalizeGitHubUser(member.githubUser);
+  const isCrossUser = Boolean(peerUser && localUser && peerUser.toLowerCase() !== localUser.toLowerCase());
   return {
-    fromMachine: verifiedMachine,
-    fromGitHubUser: verifiedGitHubUser,
-    fromScope: verifiedScope,
-    senderVerified,
-    isCrossUser,
-    trustLevel: isCrossUser
-      ? "cross_user_informational_only"
-      : senderVerified
-      ? "same_user_verified"
-      : "same_user",
+    fromMachine: member.machineId, fromGitHubUser: peerUser,
+    fromScope: normalizeScope(member.scope, "work"), fromPeerId: member.peerId,
+    senderVerified: true, isCrossUser,
+    trustLevel: isCrossUser ? "cross_user_informational_only" : "same_user_verified",
+    verifiedVia: "active_enrolled_key",
   };
 }
 
@@ -5324,21 +5590,48 @@ export function listLocalResourceLocks(cfg) {
   };
 }
 
-export async function handleRpcAction(cfg, req) {
+export async function handleRpcAction(cfg, req, context = null) {
   const { action, params = {} } = req;
-  const senderIdentity = resolveVerifiedSenderIdentity(cfg, req);
+  const senderIdentity = resolveVerifiedSenderIdentity(cfg, req, context);
   enforceCrossUserInformationalPolicy(cfg, req, senderIdentity);
 
-  let flockPolicy = req.flockPolicy || null;
-  if (!flockPolicy && req.flockId) {
-    const localFlocks = loadLocalFlocksConfig(cfg);
-    flockPolicy = localFlocks.flocks?.[String(req.flockId).toLowerCase()] || null;
-  }
-  if (flockPolicy) {
-    enforceFlockPolicyAndWalls(cfg, flockPolicy, req, senderIdentity);
-  }
+  const flockPolicy = context.policy;
+  enforceFlockPolicyAndWalls(cfg, flockPolicy, req, senderIdentity);
   const isRestrictedFlock = Boolean(flockPolicy && flockPolicy.trustTier !== "owner");
   const fromMachine = senderIdentity.fromMachine;
+
+  if (isRestrictedFlock) {
+    if (!["ping", "list_sessions", "get_transcript"].includes(action)) {
+      throw rpcSecurityError("FLOCK_ACTION_FORBIDDEN", "Guest/collaborator RPC is limited to approved informational snapshots.");
+    }
+    const snapshots = Object.entries(flockPolicy.sharedSnapshots || {})
+      .filter(([, snapshot]) => snapshot.mode === "approved-snapshot" && typeof snapshot.summarySnapshot === "string");
+    if (action === "get_transcript") {
+      const selected = snapshots.find(([sessionId]) => sessionId === params.session);
+      if (!selected) throw rpcSecurityError("SESSION_NOT_SHARED", "No approved snapshot grant exists for this session.");
+      const [sessionId, snapshot] = selected;
+      return {
+        session: { session_id: sessionId, title: snapshot.title || sessionId, mode: "approved-snapshot" },
+        messages: [{ role: "assistant", content: snapshot.summarySnapshot, timestamp: snapshot.sharedAt }],
+      };
+    }
+    const query = String(params.query || "").toLowerCase();
+    const sessions = snapshots.filter(([sessionId, snapshot]) =>
+      !query || `${sessionId} ${snapshot.title || ""}`.toLowerCase().includes(query))
+      .slice(0, Math.max(1, Math.min(50, Number(params.limit) || 30)))
+      .map(([sessionId, snapshot]) => ({
+        session_id: sessionId, title: snapshot.title || sessionId,
+        session_type: "approved-snapshot", is_running: false, updated_at: snapshot.sharedAt,
+      }));
+    if (action === "list_sessions") return { machineId: cfg.machineId, scope: cfg.scope, count: sessions.length, sessions };
+    return {
+      machineId: cfg.machineId, version: BRIDGE_VERSION, scope: cfg.scope,
+      specs: { cpu: cfg.specs?.cpu || null, memory: cfg.specs?.memory || null,
+        gpus: cfg.specs?.gpus || [], os: cfg.specs?.os || null },
+      activeSessionCount: sessions.length, recentSessions: sessions.slice(0, 5),
+      ...(params.includeSessions ? { sessions } : {}), timestamp: new Date().toISOString(),
+    };
+  }
 
   if (action === "ping") {
     const wsInfo = getLocalWsConnectionInfo();
@@ -6266,7 +6559,8 @@ export async function drainAndProcessOfflineQueue(
   {
     drainFn = drainOfflineQueue,
     ackFn = ackOfflineQueueMessages,
-    handleFn = handleRpcAction,
+    handleFn = async (runtimeCfg, req) => handleRpcAction(runtimeCfg, req,
+      await loadTrustedRpcContext(runtimeCfg, { source: "offline" })),
     statePath = getProcessedOfflineIdsPath(),
   } = {}
 ) {
@@ -6298,6 +6592,7 @@ export async function drainAndProcessOfflineQueue(
         const retryRes = await Promise.resolve(
           ackFn({
             bootstrapUrl: cfg.bootstrapUrl || DEFAULT_BOOTSTRAP_URL,
+            bootstrapOriginPin: cfg.bootstrapOriginPin || DEFAULT_BOOTSTRAP_ORIGIN,
             requestIds: retryIds,
           })
         );
@@ -6310,6 +6605,7 @@ export async function drainAndProcessOfflineQueue(
       const drained = await Promise.resolve(
         drainFn({
           bootstrapUrl: cfg.bootstrapUrl || DEFAULT_BOOTSTRAP_URL,
+          bootstrapOriginPin: cfg.bootstrapOriginPin || DEFAULT_BOOTSTRAP_ORIGIN,
           machineId: cfg.machineId,
           peekOnly: true,
         })
@@ -6358,11 +6654,7 @@ export async function drainAndProcessOfflineQueue(
 
         let handleSucceeded = false;
         try {
-          const ttlMs = Math.max(300000, ((Number(item.ttlSeconds) || 86400) + 300) * 1000);
-          await handleFn(cfg, {
-            ...item.rpcPayload,
-            maxSkewMs: ttlMs,
-          });
+          await handleFn(cfg, item.rpcPayload);
           handleSucceeded = true;
         } catch (err) {
           logDaemon(`Offline queue replay error for ${reqId}: ${err.message}`);
@@ -6401,6 +6693,7 @@ export async function drainAndProcessOfflineQueue(
         const ackRes = await Promise.resolve(
           ackFn({
             bootstrapUrl: cfg.bootstrapUrl || DEFAULT_BOOTSTRAP_URL,
+            bootstrapOriginPin: cfg.bootstrapOriginPin || DEFAULT_BOOTSTRAP_ORIGIN,
             requestIds: toAckIds,
           })
         );
@@ -6480,6 +6773,7 @@ export async function runDaemon(cfg) {
   });
 
   let reconnectAttempt = 0;
+  const rpcHandler = createRpcInvocationHandler(cfg);
 
   while (true) {
     const connectedStartedAt = Date.now();
@@ -6516,26 +6810,7 @@ export async function runDaemon(cfg) {
                 requestId,
               });
             }
-            try {
-              const result = await handleRpcAction(cfg, payload);
-              await sendSignalRToUser(cfg, replyUserId, "bridgeRpcResponse", {
-                requestId,
-                fromMachine: cfg.machineId,
-                result,
-                respondedAt: new Date().toISOString(),
-              });
-            } catch (err) {
-              const errDetail = formatErrorDetail(err);
-              logDaemon(`RPC error on action ${action}: ${errDetail}`);
-              try {
-                await sendSignalRToUser(cfg, replyUserId, "bridgeRpcResponse", {
-                  requestId,
-                  fromMachine: cfg.machineId,
-                  error: errDetail,
-                  respondedAt: new Date().toISOString(),
-                });
-              } catch {}
-            }
+            await rpcHandler(payload);
           }
         },
         onClose: (info) => {
@@ -6549,7 +6824,7 @@ export async function runDaemon(cfg) {
 
       // Announce presence & drain any offline Service Bus messages queued while offline
       try {
-        const selfInfo = await handleRpcAction(cfg, { action: "ping" });
+        const selfInfo = await handleRpcAction(cfg, { action: "ping" }, createLocalRpcContext(cfg));
         await sendSignalRBroadcast(cfg, "bridgePresence", selfInfo);
       } catch {}
       drainAndProcessOfflineQueue(cfg).catch(() => {});
@@ -6563,7 +6838,7 @@ export async function runDaemon(cfg) {
               process.exit(0);
             }
           }
-          const selfInfo = await handleRpcAction(cfg, { action: "ping" });
+          const selfInfo = await handleRpcAction(cfg, { action: "ping" }, createLocalRpcContext(cfg));
           await sendSignalRBroadcast(cfg, "bridgePresence", selfInfo);
           drainAndProcessOfflineQueue(cfg).catch(() => {});
           updateStateFile("connected");
@@ -7357,6 +7632,10 @@ export const MCP_TOOLS = [
           type: "object",
           description: "The parsed Enrollment JSON object.",
         },
+          bootstrap_origin_pin: {
+            type: "string",
+            description: "Independently verified, user-approved legacy broker HTTPS origin. Never copy trust from the invitation.",
+          },
         maintainer_visibility_ack: {
           type: "boolean",
           description: "Confirmation that the user acknowledges platform maintainer visibility (default: true).",
@@ -7627,34 +7906,19 @@ async function executeMcpTool(cfg, name, args = {}) {
     } catch (err) {
       const allowOfflineQueue = args.offline_queue !== false && !waitForReply;
       if (allowOfflineQueue && /Timed out after .* waiting for response from machine/i.test(err.message)) {
-        const reqId = crypto.randomUUID();
-        const sentAt = new Date().toISOString();
-        const auth = signRpcRequest({
-          requestId: reqId,
-          sentAt,
-          fromMachine: cfg.machineId,
-          toMachine: targetMachine,
-          action: "send_message",
-          params: rpcParams,
-        });
+        if (!err.rpcPayload?.auth || err.rpcPayload.auth.v !== 3) throw err;
+        const reqId = err.rpcPayload.requestId;
         const queued = enqueueOfflineMessage({
           bootstrapUrl: cfg.bootstrapUrl || DEFAULT_BOOTSTRAP_URL,
+          bootstrapOriginPin: cfg.bootstrapOriginPin || DEFAULT_BOOTSTRAP_ORIGIN,
           toMachine: targetMachine,
           ttlSeconds: Number(args.ttl_seconds) || 86400,
-          rpcPayload: {
-            requestId: reqId,
-            fromMachine: cfg.machineId,
-            toMachine: targetMachine,
-            action: "send_message",
-            params: rpcParams,
-            sentAt,
-            auth,
-          },
+          rpcPayload: err.rpcPayload,
         });
         if (queued?.ok) {
           return {
             status: "queued_offline",
-            deliveryStage: "queued_in_servicebus",
+            deliveryStage: queued.serviceBusPublished === true ? "queued_in_servicebus" : "persisted_in_bootstrap_queue",
             dispatchedToRuntime: false,
             requestId: reqId,
             targetMachine,
@@ -8117,22 +8381,24 @@ async function executeMcpTool(cfg, name, args = {}) {
         : args.enrollment_json;
     const pinnedOrigin = validatePinnedBootstrapOrigin(
       enrollmentJson?.bootstrapUrl,
-      cfg?.bootstrapUrl || null
+      args.bootstrap_origin_pin || cfg?.bootstrapOriginPin || DEFAULT_BOOTSTRAP_ORIGIN
     );
+    const independentPin = args.bootstrap_origin_pin || cfg?.bootstrapOriginPin || DEFAULT_BOOTSTRAP_ORIGIN;
+    if (cfg.bootstrapUrl) validatePinnedBootstrapOrigin(cfg.bootstrapUrl, independentPin);
     const effectiveBootstrapUrl = `${pinnedOrigin}/api/bootstrap`;
     const activeConfigPath = getConfigPath();
-    if (!cfg.bootstrapUrl && fs.existsSync(activeConfigPath)) {
-      try {
-        const updatedCfg = JSON.parse(fs.readFileSync(activeConfigPath, "utf8"));
-        updatedCfg.bootstrapUrl = effectiveBootstrapUrl;
-        writeConfigFileSecure(updatedCfg, activeConfigPath);
-        cfg.bootstrapUrl = effectiveBootstrapUrl;
-      } catch {}
+    if ((!cfg.bootstrapUrl || args.bootstrap_origin_pin) && fs.existsSync(activeConfigPath)) {
+      const updatedCfg = JSON.parse(fs.readFileSync(activeConfigPath, "utf8"));
+      updatedCfg.bootstrapUrl = effectiveBootstrapUrl;
+      updatedCfg.bootstrapOriginPin = new URL(independentPin).origin;
+      writeConfigFileSecure(updatedCfg, activeConfigPath);
+      cfg.bootstrapUrl = effectiveBootstrapUrl;
+      cfg.bootstrapOriginPin = updatedCfg.bootstrapOriginPin;
     }
     const idKey = ensureMachineIdentityKeypair();
     const timestamp = new Date().toISOString();
     const res = callBootstrapV3Endpoint(
-      { ...cfg, bootstrapUrl: effectiveBootstrapUrl },
+      { ...cfg, bootstrapUrl: effectiveBootstrapUrl, bootstrapOriginPin: independentPin },
       "/enroll",
       {
         method: "POST",
@@ -8228,7 +8494,7 @@ export async function generateFlockTopologyDiagram(
   const isLight = String(theme || "dark").toLowerCase() === "light";
   const [onlineMachines, bootstrapMembers] = await Promise.all([
     discoverMachines(cfg, { includeSelf: true, timeoutMs: 2500 }),
-    fetchBootstrapMembers({ bootstrapUrl: cfg.bootstrapUrl }),
+    fetchBootstrapMembers({ bootstrapUrl: cfg.bootstrapUrl, bootstrapOriginPin: cfg.bootstrapOriginPin }),
   ]);
   const onlineById = new Map(
     onlineMachines.map((m) => [String(m.machineId || "").toLowerCase(), m])
@@ -9614,7 +9880,7 @@ export async function reprovisionLocalBridge(cfg, { syncInstall = false } = {}) 
 export async function reprovisionFleetMachines(cfg, { machines = "*" } = {}) {
   const [discovered, bootstrapMembers] = await Promise.all([
     discoverMachines(cfg, { includeSelf: true, timeoutMs: 2500 }),
-    fetchBootstrapMembers(),
+    fetchBootstrapMembers({ bootstrapUrl: cfg.bootstrapUrl, bootstrapOriginPin: cfg.bootstrapOriginPin }),
   ]);
 
   const allKnownMap = new Map();
@@ -9663,29 +9929,15 @@ export async function reprovisionFleetMachines(cfg, { machines = "*" } = {}) {
       });
     } else if (/Timed out after .* waiting for response from machine/i.test(o.error || "")) {
       // Target machine is currently offline/sleeping — queue signed `reprovision` RPC in Service Bus / Bootstrap store-and-forward queue
-      const reqId = crypto.randomUUID();
-      const sentAt = new Date().toISOString();
-      const auth = signRpcRequest({
-        requestId: reqId,
-        sentAt,
-        fromMachine: cfg.machineId,
-        toMachine: mId,
-        action: "reprovision",
-        params: {},
-      });
+      const request = o.request;
+      if (request?.auth?.v !== 3) throw rpcSecurityError("RPC_QUEUE_CONTEXT_REQUIRED", "Offline reprovision requires its original authenticated request.");
+      const reqId = request.requestId;
       const queued = enqueueOfflineMessage({
         bootstrapUrl: cfg.bootstrapUrl || DEFAULT_BOOTSTRAP_URL,
+        bootstrapOriginPin: cfg.bootstrapOriginPin || DEFAULT_BOOTSTRAP_ORIGIN,
         toMachine: mId,
         ttlSeconds: 86400,
-        rpcPayload: {
-          requestId: reqId,
-          fromMachine: cfg.machineId,
-          toMachine: mId,
-          action: "reprovision",
-          params: {},
-          sentAt,
-          auth,
-        },
+        rpcPayload: request,
       });
       reprovisionResults.push({
         machineId: mId,
@@ -10087,7 +10339,7 @@ export async function diagnoseFleetMachines(
       collectAll: true,
       timeoutMs: 2500,
     }),
-    fetchBootstrapMembers(),
+    fetchBootstrapMembers({ bootstrapUrl: cfg.bootstrapUrl, bootstrapOriginPin: cfg.bootstrapOriginPin }),
   ]);
 
   const pingsByMachine = new Map();
@@ -10403,13 +10655,14 @@ export function signV3EnrollmentRequest(body, githubUserId, identity) {
 export function callBootstrapV3Endpoint(
   cfg,
   subPath,
-  { method = "POST", body = null, sandbox = isSandboxV3Mode() } = {}
+  { method = "POST", body = null, sandbox = isSandboxV3Mode(), query = {} } = {}
 ) {
-  const ghToken = resolveLocalGitHubToken();
   const baseBoot = cfg?.bootstrapUrl || DEFAULT_BOOTSTRAP_URL;
-  const origin = validatePinnedBootstrapOrigin(baseBoot);
+  const origin = validatePinnedBootstrapOrigin(baseBoot, cfg?.bootstrapOriginPin || DEFAULT_BOOTSTRAP_ORIGIN);
+  const ghToken = resolveLocalGitHubToken();
   const prefix = sandbox ? "/api/v3/preview" : "/api/v3";
   const u = new URL(`${prefix}${subPath}`, origin);
+  for (const [key, value] of Object.entries(query)) u.searchParams.set(key, String(value));
   if (method === "GET" && cfg?.githubUser) {
     u.searchParams.set("githubUser", cfg.githubUser);
   }
@@ -10441,7 +10694,7 @@ export function callBootstrapV3Endpoint(
   `;
   try {
     let requestBody = body;
-    if (subPath === "/enroll" && method === "POST" && body?.enrollmentJson) {
+    if (subPath === "/enroll" && method === "POST" && body) {
       const githubUserId = Number(execFileSync("gh", ["api", "user", "--jq", ".id"], {
         encoding: "utf8",
         stdio: ["ignore", "pipe", "pipe"],
@@ -10474,6 +10727,7 @@ export async function installBridge({
   connectionStringArg,
   serviceBusConnectionStringArg,
   bootstrapUrlArg,
+  bootstrapOriginPinArg,
   enrollmentJsonArg,
   subscriptionArg,
   resourceGroupArg,
@@ -10501,6 +10755,12 @@ export async function installBridge({
 
   backupLegacyScopeConfig(existing, activeConfigPath);
 
+  if (bootstrapOriginPinArg) {
+    const pin = new URL(String(bootstrapOriginPinArg));
+    if (pin.protocol !== "https:" || pin.username || pin.password) throw new Error("Independent bootstrap origin pin must be HTTPS without credentials.");
+    existing.bootstrapOriginPin = pin.origin;
+  }
+
   let parsedEnrollmentJson = null;
   if (enrollmentJsonArg) {
     parsedEnrollmentJson =
@@ -10508,13 +10768,13 @@ export async function installBridge({
     if (parsedEnrollmentJson?.bootstrapUrl) {
       const origin = validatePinnedBootstrapOrigin(
         parsedEnrollmentJson.bootstrapUrl,
-        existing.bootstrapUrl || null
+        existing.bootstrapOriginPin || DEFAULT_BOOTSTRAP_ORIGIN
       );
       existing.bootstrapUrl = `${origin}/api/bootstrap`;
     }
   }
   if (bootstrapUrlArg) {
-    const origin = validatePinnedBootstrapOrigin(bootstrapUrlArg, null);
+    const origin = validatePinnedBootstrapOrigin(bootstrapUrlArg, existing.bootstrapOriginPin || DEFAULT_BOOTSTRAP_ORIGIN);
     existing.bootstrapUrl = `${origin}/api/bootstrap`;
   }
   if (subscriptionArg) existing.subscription = subscriptionArg;
@@ -11119,7 +11379,7 @@ Legacy configurations/v3 broker invites retain compatibility; do not migrate imp
 Copilot Flock v${BRIDGE_VERSION}
 
 Usage:
-  node flock.mjs install [--machine-id <name>] [--scope work|personal] [--github-user <handle>] [--connection-string <str>] [--servicebus-connection-string <str>] [--bootstrap-url <url>] [--invite-file <path>]
+  node flock.mjs install [--machine-id <name>] [--scope work|personal] [--github-user <handle>] [--connection-string <str>] [--servicebus-connection-string <str>] [--bootstrap-url <url>] [--bootstrap-origin-pin <independently-verified-origin>] [--invite-file <path>]
   node flock.mjs vote-release --branch <candidate-branch> [--machines <m1,m2,*>]
   node flock.mjs update [--all] [--machines <m1,m2,DESKTOP-*>] [--scope work|personal]
   node flock.mjs diagnose [--fix] [--machines <m1,m2,DESKTOP-*>] [--scope work|personal]
@@ -11195,6 +11455,7 @@ Usage:
       serviceBusConnectionStringArg:
         flags["servicebus-connection-string"] || flags["service-bus-connection-string"],
       bootstrapUrlArg: flags["bootstrap-url"],
+      bootstrapOriginPinArg: flags["bootstrap-origin-pin"],
       enrollmentJsonArg: rawEnrollmentJson,
       subscriptionArg: flags.subscription,
       resourceGroupArg: flags["resource-group"],
@@ -11276,7 +11537,7 @@ Usage:
         githubUser: flags["github-user"] || flags.user || null,
         timeoutMs: 2500,
       }),
-      fetchBootstrapMembers(),
+      fetchBootstrapMembers({ bootstrapUrl: cfg.bootstrapUrl, bootstrapOriginPin: cfg.bootstrapOriginPin }),
     ]);
 
     const onlineById = new Map(

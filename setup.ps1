@@ -4,6 +4,7 @@ param(
     [string]$Scope = $(if ($env:COPILOT_FLOCK_SCOPE) { $env:COPILOT_FLOCK_SCOPE } elseif ($env:COPILOT_BRIDGE_SCOPE) { $env:COPILOT_BRIDGE_SCOPE } else { "" }),
     [string]$InviteFile = $env:COPILOT_FLOCK_INVITE_FILE,
     [string]$BootstrapUrl = $env:COPILOT_FLOCK_BOOTSTRAP_URL,
+    [string]$BootstrapOriginPin = $env:COPILOT_FLOCK_ALLOWED_BOOTSTRAP_ORIGIN,
     [string]$ConnectionString = $env:SIGNALR_CONNECTION_STRING,
     [string]$ServiceBusConnectionString = $env:SERVICEBUS_CONNECTION_STRING,
     [switch]$ProvisionAzure,
@@ -120,6 +121,9 @@ if ($InviteFile) {
 }
 if ($BootstrapUrl) {
     $ArgsList += @("--bootstrap-url", $BootstrapUrl)
+}
+if ($BootstrapOriginPin) {
+    $ArgsList += @("--bootstrap-origin-pin", $BootstrapOriginPin)
 }
 if ($ConnectionString -and (-not $ProvisionAzure -or $Legacy)) {
     $ArgsList += @("--connection-string", $ConnectionString)
