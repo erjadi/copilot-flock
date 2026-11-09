@@ -513,6 +513,137 @@ test("shared immutable source extraction rejects unsupported Git entries and uns
   }
 });
 
+test("offline broker capacity and corrupt state fail closed without losing accepted work or publishing", async (t) => {
+  const root = temporary(t);
+  const queuePath = path.join(root, "queue.json");
+  const items = Array.from({ length: 500 }, (_, index) => ({
+    requestId: `synthetic-${index}`, toMachine: "EXAMPLE-PC", expiresAtMs: Date.now() + 60000,
+  }));
+  broker.saveOfflineQueueStore({ items }, queuePath);
+  const original = fs.readFileSync(queuePath);
+  let published = 0;
+  const options = { toMachine: "EXAMPLE-PC", rpcPayload: { requestId: "synthetic-overflow" }, queuePath,
+    publishFn: async () => { published++; return { published: true }; } };
+  await assert.rejects(() => broker.enqueueOfflineStoreItem(options), { code: "QUEUE_CAPACITY_EXHAUSTED", statusCode: 503 });
+  assert.equal(published, 0);
+  assert.deepEqual(fs.readFileSync(queuePath), original);
+  assert.throws(() => broker.saveOfflineQueueStore({ items: [...items, items[0]] }, queuePath), { code: "QUEUE_CAPACITY_EXHAUSTED" });
+  assert.throws(() => broker.saveOfflineQueueStore({}, queuePath), { code: "QUEUE_STORAGE_ERROR" });
+  assert.deepEqual(fs.readFileSync(queuePath), original);
+  fs.writeFileSync(queuePath, "{synthetic-private-corrupt-state-canary");
+  const corrupt = fs.readFileSync(queuePath);
+  await assert.rejects(() => broker.enqueueOfflineStoreItem(options), { code: "QUEUE_STORAGE_ERROR" });
+  assert.throws(() => broker.loadOfflineQueueStore(queuePath), (error) =>
+    error.code === "QUEUE_STORAGE_ERROR" && !error.message.includes("synthetic-private-corrupt-state-canary"));
+  assert.equal(published, 0);
+  assert.deepEqual(fs.readFileSync(queuePath), corrupt);
+});
+
+test("offline broker persists before publish, deduplicates before network and never resurrects an acknowledged claim", async (t) => {
+  const root = temporary(t);
+  const queuePath = path.join(root, "queue.json");
+  let started;
+  let release;
+  let published = 0;
+  const ready = new Promise((resolve) => { started = resolve; });
+  const gate = new Promise((resolve) => { release = resolve; });
+  const options = { toMachine: "EXAMPLE-PC", rpcPayload: { requestId: "synthetic-first", action: "send_message" }, queuePath,
+    publishFn: async () => {
+      published++;
+      assert.equal(broker.loadOfflineQueueStore(queuePath).items[0].requestId, "synthetic-first");
+      started();
+      await gate;
+      return { published: true };
+    } };
+  const pending = broker.enqueueOfflineStoreItem(options);
+  await ready;
+  try {
+    const duplicate = await broker.enqueueOfflineStoreItem(options);
+    assert.equal(duplicate.deduplicated, true);
+    assert.equal(duplicate.serviceBusPublished, false);
+    assert.equal(duplicate.serviceBusPublication, "unconfirmed");
+    assert.equal(published, 1);
+    await assert.rejects(() => broker.enqueueOfflineStoreItem({ ...options, toMachine: "OTHER-PC" }), { code: "QUEUE_REQUEST_MISMATCH" });
+    const second = await broker.enqueueOfflineStoreItem({ ...options, rpcPayload: { requestId: "synthetic-second" }, publishFn: null });
+    assert.equal(second.ok, true, "Network I/O must not hold the global store lock");
+    const ack = await broker.ackOfflineStoreItems({ requestIds: ["synthetic-first"], queuePath });
+    assert.equal(ack.ackedCount, 1);
+  } finally { release(); }
+  const completed = await pending;
+  assert.equal(completed.serviceBusPublished, true);
+  assert.equal(completed.pendingInBootstrapQueue, false);
+  assert.equal(completed.status, "no_longer_pending");
+  assert.deepEqual(broker.loadOfflineQueueStore(queuePath).items.map((item) => item.requestId), ["synthetic-second"]);
+});
+
+test("offline broker duplicate receipts preserve publication metadata and explicit publisher failures", async (t) => {
+  const root = temporary(t);
+  const queuePath = path.join(root, "queue.json");
+  let published = 0;
+  const options = { toMachine: "EXAMPLE-PC", rpcPayload: { requestId: "synthetic-published", action: "send_message" }, queuePath,
+    publishFn: async () => { published++; return { published: true }; } };
+  const first = await broker.enqueueOfflineStoreItem(options);
+  const second = await broker.enqueueOfflineStoreItem({ ...options,
+    rpcPayload: { action: "send_message", requestId: "synthetic-published" } });
+  assert.equal(published, 1);
+  assert.equal(second.serviceBusPublished, true);
+  assert.equal(second.enqueuedAt, first.enqueuedAt);
+  assert.equal(second.expiresAt, first.expiresAt);
+  const failed = await broker.enqueueOfflineStoreItem({ ...options, rpcPayload: { requestId: "synthetic-publisher-failure" },
+    publishFn: async () => { throw new Error("Synthetic publication failure"); } });
+  assert.equal(failed.ok, true);
+  assert.equal(failed.pendingInBootstrapQueue, true);
+  assert.equal(failed.serviceBusPublished, false);
+  assert.equal(failed.serviceBusPublicationError, "publisher_error");
+  assert.equal(broker.loadOfflineQueueStore(queuePath).items.length, 2);
+});
+
+test("offline status reflects confirmed publication, old dedup receipts and unconfirmed runtime admission", () => {
+  for (const api of [flock, bridge]) {
+    assert.equal(api.offlineQueueMetadata({ ok: true, serviceBusPublished: false }).deliveryStage, "persisted_in_bootstrap_queue");
+    assert.equal(api.offlineQueueMetadata({ ok: true, serviceBusPublished: true }).deliveryStage, "queued_in_servicebus");
+    const old = api.offlineQueueMetadata({ ok: true, deduplicated: true, queuedItem: {
+      serviceBusPublished: true, enqueuedAt: "synthetic-original", expiresAtMs: 2000000000000,
+    } });
+    assert.equal(old.serviceBusPublished, true);
+    assert.equal(old.enqueuedAt, "synthetic-original");
+    const consumed = api.offlineQueueMetadata({ serviceBusPublished: false, pendingInBootstrapQueue: false });
+    assert.equal(consumed.deliveryStage, "bootstrap_queue_no_longer_pending");
+    assert.equal(consumed.runtimeAdmission, "unconfirmed");
+    assert.equal(consumed.executionConfirmed, false);
+  }
+});
+
+test("actual offline reprovision producer reports bootstrap fallback without claiming Service Bus or execution", async () => {
+  for (const filename of ["flock.mjs", "bridge.mjs"]) {
+    const source = fs.readFileSync(new URL(`../${filename}`, import.meta.url), "utf8");
+    const api = filename === "flock.mjs" ? flock : bridge;
+    const request = { requestId: "synthetic-reprovision", auth: { v: 3 } };
+    const target = { machineId: "EXAMPLE-PC" };
+    const context = vm.createContext({
+      discoverMachines: async () => [],
+      fetchBootstrapMembers: () => [target],
+      matchesSelectorList: () => true,
+      invokeRemoteRpcBatch: async () => [{ item: { target }, ok: false,
+        error: "Timed out after 20000ms waiting for response from machine", request }],
+      enqueueOfflineMessage: (options) => {
+        assert.equal(options.rpcPayload, request);
+        return { ok: true, serviceBusPublished: false, enqueuedAt: "synthetic-original" };
+      },
+      offlineQueueMetadata: api.offlineQueueMetadata,
+      diagnoseFleetMachines: async () => ({ synthetic: true }),
+    });
+    vm.runInContext(`${namedFunction(source, "reprovisionFleetMachines")}\nthis.run = reprovisionFleetMachines;`, context);
+    const result = await context.run({ machineId: "SYNTHETIC-SOURCE", bootstrapUrl: "https://trusted.invalid/api/bootstrap",
+      bootstrapOriginPin: "https://trusted.invalid" });
+    const queued = result.reprovisionResults[0].result;
+    assert.equal(queued.deliveryStage, "persisted_in_bootstrap_queue");
+    assert.equal(queued.serviceBusPublished, false);
+    assert.equal(queued.runtimeAdmission, "unconfirmed");
+    assert.equal(queued.executionConfirmed, false);
+    assert.doesNotMatch(queued.note, /will execute automatically/);
+  }
+});
 test("scope and address inputs reject retired private aliases and invalid values", () => {
   for (const normalize of [flock.normalizeScope, bridge.normalizeScope, broker.normalizeV3Scope]) {
     assert.equal(normalize("personal"), "personal");

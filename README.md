@@ -223,6 +223,18 @@ Fetch or installer failures are errors, never permission to reinstall stale
 code. Deferred installers report a pending update with an installer PID and
 `update-install.log`; that is not proof the upgrade completed.
 
+**Legacy offline queue evidence:** responses distinguish confirmed Service Bus
+publication from storage in the broker's local file queue. The file fallback
+requires persistent broker hosting storage; it is not evidence that Service
+Bus published or that the receiver admitted/executed the request. The broker
+persists the original request before external publication, deduplicates before
+publishing, rejects new work at its500-pending-item capacity and retains a
+corrupt store for explicit recovery instead of replacing its backlog.
+Acknowledged work is not reinserted after a slow publisher completes.
+Membership, epoch and the signed deadline are rechecked on receipt, so queued
+work is not a promise of immediate execution after wake. Preserve unknown
+outcomes and request IDs; never blindly resend.
+
 Both install profiles record `installed-source.json` with the source commit
 when known and checksums of the installed runtime modules. Release reports
 separate the published-main diff from the recorded installed-runtime diff;

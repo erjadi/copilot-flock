@@ -14,6 +14,7 @@ import path from "node:path";
 import http from "node:http";
 import https from "node:https";
 import crypto from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
 
 const PORT = Number(process.env.PORT) || 8080;
 const ALLOWED_REPO = (
@@ -197,6 +198,7 @@ async function publishToServiceBusRest(item, ttlSeconds = 86400) {
 }
 
 let queueStoreMutex = Promise.resolve();
+const MAX_OFFLINE_QUEUE_ITEMS = 500;
 
 export function withQueueStoreLock(fn) {
   const next = queueStoreMutex.then(fn, fn);
@@ -204,29 +206,45 @@ export function withQueueStoreLock(fn) {
   return next;
 }
 
+function validOfflineQueueStore(store) {
+  return store && Array.isArray(store.items) && store.items.every((item) =>
+    item && typeof item === "object" && typeof item.requestId === "string" &&
+    typeof item.toMachine === "string" && (item.expiresAtMs === undefined || Number.isFinite(item.expiresAtMs)));
+}
+
 export function loadOfflineQueueStore(customPath = OFFLINE_QUEUE_PATH) {
   try {
-    if (fs.existsSync(customPath)) {
-      const parsed = JSON.parse(fs.readFileSync(customPath, "utf8"));
-      if (parsed && Array.isArray(parsed.items)) {
-        const now = Date.now();
-        parsed.items = parsed.items.filter((x) => x && (!x.expiresAtMs || x.expiresAtMs > now));
-        return parsed;
-      }
-    }
-  } catch {}
-  return { items: [] };
+    if (!fs.existsSync(customPath)) return { items: [] };
+    const parsed = JSON.parse(fs.readFileSync(customPath, "utf8"));
+    if (!validOfflineQueueStore(parsed)) throw new Error("Invalid existing offline queue state");
+    const now = Date.now();
+    parsed.items = parsed.items.filter((item) => item.expiresAtMs === undefined || item.expiresAtMs > now);
+    return parsed;
+  } catch (error) {
+    throw Object.assign(new Error(`Offline queue storage could not be read (${error.code || "invalid_format"}); existing file was retained`),
+      { code: "QUEUE_STORAGE_ERROR", statusCode: 500 });
+  }
 }
 
 export function saveOfflineQueueStore(store, customPath = OFFLINE_QUEUE_PATH) {
+  if (!validOfflineQueueStore(store)) {
+    throw Object.assign(new Error("Invalid offline queue state; existing accepted messages were retained"),
+      { code: "QUEUE_STORAGE_ERROR", statusCode: 500 });
+  }
   const now = Date.now();
-  const valid = (store.items || [])
-    .filter((x) => x && (!x.expiresAtMs || x.expiresAtMs > now))
-    .slice(-500);
+  const valid = store.items.filter((item) => item.expiresAtMs === undefined || item.expiresAtMs > now);
+  if (valid.length > MAX_OFFLINE_QUEUE_ITEMS) {
+    throw Object.assign(new Error("Offline queue capacity exhausted; existing accepted messages were retained"),
+      { code: "QUEUE_CAPACITY_EXHAUSTED", statusCode: 503 });
+  }
   const tmpPath = `${customPath}.${process.pid}.${crypto.randomUUID()}.tmp`;
   try {
     fs.mkdirSync(path.dirname(customPath), { recursive: true });
-    fs.writeFileSync(tmpPath, JSON.stringify({ items: valid }, null, 2), "utf8");
+    const fd = fs.openSync(tmpPath, "wx", 0o600);
+    try {
+      fs.writeFileSync(fd, JSON.stringify({ items: valid }, null, 2), "utf8");
+      fs.fsyncSync(fd);
+    } finally { fs.closeSync(fd); }
     fs.renameSync(tmpPath, customPath);
   } catch (err) {
     try {
@@ -237,6 +255,21 @@ export function saveOfflineQueueStore(store, customPath = OFFLINE_QUEUE_PATH) {
     storageErr.statusCode = 500;
     throw storageErr;
   }
+}
+
+function offlineQueueReceipt(entry, { deduplicated = false, pending = true } = {}) {
+  return {
+    ok: true, status: pending ? "queued" : "no_longer_pending", deduplicated,
+    requestId: entry.requestId, toMachine: entry.toMachine, fromMachine: entry.fromMachine,
+    fromGitHubUser: entry.fromGitHubUser, enqueuedAt: entry.enqueuedAt,
+    expiresAt: Number.isFinite(entry.expiresAtMs) ? new Date(entry.expiresAtMs).toISOString() : null,
+    serviceBusNamespace: entry.serviceBusNamespace, serviceBusTopic: entry.serviceBusTopic,
+    serviceBusPublished: entry.serviceBusPublished === true,
+    serviceBusPublication: entry.serviceBusPublished === true ? "confirmed" : "unconfirmed",
+    serviceBusPublicationError: entry.serviceBusPublicationError || null,
+    pendingInBootstrapQueue: pending,
+    ...(deduplicated ? { queuedItem: entry } : {}),
+  };
 }
 
 export async function enqueueOfflineStoreItem({
@@ -269,37 +302,47 @@ export async function enqueueOfflineStoreItem({
     rpcPayload,
   };
 
-  // Perform async Service Bus publish outside the file lock, then serialize file read-modify-write inside the mutex
-  const sbRes = publishFn ? await publishFn(entry, safeTtl) : { published: false };
-  entry.serviceBusPublished = Boolean(sbRes?.published);
+  entry.serviceBusPublished = false;
   entry.serviceBusNamespace = SERVICEBUS_NAMESPACE;
   entry.serviceBusTopic = SERVICEBUS_TOPIC;
 
-  return await withQueueStoreLock(async () => {
+  const existing = await withQueueStoreLock(async () => {
     const store = loadOfflineQueueStore(queuePath);
     const existingIdx = store.items.findIndex((x) => x.requestId === rpcPayload.requestId);
     if (existingIdx !== -1) {
-      return {
-        ok: true,
-        deduplicated: true,
-        queuedItem: store.items[existingIdx],
-      };
+      const previous = store.items[existingIdx];
+      if (previous.toMachine.toLowerCase() !== cleanMachine.toLowerCase() ||
+          !isDeepStrictEqual(previous.rpcPayload, rpcPayload)) {
+        throw Object.assign(new Error("Offline request ID reused with a different target or payload"),
+          { code: "QUEUE_REQUEST_MISMATCH", statusCode: 409 });
+      }
+      return offlineQueueReceipt(previous, { deduplicated: true });
+    }
+    if (store.items.length >= MAX_OFFLINE_QUEUE_ITEMS) {
+      throw Object.assign(new Error("Offline queue capacity exhausted; existing accepted messages were retained"),
+        { code: "QUEUE_CAPACITY_EXHAUSTED", statusCode: 503 });
     }
     store.items.push(entry);
     saveOfflineQueueStore(store, queuePath);
-    return {
-      ok: true,
-      status: "queued",
-      requestId: entry.requestId,
-      toMachine: entry.toMachine,
-      fromMachine: entry.fromMachine,
-      fromGitHubUser: entry.fromGitHubUser,
-      enqueuedAt: entry.enqueuedAt,
-      expiresAt: new Date(entry.expiresAtMs).toISOString(),
-      serviceBusNamespace: SERVICEBUS_NAMESPACE,
-      serviceBusTopic: SERVICEBUS_TOPIC,
-      serviceBusPublished: entry.serviceBusPublished,
-    };
+    return null;
+  });
+  if (existing) return existing;
+  // Persist the claim before external publication, without holding the store lock over network I/O.
+  try {
+    const result = publishFn ? await publishFn(entry, safeTtl) : { published: false };
+    entry.serviceBusPublished = result?.published === true;
+    if (!entry.serviceBusPublished) entry.serviceBusPublicationError = result?.reason || "publication_unconfirmed";
+  } catch {
+    entry.serviceBusPublicationError = "publisher_error";
+  }
+  return await withQueueStoreLock(async () => {
+    const store = loadOfflineQueueStore(queuePath);
+    const pending = store.items.find((item) => item.requestId === entry.requestId);
+    if (!pending) return offlineQueueReceipt(entry, { pending: false });
+    pending.serviceBusPublished = entry.serviceBusPublished;
+    pending.serviceBusPublicationError = entry.serviceBusPublicationError || null;
+    saveOfflineQueueStore(store, queuePath);
+    return offlineQueueReceipt(pending);
   });
 }
 

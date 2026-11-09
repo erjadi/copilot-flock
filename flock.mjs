@@ -2449,6 +2449,22 @@ export function enqueueOfflineMessage({
   });
 }
 
+export function offlineQueueMetadata(queued) {
+  const entry = queued.queuedItem || queued;
+  const published = typeof queued.serviceBusPublished === "boolean" ? queued.serviceBusPublished : entry.serviceBusPublished === true;
+  const pending = queued.pendingInBootstrapQueue !== false;
+  return {
+    deliveryStage: published ? "queued_in_servicebus" : pending ? "persisted_in_bootstrap_queue" : "bootstrap_queue_no_longer_pending",
+    enqueuedAt: queued.enqueuedAt || entry.enqueuedAt || null,
+    expiresAt: queued.expiresAt || (Number.isFinite(entry.expiresAtMs) ? new Date(entry.expiresAtMs).toISOString() : null),
+    serviceBusNamespace: queued.serviceBusNamespace || entry.serviceBusNamespace || null,
+    serviceBusTopic: queued.serviceBusTopic || entry.serviceBusTopic || null,
+    serviceBusPublished: published, serviceBusPublication: published ? "confirmed" : "unconfirmed",
+    serviceBusPublicationError: queued.serviceBusPublicationError || entry.serviceBusPublicationError || null,
+    pendingInBootstrapQueue: pending, runtimeAdmission: "unconfirmed", executionConfirmed: false,
+  };
+}
+
 export function drainOfflineQueue({
   bootstrapUrl = DEFAULT_BOOTSTRAP_URL,
   bootstrapOriginPin = DEFAULT_BOOTSTRAP_ORIGIN,
@@ -6861,7 +6877,7 @@ export async function drainAndProcessOfflineQueue(
           if (cfg?.connectionString) {
             sendSignalRBroadcast(cfg, "bridgeDeliveryReceipt", {
               requestId: reqId,
-              stage: "admitted_from_servicebus_queue",
+              stage: "admitted_from_bootstrap_queue",
               fromMachine: item.fromMachine || item.rpcPayload.fromMachine || null,
               targetMachine: cfg.machineId,
               enqueuedAt: item.enqueuedAt || null,
@@ -8102,16 +8118,11 @@ async function executeMcpTool(cfg, name, args = {}) {
         if (queued?.ok) {
           return {
             status: "queued_offline",
-            deliveryStage: queued.serviceBusPublished === true ? "queued_in_servicebus" : "persisted_in_bootstrap_queue",
             dispatchedToRuntime: false,
             requestId: reqId,
             targetMachine,
             targetSession: args.to_session,
-            enqueuedAt: queued.enqueuedAt,
-            expiresAt: queued.expiresAt,
-            serviceBusNamespace: queued.serviceBusNamespace,
-            serviceBusTopic: queued.serviceBusTopic,
-            serviceBusPublished: queued.serviceBusPublished,
+            ...offlineQueueMetadata(queued),
           };
         }
       }
@@ -10092,10 +10103,10 @@ export async function reprovisionFleetMachines(cfg, { machines = "*" } = {}) {
         result: queued?.ok
           ? {
               status: "queued_offline_reprovision",
-              deliveryStage: "queued_in_servicebus",
               machineId: mId,
               requestId: reqId,
-              note: `Machine "${mId}" is currently offline/sleeping; signed 'reprovision' RPC is queued and will execute automatically as soon as "${mId}" reconnects (or run 'node bridge.mjs reprovision' locally on "${mId}").`,
+              ...offlineQueueMetadata(queued),
+              note: `Signed reprovision for "${mId}" was accepted by the queue; runtime admission and execution are unconfirmed. Current membership, epoch and deadline are checked before dispatch. Do not blindly resend.`,
             }
           : null,
         error: queued?.ok ? null : o.error,
