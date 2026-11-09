@@ -67,15 +67,22 @@ test("legacy stored-scope migration preserves identity, enrollment and recovery/
   }
 });
 
-test("canonical and compatibility CLI help advertise personal, not a private scope", () => {
+test("canonical and compatibility CLI help advertise personal for fresh and explicit legacy profiles", (t) => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "flock-help-"));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
   for (const script of ["flock.mjs", "bridge.mjs"]) {
-    const result = spawnSync(process.execPath, [
-      fileURLToPath(new URL(`../${script}`, import.meta.url)), "--help",
-    ], { encoding: "utf8", timeout: 5000 });
-    assert.equal(result.status, 0);
-    assert.match(result.stdout, /Copilot Flock v/);
-    assert.match(result.stdout, /--scope work\|personal/);
-    assert.doesNotMatch(result.stdout, /work\|private|Copilot SignalR Thread Bridge/);
+    for (const architecture of [[], ["--architecture", "legacy"]]) {
+      const result = spawnSync(process.execPath, [
+        fileURLToPath(new URL(`../${script}`, import.meta.url)), ...architecture, "--help",
+      ], { encoding: "utf8", timeout: 5000, env: {
+        ...process.env, COPILOT_HOME: home, COPILOT_FLOCK_INVITE_FILE: "",
+        COPILOT_FLOCK_BOOTSTRAP_URL: "", COPILOT_BRIDGE_SCOPE: "", COPILOT_FLOCK_SCOPE: "",
+      } });
+      assert.equal(result.status, 0, result.stderr);
+      assert.match(result.stdout, architecture.length ? /Copilot Flock v/ : /Copilot Flock .*Zero-Broker candidate/);
+      assert.match(result.stdout, architecture.length ? /--scope work\|personal/ : /--scope <personal\|work>/);
+      assert.doesNotMatch(result.stdout, /work\|private|Copilot SignalR Thread Bridge/);
+    }
   }
 });
 

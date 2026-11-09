@@ -139,6 +139,16 @@ GitHub Actions/Pages limits remain separate constraints. No paid SKU change
 or live load acceptance is implied. The administrative viewer and legacy
 topology/fleet/update tools remain legacy-only, not Zero-Broker native tools.
 
+**Release validation:** the legacy release-review RPC validates an immutable
+Git commit in an isolated, bounded worker, without blocking the daemon during
+the full root suite. It checks every `.mjs`, requires the canonical/compatibility
+entry points to match, and includes both legacy and Zero-Broker root tests.
+Version-2 Ed25519 ballots bind the full commit SHA and validation evidence.
+Missing voters, selected subsets, unregistered keys and legacy smoke-only
+ballots cannot approve a merge. Older ballots remain diagnostically verifiable,
+not full-scope approval. LAN and viewer checks remain separate release evidence;
+these changes neither upgrade live reviewers nor authorize deployment.
+
 ## Try it out hubless; deploy the components for the real potential
 
 **The Hubless LAN-Direct Trial is a "Try It Out" onboarding sandbox, not the

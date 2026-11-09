@@ -5933,7 +5933,7 @@ export async function handleRpcAction(cfg, req) {
     const candidateSha = candidateCommit.slice(0, 7);
     let diffStat = "";
     try {
-      diffStat = execFileSync("git", ["-C", repoDir, "diff", "--stat", `origin/main..FETCH_HEAD`], {
+      diffStat = execFileSync("git", ["-C", repoDir, "diff", "--stat", `origin/main..${candidateCommit}`], {
         encoding: "utf8",
         stdio: ["ignore", "pipe", "ignore"],
         timeout: 5000,
@@ -5949,7 +5949,7 @@ export async function handleRpcAction(cfg, req) {
     const checks = { bridgeSyntaxOk: false, bootstrapSyntaxOk: false, unitTestsOk: false };
     const issues = [];
     try {
-      const candidateBridge = execFileSync("git", ["-C", repoDir, "show", "FETCH_HEAD:bridge.mjs"], {
+      const candidateBridge = execFileSync("git", ["-C", repoDir, "show", `${candidateCommit}:bridge.mjs`], {
         encoding: "utf8",
         maxBuffer: 10 * 1024 * 1024,
         stdio: ["ignore", "pipe", "pipe"],
@@ -5971,7 +5971,7 @@ export async function handleRpcAction(cfg, req) {
     try {
       const candidateBootstrap = execFileSync(
         "git",
-        ["-C", repoDir, "show", "FETCH_HEAD:bootstrap-server.mjs"],
+        ["-C", repoDir, "show", `${candidateCommit}:bootstrap-server.mjs`],
         {
           encoding: "utf8",
           maxBuffer: 5 * 1024 * 1024,
@@ -5995,7 +5995,7 @@ export async function handleRpcAction(cfg, req) {
     try {
       const candidateTest = execFileSync(
         "git",
-        ["-C", repoDir, "show", "FETCH_HEAD:test/bridge.test.mjs"],
+        ["-C", repoDir, "show", `${candidateCommit}:test/bridge.test.mjs`],
         {
           encoding: "utf8",
           maxBuffer: 5 * 1024 * 1024,
@@ -6025,8 +6025,8 @@ export async function handleRpcAction(cfg, req) {
 
     checks.modulesSyntaxOk = false;
     try {
-      const { validateReleaseCandidate } = await import("./zero-broker-release.mjs");
-      const complete = validateReleaseCandidate({ repoDir, commit: candidateCommit });
+      const { validateReleaseCandidateInWorker } = await import("./zero-broker-release.mjs");
+      const complete = await validateReleaseCandidateInWorker({ repoDir, commit: candidateCommit });
       Object.assign(checks, complete);
     } catch (err) {
       checks.unitTestsOk = false;
@@ -6035,7 +6035,12 @@ export async function handleRpcAction(cfg, req) {
 
     const vote = issues.length === 0 ? "ACCEPT" : "REJECT";
     const idKey = ensureMachineIdentityKeypair();
-    const votePayload = `vote|${cfg.machineId}|${branch}|${candidateCommit}|${vote}`;
+    const evidence = {
+      machineId: cfg.machineId, branch, candidateCommit, vote, checks,
+      voteSignatureVersion: 2,
+      verificationLevel: "complete_candidate_syntax_root_tests_and_ed25519_signature",
+    };
+    const votePayload = releaseVoteSigningPayload(evidence);
     const voteSignature = crypto
       .sign(null, Buffer.from(votePayload, "utf8"), idKey.privateKey)
       .toString("base64");
@@ -6053,6 +6058,7 @@ export async function handleRpcAction(cfg, req) {
       verificationLevel: "complete_candidate_syntax_root_tests_and_ed25519_signature",
       issues,
       vote,
+      voteSignatureVersion: 2,
       votePayload,
       publicKey: idKey.publicKey,
       keyFingerprint: idKey.fingerprint,
@@ -9029,23 +9035,58 @@ export async function syncRemoteGitBranch(
   }
 }
 
+export function releaseVoteSigningPayload(ballot) {
+  if (ballot.voteSignatureVersion === 2) {
+    const checks = ballot.checks || {};
+    return JSON.stringify([
+      "flock-release-v2", ballot.machineId, ballot.branch, ballot.candidateCommit, ballot.vote,
+      ballot.verificationLevel, checks.verificationLevel, checks.modulesSyntaxOk,
+      checks.bridgeSyntaxOk, checks.bootstrapSyntaxOk, checks.unitTestsOk,
+      checks.moduleCount, checks.testFileCount,
+    ]);
+  }
+  return `vote|${ballot.machineId}|${ballot.branch || "main"}|${ballot.candidateCommit || ballot.candidateSha}|${ballot.vote}`;
+}
+
+export function summarizeReleaseVotes({ branch, votes, onlineMachines }) {
+  const expected = new Set(onlineMachines.map((id) => String(id).toLowerCase()));
+  const actual = new Set(votes.map((vote) => String(vote.machineId).toLowerCase()));
+  const votersComplete = expected.size > 0 && actual.size === votes.length &&
+    actual.size === expected.size && [...expected].every((id) => actual.has(id));
+  const assessed = votes.map((vote) => ({
+    ...vote,
+    completeValidationVerified: vote.signatureVerified === true &&
+      vote.voteSignatureVersion === 2 && vote.branch === branch &&
+      /^[0-9a-f]{40}$/.test(vote.candidateCommit || "") &&
+      vote.verificationLevel === "complete_candidate_syntax_root_tests_and_ed25519_signature" &&
+      vote.checks?.verificationLevel === "complete_candidate_syntax_and_root_tests" &&
+      vote.checks?.modulesSyntaxOk === true && vote.checks?.bridgeSyntaxOk === true &&
+      vote.checks?.bootstrapSyntaxOk === true && vote.checks?.unitTestsOk === true &&
+      Number.isInteger(vote.checks?.moduleCount) && vote.checks.moduleCount >= 9 &&
+      Number.isInteger(vote.checks?.testFileCount) && vote.checks.testFileCount >= 6,
+  }));
+  const acceptCount = assessed.filter((vote) => vote.vote === "ACCEPT" && vote.completeValidationVerified).length;
+  const commitSet = new Set(assessed.map((vote) => vote.candidateCommit).filter(Boolean));
+  const unanimousCommit = commitSet.size === 1 ? [...commitSet][0] : null;
+  const approvedForMerge = votersComplete && acceptCount === assessed.length && Boolean(unanimousCommit);
+  return {
+    votedAt: new Date().toISOString(), branch, unanimousCommit,
+    verificationScope: "complete_candidate_syntax_root_tests_and_ed25519_signature",
+    onlineVoterCount: expected.size, votersComplete, acceptCount,
+    rejectCount: assessed.length - acceptCount,
+    verifiedSignatureCount: assessed.filter((vote) => vote.signatureVerified).length,
+    daemonChecksPassed: approvedForMerge, approvedForMerge, votes: assessed,
+  };
+}
+
 export function verifyVoteBallotSignature(ballot, registeredPublicKey = null) {
   if (!ballot || !ballot.voteSignature || !ballot.machineId || !ballot.vote) {
     return false;
   }
   const pubKey = registeredPublicKey || ballot.publicKey || null;
   if (!pubKey) return false;
-  const payloadsToTry = [];
-  if (ballot.candidateCommit) {
-    payloadsToTry.push(
-      `vote|${ballot.machineId}|${ballot.branch || "main"}|${ballot.candidateCommit}|${ballot.vote}`
-    );
-  }
-  if (ballot.candidateSha && !ballot.candidateCommit) {
-    payloadsToTry.push(
-      `vote|${ballot.machineId}|${ballot.branch || "main"}|${ballot.candidateSha}|${ballot.vote}`
-    );
-  }
+  if (ballot.voteSignatureVersion !== undefined && ![1, 2].includes(ballot.voteSignatureVersion)) return false;
+  const payloadsToTry = ballot.candidateCommit || ballot.candidateSha ? [releaseVoteSigningPayload(ballot)] : [];
   for (const p of payloadsToTry) {
     try {
       const ok = crypto.verify(
@@ -9061,6 +9102,7 @@ export function verifyVoteBallotSignature(ballot, registeredPublicKey = null) {
 }
 
 export async function voteReleaseAcrossFlock(cfg, { branch = "main", machines = "*" } = {}) {
+  const { RELEASE_REVIEW_TIMEOUT_MS } = await import("./zero-broker-release.mjs");
   const [discovered, membersMap] = await Promise.all([
     discoverMachines(cfg, { includeSelf: true, timeoutMs: 2500 }),
     Promise.resolve().then(() => getCachedBootstrapMembersMap(cfg, { forceRefresh: true })),
@@ -9079,7 +9121,7 @@ export async function voteReleaseAcrossFlock(cfg, { branch = "main", machines = 
   }));
 
   const outcomes =
-    batchItems.length > 0 ? await invokeRemoteRpcBatch(cfg, batchItems, 30000) : [];
+    batchItems.length > 0 ? await invokeRemoteRpcBatch(cfg, batchItems, RELEASE_REVIEW_TIMEOUT_MS) : [];
 
   const votes = outcomes.map((o) => {
     const mId = o.item.target.machineId;
@@ -9089,10 +9131,10 @@ export async function voteReleaseAcrossFlock(cfg, { branch = "main", machines = 
       const regPubKey =
         regEntry?.publicKey ||
         regEntry?.specs?.publicKey ||
-        o.item.target?.specs?.publicKey ||
-        ballot.publicKey ||
         null;
-      const signatureVerified = verifyVoteBallotSignature(ballot, regPubKey);
+      const signatureVerified = Boolean(regPubKey) &&
+        String(ballot.machineId).toLowerCase() === String(mId).toLowerCase() &&
+        verifyVoteBallotSignature(ballot, regPubKey);
       return {
         ...ballot,
         signatureVerified,
@@ -9106,42 +9148,9 @@ export async function voteReleaseAcrossFlock(cfg, { branch = "main", machines = 
     };
   });
 
-  const acceptCount = votes.filter((v) => v.vote === "ACCEPT" && v.signatureVerified).length;
-  const rejectCount = votes.filter((v) => v.vote !== "ACCEPT" || !v.signatureVerified).length;
-  const verifiedSignatureCount = votes.filter((v) => v.signatureVerified).length;
-
-  const commitSet = new Set(
-    votes.map((v) => v.candidateCommit || v.candidateSha).filter(Boolean)
-  );
-  const unanimousCommit = commitSet.size === 1 ? [...commitSet][0] : null;
-  const approvedForMerge =
-    votes.length > 0 &&
-    rejectCount === 0 &&
-    verifiedSignatureCount === votes.length &&
-    Boolean(unanimousCommit);
-
-  const report = {
-    votedAt: new Date().toISOString(),
-    branch,
-    unanimousCommit,
-    verificationScope: "daemon_syntax_unit_tests_and_ed25519_signature",
-    onlineVoterCount: votes.length,
-    acceptCount,
-    rejectCount,
-    verifiedSignatureCount,
-    daemonChecksPassed: approvedForMerge,
-    approvedForMerge,
-    votes,
-  };
-
-  try {
-    ensureBridgeDir();
-    fs.writeFileSync(
-      path.join(getBridgeHome(), "last-vote-report.json"),
-      JSON.stringify(report, null, 2),
-      "utf8"
-    );
-  } catch {}
+  const report = summarizeReleaseVotes({ branch, votes, onlineMachines: discovered.map((machine) => machine.machineId) });
+  ensureBridgeDir();
+  fs.writeFileSync(path.join(getBridgeHome(), "last-vote-report.json"), JSON.stringify(report, null, 2), { encoding: "utf8", mode: 0o600 });
 
   return report;
 }
@@ -11007,7 +11016,7 @@ async function main() {
   if ((command === "send-file" || command === "pull-file") && !flags.help) validateFileTransferCliArgs(command, flags, positional);
   const savedConfig = fs.existsSync(getConfigPath()) ? JSON.parse(fs.readFileSync(getConfigPath(), "utf8")) : null;
   if (savedConfig?.architecture === "zero-broker" && command === "install" && (flags.architecture === "legacy" || flags.legacy)) throw new Error("In-place Zero-Broker to legacy migration is unsupported; keep its identity and admission ledger unchanged");
-  if ((!savedConfig || savedConfig.architecture === "zero-broker") && (command === "help" || flags.help)) {
+  if (flags.architecture !== "legacy" && !flags.legacy && (!savedConfig || savedConfig.architecture === "zero-broker") && (command === "help" || flags.help)) {
     console.log(`Copilot Flock ${BRIDGE_VERSION}: Zero-Broker candidate
 Node.js >=22.5; Azure SignalR Serverless + Service Bus Standard + signed Pages.
 Copilot performs setup after scope, subscription, costs and public-publication consent.

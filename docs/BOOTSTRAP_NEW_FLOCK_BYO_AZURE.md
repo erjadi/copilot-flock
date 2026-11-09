@@ -129,6 +129,15 @@ approved summaries only. Headless privileged spawning is explicitly denied. The 
 flows have local syntax/unit/mock coverage; a real Azure deployment still
 requires separate authorization and has not been validated by those mocks.
 
+Release review uses exact-commit extraction and a bounded validation worker.
+The worker clears inherited Node test selectors and isolates `COPILOT_HOME`,
+so focused parent tests cannot silently skip candidate tests. Version-2
+registered-key ballots sign both the full SHA and complete validation scope;
+legacy smoke-only ballots and partial voter selections are not merge approval.
+Review RPCs allow a bounded seven-and-a-half-minute response window, including
+the five-minute root-test budget. No live reviewer upgrade, Azure deployment
+or platform acceptance is implied.
+
 State is private under `~/.copilot/flock/zero-broker/<uuid>`, including
 per-flock device keys, SQLite trust/admission/outbox state and local grants.
 Do not reconstruct a missing ledger using old keys. `resume-init` reconciles

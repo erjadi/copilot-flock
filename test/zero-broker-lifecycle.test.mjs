@@ -4,12 +4,103 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { execFileSync } from "node:child_process";
 import * as core from "../zero-broker-roster.mjs";
 import * as lifecycle from "../zero-broker-lifecycle.mjs";
-import { createZeroBrokerNativeHost, getMcpToolDefinitions, installZeroBrokerIntegration, zeroBrokerNodeFlags } from "../flock.mjs";
+import { createZeroBrokerNativeHost, getMcpToolDefinitions, installZeroBrokerIntegration, zeroBrokerNodeFlags, releaseVoteSigningPayload, summarizeReleaseVotes, verifyVoteBallotSignature } from "../flock.mjs";
+import { RELEASE_REVIEW_TIMEOUT_MS, validateReleaseCandidateInWorker } from "../zero-broker-release.mjs";
 
 const subscriptionId = "11111111-2222-4333-8444-555555555555";
 const sessionId = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+
+test("full-scope signed release ballots reject legacy smoke, tampering, missing voters and mixed commits", () => {
+  const keys = crypto.generateKeyPairSync("ed25519");
+  const commit = "a".repeat(40);
+  const branch = "synthetic-candidate";
+  function ballot(machineId, changes = {}) {
+    const result = {
+      machineId, branch, candidateCommit: commit, vote: "ACCEPT", voteSignatureVersion: 2,
+      verificationLevel: "complete_candidate_syntax_root_tests_and_ed25519_signature",
+      checks: { modulesSyntaxOk: true, bridgeSyntaxOk: true, bootstrapSyntaxOk: true,
+        unitTestsOk: true, moduleCount: 24, testFileCount: 6,
+        verificationLevel: "complete_candidate_syntax_and_root_tests" }, ...changes,
+    };
+    result.voteSignature = crypto.sign(null, Buffer.from(releaseVoteSigningPayload(result)), keys.privateKey).toString("base64");
+    return result;
+  }
+  const first = ballot("FIRST-PC");
+  const second = ballot("SECOND-PC");
+  function summarize(items, onlineMachines = ["FIRST-PC", "SECOND-PC"]) {
+    return summarizeReleaseVotes({ branch, onlineMachines,
+      votes: items.map((item) => ({ ...item, signatureVerified: verifyVoteBallotSignature(item, keys.publicKey) })) });
+  }
+  assert.equal(summarize([first, second]).approvedForMerge, true);
+  assert.equal(summarize([first]).approvedForMerge, false);
+  assert.equal(summarize([first, first]).approvedForMerge, false);
+  assert.equal(summarize([]).approvedForMerge, false);
+  assert.equal(summarize([first, ballot("SECOND-PC", { candidateCommit: "b".repeat(40) })]).approvedForMerge, false);
+  assert.equal(summarize([ballot("FIRST-PC", { candidateCommit: commit.slice(0, 7) }), second]).approvedForMerge, false);
+  assert.equal(summarize([ballot("FIRST-PC", { branch: "other-branch" }), second]).approvedForMerge, false);
+  const legacy = ballot("FIRST-PC", { voteSignatureVersion: 1 });
+  assert.equal(verifyVoteBallotSignature(legacy, keys.publicKey), true);
+  assert.equal(summarize([legacy, second]).approvedForMerge, false);
+  for (const field of ["modulesSyntaxOk", "bridgeSyntaxOk", "bootstrapSyntaxOk", "unitTestsOk"]) {
+    const changed = { ...first, checks: { ...first.checks, [field]: false } };
+    assert.equal(verifyVoteBallotSignature(changed, keys.publicKey), false);
+    assert.equal(summarize([changed, second]).approvedForMerge, false);
+    assert.equal(summarize([ballot("FIRST-PC", { checks: changed.checks }), second]).approvedForMerge, false);
+  }
+  assert.equal(verifyVoteBallotSignature({ ...first, verificationLevel: "smoke" }, keys.publicKey), false);
+  assert.equal(verifyVoteBallotSignature({ ...first, checks: { ...first.checks, moduleCount: 1 } }, keys.publicKey), false);
+  assert.equal(summarize([ballot("FIRST-PC", { checks: { ...first.checks, testFileCount: 1 } }), second]).approvedForMerge, false);
+  assert.equal(verifyVoteBallotSignature(first, crypto.generateKeyPairSync("ed25519").publicKey), false);
+  assert.equal(summarizeReleaseVotes({ branch, onlineMachines: ["FIRST-PC"], votes: [{ ...first, signatureVerified: false }] }).approvedForMerge, false);
+});
+
+test("immutable release validation runs in a bounded worker without blocking the parent event loop", async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "flock-worker-fixture-"));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  fs.mkdirSync(path.join(directory, "test"));
+  fs.mkdirSync(path.join(directory, "no-hooks"));
+  for (const name of ["flock", "bridge", "bootstrap-server", "zero-broker-roster", "zero-broker-transport",
+    "zero-broker-runtime", "zero-broker-lifecycle", "zero-broker-enrollment", "zero-broker-release"]) {
+    fs.writeFileSync(path.join(directory, `${name}.mjs`), "export const syntheticFixture = true;");
+  }
+  for (const name of ["flock", "bridge", "setup", "contracts", "zero-broker-lifecycle"]) {
+    fs.writeFileSync(path.join(directory, "test", `${name}.test.mjs`), "export const syntheticFixture = true;");
+  }
+  const testPath = path.join(directory, "test", "zero-broker-roster.test.mjs");
+  fs.writeFileSync(testPath, 'import test from "node:test"; import { setTimeout } from "node:timers/promises"; test("synthetic worker", async () => { await setTimeout(150); });');
+  const git = (...args) => execFileSync("git", ["-C", directory, ...args], { encoding: "utf8", windowsHide: true, timeout: 10000 });
+  git("init", "--quiet", "--object-format=sha1");
+  git("add", ".");
+  const commit = () => {
+    git("-c", "user.name=Synthetic Fixture", "-c", "user.email=fixture@example.invalid",
+      "-c", "commit.gpgsign=false", "-c", `core.hooksPath=${path.join(directory, "no-hooks")}`,
+      "commit", "--quiet", "-m", "Synthetic validation fixture");
+    return git("rev-parse", "HEAD").trim();
+  };
+  const sha = commit();
+  let heartbeatTicks = 0;
+  const timer = setInterval(() => heartbeatTicks++, 10);
+  try {
+    const result = await validateReleaseCandidateInWorker({ repoDir: directory, commit: sha });
+    assert.equal(result.candidateCommit, sha);
+    assert.equal(result.moduleCount, 15);
+    assert.equal(result.testFileCount, 6);
+    assert.equal(result.unitTestsOk, true);
+    assert.ok(heartbeatTicks >= 2, "Parent event-loop heartbeat must continue during validation");
+    assert.ok(RELEASE_REVIEW_TIMEOUT_MS > 360000, "RPC budget must cover the bounded worker and Git preflight");
+  } finally { clearInterval(timer); }
+  await assert.rejects(() => validateReleaseCandidateInWorker({ repoDir: directory, commit: "main" }), /immutable commit SHA/);
+  fs.writeFileSync(testPath, 'import test from "node:test"; test("synthetic failure", () => { throw new Error("Synthetic candidate rejection"); });');
+  git("add", ".");
+  const failingSha = commit();
+  await assert.rejects(() => validateReleaseCandidateInWorker({ repoDir: directory, commit: failingSha }), /Synthetic candidate rejection/);
+  fs.unlinkSync(path.join(directory, "bridge.mjs"));
+  git("add", ".");
+  await assert.rejects(() => validateReleaseCandidateInWorker({ repoDir: directory, commit: commit() }), /lacks required/);
+});
 
 function fixture(t) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "flock-lifecycle-"));
