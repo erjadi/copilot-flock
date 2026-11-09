@@ -87,12 +87,11 @@ test("immutable release validation runs in a bounded worker without blocking the
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
   fs.mkdirSync(path.join(directory, "test"));
   fs.mkdirSync(path.join(directory, "no-hooks"));
-  for (const name of ["flock", "bridge", "bootstrap-server", "zero-broker-roster", "zero-broker-transport",
-    "zero-broker-runtime", "zero-broker-lifecycle", "zero-broker-enrollment", "zero-broker-release", "release-policy"]) {
-    fs.writeFileSync(path.join(directory, `${name}.mjs`), "export const syntheticFixture = true;");
+  for (const name of RELEASE_VALIDATION_POLICY.requiredModules) {
+    fs.writeFileSync(path.join(directory, name), "export const syntheticFixture = true;");
   }
-  for (const name of ["flock", "bridge", "setup", "contracts", "rpc-security", "zero-broker-lifecycle"]) {
-    fs.writeFileSync(path.join(directory, "test", `${name}.test.mjs`), "export const syntheticFixture = true;");
+  for (const name of RELEASE_VALIDATION_POLICY.requiredTests) {
+    fs.writeFileSync(path.join(directory, name), "export const syntheticFixture = true;");
   }
   const testPath = path.join(directory, "test", "zero-broker-roster.test.mjs");
   fs.writeFileSync(testPath, 'import test from "node:test"; import { setTimeout } from "node:timers/promises"; test("synthetic worker", async () => { await setTimeout(150); });');
@@ -111,7 +110,7 @@ test("immutable release validation runs in a bounded worker without blocking the
   try {
     const result = await validateReleaseCandidateInWorker({ repoDir: directory, commit: sha });
     assert.equal(result.candidateCommit, sha);
-    assert.equal(result.moduleCount, 17);
+    assert.equal(result.moduleCount, RELEASE_VALIDATION_POLICY.requiredModules.length + RELEASE_VALIDATION_POLICY.requiredTests.length);
     assert.equal(result.testFileCount, 7);
     assert.equal(result.unitTestsOk, true);
     assert.equal(verifyReleaseCoverage(result), true);
