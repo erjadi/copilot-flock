@@ -167,7 +167,7 @@ flowchart LR
 
 - **"The flock"**: The group of all enrolled Copilot machines connected via `copilot-flock`. Keep all other terminology standard (no extra bird metaphors).
 - **Scopes (`personal` and `work` only)**:
-  - Every machine has a primary owner scope of either **`personal`** or **`work`** (`private` is retired and automatically migrated to `personal`).
+  - Every machine has a primary owner scope of either **`personal`** or **`work`**. New inputs reject the retired `private` alias. Existing stored `private` configuration is backed up and migrated to `personal` without rotating identity, rewriting enrollment state or replacing coordinator/tracker IDs; fleet re-enrollment is separate.
 - **Universal Hierarchical Address Grammar (`<owner>/<flock>[/<machineId>]`)**:
   - `<owner>` (e.g. `erjadi`) — Owner root flock (all `personal` + `work` machines owned by `@erjadi`).
   - `<owner>/personal` (e.g. `erjadi/personal`) — Owner's personal machines.

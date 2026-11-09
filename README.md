@@ -367,7 +367,7 @@ flowchart LR
   linkStyle 10 stroke:#d97706,stroke-width:2px,stroke-dasharray: 3 3;
 ```
 
-- **Strictly Two Owner Scopes (`personal` & `work`)**: Every machine belongs to either `<owner>/personal` or `<owner>/work` (`private` is retired and automatically migrated to `personal`).
+- **Strictly Two Owner Scopes (`personal` & `work`)**: Every machine belongs to either `<owner>/personal` or `<owner>/work`. Existing stored `private` config is backed up and migrated to `personal`; new scope/address inputs reject `private` rather than keeping an alias. Identity, enrollment and coordinator/tracker records are preserved; this is not fleet re-enrollment.
 - **Owner-Level Awareness**: Because **you** own the flock and machines are participants, any `@<owner>` computer automatically discovers all flocks owned by `@<owner>` via `/api/v3/my-flocks`.
 
 ### Markdown Flock Overlap Matrix (`Machine × Flock`)

@@ -762,7 +762,8 @@ test(
     // 3. Start mock Copilot Desktop WebSocket server to test simultaneous get_transcript + ping + list_sessions + send_message
     const cfg = {
       machineId: "TEST-MACHINE",
-      scope: "private",
+      scope: "personal",
+      githubUser: "example",
       hub: "copilotbridge",
       host: "your-signalr.service.signalr.net",
       endpoint: "https://your-signalr.service.signalr.net",
@@ -855,7 +856,7 @@ test(
           targetSession: hugeSessionId,
           message: "Non-wait message on 540 MiB log",
           fromMachine: "PEER-PC",
-          fromScope: "private",
+          fromScope: "personal",
           fromSessionId: "peer-session-1",
           fromSessionName: "Peer Session 1",
           waitForReply: false,
@@ -869,7 +870,7 @@ test(
           targetSession: hugeSessionId,
           message: "Wait message on 540 MiB log",
           fromMachine: "PEER-PC",
-          fromScope: "private",
+          fromScope: "personal",
           fromSessionId: "peer-session-2",
           fromSessionName: "Peer Session 2",
           waitForReply: true,
@@ -970,7 +971,8 @@ test("injectLocalSessionMessage rejects unrelated user.message events, never rep
 
     const cfg = {
       machineId: "TEST-MACHINE",
-      scope: "private",
+      scope: "personal",
+      githubUser: "example",
       hub: "copilotbridge",
       host: "your-signalr.service.signalr.net",
       endpoint: "https://your-signalr.service.signalr.net",
@@ -985,7 +987,7 @@ test("injectLocalSessionMessage rejects unrelated user.message events, never rep
           targetSession: sessionId,
           message: "Expected target message that never gets written",
           fromMachine: "PEER-PC",
-          fromScope: "private",
+          fromScope: "personal",
           fromSessionId: "s-1",
           fromSessionName: "Sender 1",
           dispatchTimeoutMs: 220,
@@ -1007,7 +1009,7 @@ test("injectLocalSessionMessage rejects unrelated user.message events, never rep
           targetSession: sessionId,
           message: "Message triggering ws error",
           fromMachine: "PEER-PC",
-          fromScope: "private",
+          fromScope: "personal",
           fromSessionId: "s-2",
           fromSessionName: "Sender 2",
           dispatchTimeoutMs: 2000,
@@ -1061,7 +1063,7 @@ test("filterBroadcastTargets supports selective broadcast by wildcard machines, 
     },
     {
       machineId: "MAIN-WORKSTATION",
-      scope: "private",
+      scope: "personal",
       githubUser: "erjadi",
       specs: {
         memory: { totalGb: 64, freeGb: 40 },
@@ -1072,7 +1074,7 @@ test("filterBroadcastTargets supports selective broadcast by wildcard machines, 
     },
     {
       machineId: "3D-STUDIO-PC",
-      scope: "private",
+      scope: "personal",
       githubUser: "erjadi",
       specs: {
         memory: { totalGb: 64, freeGb: 38 },
@@ -1083,7 +1085,7 @@ test("filterBroadcastTargets supports selective broadcast by wildcard machines, 
     },
     {
       machineId: "GUEST-MACBOOK",
-      scope: "private",
+      scope: "personal",
       githubUser: "guestdev",
       specs: {
         memory: { totalGb: 16, freeGb: 6 },
@@ -1130,23 +1132,26 @@ test("filterBroadcastTargets supports selective broadcast by wildcard machines, 
 });
 
 test("refreshLiveSpecs and ping include githubUser and live hardware specs", async () => {
-  const specs = refreshLiveSpecs(null);
-  assert.ok(specs.cpu && specs.cpu.logicalCores >= 1);
-  assert.ok(specs.memory && specs.memory.totalGb > 0);
-  assert.ok(Array.isArray(specs.disks) && specs.disks.length >= 1);
-
-  const pingRes = await handleRpcAction(
-    {
-      machineId: "TEST-NODE",
-      scope: "private",
-      githubUser: "erjadi",
-      specs,
-    },
-    { action: "ping", params: {} }
-  );
-  assert.equal(pingRes.version, BRIDGE_VERSION);
-  assert.equal(pingRes.githubUser, "erjadi");
-  assert.ok(pingRes.specs && pingRes.specs.memory.totalGb > 0);
+  const env = setupTempCopilotEnv();
+  const previousHome = process.env.COPILOT_HOME;
+  process.env.COPILOT_HOME = env.tempRoot;
+  try {
+    const specs = refreshLiveSpecs(null);
+    assert.ok(specs.cpu && specs.cpu.logicalCores >= 1);
+    assert.ok(specs.memory && specs.memory.totalGb > 0);
+    assert.ok(Array.isArray(specs.disks) && specs.disks.length >= 1);
+    const pingRes = await handleRpcAction(
+      { machineId: "TEST-NODE", scope: "personal", githubUser: "erjadi", specs },
+      { action: "ping", params: {} }
+    );
+    assert.equal(pingRes.version, BRIDGE_VERSION);
+    assert.equal(pingRes.githubUser, "erjadi");
+    assert.ok(pingRes.specs && pingRes.specs.memory.totalGb > 0);
+  } finally {
+    if (previousHome === undefined) delete process.env.COPILOT_HOME;
+    else process.env.COPILOT_HOME = previousHome;
+    env.cleanup();
+  }
 });
 
 test("v1.8.0: daemon deduplication, chunked SHA-256 file transfer, and --message-file CLI parsing", async () => {
@@ -1162,7 +1167,7 @@ test("v1.8.0: daemon deduplication, chunked SHA-256 file transfer, and --message
     assert.equal(parsedMsg, "Multi-line message with (parentheses) and *markdown*\nLine 2");
 
     // 2. Test chunked file transfer (send_file_chunk + pull_file_chunk) with SHA-256 verification
-    const cfg = { machineId: "TEST-NODE", scope: "private", githubUser: "erjadi" };
+    const cfg = { machineId: "TEST-NODE", scope: "personal", githubUser: "erjadi" };
     const payload = Buffer.from("Hello SignalR chunked binary transfer! 🚀".repeat(200), "utf8");
     const expectedSha256 = crypto.createHash("sha256").update(payload).digest("hex");
     const half = Math.floor(payload.length / 2);
@@ -1269,7 +1274,7 @@ test("v1.8.0: daemon deduplication, chunked SHA-256 file transfer, and --message
       {
         machineId: "ERJADI-PC",
         githubUser: "erjadi",
-        scope: "private",
+        scope: "personal",
         publicKey: bobKey.publicKey,
       },
     ];
@@ -1282,9 +1287,9 @@ test("v1.8.0: daemon deduplication, chunked SHA-256 file transfer, and --message
       toMachine: "MAIN-WORKSTATION",
       action: "send_message",
       params: {
-        // Alice tries to spoof fromGitHubUser="erjadi" and fromScope="private" in params!
+        // Alice tries to spoof the owner's GitHub identity and personal scope.
         fromGitHubUser: "erjadi",
-        fromScope: "private",
+        fromScope: "personal",
         message: "What is your status?",
       },
       identity: {
@@ -1295,7 +1300,7 @@ test("v1.8.0: daemon deduplication, chunked SHA-256 file transfer, and --message
     });
 
     const resolvedSender = resolveVerifiedSenderIdentity(
-      { machineId: "MAIN-WORKSTATION", githubUser: "erjadi", scope: "private" },
+      { machineId: "MAIN-WORKSTATION", githubUser: "erjadi", scope: "personal" },
       {
         requestId: "req-sec-1",
         sentAt,
@@ -1304,7 +1309,7 @@ test("v1.8.0: daemon deduplication, chunked SHA-256 file transfer, and --message
         action: "send_message",
         params: {
           fromGitHubUser: "erjadi",
-          fromScope: "private",
+          fromScope: "personal",
           message: "What is your status?",
         },
         auth: signedAuth,
@@ -1324,7 +1329,7 @@ test("v1.8.0: daemon deduplication, chunked SHA-256 file transfer, and --message
     assert.throws(
       () =>
         resolveVerifiedSenderIdentity(
-          { machineId: "MAIN-WORKSTATION", githubUser: "erjadi", scope: "private" },
+          { machineId: "MAIN-WORKSTATION", githubUser: "erjadi", scope: "personal" },
           {
             requestId: "req-forged",
             sentAt,
@@ -1344,7 +1349,7 @@ test("v1.8.0: daemon deduplication, chunked SHA-256 file transfer, and --message
       await assert.rejects(
         () =>
           handleRpcAction(
-            { machineId: "MAIN-WORKSTATION", githubUser: "erjadi", scope: "private" },
+            { machineId: "MAIN-WORKSTATION", githubUser: "erjadi", scope: "personal" },
             {
               requestId: `req-block-${blockedAction}`,
               fromMachine: "ALICE-PC",
@@ -1513,7 +1518,7 @@ test("v1.8.0: daemon deduplication, chunked SHA-256 file transfer, and --message
       },
     });
     const delayedVerified = resolveVerifiedSenderIdentity(
-      { machineId: "MAIN-WORKSTATION", githubUser: "erjadi", scope: "private" },
+      { machineId: "MAIN-WORKSTATION", githubUser: "erjadi", scope: "personal" },
       {
         requestId: "req-delayed-10m",
         sentAt: tenMinAgoIso,
@@ -1922,11 +1927,11 @@ test("v3.0.0 multi-flock platform: universal <owner>/<flock>[/<machineId>] addre
   process.env.COPILOT_HOME = env.tempRoot;
 
   try {
-    // 1. Scope normalization ("private" -> "personal", "work" -> "work", no "private" output)
-    assert.equal(normalizeScope("private"), "personal");
+    // Stored-state migration is separate from accepting new scope inputs.
+    assert.throws(() => normalizeScope("private"), { code: "INVALID_SCOPE" });
     assert.equal(normalizeScope("personal"), "personal");
     assert.equal(normalizeScope("work"), "work");
-    assert.equal(normalizeV3Scope("private"), "personal");
+    assert.throws(() => normalizeV3Scope("private"), { code: "INVALID_SCOPE" });
     assert.equal(normalizeV3Scope("work"), "work");
 
     // 2. Universal <owner>/<flock>[/<machineId>] address parser
@@ -1940,10 +1945,7 @@ test("v3.0.0 multi-flock platform: universal <owner>/<flock>[/<machineId>] addre
     assert.equal(addrPersonal.isBuiltInScope, true);
     assert.equal(addrPersonal.machineId, null);
 
-    const addrLegacyPrivate = parseFlockAddress("erjadi/private/MAIN-WORKSTATION");
-    assert.equal(addrLegacyPrivate.flockId, "erjadi/personal");
-    assert.equal(addrLegacyPrivate.machineId, "MAIN-WORKSTATION");
-    assert.equal(addrLegacyPrivate.canonicalPath, "erjadi/personal/MAIN-WORKSTATION");
+    assert.throws(() => parseFlockAddress("erjadi/private/MAIN-WORKSTATION"), { code: "INVALID_SCOPE" });
 
     const addrTeamPc = parseFlockAddress("erjadi/studio-team/CLOUD-DEV-VM");
     assert.equal(addrTeamPc.flockId, "erjadi/studio-team");

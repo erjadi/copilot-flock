@@ -6,7 +6,7 @@ import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { createServer } from "vite";
 
-let server, rel, SessionsView, api;
+let server, rel, SessionsView, api, flocks;
 before(async () => {
   const root = fileURLToPath(new URL("../", import.meta.url));
   server = await createServer({
@@ -17,6 +17,7 @@ before(async () => {
   ({ rel } = await server.ssrLoadModule(path.join(root, "src", "components", "fleet", "ui.tsx")));
   ({ SessionsView } = await server.ssrLoadModule(path.join(root, "src", "components", "fleet", "SessionsView.tsx")));
   api = await server.ssrLoadModule(path.join(root, "src", "lib", "fleet", "api.ts"));
+  flocks = await server.ssrLoadModule(path.join(root, "src", "lib", "fleet", "flocks.ts"));
 });
 after(async () => { await server?.close(); });
 
@@ -54,4 +55,10 @@ test("synthetic transcripts and projects remain explicitly available in preview 
   const session = { machineId: "EXAMPLE-PC", session_id: "example-chat", title: "Example", repo: "example/project", branch: "main", updated_at: new Date().toISOString() };
   assert.equal((await api.fetchTranscript("", "seed", session)).simulated, true);
   assert.equal((await api.fetchProjects("", "seed", "EXAMPLE-PC", [session], "personal")).simulated, true);
+});
+
+test("invite validation rejects private as a retired scope before a request", () => {
+  const input = { targetPath: "example/private/EXAMPLE-PC", githubHandle: "example", durationMinutes: null, maxDevices: 1 };
+  assert.match(flocks.validateInvite(input), /retired/);
+  assert.equal(flocks.validateInvite({ ...input, targetPath: "example/personal/EXAMPLE-PC" }), null);
 });

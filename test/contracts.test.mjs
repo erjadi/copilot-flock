@@ -7,6 +7,77 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import * as flock from "../flock.mjs";
 import * as bridge from "../bridge.mjs";
+import * as broker from "../bootstrap-server.mjs";
+
+test("scope and address inputs reject retired private aliases and invalid values", () => {
+  for (const normalize of [flock.normalizeScope, bridge.normalizeScope, broker.normalizeV3Scope]) {
+    assert.equal(normalize("personal"), "personal");
+    assert.equal(normalize(" WORK "), "work");
+    assert.equal(normalize(undefined, null), null);
+    for (const scope of ["private", "PRIVATE", "unknown", "corp", "corporate", false, 0]) {
+      assert.throws(() => normalize(scope), { code: "INVALID_SCOPE" });
+    }
+    assert.throws(() => normalize(undefined, "private"), { code: "INVALID_SCOPE" });
+  }
+  for (const api of [flock, bridge, broker]) {
+    assert.throws(() => api.parseFlockAddress("example/private/EXAMPLE-PC"), { code: "INVALID_SCOPE" });
+    assert.equal(api.parseFlockAddress("example/personal/EXAMPLE-PC").canonicalPath, "example/personal/EXAMPLE-PC");
+  }
+});
+
+test("legacy stored-scope migration preserves identity, enrollment and recovery/session metadata", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "flock-scope-migration-"));
+  const keys = ["COPILOT_HOME", "COPILOT_BRIDGE_SCOPE", "COPILOT_FLOCK_SCOPE",
+    "COPILOT_BRIDGE_SANDBOX", "COPILOT_FLOCK_SANDBOX", "COPILOT_BRIDGE_GITHUB_USER"];
+  const previous = new Map(keys.map((key) => [key, process.env[key]]));
+  for (const key of keys) delete process.env[key];
+  process.env.COPILOT_BRIDGE_GITHUB_USER = "example";
+  try {
+    for (const [index, api] of [flock, bridge].entries()) {
+      process.env.COPILOT_HOME = path.join(root, String(index));
+      const home = path.join(process.env.COPILOT_HOME, "flock");
+      fs.mkdirSync(home, { recursive: true });
+      const configPath = path.join(home, "config.json");
+      const original = JSON.stringify({
+        scope: "private", machineId: "EXAMPLE-PC", githubUser: "example",
+        connectionString: "Endpoint=https://example.invalid;AccessKey=synthetic;",
+        specs: { cpu: { model: "Synthetic CPU" } },
+        coordinatorSessionId: "synthetic-coordinator", threadTrackerSessionId: "synthetic-tracker",
+        recoveryMarker: "synthetic-recovery-preserved",
+      });
+      fs.writeFileSync(configPath, original, { mode: 0o600 });
+      fs.writeFileSync(path.join(home, "identity.json"), "synthetic identity must remain unchanged");
+      fs.writeFileSync(path.join(home, "flocks.json"), "synthetic enrollment must remain unchanged");
+      assert.equal(api.loadConfig({ autoFetchAz: false }).scope, "personal");
+      const migrated = JSON.parse(fs.readFileSync(configPath, "utf8"));
+      assert.equal(migrated.scope, "personal");
+      assert.equal(migrated.coordinatorSessionId, "synthetic-coordinator");
+      assert.equal(migrated.threadTrackerSessionId, "synthetic-tracker");
+      assert.equal(migrated.recoveryMarker, "synthetic-recovery-preserved");
+      assert.equal(fs.readFileSync(`${configPath}.v2.bak.json`, "utf8"), original);
+      assert.equal(fs.readFileSync(path.join(home, "identity.json"), "utf8"), "synthetic identity must remain unchanged");
+      assert.equal(fs.readFileSync(path.join(home, "flocks.json"), "utf8"), "synthetic enrollment must remain unchanged");
+    }
+  } finally {
+    for (const [key, value] of previous) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("canonical and compatibility CLI help advertise personal, not a private scope", () => {
+  for (const script of ["flock.mjs", "bridge.mjs"]) {
+    const result = spawnSync(process.execPath, [
+      fileURLToPath(new URL(`../${script}`, import.meta.url)), "--help",
+    ], { encoding: "utf8", timeout: 5000 });
+    assert.equal(result.status, 0);
+    assert.match(result.stdout, /Copilot Flock v/);
+    assert.match(result.stdout, /--scope work\|personal/);
+    assert.doesNotMatch(result.stdout, /work\|private|Copilot SignalR Thread Bridge/);
+  }
+});
 
 function temporary(t) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "flock-contracts-"));

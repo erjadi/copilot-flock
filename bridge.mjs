@@ -549,12 +549,32 @@ function logDaemon(msg, extra = undefined) {
 // ---------------------------------------------------------------------------
 
 export function normalizeScope(val, fallback = "work") {
-  const s = String(val || "").trim().toLowerCase();
-  if (s === "personal" || s === "private") return "personal";
-  if (s === "work" || s === "corp" || s === "corporate") return "work";
-  if (fallback === null || fallback === undefined || fallback === "") return fallback;
-  const fb = String(fallback).trim().toLowerCase();
-  return fb === "personal" || fb === "private" ? "personal" : "work";
+  const s = String(val ?? "").trim().toLowerCase();
+  if (!s) {
+    if (fallback === null || fallback === undefined || fallback === "") return fallback;
+    return normalizeScope(fallback, null);
+  }
+  if (s === "personal" || s === "work") return s;
+  const err = new Error("Invalid machine scope. Use personal or work; private is retired.");
+  err.code = "INVALID_SCOPE";
+  err.statusCode = 400;
+  throw err;
+}
+
+function normalizeStoredScope(val) {
+  const legacy = String(val ?? "").trim().toLowerCase();
+  return legacy === "private" ? "personal"
+    : legacy === "corp" || legacy === "corporate" ? "work"
+    : normalizeScope(val, "work");
+}
+
+function backupLegacyScopeConfig(cfg, configPath) {
+  if (String(cfg.scope ?? "").trim().toLowerCase() !== "private" || !fs.existsSync(configPath)) return;
+  const backupPath = `${configPath}.v2.bak.json`;
+  if (!fs.existsSync(backupPath)) {
+    fs.copyFileSync(configPath, backupPath);
+    if (process.platform !== "win32") fs.chmodSync(backupPath, 0o600);
+  }
 }
 
 export function parseFlockAddress(targetStr, defaultOwner = null) {
@@ -586,7 +606,13 @@ export function parseFlockAddress(targetStr, defaultOwner = null) {
     };
   }
   const owner = (parts[0] || defaultOwner || "").toLowerCase();
-  const flockName = parts[1].toLowerCase() === "private" ? "personal" : parts[1].toLowerCase();
+  const flockName = parts[1].toLowerCase();
+  if (flockName === "private") {
+    const err = new Error("The private flock scope is retired; use personal.");
+    err.code = "INVALID_SCOPE";
+    err.statusCode = 400;
+    throw err;
+  }
   const machineId = parts.length === 3 ? parts[2] : null;
   const flockId = `${owner}/${flockName}`;
   const isBuiltInScope = flockName === "personal" || flockName === "work";
@@ -1216,15 +1242,7 @@ export function loadConfig({ autoFetchAz = true, refreshSpecs = false } = {}) {
     } catch {}
   }
 
-  // Automatic v2 -> v3 backup when migrating legacy "private" scope to "personal"
-  if (cfg.scope === "private" && fs.existsSync(activeConfigPath)) {
-    const bakPath = `${activeConfigPath}.v2.bak.json`;
-    try {
-      if (!fs.existsSync(bakPath)) {
-        fs.copyFileSync(activeConfigPath, bakPath);
-      }
-    } catch {}
-  }
+  backupLegacyScopeConfig(cfg, activeConfigPath);
 
   const machineId =
     process.env.COPILOT_BRIDGE_MACHINE_ID ||
@@ -1233,7 +1251,7 @@ export function loadConfig({ autoFetchAz = true, refreshSpecs = false } = {}) {
 
   const hasExplicitScope = Boolean(process.env.COPILOT_BRIDGE_SCOPE || cfg.scope);
   let scope = normalizeScope(
-    process.env.COPILOT_BRIDGE_SCOPE || cfg.scope,
+    process.env.COPILOT_BRIDGE_SCOPE || normalizeStoredScope(cfg.scope),
     "work"
   );
 
@@ -1275,7 +1293,7 @@ export function loadConfig({ autoFetchAz = true, refreshSpecs = false } = {}) {
       connectionString = bootRes.connectionString || null;
       if (bootRes.githubUser) githubUser = normalizeGitHubUser(bootRes.githubUser) || githubUser;
       if (!hasExplicitScope && bootRes.registered?.scope) {
-        scope = normalizeScope(bootRes.registered.scope, scope);
+        scope = normalizeStoredScope(bootRes.registered.scope);
       }
     } else if (typeof bootRes === "string") {
       connectionString = bootRes;
@@ -10472,6 +10490,8 @@ export async function installBridge({
     } catch {}
   }
 
+  backupLegacyScopeConfig(existing, activeConfigPath);
+
   let parsedEnrollmentJson = null;
   if (enrollmentJsonArg) {
     parsedEnrollmentJson =
@@ -10499,7 +10519,7 @@ export async function installBridge({
   if (scopeArg) {
     existing.scope = normalizeScope(scopeArg, existing.scope || "work");
   } else if (existing.scope) {
-    existing.scope = normalizeScope(existing.scope, "work");
+    existing.scope = normalizeStoredScope(existing.scope);
   } else {
     const detected = detectMachineScopeRecommendation(existing.specs);
     existing.scope = detected.recommendedScope;
@@ -11087,39 +11107,40 @@ Legacy configurations/v3 broker invites retain compatibility; do not migrate imp
 
   if (command === "help" || flags.help) {
     console.log(`
-Copilot SignalR Thread Bridge v${BRIDGE_VERSION} (your-signalr.service.signalr.net)
+Copilot Flock v${BRIDGE_VERSION}
 
 Usage:
-  node bridge.mjs install [--machine-id <name>] [--scope work|private] [--github-user <handle>] [--connection-string <str>]
-  node bridge.mjs vote-release --branch <candidate-branch> [--machines <m1,m2,*>]
-  node bridge.mjs update [--all] [--machines <m1,m2,DESKTOP-*>] [--scope work|private]
-  node bridge.mjs diagnose [--fix] [--machines <m1,m2,DESKTOP-*>] [--scope work|private]
-  node bridge.mjs reprovision --machines <m1,m2>
-  node bridge.mjs set-scope <work|private>
-  node bridge.mjs version
-  node bridge.mjs status
-  node bridge.mjs flock [--scope work|private] [--github-user <handle>]
-  node bridge.mjs members [--scope work|private] [--github-user <handle>]
-  node bridge.mjs specs [--refresh]
-  node bridge.mjs machines [--scope work|private] [--github-user <handle>] [--gpu <text>] [--min-ram-gb <n>] [--min-free-disk-gb <n>]
-  node bridge.mjs sessions [--machine <name>] [--scope work|private] [--query <text>]
-  node bridge.mjs projects [--machine <name>]
-  node bridge.mjs transcript --session <id-or-title> [--to-machine <name>] [--limit 10]
-  node bridge.mjs create-session [--to-machine <name>] [--title <title>] [--repo <owner/repo>] [--workspace-type branch|worktree] [--branch <branch>] [--cwd <path>] [--model <model>] [--message <prompt> | --message-file <path> | --stdin] [--wait]
-  node bridge.mjs broadcast [--message <text> | --message-file <path> | --stdin] [--scope work|private] [--machines <m1,m2,DESKTOP-*>] [--exclude <m3>] [--github-user <u1,u2>] [--exclude-user <u3>] [--gpu <text>] [--min-ram-gb <n>] [--min-free-disk-gb <n>] [--has-repo <repo>] [--to-session <selector>] [--new-session] [--title <title>] [--wait] [--dry-run]
-  node bridge.mjs send --to-session <id-or-title-or-latest> [--message <text> | --message-file <path> | --stdin] [--to-machine <name>] [--from-session <id>] [--delegate] [--title <worker-title>] [--repo <worker-repo>] [--notify-on-idle] [--wait] [--dry-run]
-  node bridge.mjs clarify --to-machine <name> --to-session <id-or-title> --question <text> [--context <text>] [--options <opt1,opt2>] [--from-session <id>] [--wait]
-  node bridge.mjs lock --to-machine <name> --resource <name> [--ttl <sec>] [--reason <text>] [--force]
-  node bridge.mjs unlock --to-machine <name> --resource <name> [--lease-id <id>] [--force]
-  node bridge.mjs locks [--to-machine <name>]
-  node bridge.mjs sync-branch --to-machine <name> [--repo <dir>] [--branch <branch>] [--target-repo <nwo>]
-  node bridge.mjs queue [--machine <name>] [--drain]
-  node bridge.mjs send-file --to-machine <name> --file <local-path> [--remote-path <dest-path>]
-  node bridge.mjs pull-file --from-machine <name> --remote-path <src-path> [--local-path <dest-path>]
-  node bridge.mjs self-test
-  node bridge.mjs daemon
-  node bridge.mjs stop-daemon
-  node bridge.mjs mcp
+  node flock.mjs install [--machine-id <name>] [--scope work|personal] [--github-user <handle>] [--connection-string <str>] [--servicebus-connection-string <str>] [--bootstrap-url <url>] [--invite-file <path>]
+  node flock.mjs vote-release --branch <candidate-branch> [--machines <m1,m2,*>]
+  node flock.mjs update [--all] [--machines <m1,m2,DESKTOP-*>] [--scope work|personal]
+  node flock.mjs diagnose [--fix] [--machines <m1,m2,DESKTOP-*>] [--scope work|personal]
+  node flock.mjs reprovision --machines <m1,m2>
+  node flock.mjs set-scope <work|personal>
+  node flock.mjs --version
+  node flock.mjs version
+  node flock.mjs status
+  node flock.mjs flock [--scope work|personal] [--github-user <handle>]
+  node flock.mjs members [--scope work|personal] [--github-user <handle>]
+  node flock.mjs specs [--refresh]
+  node flock.mjs machines [--scope work|personal] [--github-user <handle>] [--gpu <text>] [--min-ram-gb <n>] [--min-free-disk-gb <n>]
+  node flock.mjs sessions [--machine <name>] [--scope work|personal] [--query <text>]
+  node flock.mjs projects [--machine <name>]
+  node flock.mjs transcript --session <id-or-title> [--to-machine <name>] [--limit 10]
+  node flock.mjs create-session [--to-machine <name>] [--title <title>] [--repo <owner/repo>] [--workspace-type branch|worktree] [--branch <branch>] [--cwd <path>] [--model <model>] [--message <prompt> | --message-file <path> | --stdin] [--wait]
+  node flock.mjs broadcast [--message <text> | --message-file <path> | --stdin] [--scope work|personal] [--machines <m1,m2,DESKTOP-*>] [--exclude <m3>] [--github-user <u1,u2>] [--exclude-user <u3>] [--gpu <text>] [--min-ram-gb <n>] [--min-free-disk-gb <n>] [--has-repo <repo>] [--to-session <selector>] [--new-session] [--title <title>] [--wait] [--dry-run]
+  node flock.mjs send --to-session <id-or-title-or-latest> [--message <text> | --message-file <path> | --stdin] [--to-machine <name>] [--from-session <id>] [--delegate] [--title <worker-title>] [--repo <worker-repo>] [--notify-on-idle] [--wait] [--dry-run]
+  node flock.mjs clarify --to-machine <name> --to-session <id-or-title> --question <text> [--context <text>] [--options <opt1,opt2>] [--from-session <id>] [--wait]
+  node flock.mjs lock --to-machine <name> --resource <name> [--ttl <sec>] [--reason <text>] [--force]
+  node flock.mjs unlock --to-machine <name> --resource <name> [--lease-id <id>] [--force]
+  node flock.mjs locks [--to-machine <name>]
+  node flock.mjs sync-branch --to-machine <name> [--repo <dir>] [--branch <branch>] [--target-repo <nwo>]
+  node flock.mjs queue [--machine <name>] [--drain]
+  node flock.mjs send-file --to-machine <name> --file <local-path> [--remote-path <dest-path>]
+  node flock.mjs pull-file --from-machine <name> --remote-path <src-path> [--local-path <dest-path>]
+  node flock.mjs self-test
+  node flock.mjs daemon
+  node flock.mjs stop-daemon
+  node flock.mjs mcp
 `);
     return;
   }

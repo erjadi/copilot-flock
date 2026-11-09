@@ -64,6 +64,7 @@ export function revokeMember(state: FlockState, flockId: string, peerId: string)
 }
 export function validateInvite(input: InviteInput): string | null {
   if (!/^[\w-]+\/[\w-]+(?:\/[\w.-]+)?$/.test(input.targetPath)) return "Enter an owner/flock path with an optional machine ID.";
+  if (input.targetPath.split("/")[1].toLowerCase() === "private") return "The private scope is retired; use personal.";
   if (!/^@?[a-z\d](?:[a-z\d-]{0,38})$/i.test(input.githubHandle)) return "Enter a valid GitHub handle.";
   if (!Number.isInteger(input.maxDevices) || input.maxDevices < 1) return "Device limit must be a positive whole number.";
   if (input.durationMinutes !== null && !GUEST_DURATIONS.some((n) => n === input.durationMinutes)) return "Choose a supported guest duration.";

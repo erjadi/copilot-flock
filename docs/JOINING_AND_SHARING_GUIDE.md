@@ -80,7 +80,7 @@ Every flock and machine in `copilot-flock` follows one consistent, human-readabl
 | **`<owner>/<team>`** | `erjadi/studio-team` | **Collaborator Team Flock** — A named shared flock where invited `@githubUser` teammates can collaborate across specific machines. | **Explicit opt-in only** (`0` existing threads exposed by default) |
 | **`<owner>/<flock>/<machineId>`** | `erjadi/work/CLOUD-DEV-VM` | **Single-Machine Address / Guest Pass** — Targets a single PC (or grants time-bound guest access to just that PC). | **Explicit opt-in only** (`0` existing threads exposed by default) |
 
-> **Note on Scope Naming**: Only **`personal`** and **`work`** are used for owner scopes (`private` is retired and automatically migrated to `personal`).
+> **Note on Scope Naming**: Only **`personal`** and **`work`** are valid new owner-scope/address inputs; `private` is not an alias. Existing stored `private` config is backed up and migrated to `personal` while identity, enrollment and coordinator/tracker records remain intact. This local migration does not authorize fleet re-enrollment.
 
 ---
 
