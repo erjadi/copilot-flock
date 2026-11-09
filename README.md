@@ -212,6 +212,20 @@ durably **UNKNOWN**, with the original claims/outbox retained and no automatic
 redispatch. These bounds are verified with synthetic keys and cloud adapters,
 not live provider acceptance; no chunking or Premium SKU is implied.
 
+Automatic receipt reconciliation stops when the original signed request
+deadline expires, without deleting UNKNOWN receipts, outbox rows or admission
+claims. Late authenticated receipts can still resolve that uncertainty.
+Each group has at most four reconciliation publications in flight; durable
+scheduling metadata backs subsequent queries off by 30, 60, 120, 240 and then
+300 seconds, fairly selecting other due entries instead of repeatedly selecting
+the oldest uncertain row. The original `attempted` boolean remains admission
+proof, never a retry counter. A failed or blocked publication does not prevent
+the daemon from polling Service Bus receipts or enrollment, and each poll phase
+reports its own failure without skipping the next phase. Current authorization
+and authenticated missing-receipt reconciliation remain mandatory; this is not
+permission to re-sign/rebind old requests or blindly dispatch them again.
+These synthetic-clock/daemon controls do not establish live quota or throughput.
+
 **Release validation:** before either smoke tests or full worker execution,
 each voter requires explicit **local approval of the exact reviewed SHA**.
 Ask that PC's Copilot to review the source without running it, then approve

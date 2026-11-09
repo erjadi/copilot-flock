@@ -9,6 +9,7 @@ const VERIFIED_CONTEXTS = new WeakSet();
 const SNAPSHOT_ACTIONS = new Set(["list_sessions", "list_shared_threads", "get_transcript"]);
 const TERMINAL_STATUSES = new Set(["DELIVERED", "DENIED", "OFFLINE", "BUSY", "UNKNOWN"]);
 export const RPC_BODY_LIMIT_BYTES = 128 * 1024;
+export const AUTOMATIC_RECONCILE_LIMIT = 4;
 
 function requireValue(condition, message) {
   if (!condition) throw new Error(message);
@@ -36,6 +37,7 @@ export function createZeroBrokerRuntime({
   requireValue(Number.isSafeInteger(capacity) && capacity > 0 && capacity <= 256, "Invalid runtime capacity");
   const waiters = new Map();
   const responsesInFlight = new Set();
+  const reconciliationInFlight = new Map();
   let incoming = 0;
   let closed = false;
   let refreshing = null;
@@ -383,18 +385,27 @@ export function createZeroBrokerRuntime({
     }
   }
 
-  async function reconcilePending() {
+  async function reconcilePending({ waitForCompletion = true } = {}) {
     await refresh();
-    for (const entry of state.pendingOutbox(device.flockUuid, capacity)) {
+    const available = Math.min(capacity, AUTOMATIC_RECONCILE_LIMIT) - reconciliationInFlight.size;
+    if (available <= 0) return { scheduled: 0 };
+    const batch = [];
+    for (const entry of state.claimOutboxReconciliation({ flockUuid: device.flockUuid,
+      sender: device.opaquePeerId, limit: available, nowMs: now() })) {
       const coordinates = { flockUuid: device.flockUuid, sender: entry.sender, recipient: entry.recipient, requestId: entry.request };
-      if (entry.sender !== device.opaquePeerId) continue;
-      if (!entry.attempted && entry.expiry > now()) {
-        state.markOutboxAttempt(coordinates);
-        await transmit(entry);
-      } else {
-        await transmit(entry, true);
-      }
+      const key = canonicalJson([entry.sender, entry.recipient, entry.request]);
+      if (reconciliationInFlight.has(key)) continue;
+      const work = (async () => {
+        const firstAttempt = !entry.attempted && state.markOutboxAttempt(coordinates);
+        await transmit(entry, !firstAttempt);
+      })().catch(() => {
+        if (!closed) error("UNKNOWN", "Automatic receipt reconciliation failed; original uncertainty and outbox retained", entry.request);
+      }).finally(() => reconciliationInFlight.delete(key));
+      reconciliationInFlight.set(key, work);
+      batch.push(work);
     }
+    if (waitForCompletion) await Promise.all(batch);
+    return { scheduled: batch.length };
   }
 
   return {

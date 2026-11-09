@@ -7,6 +7,8 @@ import { DatabaseSync } from "node:sqlite";
 export const ROSTER_SCHEMA = "copilot-flock/roster/v3-zero-broker";
 export const ENVELOPE_VERSION = "v3-zb-1";
 export const MAX_LEASE_MS = 3600000;
+export const OUTBOX_RECONCILE_BASE_DELAY_MS = 30000;
+export const OUTBOX_RECONCILE_MAX_DELAY_MS = 300000;
 const MAX_DOCUMENT_BYTES = 1048576;
 const MAX_ENVELOPE_BYTES = 700 * 1024;
 const PEER = /^peer_[0-9a-f]{24}$/;
@@ -200,6 +202,9 @@ export function createRosterState({ directory, capacity = 100000 }) {
   const db = new DatabaseSync(file);
   db.exec("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA busy_timeout=1000; CREATE TABLE IF NOT EXISTS rosters (flock TEXT PRIMARY KEY, epoch INTEGER NOT NULL, hash TEXT NOT NULL, document TEXT NOT NULL); CREATE TABLE IF NOT EXISTS claims (direction TEXT NOT NULL, flock TEXT NOT NULL, epoch INTEGER NOT NULL, sender TEXT NOT NULL, message TEXT NOT NULL, expiry INTEGER NOT NULL, PRIMARY KEY(direction,flock,epoch,sender,message)); CREATE TABLE IF NOT EXISTS admissions (flock TEXT NOT NULL, sender TEXT NOT NULL, recipient TEXT NOT NULL, request TEXT NOT NULL, digest TEXT NOT NULL, expiry INTEGER NOT NULL, status TEXT NOT NULL, result TEXT, PRIMARY KEY(flock,sender,recipient,request)); CREATE TABLE IF NOT EXISTS outbox (flock TEXT NOT NULL, sender TEXT NOT NULL, recipient TEXT NOT NULL, request TEXT NOT NULL, digest TEXT NOT NULL, expiry INTEGER NOT NULL, document TEXT NOT NULL, PRIMARY KEY(flock,sender,recipient,request));");
   if (!db.prepare("PRAGMA table_info(outbox)").all().some((column) => column.name === "attempted")) db.exec("ALTER TABLE outbox ADD COLUMN attempted INTEGER NOT NULL DEFAULT 0");
+  if (!db.prepare("PRAGMA table_info(outbox)").all().some((column) => column.name === "next_reconcile_at")) db.exec("ALTER TABLE outbox ADD COLUMN next_reconcile_at INTEGER NOT NULL DEFAULT 0");
+  if (!db.prepare("PRAGMA table_info(outbox)").all().some((column) => column.name === "reconcile_attempts")) db.exec("ALTER TABLE outbox ADD COLUMN reconcile_attempts INTEGER NOT NULL DEFAULT 0");
+  db.exec("CREATE INDEX IF NOT EXISTS outbox_reconciliation_due ON outbox(flock,sender,next_reconcile_at,expiry)");
   if (!db.prepare("PRAGMA table_info(admissions)").all().some((column) => column.name === "authorization")) db.exec("ALTER TABLE admissions ADD COLUMN authorization TEXT");
   db.exec("CREATE TABLE IF NOT EXISTS receipts (flock TEXT NOT NULL,sender TEXT NOT NULL,recipient TEXT NOT NULL,request TEXT NOT NULL,digest TEXT NOT NULL,status TEXT NOT NULL,result TEXT NOT NULL,PRIMARY KEY(flock,sender,recipient,request))");
   function transaction(fn) {
@@ -242,6 +247,19 @@ export function createRosterState({ directory, capacity = 100000 }) {
       requireValue(Number.isInteger(limit) && limit > 0 && limit <= capacity, "Invalid outbox query limit");
       return db.prepare("SELECT * FROM outbox WHERE flock=? ORDER BY rowid LIMIT ?").all(flockUuid, limit).map((row) => ({ ...row, payload: JSON.parse(row.document) }));
     },
+    claimOutboxReconciliation: ({ flockUuid, sender, limit, nowMs }) => transaction(() => {
+      requireValue(Number.isInteger(limit) && limit > 0 && limit <= capacity &&
+        Number.isSafeInteger(nowMs) && nowMs >= 0 && Number.isSafeInteger(nowMs + OUTBOX_RECONCILE_MAX_DELAY_MS), "Invalid reconciliation schedule");
+      const rows = db.prepare("SELECT rowid,* FROM outbox WHERE flock=? AND sender=? AND expiry>? AND next_reconcile_at<=? ORDER BY next_reconcile_at,rowid LIMIT ?")
+        .all(flockUuid, sender, nowMs, nowMs, limit);
+      for (const row of rows) {
+        requireValue(Number.isSafeInteger(row.reconcile_attempts) && row.reconcile_attempts >= 0 && row.reconcile_attempts <= 5, "Invalid stored reconciliation schedule");
+        const delay = Math.min(OUTBOX_RECONCILE_MAX_DELAY_MS, OUTBOX_RECONCILE_BASE_DELAY_MS * 2 ** row.reconcile_attempts);
+        db.prepare("UPDATE outbox SET reconcile_attempts=?,next_reconcile_at=? WHERE rowid=?")
+          .run(Math.min(5, row.reconcile_attempts + 1), nowMs + delay, row.rowid);
+      }
+      return rows.map((row) => ({ ...row, payload: JSON.parse(row.document) }));
+    }),
     getOutboxEntry: ({ flockUuid, sender, recipient, requestId }) => {
       const row = db.prepare("SELECT * FROM outbox WHERE flock=? AND sender=? AND recipient=? AND request=?").get(flockUuid, sender, recipient, requestId);
       return row ? { ...row, payload: JSON.parse(row.document) } : null;

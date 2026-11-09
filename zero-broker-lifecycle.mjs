@@ -582,16 +582,25 @@ export async function runZeroBrokerService({ home, config, host, signal, request
       }
       for (const group of groups) {
         if (stopping) break;
-        try {
+        let degraded = false;
+        const synchronize = async (operation) => {
+          if (stopping) return;
+          try { await operation(); }
+          catch {
+            degraded = true;
+            host.reportError({ status: "UNKNOWN", message: "Zero-Broker synchronization phase failed closed; queued work and recovery state retained" });
+          }
+        };
+        await synchronize(async () => {
           await group.renewAndPrune();
           if (group.configuration().issuer) await group.retryPendingCloses();
           await group.runtime.refresh();
           await connect(group);
-          await group.runtime.reconcilePending();
-          await group.poll();
-          await group.pollEnrollment();
-          onStatus({ status: "ready", group: group.device.flockUuid });
-        } catch { onStatus({ status: "degraded", group: group.device.flockUuid }); host.reportError({ status: "UNKNOWN", message: "Zero-Broker synchronization failed closed; queued work and recovery state retained" }); }
+        });
+        await synchronize(() => group.runtime.reconcilePending({ waitForCompletion: false }));
+        await synchronize(() => group.poll());
+        await synchronize(() => group.pollEnrollment());
+        if (!stopping) onStatus({ status: degraded ? "degraded" : "ready", group: group.device.flockUuid });
       }
       if (!stopping) await new Promise((resolve) => {
         const timer = setTimeout(done, intervalMs);

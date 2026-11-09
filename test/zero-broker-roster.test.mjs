@@ -4,9 +4,10 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import vm from "node:vm";
 import { DatabaseSync } from "node:sqlite";
 import * as zb from "../zero-broker-roster.mjs";
-import { createZeroBrokerRuntime, isVerifiedZeroBrokerContext, RPC_BODY_LIMIT_BYTES } from "../zero-broker-runtime.mjs";
+import { AUTOMATIC_RECONCILE_LIMIT, createZeroBrokerRuntime, isVerifiedZeroBrokerContext, RPC_BODY_LIMIT_BYTES } from "../zero-broker-runtime.mjs";
 import { cloudRequest, createGitHubRosterRepository, ENCRYPTED_PACKET_HEADER_RESERVE_BYTES, peekLockEncryptedPacket,
   prepareEncryptedPacket, sendEncryptedPacket, SERVICE_BUS_STANDARD_MESSAGE_BYTES, stageEpochResources } from "../zero-broker-transport.mjs";
 import { getZeroBrokerApi as flockApi } from "../flock.mjs";
@@ -294,7 +295,7 @@ test("application claims fail closed at capacity, preserve deadlines and cannot 
   assert.throws(() => limited.queue({ ...queue, requestId: crypto.randomUUID() }), /capacity/);
 });
 
-test("admission authorization schema upgrades in place without resetting existing claims or identity", (t) => {
+test("admission and reconciliation schema upgrades preserve existing claims, attempted proof, schedules and identity", (t) => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "flock-zb-ledger-upgrade-"));
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
   const stateDirectory = path.join(directory, "roster-state");
@@ -309,9 +310,17 @@ test("admission authorization schema upgrades in place without resetting existin
     original.prepare("INSERT INTO admissions VALUES (?,?,?,?,?,?,?,?)").run(
       "synthetic-flock", "synthetic-sender", "synthetic-recipient", "synthetic-request",
       "synthetic-digest", 123456789, "DELIVERED", '{"transcript":"Synthetic retained private receipt"}');
+    original.exec("CREATE TABLE outbox (flock TEXT,sender TEXT,recipient TEXT,request TEXT,digest TEXT,expiry INTEGER,document TEXT,attempted INTEGER,PRIMARY KEY(flock,sender,recipient,request)); CREATE TABLE claims (direction TEXT,flock TEXT,epoch INTEGER,sender TEXT,message TEXT,expiry INTEGER,PRIMARY KEY(direction,flock,epoch,sender,message))");
+    original.prepare("INSERT INTO outbox VALUES (?,?,?,?,?,?,?,?)").run("synthetic-flock", "synthetic-sender", "synthetic-recipient",
+      "synthetic-request", "synthetic-digest", 123456789, '{"retained":true}', 1);
+    original.prepare("INSERT INTO claims VALUES (?,?,?,?,?,?)").run("send", "synthetic-flock", 1, "synthetic-sender", "synthetic-message", 123456789);
   } finally { original.close(); }
   for (let attempt = 0; attempt < 2; attempt++) {
     const upgraded = zb.createRosterState({ directory });
+    if (attempt === 0) assert.equal(upgraded.claimOutboxReconciliation({
+      flockUuid: "synthetic-flock", sender: "synthetic-sender", nowMs: 1000, limit: 1 }).length, 1);
+    else assert.equal(upgraded.claimOutboxReconciliation({
+      flockUuid: "synthetic-flock", sender: "synthetic-sender", nowMs: 1000, limit: 1 }).length, 0);
     upgraded.close();
   }
   const inspected = new DatabaseSync(file);
@@ -324,11 +333,19 @@ test("admission authorization schema upgrades in place without resetting existin
     assert.equal(rows[0].status, "DELIVERED");
     assert.equal(rows[0].result, '{"transcript":"Synthetic retained private receipt"}');
     assert.equal(rows[0].authorization, null);
+    const queued = inspected.prepare("SELECT * FROM outbox").get();
+    assert.equal(queued.digest, "synthetic-digest");
+    assert.equal(queued.document, '{"retained":true}');
+    assert.equal(queued.expiry, 123456789);
+    assert.equal(queued.attempted, 1);
+    assert.equal(queued.reconcile_attempts, 1);
+    assert.equal(queued.next_reconcile_at, 1000 + zb.OUTBOX_RECONCILE_BASE_DELAY_MS);
+    assert.equal(inspected.prepare("SELECT COUNT(*) AS count FROM claims").get().count, 1);
     assert.equal(fs.readFileSync(identity, "utf8"), "Synthetic existing identity must remain unchanged");
   } finally { inspected.close(); }
 });
 
-function runtimeFixture(t, { dispatch, readSnapshot, role = "owner", canMintTokens = false, captureResponses = false, cloudTransport = false } = {}) {
+function runtimeFixture(t, { dispatch, readSnapshot, role = "owner", canMintTokens = false, captureResponses = false, cloudTransport = false, fakeClock = false } = {}) {
   const f = fixture(t);
   const roster = zb.createPreBoundInvite({
     roster: f.genesis, actor: f.owner, recipient: f.peer, role,
@@ -347,8 +364,16 @@ function runtimeFixture(t, { dispatch, readSnapshot, role = "owner", canMintToke
   let grantRevision = 0;
   let summary = "Synthetic approved summary";
   let calls = 0;
+  let clock = f.nowMs;
+  let publicationGate = null;
+  let publicationGateOnce = false;
   const sendPacket = async ({ transport, envelope }) => {
     packets.push(envelope);
+    if (publicationGate) {
+      const gate = publicationGate;
+      if (publicationGateOnce) publicationGate = null;
+      await gate;
+    }
     if (offline) throw Object.assign(new Error("Synthetic offline transport"), { ambiguous: true });
     if (captureResponses && envelope.fromOpaquePeerId === f.peer.opaquePeerId) return { admittedToTransport: true };
     if (cloudTransport) return await sendEncryptedPacket({ transport, envelope, request: async (url, options) => {
@@ -361,6 +386,7 @@ function runtimeFixture(t, { dispatch, readSnapshot, role = "owner", canMintToke
   };
   const options = {
     sendPacket,
+    now: fakeClock ? () => clock : Date.now,
     reportError: (error) => errors.push(error),
     authorizeRoot: async () => rootGrants,
     authorizeSnapshot: async () => grants,
@@ -381,6 +407,8 @@ function runtimeFixture(t, { dispatch, readSnapshot, role = "owner", canMintToke
   peers.set(f.peer.opaquePeerId, peerRuntime);
   f.trackCleanup(() => { ownerRuntime.close(); peerRuntime.close(); });
   return { ...f, ownerRuntime, peerRuntime, packets, errors, cloudAttempts, calls: () => calls,
+    advance: (milliseconds) => { clock += milliseconds; },
+    setPublicationGate: (gate, once = false) => { publicationGate = gate; publicationGateOnce = once; },
     setOffline: (value) => { offline = value; },
     setGrants: (value) => { grants = value; grantRevision++; },
     setRootGrants: (value) => { rootGrants = value; grantRevision++; },
@@ -892,6 +920,117 @@ test("Standard runtime retains durable UNKNOWN without redispatch when a post-ac
   assert.equal((await f.ownerRuntime.request(request)).status, "UNKNOWN");
   assert.equal(f.calls(), 1);
   assert.equal(f.state.pendingOutbox(f.flockUuid).length, 1);
+});
+
+test("automatic reconciliation stops expired queries but retains uncertainty and accepts a late authenticated receipt", async (t) => {
+  const f = runtimeFixture(t, { captureResponses: true, fakeClock: true });
+  const request = { toOpaquePeerId: f.peer.opaquePeerId, requestId: crypto.randomUUID(),
+    action: "send_message", params: {}, expiresAt: f.nowMs + 1000, timeoutMs: 20 };
+  assert.equal((await f.ownerRuntime.request(request)).status, "UNKNOWN");
+  const lateReceipt = f.packets.at(-1);
+  const before = f.packets.length;
+  f.advance(1001);
+  for (let cycle = 0; cycle < 3; cycle++) await f.ownerRuntime.reconcilePending();
+  assert.equal(f.packets.length, before, "Expired uncertainty is retained, not polled indefinitely");
+  const [retained] = f.state.pendingOutbox(f.flockUuid);
+  assert.equal(retained.request, request.requestId);
+  assert.equal(retained.attempted, 1);
+  assert.equal(f.calls(), 1);
+  assert.equal((await f.ownerRuntime.receive(lateReceipt)).status, "RECEIPT_ACCEPTED");
+  assert.equal(f.state.pendingOutbox(f.flockUuid).length, 0);
+  assert.equal(f.calls(), 1);
+});
+
+test("actual daemon still polls receipts/enrollment when an outgoing reconciliation is denied or its publication stalls", async (t) => {
+  for (const blocked of [false, true]) {
+    const f = runtimeFixture(t, { captureResponses: true });
+    const request = { toOpaquePeerId: f.peer.opaquePeerId, action: "send_message",
+      params: {}, requestId: crypto.randomUUID(), expiresAt: f.nowMs + 60000, timeoutMs: 20 };
+    assert.equal((await f.ownerRuntime.request(request)).status, "UNKNOWN");
+    let release, watchdogFired = false;
+    const gate = new Promise((resolve) => { release = resolve; });
+    if (blocked) f.setPublicationGate(gate);
+    else addSharedMember(f);
+    let polls = 0, enrollmentPolls = 0;
+    const controller = new AbortController();
+    const group = { device: f.owner, state: f.state, runtime: f.ownerRuntime,
+      transport: () => f.memberBundle(f.state.get(f.flockUuid), f.owner).transport,
+      configuration: () => ({ issuer: false }), renewAndPrune: async () => {},
+      poll: async () => { polls++; }, pollEnrollment: async () => { enrollmentPolls++; },
+      suspend: () => f.ownerRuntime.close(), close: () => {} };
+    const config = { architecture: "zero-broker", groups: [{ flockUuid: f.flockUuid, rootFingerprint: f.genesis.rootFingerprint }] };
+    const source = fs.readFileSync(new URL("../zero-broker-lifecycle.mjs", import.meta.url), "utf8");
+    const start = source.indexOf("export async function runZeroBrokerService(");
+    assert.ok(start > 0);
+    const service = vm.runInNewContext(`${source.slice(start).replace("export async function", "async function")}\nrunZeroBrokerService`, {
+      openZeroBrokerGroup: () => group, rosterApi: { readPrivateJson: () => config },
+      check: (condition, message) => { if (!condition) throw new Error(message); },
+      WebSocket: class { close() { this.onclose?.(); } }, URL, Buffer, setTimeout, clearTimeout, setInterval, clearInterval,
+    });
+    const watchdog = setTimeout(() => { watchdogFired = true; release(); controller.abort(); }, 1000);
+    try {
+      await service({ home: "synthetic-only", config, host: { reportError: () => {} },
+        signal: controller.signal, onStatus: () => controller.abort() });
+      assert.equal(watchdogFired, false, "Blocked publication must not hold up the polling cycle");
+      assert.equal(polls, 1);
+      assert.equal(enrollmentPolls, 1);
+    } finally { clearTimeout(watchdog); release(); controller.abort(); }
+  }
+});
+
+test("automatic reconciliation is bounded, fair across failures and exponentially backed off without changing attempted proof", async (t) => {
+  const f = runtimeFixture(t, { fakeClock: true });
+  f.setOffline(true);
+  const count = AUTOMATIC_RECONCILE_LIMIT + 2;
+  for (let index = 0; index < count; index++) {
+    assert.equal((await f.ownerRuntime.request({ toOpaquePeerId: f.peer.opaquePeerId, action: "send_message",
+      params: { index }, expiresAt: f.nowMs + zb.MAX_LEASE_MS - 1000, timeoutMs: 20 })).status, "UNKNOWN");
+  }
+  const initial = f.packets.length;
+  assert.equal((await f.ownerRuntime.reconcilePending()).scheduled, AUTOMATIC_RECONCILE_LIMIT);
+  assert.equal((await f.ownerRuntime.reconcilePending()).scheduled, 2, "Later rows progress despite earlier transport failures");
+  assert.equal((await f.ownerRuntime.reconcilePending()).scheduled, 0);
+  assert.equal(f.packets.length, initial + count);
+  let clock = f.nowMs;
+  for (const delay of [30000, 60000, 120000, 240000, 300000, 300000]) {
+    f.advance(delay - 1);
+    assert.equal((await f.ownerRuntime.reconcilePending()).scheduled, 0);
+    f.advance(1); clock += delay;
+    assert.equal((await f.ownerRuntime.reconcilePending()).scheduled, AUTOMATIC_RECONCILE_LIMIT);
+    assert.equal((await f.ownerRuntime.reconcilePending()).scheduled, 2);
+    assert.equal((await f.ownerRuntime.reconcilePending()).scheduled, 0);
+    const retained = f.state.pendingOutbox(f.flockUuid);
+    assert.equal(retained.length, count);
+    for (const row of retained) {
+      assert.equal(row.attempted, 1, "Admission-attempt proof is a boolean, never a retry counter");
+      assert.ok(row.reconcile_attempts >= 1 && row.reconcile_attempts <= 5);
+      assert.equal(row.next_reconcile_at, clock + Math.min(zb.OUTBOX_RECONCILE_MAX_DELAY_MS,
+        zb.OUTBOX_RECONCILE_BASE_DELAY_MS * 2 ** (row.reconcile_attempts - 1)));
+    }
+  }
+  assert.equal(f.calls(), 0);
+  assert.ok(f.errors.some((entry) => /reconciliation failed/.test(entry.message) && entry.status === "UNKNOWN"));
+});
+
+test("one blocked automatic publication cannot monopolize reconciliation slots or prevent later rows progressing", async (t) => {
+  const f = runtimeFixture(t, { fakeClock: true, captureResponses: true });
+  f.setOffline(true);
+  const count = AUTOMATIC_RECONCILE_LIMIT + 2;
+  for (let index = 0; index < count; index++) await f.ownerRuntime.request({ toOpaquePeerId: f.peer.opaquePeerId,
+    action: "send_message", params: { index }, expiresAt: f.nowMs + 60000, timeoutMs: 20 });
+  f.setOffline(false);
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  f.setPublicationGate(gate, true);
+  try {
+    assert.equal((await f.ownerRuntime.reconcilePending({ waitForCompletion: false })).scheduled, AUTOMATIC_RECONCILE_LIMIT);
+    await new Promise(setImmediate);
+    assert.equal((await f.ownerRuntime.reconcilePending({ waitForCompletion: false })).scheduled, 2);
+    await new Promise(setImmediate);
+    assert.equal((await f.ownerRuntime.reconcilePending({ waitForCompletion: false })).scheduled, 0);
+    assert.ok(f.state.pendingOutbox(f.flockUuid).every((row) => row.reconcile_attempts === 1 && row.attempted === 1));
+    assert.equal(f.calls(), 0);
+  } finally { release(); await new Promise(setImmediate); }
 });
 
 test("cloud HTTP is bounded, HTTPS-only and does not follow credential-bearing redirects", async () => {
