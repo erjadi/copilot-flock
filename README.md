@@ -269,6 +269,12 @@ Acknowledged work is not reinserted after a slow publisher completes.
 Membership, epoch and the signed deadline are rechecked on receipt, so queued
 work is not a promise of immediate execution after wake. Preserve unknown
 outcomes and request IDs; never blindly resend.
+The retained legacy Desktop adapter may keep a socket open after its initial
+wait while admission is still pending. That production-timeout response is
+UNKNOWN/`awaiting_desktop_admission`, with no claimed `deliveredAt` or confirmed
+dispatch. A later matching persisted event can emit a separate admission
+receipt. The initial uncertain response is not permission to resend, and a
+later admission still does not establish task execution.
 
 Both install profiles record `installed-source.json` with the source commit
 when known and checksums of the installed runtime modules. Release reports

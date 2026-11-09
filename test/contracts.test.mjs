@@ -4,6 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import vm from "node:vm";
+import crypto from "node:crypto";
 import { execFileSync, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import * as flock from "../flock.mjs";
@@ -719,6 +720,63 @@ test("existing malformed legacy identity is retained rather than silently rotate
     fs.writeFileSync(identity, original);
     assert.throws(() => api.ensureMachineIdentityKeypair());
     assert.equal(fs.readFileSync(identity, "utf8"), original);
+  }
+});
+
+test("legacy production timeout remains UNKNOWN until Desktop admission is observed", async () => {
+  for (const filename of ["flock.mjs", "bridge.mjs"]) {
+    const source = fs.readFileSync(new URL(`../${filename}`, import.meta.url), "utf8");
+    const initial = Date.now();
+    let clock = initial, admitted = false, closed = false;
+    const delayed = [], receipts = [];
+    class Clock extends Date {
+      constructor(...args) { super(...(args.length ? args : [clock])); }
+      static now() { return clock; }
+    }
+    const context = vm.createContext({
+      crypto, path, Date: Clock, fs: { existsSync: () => false },
+      getCopilotDir: () => path.resolve("synthetic-profile-never-accessed"),
+      getLocalWsConnectionInfo: () => ({ port: 12345, token: "synthetic-token-never-used" }),
+      resolveLocalSession: () => ({ session_id: "synthetic-session", title: "Synthetic session" }),
+      createIncrementalEventReader: () => ({
+        readNewEvents: () => admitted ? [{ type: "user.message", data: { turnId: "synthetic-turn" } }] : [],
+      }),
+      buildCrossSessionEnvelope: () => "Synthetic prompt",
+      normalizeScope: (value) => value || "personal", normalizeGitHubUser: (value) => value || null,
+      isMatchingDispatchedUserEvent: () => admitted,
+      RawWebSocketClient: class {
+        async connect() {}
+        sendText() {}
+        close() { closed = true; }
+      },
+      setTimeout: (callback, ms) => {
+        clock += ms;
+        if (clock - initial <= 3000) queueMicrotask(callback);
+        else delayed.push(callback);
+      },
+      sendSignalRBroadcast: async (_cfg, _target, receipt) => { receipts.push(receipt); },
+    });
+    vm.runInContext(`${namedFunction(source, "injectLocalSessionMessage")}\nthis.inject = injectLocalSessionMessage;`, context);
+    const result = await context.inject({
+      cfg: { machineId: "SYNTHETIC-TARGET", connectionString: "synthetic-not-used" },
+      targetSession: "synthetic-session", message: "Synthetic message", fromMachine: "SYNTHETIC-SOURCE",
+      fromScope: "personal", waitForReply: false, dispatchTimeoutMs: 3000,
+    });
+    assert.equal(result.status, "unknown");
+    assert.equal(result.deliveryStage, "awaiting_desktop_admission");
+    assert.equal(result.dispatchedToRuntime, false);
+    assert.equal(result.admissionConfirmed, false);
+    assert.equal(result.queuedBehindActiveTurn, null);
+    assert.equal(result.lateAdmissionPending, true);
+    assert.equal(result.deliveredAt, undefined);
+    assert.equal(closed, false, "Keep the pending Desktop adapter alive without fabricating admission");
+    assert.equal(receipts.length, 0);
+    admitted = true;
+    for (const callback of delayed.splice(0)) callback();
+    await Promise.resolve();
+    await Promise.resolve();
+    assert.equal(closed, true);
+    assert.equal(receipts[0].stage, "admitted_after_queue");
   }
 });
 

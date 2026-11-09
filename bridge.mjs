@@ -4597,17 +4597,19 @@ export async function injectLocalSessionMessage({
         })();
 
         return {
-          status: "delivered",
-          deliveryStage: "queued_behind_active_turn",
-          dispatchedToRuntime: true,
-          queuedBehindActiveTurn: true,
+          status: "unknown",
+          deliveryStage: "awaiting_desktop_admission",
+          dispatchedToRuntime: false,
+          admissionConfirmed: false,
+          queuedBehindActiveTurn: null,
+          lateAdmissionPending: true,
           notifyOnIdleScheduled: Boolean(notifyOnIdle && fromMachine),
           requestId,
           targetMachine: cfg.machineId,
           targetSessionId: resolved.session_id,
           targetSessionTitle: resolved.title,
           mode: frame.mode,
-          deliveredAt: new Date().toISOString(),
+          pendingAt: new Date().toISOString(),
         };
       }
 
