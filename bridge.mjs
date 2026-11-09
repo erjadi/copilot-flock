@@ -1235,6 +1235,71 @@ export function saveLocalFlocksConfig(flocksConfig, customPath = getFlocksConfig
   return flocksConfig;
 }
 
+export function applyV3EnrollmentResult(cfg, result, customPath = getFlocksConfigPath()) {
+  const principal = normalizeGitHubUser(result?.githubUser)?.toLowerCase();
+  const principalId = Number(result?.githubUserId);
+  if (!result?.ok || !principal || !Number.isSafeInteger(principalId) || principalId <= 0 ||
+      !Array.isArray(result.enrolledFlocks) || result.enrolledFlocks.length === 0) {
+    throw new Error("Enrollment response is missing its authenticated GitHub principal or flock records");
+  }
+  const records = result.enrolledFlocks.map((flock) => {
+    const address = parseFlockAddress(flock.flockId);
+    if (address.machineId) throw new Error("Enrollment response must identify a flock, not a machine");
+    const ownerMember = flock.members?.find((member) =>
+      member.peerId === result.peerId &&
+      Number(member.githubUserId) === principalId &&
+      normalizeGitHubUser(member.githubUser)?.toLowerCase() === principal &&
+      member.deviceId === result.deviceId &&
+      member.trustTier === "owner");
+    const isOwner = flock.trustTier === "owner" &&
+      address.owner === principal &&
+      normalizeGitHubUser(flock.ownerGitHubUser)?.toLowerCase() === principal &&
+      (!flock.ownerGitHubUserId || Number(flock.ownerGitHubUserId) === principalId) &&
+      !flock.targetMachineId &&
+      ((address.isOwnerRoot && flock.flockType === "owner_root") ||
+       (!address.isOwnerRoot && address.isBuiltInScope && flock.flockType === "owner_scope")) &&
+      Boolean(ownerMember);
+    if (!isOwner && flock.trustTier !== "collaborator" && flock.trustTier !== "guest") {
+      throw new Error(`Enrollment response has unverified owner authority for "${address.flockId}"`);
+    }
+    return {
+      flock: { ...flock, flockId: address.flockId },
+      rank: isOwner ? 0 : flock.trustTier === "guest" ? 1 : 2,
+      serialized: JSON.stringify(flock),
+    };
+  });
+  // Select only fresh broker records, never cached owner privileges or invite labels.
+  records.sort((a, b) => a.rank - b.rank ||
+    (Number(b.flock.rosterEpoch) || 0) - (Number(a.flock.rosterEpoch) || 0) ||
+    (a.serialized < b.serialized ? -1 : a.serialized > b.serialized ? 1 : 0));
+  const selected = new Map();
+  for (const { flock } of records) {
+    const previous = selected.get(flock.flockId);
+    if (!previous) {
+      selected.set(flock.flockId, { ...flock });
+    } else if (previous.trustTier !== "owner") {
+      const expirations = [previous.membershipExpiresAtMs, flock.membershipExpiresAtMs]
+        .filter((expiry) => expiry != null);
+      previous.membershipExpiresAtMs = expirations.length ? Math.min(...expirations) : null;
+      previous.membershipExpiresAt = previous.membershipExpiresAtMs
+        ? new Date(previous.membershipExpiresAtMs).toISOString() : null;
+    }
+  }
+  const localFlocks = loadLocalFlocksConfig({ ...cfg, githubUser: principal, scope: result.scope }, customPath);
+  for (const flock of selected.values()) {
+    const previous = localFlocks.flocks[flock.flockId];
+    localFlocks.flocks[flock.flockId] = {
+      ...flock,
+      sharedSessionIds: previous?.sharedSessionIds || [],
+      sharedSnapshots: previous?.sharedSnapshots || {},
+      sessionVisibility: flock.trustTier === "owner" ? "all" : "explicit_opt_in_only",
+      shareSpecs: flock.trustTier === "owner" ? "full" : "summary",
+    };
+  }
+  saveLocalFlocksConfig(localFlocks, customPath);
+  return { ...result, enrolledFlocks: [...selected.values()] };
+}
+
 export function shareThreadWithFlock(
   cfg,
   {
@@ -7856,17 +7921,7 @@ async function executeMcpTool(cfg, name, args = {}) {
     if (!res?.ok) {
       throw new Error(res?.error || "Failed to enroll from invite JSON");
     }
-    const localFlocks = loadLocalFlocksConfig(cfg);
-    for (const ef of res.enrolledFlocks || []) {
-      localFlocks.flocks[ef.flockId] = {
-        ...(localFlocks.flocks[ef.flockId] || {}),
-        ...ef,
-        sessionVisibility: ef.trustTier === "owner" ? "all" : "explicit_opt_in_only",
-        shareSpecs: ef.trustTier === "owner" ? "full" : "summary",
-      };
-    }
-    saveLocalFlocksConfig(localFlocks);
-    return res;
+    return applyV3EnrollmentResult(cfg, res);
   }
 
   if (name === "share_thread") {
@@ -10122,15 +10177,62 @@ export function callBootstrapV3Endpoint(
       headers["Content-Type"] = "application/json; charset=utf-8";
       headers["Content-Length"] = Buffer.byteLength(body);
     }
-    const req = https.request(url, { method, headers, timeout: 10000 }, (res) => {
-      let data = "";
-      res.on("data", (c) => data += c);
-      res.on("end", () => process.stdout.write(data));
-    });
-    req.on("error", (e) => process.stdout.write(JSON.stringify({ ok: false, error: e.message })));
-    req.on("timeout", () => { req.destroy(); process.stdout.write(JSON.stringify({ ok: false, error: "timeout" })); });
-    if (method === "POST" && body) req.write(body);
-    req.end();
+    let completed = false;
+    let req;
+    let response;
+    const deadline = setTimeout(() => fail("Bootstrap request timed out after 10000ms"), 10000);
+    function finish(result) {
+      if (completed) return;
+      completed = true;
+      clearTimeout(deadline);
+      if (req) {
+        req.setTimeout(0);
+        req.destroy();
+      }
+      if (response) response.destroy();
+      process.stdout.write(JSON.stringify(result));
+    }
+    function fail(message, error) {
+      if (completed) return;
+      let detail = error?.message ? message + ": " + error.message : message;
+      const token = process.env.GH_BOOT_TOKEN;
+      if (token) detail = detail.split(token).join("[redacted]");
+      finish({ ok: false, error: detail });
+    }
+    try {
+      req = https.request(url, { method, headers, timeout: 10000 }, (res) => {
+        response = res;
+        let data = "";
+        res.on("error", (error) => fail("Bootstrap response failed", error));
+        res.on("aborted", () => fail("Bootstrap response aborted"));
+        res.on("close", () => {
+          if (!completed) fail("Bootstrap response closed before completion");
+        });
+        res.on("data", (chunk) => { if (!completed) data += chunk; });
+        res.on("end", () => {
+          if (completed) return;
+          if (res.complete === false) return fail("Bootstrap response was incomplete");
+          let result;
+          try { result = JSON.parse(data); }
+          catch { return fail("Bootstrap returned invalid or empty JSON (HTTP " + res.statusCode + ")"); }
+          finish(result);
+        });
+        if (completed) res.destroy();
+      });
+      req.on("error", (error) => fail("Bootstrap request failed", error));
+      req.on("timeout", () => fail("Bootstrap request timed out after 10000ms"));
+      req.on("abort", () => fail("Bootstrap request aborted"));
+      req.on("close", () => {
+        if (!response && !completed) fail("Bootstrap request closed before a response");
+      });
+      if (completed) req.destroy();
+      else {
+        if (method === "POST" && body) req.write(body);
+        req.end();
+      }
+    } catch (error) {
+      fail("Bootstrap request failed", error);
+    }
   `;
   try {
     let requestBody = body;
@@ -10240,6 +10342,7 @@ export async function installBridge({
   // Register member metadata (machineId, githubUser, scope, version, specs) with bootstrap server
   let memberRegistration = null;
   let enrolledFlockCount = 0;
+  let enrollmentError = null;
   try {
     memberRegistration = await registerWithBootstrapServer(cfg);
     if (memberRegistration?.member?.githubUser && !cfg.githubUser) {
@@ -10265,18 +10368,14 @@ export async function installBridge({
         timestamp: new Date().toISOString(),
       },
     });
-    if (enrolledV3?.ok && Array.isArray(enrolledV3.enrolledFlocks)) {
-      const fCfg = loadLocalFlocksConfig(cfg);
-      for (const ef of enrolledV3.enrolledFlocks) {
-        fCfg.flocks[ef.flockId] = {
-          ...(fCfg.flocks[ef.flockId] || {}),
-          ...ef,
-        };
-      }
-      saveLocalFlocksConfig(fCfg);
-      enrolledFlockCount = enrolledV3.enrolledFlocks.length;
+    if (!enrolledV3?.ok) {
+      throw new Error(enrolledV3?.error || "Broker did not confirm v3 flock enrollment");
     }
-  } catch {}
+    const applied = applyV3EnrollmentResult(cfg, enrolledV3);
+    enrolledFlockCount = applied.enrolledFlocks.length;
+  } catch (error) {
+    enrollmentError = formatErrorDetail(error);
+  }
 
   // 1. Copy flock.mjs and bridge.mjs into active home (`~/.copilot/flock/flock.mjs` and `bridge.mjs`)
   const targetScript = path.join(getBridgeHome(), "flock.mjs");
@@ -10531,6 +10630,7 @@ export async function installBridge({
     specs: cfg.specs || null,
     memberRegistered: Boolean(memberRegistration?.ok),
     enrolledFlockCount,
+    enrollmentError,
     endpoint: cfg.endpoint,
     hub: cfg.hub,
     daemonPid: daemonInfo.pid,

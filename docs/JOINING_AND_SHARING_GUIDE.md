@@ -73,6 +73,14 @@ As a flock owner, you never have to construct JSON or run CLI flags manually—j
 ### A. Enroll Another One of Your Own Computers
 > *"Generate an invite so I can add my new Linux desktop to `erjadi/personal`."*
 
+The broker verifies the recipient's GitHub identity. An owner redeeming their own
+invite retains owner access to their built-in root and scope flocks, even when
+the voucher says `collaborator` or `guest`. Vouchers cannot grant owner trust to
+another user or to a shared team flock. Repeated flock records are applied once;
+cached permissions and caller-supplied identity labels never establish ownership.
+Rejected enrollment is reported as incomplete even if legacy local installation
+can still finish.
+
 ### B. Invite a Teammate to a Shared Team Flock (Up to 3 PCs Automatically)
 > *"Invite `@alice` to `erjadi/studio-team` so she can connect her work laptop and desktop."*
 - By default, collaborator vouchers include `maxDevices: 3`, so `@alice` can enroll up to 3 of her machines using the same pasteable JSON within 24 hours.

@@ -875,10 +875,22 @@ export async function enrollV3Device(
       sandbox,
     });
 
-    const targetFlocksToJoin = [
-      { flock: rootFlock, trustTier: "owner", membershipExpiresAtMs: null },
-      { flock: scopeFlock, trustTier: "owner", membershipExpiresAtMs: null },
-    ];
+    for (const [flock, flockType] of [[rootFlock, "owner_root"], [scopeFlock, "owner_scope"]]) {
+      if (
+        flock.ownerGitHubUser !== cleanUser ||
+        (flock.ownerGitHubUserId && Number(flock.ownerGitHubUserId) !== numUserId)
+      ) {
+        const err = new Error(`Built-in flock "${flock.flockId}" belongs to a different GitHub principal`);
+        err.statusCode = 403;
+        throw err;
+      }
+      flock.flockType = flockType;
+      flock.ownerGitHubUserId = numUserId || null;
+    }
+    const targetFlocksToJoin = new Map([
+      [rootFlock.flockId, { flock: rootFlock, trustTier: "owner", membershipExpiresAtMs: null }],
+      [scopeFlock.flockId, { flock: scopeFlock, trustTier: "owner", membershipExpiresAtMs: null }],
+    ]);
 
     // 2. Redeem any Enrollment JSON vouchers atomically
     if (enrollmentJson && Array.isArray(enrollmentJson.flocks)) {
@@ -964,20 +976,29 @@ export async function enrollV3Device(
           : voucher.membershipExpiresAtMs || null;
         voucher.membershipExpiresAtMs = membershipExpiresAtMs;
 
-        targetFlocksToJoin.push({
-          flock: targetFlock,
-          trustTier:
-            voucher.trustTier ||
-            (targetFlock.flockType === "guest_pass" || targetFlock.targetMachineId
-              ? "guest"
-              : "collaborator"),
-          membershipExpiresAtMs,
-        });
+        const trustTier = voucher.trustTier ||
+          (targetFlock.flockType === "guest_pass" || targetFlock.targetMachineId ? "guest" : "collaborator");
+        if (trustTier !== "collaborator" && trustTier !== "guest") {
+          const err = new Error("Invite vouchers cannot grant owner trust");
+          err.statusCode = 403;
+          throw err;
+        }
+        const previous = targetFlocksToJoin.get(targetFlock.flockId);
+        // Only the authenticated principal's built-ins above confer owner authority.
+        if (previous?.trustTier !== "owner") {
+          const expirations = [previous?.membershipExpiresAtMs, membershipExpiresAtMs]
+            .filter((expiry) => expiry != null);
+          targetFlocksToJoin.set(targetFlock.flockId, {
+            flock: targetFlock,
+            trustTier: previous?.trustTier === "guest" || trustTier === "guest" ? "guest" : "collaborator",
+            membershipExpiresAtMs: expirations.length ? Math.min(...expirations) : null,
+          });
+        }
       }
     }
 
     const enrolledFlocks = [];
-    for (const item of targetFlocksToJoin) {
+    for (const item of targetFlocksToJoin.values()) {
       const f = item.flock;
       if (replaceExistingMachineKey) {
         for (const [mKey, mVal] of Object.entries(f.members || {})) {
@@ -1036,6 +1057,7 @@ export async function enrollV3Device(
         hubName: f.hubName,
         flockType: f.flockType,
         ownerGitHubUser: f.ownerGitHubUser,
+        ownerGitHubUserId: f.ownerGitHubUserId,
         trustTier: item.trustTier,
         allowedScopes: f.allowedScopes,
         targetMachineId: f.targetMachineId || null,
@@ -1230,12 +1252,17 @@ export async function createV3FlockInvite(
     err.statusCode = 400;
     throw err;
   }
+  if (trustTier && trustTier !== "collaborator" && trustTier !== "guest") {
+    const err = new Error("Invite vouchers can grant only collaborator or guest trust");
+    err.statusCode = 400;
+    throw err;
+  }
 
   return await withFlockStoreLock(async () => {
     const store = loadV3FlockStore(storePath);
     const now = Date.now();
     let flockIdToUse = parsed.flockId;
-    let flockType = parsed.isBuiltInScope ? "owner_scope" : "shared";
+    let flockType = parsed.isOwnerRoot ? "owner_root" : parsed.isBuiltInScope ? "owner_scope" : "shared";
 
     // If inviting a guest to a single PC (`erjadi/work/CLOUD-DEV-VM`) or built-in personal/work flock for a bounded duration,
     // create an isolated guest-pass flock so the guest never sees sibling PCs' broadcast metadata

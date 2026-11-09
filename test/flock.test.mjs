@@ -286,6 +286,42 @@ test("broker HTTP routes admit signed invited devices without repo write access 
     }
     const ownerEnrollment = await request("/api/v3/enroll", "maintainer", { ...body, enrollmentJson: null });
     assert.equal(ownerEnrollment.status, 200, ownerEnrollment.body.error);
+    const ownerInvites = [];
+    for (const target of ["deployment-maintainer", "deployment-maintainer/work"]) {
+      const selfInvite = await request("/api/v3/flocks/invite", "maintainer", {
+        targetAddress: target, invitedUser: "deployment-maintainer", allowedScopes: ["work"],
+      });
+      assert.equal(selfInvite.status, 200, selfInvite.body.error);
+      ownerInvites.push(...selfInvite.body.enrollmentJson.flocks);
+    }
+    for (const flocks of [ownerInvites, [...ownerInvites].reverse()]) {
+      const selfEnrollment = await request("/api/v3/enroll", "maintainer", {
+        ...body, githubUser: "spoofed-label", githubUserId: 9999,
+        enrollmentJson: { flocks, invitedUser: "spoofed-label", trustTier: "guest" },
+      });
+      assert.equal(selfEnrollment.status, 200, selfEnrollment.body.error);
+      assert.equal(selfEnrollment.body.githubUser, "deployment-maintainer");
+      assert.equal(selfEnrollment.body.githubUserId, 1001);
+      assert.equal(selfEnrollment.body.enrolledFlocks.length, 2);
+      assert.deepEqual(selfEnrollment.body.enrolledFlocks.map((flock) => flock.trustTier), ["owner", "owner"]);
+    }
+    for (const [trustTier, durationMinutes] of [["collaborator", null], ["guest", 10]]) {
+      const scopedInvite = await request("/api/v3/flocks/invite", "maintainer", {
+        targetAddress: "deployment-maintainer/work", invitedUser: "invited-user",
+        allowedScopes: ["work"], trustTier, durationMinutes,
+      });
+      assert.equal(scopedInvite.status, 200, scopedInvite.body.error);
+      const spoofedOwner = await request("/api/v3/enroll", "guest", signV3EnrollmentRequest({
+        ...body, enrollmentJson: {
+          ...scopedInvite.body.enrollmentJson,
+          invitedUser: "deployment-maintainer", trustTier: "owner",
+        },
+      }, 2002, keys));
+      assert.equal(spoofedOwner.status, 200, spoofedOwner.body.error);
+      assert.equal(spoofedOwner.body.githubUser, "invited-user");
+      assert.equal(spoofedOwner.body.enrolledFlocks.find((flock) =>
+        flock.flockId === "deployment-maintainer/work").trustTier, trustTier);
+    }
     const store = JSON.parse(fs.readFileSync(storePath, "utf8"));
     const voucher = store.flocks[invite.flockId].vouchers[invite.enrollmentJson.flocks[0].voucherId];
     voucher.membershipExpiresAtMs = Date.now() - 1;

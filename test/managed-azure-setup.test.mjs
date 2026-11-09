@@ -145,23 +145,31 @@ test("actual mirrored registration blocks report enrollment only after successfu
     const end = source.indexOf("  // 1. Copy flock.mjs", start);
     assert.ok(start > 0 && end > start);
     const registration = new AsyncFunction("registerWithBootstrapServer", "ensureMachineIdentityKeypair",
-      "callBootstrapV3Endpoint", "loadLocalFlocksConfig", "saveLocalFlocksConfig",
+      "callBootstrapV3Endpoint", "applyV3EnrollmentResult", "formatErrorDetail",
       `const cfg = {machineId:"DEMO-PC", scope:"personal"}; const sandboxMode=false; const parsedEnrollmentJson=null;
       ${source.slice(start, end)}
-      return {memberRegistration, enrolledFlockCount};`);
-    for (const failure of ["none", "enroll", "save"]) {
+      return {memberRegistration, enrolledFlockCount, enrollmentError};`);
+    const resultBlock = source.slice(source.indexOf("  return {", end),
+      source.indexOf("function generateTopologySkillMarkdown", end));
+    assert.match(resultBlock, /\benrollmentError,/);
+    for (const failure of ["none", "enroll", "save", "rejected", "validation"]) {
       let saves = 0;
       const result = await registration(async () => ({ ok: true }), () => ({ fingerprint: "synthetic", publicKey: "synthetic" }),
         async () => {
           if (failure === "enroll") throw Error("synthetic enrollment failure");
+          if (failure === "rejected") return { ok: false, error: "synthetic broker rejection" };
           return { ok: true, enrolledFlocks: [{ flockId: "demo-flock" }] };
-        }, () => ({ flocks: {} }), () => {
+        }, (_cfg, enrollment) => {
           saves++;
           if (failure === "save") throw Error("synthetic storage failure");
-        });
+          if (failure === "validation") throw Error("unverified owner authority");
+          return enrollment;
+        }, (error) => error.message);
       assert.equal(result.memberRegistration.ok, true);
       assert.equal(result.enrolledFlockCount, failure === "none" ? 1 : 0);
-      assert.equal(saves, failure === "enroll" ? 0 : 1);
+      assert.equal(saves, failure === "enroll" || failure === "rejected" ? 0 : 1);
+      if (failure === "none") assert.equal(result.enrollmentError, null);
+      else assert.match(result.enrollmentError, /synthetic|unverified owner authority/);
     }
   }
 });
