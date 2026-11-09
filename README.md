@@ -39,6 +39,15 @@ For example: *"Message the existing Desktop session I granted on my other PC."*
 The viewer's local server binds to `127.0.0.1` by default. `VIEWER_HOST` is an
 explicit opt-in to another bind address; this administrative viewer has no
 added authentication boundary and must not be exposed to an untrusted network.
+Its HTTP routes reject foreign or opaque browser origins and unrecognized
+Host headers, including before CORS preflight or privileged RPC work; responses
+cannot be embedded in another site's frame. Same-origin browser use and local
+CLI clients remain supported. For the separate Vite development proxy, Copilot
+must explicitly approve its exact origin through `VIEWER_ALLOWED_ORIGINS`
+(for example `http://localhost:5173`); there is no wildcard or automatic
+development-origin trust. Vite uses the fixed port5173 and forwards the correct
+backend Host. These browser protections are not LAN user/token authentication
+or a guarantee about every browser's private-network permission behavior.
 
 Live viewer transcript/project failures are visible errors, not synthetic
 working-tree or test-result substitutes. Synthetic content is preview-only;

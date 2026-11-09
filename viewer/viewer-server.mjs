@@ -39,6 +39,13 @@ const __dirname = path.dirname(__filename);
 
 const PORT = Number(process.env.PORT || process.env.VIEWER_PORT) || 8099;
 const HOST = process.env.VIEWER_HOST || "127.0.0.1";
+const VIEWER_ALLOWED_ORIGINS = new Set((process.env.VIEWER_ALLOWED_ORIGINS || "").split(",").map((value) => value.trim()).filter(Boolean).map((value) => {
+  const origin = new URL(value);
+  if (!["http:", "https:"].includes(origin.protocol) || origin.origin !== value || origin.username || origin.password) {
+    throw new Error("VIEWER_ALLOWED_ORIGINS requires explicit HTTP(S) origins without paths or credentials");
+  }
+  return origin.origin;
+}));
 const DIST_DIR = path.join(__dirname, "dist");
 const SEED_TRAFFIC_PATH = path.join(__dirname, "seed-traffic.json");
 
@@ -644,11 +651,46 @@ function sendJson(res, statusCode, data) {
   res.writeHead(statusCode, {
     "Content-Type": "application/json; charset=utf-8",
     "Cache-Control": "no-store",
-    "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type, Authorization",
   });
   res.end(body);
+}
+
+function guardViewerRequest(req, res) {
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("X-Frame-Options", "DENY");
+  res.setHeader("Content-Security-Policy", "frame-ancestors 'none'");
+  const reject = (status, error) => {
+    sendJson(res, status, { error });
+    return false;
+  };
+  let authority;
+  try { authority = new URL(`http://${req.headers.host || ""}`); }
+  catch { return reject(400, "Invalid viewer Host"); }
+  const normalizeHost = (value) => String(value).toLowerCase().replace(/^\[|\]$/g, "");
+  const allowedHosts = new Set(["127.0.0.1", "localhost", "::1"]);
+  const bindHost = normalizeHost(HOST);
+  if (!allowedHosts.has(bindHost)) {
+    if (!["0.0.0.0", "::"].includes(bindHost)) allowedHosts.add(bindHost);
+    allowedHosts.add(os.hostname().toLowerCase());
+    for (const interfaces of Object.values(os.networkInterfaces())) {
+      for (const entry of interfaces || []) allowedHosts.add(normalizeHost(entry.address));
+    }
+  }
+  if (authority.username || authority.password || authority.pathname !== "/" || authority.search || authority.hash ||
+      Number(authority.port || 80) !== PORT || !allowedHosts.has(normalizeHost(authority.hostname))) {
+    return reject(403, "Viewer Host is not an allowed local authority");
+  }
+  const origin = req.headers.origin;
+  if (origin) {
+    if (typeof origin !== "string" || origin !== authority.origin && !VIEWER_ALLOWED_ORIGINS.has(origin)) {
+      return reject(403, "Viewer requests require the same origin or an explicitly approved development origin");
+    }
+    res.setHeader("Access-Control-Allow-Origin", origin);
+    res.setHeader("Vary", "Origin");
+  } else if (req.headers["sec-fetch-site"] === "cross-site") {
+    return reject(403, "Cross-site viewer requests are not allowed");
+  }
+  return true;
 }
 
 function readJsonBody(req) {
@@ -684,11 +726,11 @@ const MIME_TYPES = {
 };
 
 const server = http.createServer(async (req, res) => {
+  if (!guardViewerRequest(req, res)) return;
   if (req.method === "OPTIONS") {
     res.writeHead(204, {
-      "Access-Control-Allow-Origin": "*",
       "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-      "Access-Control-Allow-Headers": "Content-Type, Authorization",
+      "Access-Control-Allow-Headers": "Content-Type",
     });
     res.end();
     return;
@@ -705,7 +747,6 @@ const server = http.createServer(async (req, res) => {
       "Content-Type": "text/event-stream",
       "Cache-Control": "no-cache, no-transform",
       Connection: "keep-alive",
-      "Access-Control-Allow-Origin": "*",
     });
     res.write(`data: ${JSON.stringify({ type: "hello", connected: true, viewerHost: VIEWER_HOST_LABEL })}\n\n`);
     sseClients.add(res);
