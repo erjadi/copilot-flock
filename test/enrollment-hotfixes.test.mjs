@@ -251,7 +251,7 @@ function stubBootstrapTransport(scenario) {
     const nativeClearTimeout = global.clearTimeout;
     const deadlines = new Set();
     global.setTimeout = (fn, delay, ...args) => {
-      const timer = nativeSetTimeout(fn, delay === 10000 ? 20 : delay, ...args);
+      const timer = nativeSetTimeout(fn, delay === 10000 && scenario === "deadline" ? 20 : delay, ...args);
       if (delay === 10000) deadlines.add(timer);
       return timer;
     };

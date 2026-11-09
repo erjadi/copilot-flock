@@ -97,7 +97,11 @@ test("public distribution has Apache licensing, loopback viewer defaults and syn
   for (const file of ["../package.json", "../viewer/package.json"]) {
     const manifest = JSON.parse(fs.readFileSync(new URL(file, import.meta.url), "utf8"));
     assert.equal(manifest.license, "Apache-2.0");
+    assert.equal(manifest.version, BRIDGE_VERSION);
   }
+  const viewerLock = JSON.parse(fs.readFileSync(new URL("../viewer/package-lock.json", import.meta.url), "utf8"));
+  assert.equal(viewerLock.version, BRIDGE_VERSION);
+  assert.equal(viewerLock.packages[""].version, BRIDGE_VERSION);
   const license = fs.readFileSync(new URL("../LICENSE", import.meta.url), "utf8");
   assert.match(license, /Apache License\s+Version 2\.0, January 2004/);
   const viewer = fs.readFileSync(new URL("../viewer/viewer-server.mjs", import.meta.url), "utf8");
@@ -653,7 +657,7 @@ test(
 
   let wsServer = null;
   try {
-    assert.equal(BRIDGE_VERSION, "3.3.0");
+    assert.equal(BRIDGE_VERSION, "3.3.1");
 
     const hugeSessionId = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
     const eventsPath = env.insertSession({

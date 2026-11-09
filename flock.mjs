@@ -74,7 +74,7 @@ function ipv4Lookup(hostname, options, callback) {
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-export const BRIDGE_VERSION = "3.3.0";
+export const BRIDGE_VERSION = "3.3.1";
 
 const DEFAULT_AZURE_SUBSCRIPTION = process.env.COPILOT_FLOCK_SUBSCRIPTION || "";
 const DEFAULT_AZURE_RESOURCE_GROUP = process.env.COPILOT_FLOCK_RESOURCE_GROUP || "";
