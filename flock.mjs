@@ -1002,7 +1002,9 @@ export function verifySignedRpcResponse(cfg, response, request, context) {
 }
 
 function assertRpcDisclosureAuthority(cfg, req, original, current, { checkAction = true } = {}) {
-  if (current.policy.flockUuid !== original.policy.flockUuid ||
+  if (current.policy.flockId !== original.policy.flockId ||
+      current.policy.flockUuid !== original.policy.flockUuid ||
+      current.policy.rosterEpoch !== original.policy.rosterEpoch ||
       current.policy.trustTier !== original.policy.trustTier ||
       current.localMember.peerId !== original.localMember.peerId ||
       current.localMember.publicKey.trim() !== original.localMember.publicKey.trim()) {
@@ -1047,7 +1049,7 @@ export function createRpcInvocationHandler(cfg, {
       authenticated = true;
       const result = await handleRpcAction(cfg, req, context);
       const fresh = await contextProvider(cfg);
-      assertRpcDisclosureAuthority(cfg, req, context, fresh, { checkAction: false });
+      assertRpcDisclosureAuthority(cfg, req, context, fresh);
       const response = {
         requestId: req.requestId, fromMachine: fresh.localMember.machineId,
         result, respondedAt: new Date().toISOString(),
@@ -6301,11 +6303,21 @@ export async function handleRpcAction(cfg, req, context = null) {
       fs.mkdirSync(tmpTestDir, { recursive: true });
       const tmpTest = path.join(tmpTestDir, "bridge.test.mjs");
       fs.writeFileSync(tmpTest, candidateTest, "utf8");
+      fs.writeFileSync(path.join(tmpTestDir, "local-rpc-fixture.mjs"), execFileSync(
+        "git", ["-C", repoDir, "show", `${candidateCommit}:test/local-rpc-fixture.mjs`],
+        { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: 5000, windowsHide: true }
+      ));
+      const testEnv = { ...process.env, BRIDGE_FAST_VOTE_TEST: "1",
+        COPILOT_HOME: path.join(tmpDir, "isolated-home"), NODE_OPTIONS: "", NODE_V8_COVERAGE: "",
+        SIGNALR_CONNECTION_STRING: "", SERVICEBUS_CONNECTION_STRING: "",
+        COPILOT_FLOCK_BOOTSTRAP_URL: "", COPILOT_BRIDGE_BOOTSTRAP_URL: "" };
+      for (const key of Object.keys(testEnv)) if (key.startsWith("NODE_TEST_")) delete testEnv[key];
       execFileSync(process.execPath, ["--test", tmpTest], {
         stdio: ["ignore", "pipe", "pipe"],
         timeout: 15000,
         windowsHide: true,
-        env: { ...process.env, BRIDGE_FAST_VOTE_TEST: "1" },
+        cwd: tmpDir,
+        env: testEnv,
       });
       checks.unitTestsOk = true;
     } catch (err) {
@@ -7389,7 +7401,7 @@ export const MCP_TOOLS = [
   {
     name: "vote_bridge_release",
     description:
-      "Pre-merge flock governance check: ask every online member of the flock to fetch a candidate git branch, validate bridge.mjs + bootstrap-server.mjs syntax on their OS/arch, and return an Ed25519-signed ACCEPT/REJECT vote before merging to main.",
+      "Pre-merge governance: every online voter validates the immutable full candidate, all .mjs syntax and all root suites including legacy RPC security and Zero-Broker, then returns a registered-key v2 Ed25519 ballot binding the full SHA and coverage. Legacy smoke-only ballots cannot approve a merge.",
     inputSchema: {
       type: "object",
       properties: {
@@ -9329,7 +9341,7 @@ export function summarizeReleaseVotes({ branch, votes, onlineMachines }) {
       vote.checks?.modulesSyntaxOk === true && vote.checks?.bridgeSyntaxOk === true &&
       vote.checks?.bootstrapSyntaxOk === true && vote.checks?.unitTestsOk === true &&
       Number.isInteger(vote.checks?.moduleCount) && vote.checks.moduleCount >= 9 &&
-      Number.isInteger(vote.checks?.testFileCount) && vote.checks.testFileCount >= 6,
+      Number.isInteger(vote.checks?.testFileCount) && vote.checks.testFileCount >= 7,
   }));
   const acceptCount = assessed.filter((vote) => vote.vote === "ACCEPT" && vote.completeValidationVerified).length;
   const commitSet = new Set(assessed.map((vote) => vote.candidateCommit).filter(Boolean));

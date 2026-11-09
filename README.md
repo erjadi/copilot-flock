@@ -60,6 +60,8 @@ Legacy RPC senders, receivers and broker must be upgraded coherently. Requests
 and responses bind the receiving flock UUID/epoch, enrolled peer, recipient,
 reply audience and payload. Active keys/membership come from the authenticated
 broker directory, never caller-provided registries/policies or presence.
+Successful responses recheck active authority, the roster epoch and current
+snapshot grants before disclosure; revoked or replaced grants fail closed.
 Unbound v2 packets and old queued authority are rejected rather than silently
 reinterpreted. Direct credentials without trusted enrollment are not an RPC
 enrollment substitute. Guest/collaborator legacy access is limited to explicit
@@ -163,7 +165,10 @@ topology/fleet/update tools remain legacy-only, not Zero-Broker native tools.
 **Release validation:** the legacy release-review RPC validates an immutable
 Git commit in an isolated, bounded worker, without blocking the daemon during
 the full root suite. It checks every `.mjs`, requires the canonical/compatibility
-entry points to match, and includes both legacy and Zero-Broker root tests.
+entry points to match, and requires all seven root suites, including the
+actual legacy RPC security regressions and both Zero-Broker suites.
+The compatibility fast check includes its local fixture dependency and an
+isolated profile; it does not replace full-candidate validation.
 Version-2 Ed25519 ballots bind the full commit SHA and validation evidence.
 Missing voters, selected subsets, unregistered keys and legacy smoke-only
 ballots cannot approve a merge. Older ballots remain diagnostically verifiable,

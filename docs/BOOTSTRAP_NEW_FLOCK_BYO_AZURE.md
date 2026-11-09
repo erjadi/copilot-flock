@@ -134,6 +134,8 @@ The worker clears inherited Node test selectors and isolates `COPILOT_HOME`,
 so focused parent tests cannot silently skip candidate tests. Version-2
 registered-key ballots sign both the full SHA and complete validation scope;
 legacy smoke-only ballots and partial voter selections are not merge approval.
+All seven root suites are required, including the retained legacy RPC security
+suite; omission of that suite or a six-suite ballot cannot satisfy the gate.
 Review RPCs allow a bounded seven-and-a-half-minute response window, including
 the five-minute root-test budget. No live reviewer upgrade, Azure deployment
 or platform acceptance is implied.

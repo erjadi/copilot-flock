@@ -151,6 +151,34 @@ function functionSource(source, name) {
   return source.slice(start, next < 0 ? source.length : start + 1 + next).replace(/^export /, "");
 }
 
+test("successful callback rechecks snapshot grants and roster epoch before disclosure", async () => {
+  for (const api of [flock, bridge]) {
+    for (const change of ["revoke", "replace", "epoch"]) {
+      const f = await fixture(api, { shared: true });
+      const policy = {
+        ...f.receiving.policy,
+        sharedSessionIds: change === "revoke" ? [] : [...f.receiving.policy.sharedSessionIds],
+        sharedSnapshots: change === "revoke" ? {} : {
+          ...f.receiving.policy.sharedSnapshots,
+          shared: { ...f.receiving.policy.sharedSnapshots.shared,
+            summarySnapshot: change === "replace" ? "Replacement grant" : "Exactly the approved summary" },
+        },
+        rosterEpoch: f.receiving.policy.rosterEpoch + (change === "epoch" ? 1 : 0),
+      };
+      let reads = 0;
+      const replies = [];
+      const callback = api.createRpcInvocationHandler(f.cfg, {
+        contextProvider: async () => ++reads === 1 ? f.receiving : { ...f.receiving, policy },
+        logger() {}, sendResponse: async (_audience, reply) => replies.push(reply),
+      });
+      const outcome = await callback(f.request("get_transcript", { session: "shared" }));
+      assert.equal(outcome.status, "rejected", change);
+      assert.equal(replies.length, 0, "Revoked/replaced/stale content must not be disclosed");
+      assert.ok(reads >= 2);
+    }
+  }
+});
+
 test("all legacy token-bearing helpers require independent origin trust before token resolution or request execution", () => {
   for (const filename of ["flock.mjs", "bridge.mjs"]) {
     const source = fs.readFileSync(new URL(`../${filename}`, import.meta.url), "utf8");

@@ -61,7 +61,7 @@ export function validateReleaseCandidate({ repoDir, commit, exec = execFileSync 
     const requiredModules = ["flock.mjs", "bridge.mjs", "bootstrap-server.mjs",
       "zero-broker-roster.mjs", "zero-broker-transport.mjs", "zero-broker-runtime.mjs",
       "zero-broker-lifecycle.mjs", "zero-broker-enrollment.mjs", "zero-broker-release.mjs"];
-    const requiredTests = ["flock", "bridge", "setup", "contracts", "zero-broker-roster", "zero-broker-lifecycle"];
+    const requiredTests = ["flock", "bridge", "setup", "contracts", "rpc-security", "zero-broker-roster", "zero-broker-lifecycle"];
     if (requiredModules.some((name) => !files.includes(path.join(directory, name))) ||
         requiredTests.some((name) => !tests.includes(path.join(directory, "test", `${name}.test.mjs`)))) {
       throw new Error("Release candidate lacks required canonical, legacy or Zero-Broker validation surfaces");

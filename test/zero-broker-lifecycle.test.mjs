@@ -22,7 +22,7 @@ test("full-scope signed release ballots reject legacy smoke, tampering, missing 
       machineId, branch, candidateCommit: commit, vote: "ACCEPT", voteSignatureVersion: 2,
       verificationLevel: "complete_candidate_syntax_root_tests_and_ed25519_signature",
       checks: { modulesSyntaxOk: true, bridgeSyntaxOk: true, bootstrapSyntaxOk: true,
-        unitTestsOk: true, moduleCount: 24, testFileCount: 6,
+        unitTestsOk: true, moduleCount: 26, testFileCount: 7,
         verificationLevel: "complete_candidate_syntax_and_root_tests" }, ...changes,
     };
     result.voteSignature = crypto.sign(null, Buffer.from(releaseVoteSigningPayload(result)), keys.privateKey).toString("base64");
@@ -53,6 +53,7 @@ test("full-scope signed release ballots reject legacy smoke, tampering, missing 
   assert.equal(verifyVoteBallotSignature({ ...first, verificationLevel: "smoke" }, keys.publicKey), false);
   assert.equal(verifyVoteBallotSignature({ ...first, checks: { ...first.checks, moduleCount: 1 } }, keys.publicKey), false);
   assert.equal(summarize([ballot("FIRST-PC", { checks: { ...first.checks, testFileCount: 1 } }), second]).approvedForMerge, false);
+  assert.equal(summarize([ballot("FIRST-PC", { checks: { ...first.checks, testFileCount: 6 } }), second]).approvedForMerge, false);
   assert.equal(verifyVoteBallotSignature(first, crypto.generateKeyPairSync("ed25519").publicKey), false);
   assert.equal(summarizeReleaseVotes({ branch, onlineMachines: ["FIRST-PC"], votes: [{ ...first, signatureVerified: false }] }).approvedForMerge, false);
 });
@@ -66,7 +67,7 @@ test("immutable release validation runs in a bounded worker without blocking the
     "zero-broker-runtime", "zero-broker-lifecycle", "zero-broker-enrollment", "zero-broker-release"]) {
     fs.writeFileSync(path.join(directory, `${name}.mjs`), "export const syntheticFixture = true;");
   }
-  for (const name of ["flock", "bridge", "setup", "contracts", "zero-broker-lifecycle"]) {
+  for (const name of ["flock", "bridge", "setup", "contracts", "rpc-security", "zero-broker-lifecycle"]) {
     fs.writeFileSync(path.join(directory, "test", `${name}.test.mjs`), "export const syntheticFixture = true;");
   }
   const testPath = path.join(directory, "test", "zero-broker-roster.test.mjs");
@@ -86,8 +87,8 @@ test("immutable release validation runs in a bounded worker without blocking the
   try {
     const result = await validateReleaseCandidateInWorker({ repoDir: directory, commit: sha });
     assert.equal(result.candidateCommit, sha);
-    assert.equal(result.moduleCount, 15);
-    assert.equal(result.testFileCount, 6);
+    assert.equal(result.moduleCount, 16);
+    assert.equal(result.testFileCount, 7);
     assert.equal(result.unitTestsOk, true);
     assert.ok(heartbeatTicks >= 2, "Parent event-loop heartbeat must continue during validation");
     assert.ok(RELEASE_REVIEW_TIMEOUT_MS > 360000, "RPC budget must cover the bounded worker and Git preflight");
@@ -97,6 +98,11 @@ test("immutable release validation runs in a bounded worker without blocking the
   git("add", ".");
   const failingSha = commit();
   await assert.rejects(() => validateReleaseCandidateInWorker({ repoDir: directory, commit: failingSha }), /Synthetic candidate rejection/);
+  const rpcTestPath = path.join(directory, "test", "rpc-security.test.mjs");
+  fs.unlinkSync(rpcTestPath);
+  git("add", ".");
+  await assert.rejects(() => validateReleaseCandidateInWorker({ repoDir: directory, commit: commit() }), /lacks required/);
+  fs.writeFileSync(rpcTestPath, "export const syntheticFixture = true;");
   fs.unlinkSync(path.join(directory, "bridge.mjs"));
   git("add", ".");
   await assert.rejects(() => validateReleaseCandidateInWorker({ repoDir: directory, commit: commit() }), /lacks required/);
