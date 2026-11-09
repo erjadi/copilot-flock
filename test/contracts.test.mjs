@@ -10,7 +10,6 @@ import { fileURLToPath } from "node:url";
 import * as flock from "../flock.mjs";
 import * as bridge from "../bridge.mjs";
 import * as broker from "../bootstrap-server.mjs";
-import crypto from "node:crypto";
 import { RELEASE_VALIDATION_POLICY, RELEASE_VALIDATION_POLICY_HASH, createReleaseCoverage } from "../release-policy.mjs";
 
 test("expected release SHA rejects moved branches while preserving Git checkout and metadata", (t) => {
@@ -868,6 +867,79 @@ function temporary(t) {
   });
   return root;
 }
+
+test("public flock MCP and CLI metadata exclude stored and future credential fields without changing transport state", async (t) => {
+  const root = temporary(t);
+  const cfg = { architecture: "legacy", machineId: "SYNTHETIC-PC", scope: "personal", githubUser: "example" };
+  const secrets = {
+    hubToken: "SYNTHETIC_BEARER_SENTINEL", privateKey: "SYNTHETIC_PRIVATE_KEY_SENTINEL",
+    connectionString: "SYNTHETIC_CONNECTION_SENTINEL", futureCredential: { nested: "SYNTHETIC_NESTED_SENTINEL" },
+  };
+  const entry = {
+    flockId: "example/team", flockUuid: "synthetic-flock", hubName: "synthetic-hub",
+    ownerGitHubUser: "example", flockType: "shared", trustTier: "collaborator",
+    allowedScopes: ["personal", { ...secrets }], rosterEpoch: 4, memberCount: 1,
+    members: [{ peerId: "synthetic-peer", machineId: "SYNTHETIC-PC", publicKey: "synthetic-public-key",
+      keyFingerprint: "synthetic-public-fingerprint", active: true, ...secrets }],
+    sharedSnapshots: { privateSession: { summarySnapshot: "SYNTHETIC_SNAPSHOT_SENTINEL" } },
+    ...secrets,
+  };
+  for (const [filename, api] of [["flock.mjs", flock], ["bridge.mjs", bridge]]) {
+    const statePath = path.join(root, `${filename}-flocks.json`);
+    api.saveLocalFlocksConfig({ flocks: { "example/team": entry } }, statePath);
+    const original = fs.readFileSync(statePath);
+    const source = fs.readFileSync(new URL(`../${filename}`, import.meta.url), "utf8");
+    const extract = (name) => {
+      const match = source.match(new RegExp(`(?:async )?function ${name}\\([^]*?\\n\\}`));
+      assert.ok(match, `Actual ${name} function must be exercised`);
+      return match[0];
+    };
+    const output = [];
+    const context = vm.createContext({
+      process: { argv: ["node", filename, "flocks"] }, fs,
+      getConfigPath: () => path.join(root, "absent-config.json"), loadConfig: () => cfg,
+      normalizeScope: api.normalizeScope,
+      loadLocalFlocksConfig: () => api.loadLocalFlocksConfig(cfg, statePath),
+      projectPublicFlockMetadata: api.projectPublicFlockMetadata,
+      callBootstrapV3Endpoint: () => ({ ownedFlocks: [entry], joinedFlocks: [entry] }),
+      console: { log: (value) => output.push(value) },
+    });
+    vm.runInContext(`${extract("parseCliArgs")}\n${extract("executeMcpTool")}\n${extract("main")}\nthis.invoke = executeMcpTool; this.cli = main;`, context);
+    const result = await context.invoke(cfg, "list_flocks", {});
+    await context.cli();
+    assert.deepEqual(JSON.parse(output[0]), JSON.parse(JSON.stringify(result)));
+    for (const entries of [result.localFlocks, result.remoteOwnedFlocks, result.remoteJoinedFlocks]) {
+      const visible = entries.find((value) => value.flockId === "example/team");
+      assert.equal(visible.hubName, entry.hubName);
+      assert.equal(visible.members[0].publicKey, "synthetic-public-key");
+      assert.equal(visible.members[0].active, true);
+      assert.deepEqual(Array.from(visible.allowedScopes), ["personal"]);
+    }
+    const json = JSON.stringify(result);
+    for (const sentinel of ["SYNTHETIC_BEARER", "SYNTHETIC_PRIVATE", "SYNTHETIC_CONNECTION", "SYNTHETIC_NESTED", "SYNTHETIC_SNAPSHOT"]) {
+      assert.equal(json.includes(sentinel), false);
+    }
+    assert.ok(fs.readFileSync(statePath).equals(original));
+    assert.equal(api.loadLocalFlocksConfig(cfg, statePath).flocks["example/team"].hubToken, secrets.hubToken);
+    const group = { flockUuid: "synthetic-zero", label: "example/zero", rootFingerprint: "synthetic-root", ...secrets };
+    let closed = 0;
+    Object.assign(context, {
+      getZeroBrokerApi: async () => ({ openZeroBrokerGroup: () => ({
+        state: { get: () => ({ rosterEpoch: 1, leaseExpiresAt: new Date(Date.now() + 60000).toISOString(), members: [] }) },
+        device: { opaquePeerId: "synthetic-local" }, close: () => closed++,
+      }) }),
+      getBridgeHome: () => root, createZeroBrokerNativeHost: () => ({}), getLocalWsConnectionInfo: () => null,
+    });
+    vm.runInContext(`${extract("executeZeroBrokerTool")}\nthis.zero = executeZeroBrokerTool;`, context);
+    for (const name of ["list_flocks", "flock_status", "bridge_status"]) {
+      const status = await context.zero({ groups: [group] }, name, {});
+      assert.deepEqual(JSON.parse(JSON.stringify(status.groups)), [{ flockUuid: group.flockUuid, label: group.label, rootFingerprint: group.rootFingerprint }]);
+      assert.equal(JSON.stringify(status).includes("SENTINEL"), false);
+    }
+    assert.equal(closed, 3);
+    assert.equal(group.hubToken, secrets.hubToken);
+  }
+});
 
 test("Desktop control files validate first lines without accepting later metadata as credentials", (t) => {
   const root = temporary(t);

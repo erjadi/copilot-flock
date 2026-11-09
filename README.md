@@ -300,6 +300,12 @@ become a terminal DENIED/no-admission claim or expose a cached result before
 current authority is checked. Definitely never-attempted work can still be
 denied; do not re-sign, rebind or blindly resend uncertain work.
 
+Flock list/status responses expose only explicitly selected public metadata,
+including registered public signing keys where available. Cached transport
+tokens, private keys, connection strings, unknown fields and stored snapshots
+are not serialized by those views. The private transport store and explicitly
+requested recipient-bound invitation exports retain their separate purposes.
+
 **Legacy mutation admission is a coherent candidate protocol upgrade.**
 Mutating RPC signatures now bind the
 `copilot-flock/legacy-mutation-admission/v1` domain and a random receiver-owned

@@ -146,7 +146,7 @@ async function executeZeroBrokerTool(cfg, name, args = {}) {
     }
     if (["flock_status", "bridge_status", "list_flocks"].includes(name)) {
       const roster = service.state.get(group.flockUuid);
-      return { architecture: "zero-broker", groups: cfg.groups, localOpaquePeerId: service.device.opaquePeerId, rosterEpoch: roster.rosterEpoch, leaseExpiresAt: roster.leaseExpiresAt, leaseFresh: Date.parse(roster.leaseExpiresAt) > Date.now(), nativeAdapter: getLocalWsConnectionInfo() ? "desktop" : "unavailable", members: roster.members.map(({ opaquePeerId, role, membershipExpiresAt }) => ({ opaquePeerId, role, membershipExpiresAt })) };
+      return { architecture: "zero-broker", groups: cfg.groups.map(projectPublicFlockMetadata), localOpaquePeerId: service.device.opaquePeerId, rosterEpoch: roster.rosterEpoch, leaseExpiresAt: roster.leaseExpiresAt, leaseFresh: Date.parse(roster.leaseExpiresAt) > Date.now(), nativeAdapter: getLocalWsConnectionInfo() ? "desktop" : "unavailable", members: roster.members.map(({ opaquePeerId, role, membershipExpiresAt }) => ({ opaquePeerId, role, membershipExpiresAt })) };
     }
     if (name === "invite_to_flock" && !args.recipient) return service.createVoucher({ role: args.role || "guest", durationMinutes: Number(args.duration_minutes) || 60 });
     if (name === "invite_to_flock") return service.invite({
@@ -1938,6 +1938,34 @@ export function loadLocalFlocksConfig(cfg = null, customPath = getFlocksConfigPa
     scope,
     flocks,
   };
+}
+
+export function projectPublicFlockMetadata(entry) {
+  function pickScalars(value, fields) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Invalid public flock metadata record");
+    const result = {};
+    for (const field of fields) {
+      const item = value[field];
+      if (item === null || typeof item === "string" || typeof item === "boolean" ||
+          (typeof item === "number" && Number.isFinite(item))) result[field] = item;
+    }
+    return result;
+  }
+  const result = pickScalars(entry, [
+    "flockId", "flockUuid", "hubName", "ownerGitHubUser", "ownerGitHubUserId", "flockType",
+    "trustTier", "sessionVisibility", "shareSpecs", "rosterEpoch", "targetMachineId",
+    "expiresAtMs", "expiresAt", "membershipExpiresAtMs", "membershipExpiresAt",
+    "role", "status", "active", "revoked", "memberCount", "label", "rootFingerprint",
+  ]);
+  for (const field of ["allowedScopes", "sharedSessionIds"]) {
+    if (Array.isArray(entry[field])) result[field] = entry[field].filter((value) => typeof value === "string");
+  }
+  if (Array.isArray(entry.members)) result.members = entry.members.map((member) => pickScalars(member, [
+    "peerId", "opaquePeerId", "githubUser", "githubUserId", "deviceId", "machineId", "scope",
+    "trustTier", "publicKey", "keyFingerprint", "role", "active", "status", "revoked",
+    "membershipExpiresAtMs", "membershipExpiresAt",
+  ]));
+  return result;
 }
 
 export function saveLocalFlocksConfig(flocksConfig, customPath = getFlocksConfigPath()) {
@@ -8750,9 +8778,9 @@ async function executeMcpTool(cfg, name, args = {}) {
       machineId: cfg.machineId,
       canonicalAddress: `${(cfg.githubUser || "unknown").toLowerCase()}/${normalizeScope(cfg.scope, "work")}/${cfg.machineId}`,
       scope: normalizeScope(cfg.scope, "work"),
-      localFlocks: Object.values(localFlocks.flocks || {}),
-      remoteOwnedFlocks: remoteRes?.ownedFlocks || [],
-      remoteJoinedFlocks: remoteRes?.joinedFlocks || [],
+      localFlocks: Object.values(localFlocks.flocks || {}).map(projectPublicFlockMetadata),
+      remoteOwnedFlocks: (remoteRes?.ownedFlocks || []).map(projectPublicFlockMetadata),
+      remoteJoinedFlocks: (remoteRes?.joinedFlocks || []).map(projectPublicFlockMetadata),
     };
   }
 
