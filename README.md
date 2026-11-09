@@ -11,8 +11,10 @@ Azure/Pages acceptance are still required; production installations are
 unchanged. Existing legacy configurations and `copilot-flock-invite-v3`
 broker invites retain their original path. No silent migration is performed.
 
-Node 22.5-22.12 requires `--experimental-sqlite`; setup, installed MCP and
+Node 22.5-22.12 (also obsolete Node 23.0-23.3) requires `--experimental-sqlite`; setup, installed MCP and
 daemon/startup commands propagate it. Prefer Node 22.13+ for unflagged startup.
+The npm Flock/test scripts enable SQLite explicitly; Copilot must supply the flag
+for direct CLI/API execution on those older versions.
 This candidate was exercised on Node 24, not every supported Node/platform pair.
 Fresh provisioning rejects an existing configuration before creating Azure
 resources. Re-running installation for an existing Zero-Broker identity repairs
@@ -407,7 +409,7 @@ Sharing a GPU server or cloud VM with a teammate or guest **never** exposes your
 1. **Wall 1 — Per-Flock Cryptographic Hub Isolation (`v3_flock_<uuid>`)**: Each flock has its own isolated SignalR hub, Ed25519 envelope signatures, and short-lived 60-minute JWTs.
 2. **Wall 2 — Explicit Thread Opt-In (`share_thread`)**: Collaborator flocks (`<owner>/<team>`) and guest passes have **zero visibility** into existing local threads. External members can only see a thread if you explicitly say *"Share this thread with `<owner>/<team>`"*, which exports a redacted `approved-snapshot`.
 3. **Wall 3 — `boundFlockId` Partitioning (No Cross-Flock Pivot)**: Any thread created from a shared flock is permanently tagged with `boundFlockId` and blocked from listing, reading, or messaging threads in your `personal` or `work` flocks.
-4. **Wall 4 — Instant Revocation & Time-Bound Guest Passes (`membershipExpiresAt`)**: Guest passes expire automatically on the minute, and saying *"Remove `@user` from `<owner>/<flock>`"* increments `rosterEpoch` and drops active WebSocket connections in real time.
+4. **Wall 4 — Membership Revocation & Time-Bound Guest Passes (`membershipExpiresAt`)**: Expiry/revocation denies membership renewal and closes active connections. In the retained legacy static-hub transport, closing a connection does **not** invalidate an already issued hub JWT; a reconnect window can remain until token expiry (nearly an hour). Receiver-owned membership/policy authorization and transport token validity are separate boundaries. Do not claim complete transport revocation or demonstrated post-revocation RPC rejection without live evidence. Zero-Broker instead rotates epoch hubs, topics, group keys and recipient bundles, with signed freshness leases bounding fail-closed execution.
 
 ---
 
@@ -430,7 +432,7 @@ Sharing a GPU server or cloud VM with a teammate or guest **never** exposes your
 `copilot-flock` also includes a full interactive React + Vite + Tailwind **Fleet Console UI** in [`viewer/`](./viewer/) (`npm run dev` or `node viewer/viewer-server.mjs`):
 - **Flocks View & Header Switcher**: Inspect `<owner>`, `<owner>/personal`, `<owner>/work`, collaborator teams, and guest passes with live countdown badges.
 - **Interactive Topology & Overlap Matrix (`TopologyView.tsx` & `FlockOverlap.tsx`)**: Switch between Orbital, Mesh, Bipartite Ribbon Graph, and Matrix views in both Dark and Warm-Alabaster Light themes.
-- **1-Click Invite Generator, Shared Thread Audit & Instant Kick**: Generate copy-pasteable `copilot-flock-invite-v3` prompts, audit opted-in threads, and inspect 7/7 Ed25519 governance votes.
+- **Invite Generator, Shared Thread Audit & Membership Kick**: Generate copy-pasteable `copilot-flock-invite-v3` prompts, audit opted-in threads, and inspect recorded Ed25519 governance votes. Legacy connection closure is not immediate JWT invalidation.
 
 ---
 

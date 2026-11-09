@@ -292,11 +292,11 @@ test("application claims fail closed at capacity, preserve deadlines and cannot 
   assert.throws(() => limited.queue({ ...queue, requestId: crypto.randomUUID() }), /capacity/);
 });
 
-function runtimeFixture(t, { dispatch, readSnapshot, role = "owner" } = {}) {
+function runtimeFixture(t, { dispatch, readSnapshot, role = "owner", canMintTokens = false } = {}) {
   const f = fixture(t);
   const roster = zb.createPreBoundInvite({
     roster: f.genesis, actor: f.owner, recipient: f.peer, role,
-    ...(role === "owner" ? { ownerPermissions: { canKick: false, canModifyOwners: false, canMintTokens: false } } : {}),
+    ...(role === "owner" ? { ownerPermissions: { canKick: false, canModifyOwners: false, canMintTokens } } : {}),
     ownerCredentials: f.credentials(2), nowMs: f.nowMs,
   });
   f.trust(f.state, f.genesis, [roster]);
@@ -359,6 +359,55 @@ test("mock-adapter RPC confirms admission once, seals recipients and rejects del
   const decrypted = zb.decryptFlockEnvelope({ envelope: f.packets[0], roster, state: inspectionState, flockKey: key, recipientOpaquePeerId: f.peer.opaquePeerId });
   assert.throws(() => zb.openSealedBundle({ bundle: decrypted.body.sealedRpcBody, recipientEncPrivPem: f.owner.encPriv, flockUuid: f.flockUuid, rosterEpoch: roster.rosterEpoch, recipientOpaquePeerId: f.peer.opaquePeerId, bundleType: "rpc-body" }));
   key.fill(0);
+});
+
+test("incoming mint-enabled delegates cannot replace receiver authority or turn snapshots into root dispatch", async (t) => {
+  const f = runtimeFixture(t, { canMintTokens: true });
+  const roster = f.state.get(f.flockUuid);
+  assert.ok(roster.sealedOwnerVault[f.owner.opaquePeerId]);
+  assert.ok(roster.sealedOwnerVault[f.peer.opaquePeerId]);
+  const key = Buffer.from(f.memberBundle(roster, f.peer).flockKey, "base64");
+  const maliciousParameters = {
+    targetSession: "synthetic-root-session", message: "Synthetic attempted privileged task",
+    registryMembers: [{ opaquePeerId: f.owner.opaquePeerId, signingPub: f.peer.signingPub }],
+    flockPolicy: { trustTier: "owner_root", canMintTokens: true, allowedActions: ["*"] },
+    verifiedContext: { mode: "ROOT" }, allowAll: true,
+  };
+  async function incoming(action) {
+    const request = { requestId: crypto.randomUUID(), action, params: maliciousParameters, expiresAt: f.nowMs + 60000 };
+    f.receiverState.queue({
+      flockUuid: f.flockUuid, sender: f.peer.opaquePeerId, recipient: f.owner.opaquePeerId,
+      requestId: request.requestId, payload: request, expiresAt: request.expiresAt, nowMs: f.nowMs,
+    });
+    const sealedRpcBody = zb.sealBundle({
+      payload: { kind: "request", request }, recipientEncPubPem: f.owner.encPub,
+      flockUuid: f.flockUuid, rosterEpoch: roster.rosterEpoch,
+      recipientOpaquePeerId: f.owner.opaquePeerId, bundleType: "rpc-body",
+    });
+    const envelope = zb.encryptFlockEnvelope({
+      roster, state: f.receiverState, flockKey: key, signingPriv: f.peer.signingPriv,
+      fromOpaquePeerId: f.peer.opaquePeerId, toOpaquePeerId: f.owner.opaquePeerId,
+      action, body: { sealedRpcBody }, nowMs: f.nowMs,
+    });
+    const received = await f.ownerRuntime.receive(envelope);
+    const receipt = f.receiverState.getOutboxReceipt({
+      flockUuid: f.flockUuid, sender: f.peer.opaquePeerId, recipient: f.owner.opaquePeerId,
+      requestId: request.requestId, payload: request, expiresAt: request.expiresAt,
+    });
+    assert.equal(receipt.status, received.status);
+    return receipt;
+  }
+  try {
+    assert.equal((await incoming("send_message")).status, "DENIED");
+    assert.equal((await incoming("get_transcript")).status, "DENIED");
+    assert.equal(f.calls(), 0);
+    f.setGrants(true);
+    const shared = await incoming("get_transcript");
+    assert.equal(shared.status, "DELIVERED");
+    assert.deepEqual(shared.result, { approvedSnapshot: true, summary: "Synthetic approved summary" });
+    assert.equal(f.calls(), 0);
+    assert.equal(f.packets.length, 3);
+  } finally { key.fill(0); }
 });
 
 test("authenticated missing-receipt reconciliation preserves offline work without blind redispatch of UNKNOWN", async (t) => {

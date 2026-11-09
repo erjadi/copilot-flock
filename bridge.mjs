@@ -186,7 +186,7 @@ async function executeZeroBrokerTool(cfg, name, args = {}) {
 
 export function zeroBrokerNodeFlags(version = process.versions.node) {
   const [major, minor] = version.split(".").map(Number);
-  return major === 22 && minor < 13 ? ["--experimental-sqlite"] : [];
+  return major === 22 && minor < 13 || major === 23 && minor < 4 ? ["--experimental-sqlite"] : [];
 }
 
 export async function installZeroBrokerIntegration(cfg, { configureStartup = configureBootPersistence, startDaemon = ensureDaemonStarted, skillRoots } = {}) {

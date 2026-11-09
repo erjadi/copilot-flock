@@ -99,7 +99,7 @@ As a flock owner, you never have to construct JSON or run CLI flags manually—j
 > *"Give `@bob` a 4-hour guest pass to `erjadi/personal/LINUX-GPU-HOST` so his Copilot can inspect our shared calibration thread and check GPU status."*
 - Sets `durationMinutes: 240` (`membershipExpiresAt`).
 - Across different GitHub users (`trustTier: "guest"` or `"collaborator"`), access is strictly informational / scoped to `boundFlockId` and explicitly shared threads (`FLOCK_MUTATION_FORBIDDEN` blocks `self_update` or unapproved host mutations; `autopilot` + `allow-all` Coordinator/Thread Tracker execution is strictly limited to same-owner `owner_root` / `owner_scope` flocks).
-- When the 4 hours expire (or you revoke access early), the Bootstrap Broker refuses new token refreshes and evicts active WebSocket connections going forward.
+- When the 4 hours expire (or you revoke access early), the Bootstrap Broker refuses new token refreshes and closes active WebSocket connections. Legacy static-hub JWTs are not invalidated by connection deletion; reconnect may remain possible until the previously issued token expires (nearly an hour). This is distinct from receiver-owned RPC authorization and is not a guarantee of complete transport revocation. Zero-Broker uses epoch-isolated hubs/topics, fresh group keys and signed lease enforcement instead; do not silently migrate legacy deployments or claim unverified live rejection.
 
 ---
 

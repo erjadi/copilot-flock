@@ -8,7 +8,7 @@ export function validateReleaseCandidate({ repoDir, commit, exec = execFileSync 
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "flock-release-"));
   const options = { stdio: ["ignore", "pipe", "pipe"], windowsHide: true, maxBuffer: 8 * 1024 * 1024, timeout: 15000 };
   const [major, minor] = process.versions.node.split(".").map(Number);
-  const nodeFlags = major === 22 && minor < 13 ? ["--experimental-sqlite"] : [];
+  const nodeFlags = major === 22 && minor < 13 || major === 23 && minor < 4 ? ["--experimental-sqlite"] : [];
   try {
     const entries = exec("git", ["-C", repoDir, "ls-tree", "-r", "-z", commit], options).toString("utf8").split("\0").filter(Boolean);
     const files = [];

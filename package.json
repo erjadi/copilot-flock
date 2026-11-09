@@ -11,18 +11,18 @@
   },
   "scripts": {
     "start": "node bootstrap-server.mjs",
-    "daemon": "node flock.mjs daemon",
-    "install-flock": "node flock.mjs install",
-    "install-bridge": "node flock.mjs install",
-    "status": "node flock.mjs status",
-    "machines": "node flock.mjs machines",
-    "members": "node flock.mjs members",
-    "specs": "node flock.mjs specs",
-    "sessions": "node flock.mjs sessions",
+    "daemon": "node --experimental-sqlite flock.mjs daemon",
+    "install-flock": "node --experimental-sqlite flock.mjs install",
+    "install-bridge": "node --experimental-sqlite flock.mjs install",
+    "status": "node --experimental-sqlite flock.mjs status",
+    "machines": "node --experimental-sqlite flock.mjs machines",
+    "members": "node --experimental-sqlite flock.mjs members",
+    "specs": "node --experimental-sqlite flock.mjs specs",
+    "sessions": "node --experimental-sqlite flock.mjs sessions",
     "viewer": "node viewer/viewer-server.mjs",
-    "self-test": "node flock.mjs self-test",
-    "test": "node --test --test-concurrency=1 test/flock.test.mjs test/bridge.test.mjs test/setup.test.mjs test/contracts.test.mjs test/zero-broker-roster.test.mjs test/zero-broker-lifecycle.test.mjs",
-    "test:zero-broker": "node --test --test-concurrency=1 test/zero-broker-roster.test.mjs test/zero-broker-lifecycle.test.mjs"
+    "self-test": "node --experimental-sqlite flock.mjs self-test",
+    "test": "node --experimental-sqlite --test --test-concurrency=1 test/flock.test.mjs test/bridge.test.mjs test/setup.test.mjs test/contracts.test.mjs test/zero-broker-roster.test.mjs test/zero-broker-lifecycle.test.mjs",
+    "test:zero-broker": "node --experimental-sqlite --test --test-concurrency=1 test/zero-broker-roster.test.mjs test/zero-broker-lifecycle.test.mjs"
   },
   "engines": {
     "node": ">=22.5.0"

@@ -31,7 +31,7 @@ if ([int]$Matches[1] -lt 22 -or ([int]$Matches[1] -eq 22 -and [int]$Matches[2] -
     throw "Node.js >=22.5 is required before setup; no tools or resources were installed."
 }
 $NodeFlags = @()
-if (-not $Legacy -and [int]$Matches[1] -eq 22 -and [int]$Matches[2] -lt 13) { $NodeFlags += "--experimental-sqlite" }
+if (-not $Legacy -and (([int]$Matches[1] -eq 22 -and [int]$Matches[2] -lt 13) -or ([int]$Matches[1] -eq 23 -and [int]$Matches[2] -lt 4))) { $NodeFlags += "--experimental-sqlite" }
 if ($ProvisionAzure) {
     $CopilotHome = if ($env:COPILOT_HOME) { $env:COPILOT_HOME } else { Join-Path $HOME ".copilot" }
     if (-not $Legacy -and (Test-Path (Join-Path $CopilotHome "flock\config.json"))) {

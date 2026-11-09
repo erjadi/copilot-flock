@@ -35,9 +35,11 @@ Do not use this path for an existing invite or for the separate hubless LAN tria
 
 The wrappers require Node.js >=22.5 already installed and perform these steps:
 
-For Node 22.5-22.12 they propagate `--experimental-sqlite` to setup, MCP and
+For Node 22.5-22.12 (also obsolete Node 23.0-23.3) they propagate `--experimental-sqlite` to setup, MCP and
 managed daemon/startup commands; prefer Node 22.13+ for unflagged use. Validation
-here used Node 24. Select a dedicated **project-site** repository (not
+here used Node 24. The npm Flock/test scripts enable SQLite explicitly; direct
+CLI/API execution on older versions requires Copilot to supply that flag.
+Select a dedicated **project-site** repository (not
 `<owner>.github.io`). Fresh provisioning stops before Azure changes if a local
 Flock configuration already exists; use the explicit legacy path for legacy
 work, not automatic migration. Existing Zero-Broker installation can repair
@@ -369,7 +371,7 @@ node ./flock.mjs install \
 
 ## Platform, Boot Persistence & Network Notes
 
-- **Node.js Requirement**: Requires **Node.js `>= 22.5`** (uses built-in `node:sqlite` with zero native npm addons; Node 18/20 is supported if the `sqlite3` CLI binary is installed on `PATH`).
+- **Node.js Requirement**: Zero-Broker requires **Node.js `>= 22.5`** with built-in `node:sqlite`; prefer maintained Node 22.13+ or Node 24. Older versions listed above require the SQLite flag. Node 18/20 plus an external `sqlite3` CLI is only a legacy metadata-query compatibility path, not supported Zero-Broker enrollment, durable runtime or release validation.
 - **Headless Linux Boot Persistence (`systemd --user`)**:
   - `node flock.mjs install` writes and enables `~/.config/systemd/user/copilot-flock.service`.
   - On headless Linux servers (`Ubuntu` / `Debian` / `Jetson`) where no user logs into a desktop session after reboot, enable systemd user lingering once so the daemon starts automatically on boot and stays alive after SSH logout:

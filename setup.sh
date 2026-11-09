@@ -49,7 +49,7 @@ if (( BASH_REMATCH[1] < 22 || (BASH_REMATCH[1] == 22 && BASH_REMATCH[2] < 5) ));
 fi
 [[ -z "$SCOPE" || "$SCOPE" == work || "$SCOPE" == personal ]] || fail "Scope must be work or personal."
 NODE_FLAGS=()
-if [[ "$LEGACY" == false ]] && (( BASH_REMATCH[1] == 22 && BASH_REMATCH[2] < 13 )); then
+if [[ "$LEGACY" == false ]] && (( (BASH_REMATCH[1] == 22 && BASH_REMATCH[2] < 13) || (BASH_REMATCH[1] == 23 && BASH_REMATCH[2] < 4) )); then
   NODE_FLAGS+=("--experimental-sqlite")
 fi
 if [[ "$PROVISION_AZURE" == true ]]; then

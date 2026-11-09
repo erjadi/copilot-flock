@@ -104,6 +104,7 @@ flowchart LR
 ```
 
 ### Fresh-Machine Prerequisite Tip (Zero-UAC Node.js `>= 22.5` & Bundled `git`/`gh`)
+- Prefer maintained Node 22.13+ or Node 24. Node 22.5-22.12 and obsolete Node 23.0-23.3 need `--experimental-sqlite`; Copilot must supply it for direct CLI/API execution. Setup, installed Zero-Broker MCP/daemon/startup commands and npm scripts handle this requirement. An external `sqlite3` executable is not a Zero-Broker substitute.
 - On a brand-new Windows 11 or Linux machine where `node` is not yet on `PATH`:
   - **Windows 11**: Avoid `winget` MSI installers that trigger blocking UAC prompts. Download the official portable `node-v22.x-win-x64.zip` (or `win-arm64.zip`) into `%LOCALAPPDATA%\Programs\nodejs` and add it to the user `PATH` (`node >= 22.5` includes built-in `node:sqlite`). Note that GitHub Copilot Desktop already bundles `git.exe` (`%LOCALAPPDATA%\github-copilot-git-*\cmd`) and `gh.exe` (`%LOCALAPPDATA%\copilot-desktop-gh-*`).
   - **Headless Linux (`Ubuntu` / `Debian` / `ARM64`)**: Install Node.js `>= 22.5` into user space (e.g. `~/.local/bin` or `fnm`/`nvm`) and run `sudo loginctl enable-linger "$USER"` so `systemd --user` keeps `copilot-flock.service` running across SSH logouts and unattended reboots.
@@ -222,7 +223,7 @@ Each enrolled machine runs two distinct coordinator threads:
 1. **Per-Flock Cryptographic Hub Isolation**: Each v3 flock routes over its own isolated hub (`v3_flock_<flockUuid>`) with short-lived 60-minute JWTs and Ed25519 envelope signatures.
 2. **Default Thread Visibility = Zero for External Flocks**: Collaborator flocks (`<owner>/<team>`) and guest passes see **zero** existing personal/work threads unless a thread is explicitly opted in via `share_thread` (which exports an `approved-snapshot` redacting tool secrets).
 3. **`boundFlockId` Partitioning (No Cross-Flock Pivot)**: A thread created by or bound to Flock B (`boundFlockId`) can never list, query, or message threads in Flock A (`personal` / `work`).
-4. **Instant Revocation & Time-Bound Expiry (`membershipExpiresAt`)**: Expiring a guest pass or calling `kick_flock_member` increments `rosterEpoch` and evicts active WebSocket connections immediately.
+4. **Membership Revocation & Time-Bound Expiry (`membershipExpiresAt`)**: Revocation/expiry denies renewal and closes active connections. Legacy static-hub JWTs can remain valid until token expiry; deletion alone is not complete transport revocation. Do not claim verified post-revocation RPC rejection without live evidence. Zero-Broker rotates epoch hubs/topics, keys and recipient bundles and fails closed on expired signed leases; never silently migrate legacy transport to claim that stronger boundary.
 
 ---
 

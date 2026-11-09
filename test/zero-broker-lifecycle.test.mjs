@@ -130,8 +130,10 @@ test("two distinct owner PCs preserve selected-session grants and confirm one du
   const peer = f.open("peer", group, { ...f.host, sendMessage: async ({ allowed }) => { assert.equal(allowed(), true); admissions++; return { status: "DELIVERED", result: { admitted: true } }; } });
   assert.equal(peer.state.get(group.flockUuid).sealedOwnerVault[peer.device.opaquePeerId], undefined);
   peer.setGrants({ rootSessions: [sessionId], snapshots: {} });
+  const ownerDaemon = f.open("owner", group);
+  assert.notEqual(ownerDaemon.runtime, owner.runtime);
   let polling = Promise.resolve();
-  const timer = setInterval(() => { polling = polling.then(() => Promise.all([owner.poll(), peer.poll()])); }, 20);
+  const timer = setInterval(() => { polling = polling.then(() => Promise.all([ownerDaemon.poll(), peer.poll()])); }, 20);
   try {
     const result = await owner.runtime.request({ toOpaquePeerId: peer.device.opaquePeerId, action: "send_message", params: { sessionId, message: "Synthetic task" }, timeoutMs: 3000 });
     assert.equal(result.status, "DELIVERED");
@@ -145,6 +147,14 @@ test("two distinct owner PCs preserve selected-session grants and confirm one du
     assert.equal(denied.status, "DENIED");
     assert.equal(admissions, 1);
   } finally { clearInterval(timer); await polling; }
+  f.advance(core.MAX_LEASE_MS + 1);
+  await assert.rejects(owner.runtime.request({ toOpaquePeerId: peer.device.opaquePeerId, action: "send_message", params: { sessionId, message: "Expired lease" }, timeoutMs: 1000 }), /lease.*expired/i);
+  assert.equal(admissions, 1);
+  const expiredEpoch = owner.state.get(group.flockUuid).rosterEpoch;
+  assert.equal(await owner.renewAndPrune(), true);
+  assert.equal(owner.state.get(group.flockUuid).rosterEpoch, expiredEpoch + 1);
+  await owner.runtime.refresh();
+  assert.ok(Date.parse(owner.state.get(group.flockUuid).leaseExpiresAt) > f.options.now());
 });
 
 test("provisional claims are recipient-sealed, independently approved and pruned at expiry", async (t) => {
@@ -271,5 +281,7 @@ test("installer isolates package and MCP destinations, preserves other servers a
     assert.equal(starts, 1);
     assert.deepEqual(zeroBrokerNodeFlags("22.5.0"), ["--experimental-sqlite"]);
     assert.deepEqual(zeroBrokerNodeFlags("22.13.0"), []);
+    assert.deepEqual(zeroBrokerNodeFlags("23.0.0"), ["--experimental-sqlite"]);
+    assert.deepEqual(zeroBrokerNodeFlags("23.4.0"), []);
   } finally { if (previous === undefined) delete process.env.COPILOT_HOME; else process.env.COPILOT_HOME = previous; }
 });
