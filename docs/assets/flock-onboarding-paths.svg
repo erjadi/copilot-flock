@@ -8,8 +8,8 @@
   <rect width="1280" height="540" fill="url(#bgLight)" rx="14" />
 
   <!-- Header -->
-  <text x="60" y="52" fill="#0f172a" font-family="Segoe UI, system-ui, sans-serif" font-size="24" font-weight="700">Two Ways to Bootstrap Copilot Flock — Choose Your Path</text>
-  <text x="60" y="78" fill="#475569" font-family="Consolas, monospace" font-size="13">Copilot is the interface: point your GitHub Copilot at this repo and tell it which case applies to you</text>
+  <text x="60" y="52" fill="#0f172a" font-family="Segoe UI, system-ui, sans-serif" font-size="24" font-weight="700">Fresh Zero-Broker Setup or Explicit Legacy Enrollment</text>
+  <text x="60" y="78" fill="#475569" font-family="Consolas, monospace" font-size="13">Copilot confirms architecture, trust and costs. The LAN trial is separate; deployment paths are not live acceptance.</text>
 
   <!-- CASE 1 CARD: JOIN VIA INVITE -->
   <g transform="translate(60, 106)">
@@ -18,32 +18,32 @@
     <line x1="0" y1="58" x2="555" y2="58" stroke="#059669" stroke-opacity="0.25" />
     <rect width="555" height="388" rx="14" fill="none" stroke="#059669" stroke-width="2.5" />
     <circle cx="32" cy="29" r="10" fill="#059669" />
-    <text x="54" y="26" fill="#064e3b" font-family="Segoe UI, system-ui, sans-serif" font-size="17" font-weight="700">CASE 1 — Joining an Existing Flock (You Have an Invite)</text>
-    <text x="54" y="45" fill="#047857" font-family="Consolas, monospace" font-size="12">Zero Azure setup · bootstrapUrl is embedded inside the invite JSON</text>
+    <text x="54" y="26" fill="#064e3b" font-family="Segoe UI, system-ui, sans-serif" font-size="17" font-weight="700">LEGACY — Existing Broker Invite</text>
+    <text x="54" y="45" fill="#047857" font-family="Consolas, monospace" font-size="12">Independently confirm issuer before any GitHub token use</text>
 
     <!-- Step 1 -->
     <g transform="translate(26, 82)">
       <rect width="503" height="74" rx="10" fill="#f8fafc" stroke="#cbd5e1" stroke-width="1.2" />
       <text x="18" y="25" fill="#059669" font-family="Consolas, monospace" font-size="13" font-weight="700">STEP 1 · Copy Invite from Existing Flock Owner</text>
       <text x="18" y="46" fill="#334155" font-family="Segoe UI, system-ui, sans-serif" font-size="13">Owner tells their Copilot: "Generate an invite for my other PCs"</text>
-      <text x="18" y="64" fill="#64748b" font-family="Consolas, monospace" font-size="11">Or for a teammate/guest: "Invite @alice to erjadi/studio-team for 4 hours"</text>
+      <text x="18" y="64" fill="#64748b" font-family="Consolas, monospace" font-size="11">Or: "Invite @guest to owner/studio-team for 4 hours"</text>
     </g>
 
     <!-- Step 2 -->
     <g transform="translate(26, 172)">
       <rect width="503" height="84" rx="10" fill="#ecfdf5" stroke="#6ee7b7" stroke-width="1.5" />
-      <text x="18" y="25" fill="#065f46" font-family="Consolas, monospace" font-size="13" font-weight="700">STEP 2 · Paste Into Your New Machine's Copilot Chat</text>
-      <text x="18" y="46" fill="#0f172a" font-family="Consolas, monospace" font-size="12">"Clone https://github.com/erjadi/copilot-flock, read AGENTS.md,</text>
-      <text x="18" y="64" fill="#0f172a" font-family="Consolas, monospace" font-size="12">and enroll me using this invite JSON: { ... }"</text>
+      <text x="18" y="25" fill="#065f46" font-family="Consolas, monospace" font-size="13" font-weight="700">STEP 2 · Confirm Independent Issuer Trust</text>
+      <text x="18" y="46" fill="#0f172a" font-family="Consolas, monospace" font-size="12">"Read AGENTS.md and enroll with this legacy invite."</text>
+      <text x="18" y="64" fill="#0f172a" font-family="Consolas, monospace" font-size="12">The invite's URL or key cannot establish its own trust.</text>
     </g>
 
     <!-- Step 3 -->
     <g transform="translate(26, 272)">
       <rect width="503" height="92" rx="10" fill="#f8fafc" stroke="#cbd5e1" stroke-width="1.2" />
-      <text x="18" y="25" fill="#059669" font-family="Consolas, monospace" font-size="13" font-weight="700">STEP 3 · Single-Command Turnkey Enrollment</text>
-      <text x="18" y="46" fill="#334155" font-family="Consolas, monospace" font-size="12">• Reads bootstrapUrl + flockId from the signed Enrollment JSON</text>
-      <text x="18" y="64" fill="#334155" font-family="Consolas, monospace" font-size="12">• Generates local Ed25519 keypair + installs daemon &amp; MCP tools</text>
-      <text x="18" y="82" fill="#334155" font-family="Consolas, monospace" font-size="12">• Auto-installs copilot-flock &amp; flock-topology skills + boot service</text>
+      <text x="18" y="25" fill="#059669" font-family="Consolas, monospace" font-size="13" font-weight="700">STEP 3 · Approved Legacy Enrollment</text>
+      <text x="18" y="46" fill="#334155" font-family="Consolas, monospace" font-size="12">• Explicit legacy selector + independently pinned issuer</text>
+      <text x="18" y="64" fill="#334155" font-family="Consolas, monospace" font-size="12">• Reuse valid identity; reject malformed existing keys</text>
+      <text x="18" y="82" fill="#334155" font-family="Consolas, monospace" font-size="12">• Consented startup; Windows runs at user sign-in</text>
     </g>
   </g>
 
@@ -54,33 +54,34 @@
     <line x1="0" y1="58" x2="555" y2="58" stroke="#6d28d9" stroke-opacity="0.25" />
     <rect width="555" height="388" rx="14" fill="none" stroke="#6d28d9" stroke-width="2.5" />
     <circle cx="32" cy="29" r="10" fill="#6d28d9" />
-    <text x="54" y="26" fill="#2e1065" font-family="Segoe UI, system-ui, sans-serif" font-size="17" font-weight="700">CASE 2 — Starting a Brand-New Flock (BYO Azure)</text>
-    <text x="54" y="45" fill="#5b21b6" font-family="Consolas, monospace" font-size="12">100% self-hosted in your own Azure subscription · Zero hardcoded keys</text>
+    <text x="54" y="26" fill="#2e1065" font-family="Segoe UI, system-ui, sans-serif" font-size="17" font-weight="700">FRESH — Zero-Broker Owner Setup</text>
+    <text x="54" y="45" fill="#5b21b6" font-family="Consolas, monospace" font-size="12">Signed Pages roster + explicit grants; no Token Broker</text>
 
     <!-- Step 1 -->
     <g transform="translate(26, 82)">
       <rect width="503" height="74" rx="10" fill="#f5f3ff" stroke="#c4b5fd" stroke-width="1.5" />
       <text x="18" y="25" fill="#5b21b6" font-family="Consolas, monospace" font-size="13" font-weight="700">STEP 1 · Tell Your Copilot to Set Up a New Flock</text>
-      <text x="18" y="46" fill="#0f172a" font-family="Consolas, monospace" font-size="12">"Clone https://github.com/erjadi/copilot-flock, read AGENTS.md,</text>
-      <text x="18" y="64" fill="#0f172a" font-family="Consolas, monospace" font-size="12">and set up a new Copilot Flock in my Azure subscription."</text>
+      <text x="18" y="46" fill="#0f172a" font-family="Consolas, monospace" font-size="12">"Set up a fresh Zero-Broker flock; confirm scope,</text>
+      <text x="18" y="64" fill="#0f172a" font-family="Consolas, monospace" font-size="12">Azure costs and a dedicated public roster repository."</text>
     </g>
 
     <!-- Step 2 -->
     <g transform="translate(26, 172)">
       <rect width="503" height="84" rx="10" fill="#f8fafc" stroke="#cbd5e1" stroke-width="1.2" />
-      <text x="18" y="25" fill="#6d28d9" font-family="Consolas, monospace" font-size="13" font-weight="700">STEP 2 · Copilot Provisions or Connects Your BYO Resources</text>
-      <text x="18" y="46" fill="#334155" font-family="Consolas, monospace" font-size="12">• Azure SignalR Service (Serverless mode — real-time WebSockets)</text>
-      <text x="18" y="64" fill="#334155" font-family="Consolas, monospace" font-size="12">• Azure Service Bus (Standard/Basic — durable offline PC queues)</text>
-      <text x="18" y="79" fill="#64748b" font-family="Consolas, monospace" font-size="11">• Optional: Bootstrap Token Broker App Service for 1-step invites</text>
+      <text x="18" y="25" fill="#6d28d9" font-family="Consolas, monospace" font-size="13" font-weight="700">STEP 2 · Confirm Resources and Publication</text>
+      <text x="18" y="46" fill="#334155" font-family="Consolas, monospace" font-size="12">• SignalR Serverless + Service Bus Standard topics</text>
+      <text x="18" y="64" fill="#334155" font-family="Consolas, monospace" font-size="12">• Actions-backed Pages publishes the signed roster</text>
+      <text x="18" y="79" fill="#64748b" font-family="Consolas, monospace" font-size="11">• Confirm subscription, region, resource group and tool installs</text>
     </g>
 
     <!-- Step 3 -->
     <g transform="translate(26, 272)">
       <rect width="503" height="92" rx="10" fill="#f8fafc" stroke="#cbd5e1" stroke-width="1.2" />
-      <text x="18" y="25" fill="#6d28d9" font-family="Consolas, monospace" font-size="13" font-weight="700">STEP 3 · Auto-Detects Scope &amp; Mints Your First Invite</text>
-      <text x="18" y="46" fill="#334155" font-family="Consolas, monospace" font-size="12">• Detects personal vs work scope from OS/domain (1-click confirm)</text>
-      <text x="18" y="64" fill="#334155" font-family="Consolas, monospace" font-size="12">• Enrolls your first PC as &lt;githubUser&gt;/&lt;scope&gt;/&lt;machineId&gt;</text>
-      <text x="18" y="82" fill="#334155" font-family="Consolas, monospace" font-size="12">• Generates a Case 1 invite JSON for all your other computers!</text>
+      <text x="18" y="25" fill="#6d28d9" font-family="Consolas, monospace" font-size="13" font-weight="700">STEP 3 · Verify Identity and Local Grants</text>
+      <text x="18" y="46" fill="#334155" font-family="Consolas, monospace" font-size="12">• Keep genesis/root and issuer secrets private</text>
+      <text x="18" y="64" fill="#334155" font-family="Consolas, monospace" font-size="12">• Remote execution/transcripts need local grants</text>
+      <text x="18" y="82" fill="#334155" font-family="Consolas, monospace" font-size="12">• Other PCs: bound invites or independently approved claims</text>
     </g>
   </g>
+  <text x="60" y="522" fill="#475569" font-family="Consolas, monospace" font-size="12">SignalR Free has quotas; Service Bus Standard costs apply. No automatic migration or live deployment authority.</text>
 </svg>
