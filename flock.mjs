@@ -1887,6 +1887,12 @@ export function loadConfig({ autoFetchAz = true, refreshSpecs = false } = {}) {
 // 1b. v3 Multi-Flock Local Configuration, Sharing Audit & Anti-Leakage Walls
 // ---------------------------------------------------------------------------
 
+function validLocalFlocksState(value) {
+  return value && typeof value === "object" && !Array.isArray(value) &&
+    value.flocks && typeof value.flocks === "object" && !Array.isArray(value.flocks) &&
+    Object.values(value.flocks).every((flock) => flock && typeof flock === "object" && !Array.isArray(flock));
+}
+
 export function loadLocalFlocksConfig(cfg = null, customPath = getFlocksConfigPath()) {
   const owner = normalizeGitHubUser(cfg?.githubUser || "erjadi")?.toLowerCase() || "erjadi";
   const scope = normalizeScope(cfg?.scope, "work");
@@ -1896,12 +1902,16 @@ export function loadLocalFlocksConfig(cfg = null, customPath = getFlocksConfigPa
   let stored = { flocks: {} };
   if (fs.existsSync(customPath)) {
     try {
-      stored = JSON.parse(fs.readFileSync(customPath, "utf8")) || { flocks: {} };
-    } catch {}
+      stored = JSON.parse(fs.readFileSync(customPath, "utf8"));
+      if (!validLocalFlocksState(stored)) throw new Error("Invalid flock state shape");
+    } catch {
+      throw Object.assign(new Error("Existing local flock enrollment state is invalid or unreadable; original file was retained for explicit recovery"),
+        { code: "FLOCK_STATE_INVALID" });
+    }
   }
   const flocks = { ...(stored.flocks || {}) };
 
-  if (!flocks[builtInRootId]) {
+  if (!Object.hasOwn(flocks, builtInRootId)) {
     flocks[builtInRootId] = {
       flockId: builtInRootId,
       flockUuid: stored.flocks?.[builtInRootId]?.flockUuid || `builtin-${builtInRootId}`,
@@ -1917,7 +1927,7 @@ export function loadLocalFlocksConfig(cfg = null, customPath = getFlocksConfigPa
       rosterEpoch: 1,
     };
   }
-  if (!flocks[builtInScopeId]) {
+  if (!Object.hasOwn(flocks, builtInScopeId)) {
     flocks[builtInScopeId] = {
       flockId: builtInScopeId,
       flockUuid: stored.flocks?.[builtInScopeId]?.flockUuid || `builtin-${builtInScopeId.replace("/", "-")}`,
@@ -1934,6 +1944,7 @@ export function loadLocalFlocksConfig(cfg = null, customPath = getFlocksConfigPa
     };
   }
   return {
+    ...stored,
     ownerGitHubUser: owner,
     scope,
     flocks,
@@ -1969,7 +1980,17 @@ export function projectPublicFlockMetadata(entry) {
 }
 
 export function saveLocalFlocksConfig(flocksConfig, customPath = getFlocksConfigPath()) {
-  writeConfigFileSecure(flocksConfig, customPath);
+  if (!validLocalFlocksState(flocksConfig)) {
+    throw Object.assign(new Error("Invalid local flock state was not saved; existing enrollment was retained"),
+      { code: "FLOCK_STATE_INVALID" });
+  }
+  const temporary = `${customPath}.${process.pid}.${crypto.randomUUID()}.tmp`;
+  try {
+    writeConfigFileSecure(flocksConfig, temporary);
+    const fd = fs.openSync(temporary, "r+");
+    try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+    fs.renameSync(temporary, customPath);
+  } finally { if (fs.existsSync(temporary)) fs.unlinkSync(temporary); }
   return flocksConfig;
 }
 
@@ -1986,7 +2007,7 @@ export function shareThreadWithFlock(
 ) {
   const parsed = parseFlockAddress(flockId, cfg?.githubUser);
   const fCfg = loadLocalFlocksConfig(cfg, customPath);
-  if (!fCfg.flocks[parsed.flockId]) {
+  if (!Object.hasOwn(fCfg.flocks, parsed.flockId)) {
     fCfg.flocks[parsed.flockId] = {
       flockId: parsed.flockId,
       flockUuid: crypto.randomUUID(),

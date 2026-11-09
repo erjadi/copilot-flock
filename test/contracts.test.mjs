@@ -779,6 +779,65 @@ test("legacy production timeout remains UNKNOWN until Desktop admission is obser
   }
 });
 
+test("malformed existing flock enrollment is never replaced by a sharing operation", (t) => {
+  const root = temporary(t);
+  const cfg = { githubUser: "example", scope: "personal", machineId: "EXAMPLE-PC" };
+  for (const [index, api] of [flock, bridge].entries()) {
+    const file = path.join(root, `flocks-${index}.json`);
+    const original = "{synthetic-private-enrollment-corrupt-canary";
+    fs.writeFileSync(file, original);
+    assert.throws(() => api.shareThreadWithFlock(cfg, {
+      flockId: "example/studio-team", sessionId: "synthetic-session", summarySnapshot: "Approved synthetic summary",
+    }, file), { code: "FLOCK_STATE_INVALID" });
+    assert.equal(fs.readFileSync(file, "utf8"), original);
+    assert.throws(() => api.listSharedThreadsForMachine(cfg, file), (error) =>
+      error.code === "FLOCK_STATE_INVALID" && !error.message.includes("synthetic-private-enrollment-corrupt-canary"));
+  }
+});
+
+test("valid flock sharing preserves future metadata and object-like owner names without silent schema defaults", (t) => {
+  const root = temporary(t);
+  for (const [index, api] of [flock, bridge].entries()) {
+    const file = path.join(root, `valid-${index}.json`);
+    const cfg = { githubUser: "constructor", scope: "personal", machineId: "EXAMPLE-PC" };
+    fs.writeFileSync(file, JSON.stringify({ metadata: { recoveryMarker: "synthetic-preserved" }, flocks: {} }));
+    const loaded = api.loadLocalFlocksConfig(cfg, file);
+    assert.equal(Object.hasOwn(loaded.flocks, "constructor"), true);
+    api.shareThreadWithFlock(cfg, { flockId: "constructor/studio-team", sessionId: "synthetic-session", summarySnapshot: "Approved summary" }, file);
+    const stored = JSON.parse(fs.readFileSync(file, "utf8"));
+    assert.equal(stored.metadata.recoveryMarker, "synthetic-preserved");
+    assert.equal(stored.flocks["constructor/studio-team"].sharedSnapshots["synthetic-session"].summarySnapshot, "Approved summary");
+    const original = fs.readFileSync(file);
+    assert.throws(() => api.saveLocalFlocksConfig({}, file), { code: "FLOCK_STATE_INVALID" });
+    assert.deepEqual(fs.readFileSync(file), original);
+    for (const invalid of ["null", "[]", "{}", '{"flocks":[]}', '{"flocks":{"bad":null}}']) {
+      fs.writeFileSync(file, invalid);
+      assert.throws(() => api.unshareThreadFromFlock(cfg, { sessionId: "synthetic-session" }, file), { code: "FLOCK_STATE_INVALID" });
+      assert.equal(fs.readFileSync(file, "utf8"), invalid);
+    }
+  }
+});
+
+test("atomic flock-state replacement failure retains prior bytes and removes only its own temporary file", (t) => {
+  const root = temporary(t);
+  for (const [index, api] of [flock, bridge].entries()) {
+    const source = fs.readFileSync(new URL(`../${index ? "bridge" : "flock"}.mjs`, import.meta.url), "utf8");
+    const file = path.join(root, `atomic-${index}.json`);
+    const original = '{"flocks":{},"metadata":"synthetic-original"}';
+    fs.writeFileSync(file, original);
+    const before = fs.readdirSync(root).sort();
+    const context = vm.createContext({
+      crypto, process,
+      fs: { ...fs, renameSync: () => { throw new Error("Synthetic atomic replacement failure"); } },
+      writeConfigFileSecure: api.writeConfigFileSecure,
+    });
+    vm.runInContext(`${namedFunction(source, "validLocalFlocksState")}\n${namedFunction(source, "saveLocalFlocksConfig")}\nthis.save = saveLocalFlocksConfig;`, context);
+    assert.throws(() => context.save({ flocks: {}, metadata: "synthetic-new" }, file), /Synthetic atomic replacement failure/);
+    assert.equal(fs.readFileSync(file, "utf8"), original);
+    assert.deepEqual(fs.readdirSync(root).sort(), before);
+  }
+});
+
 test("scope and address inputs reject retired private aliases and invalid values", () => {
   for (const normalize of [flock.normalizeScope, bridge.normalizeScope, broker.normalizeV3Scope]) {
     assert.equal(normalize("personal"), "personal");

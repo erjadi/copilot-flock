@@ -257,6 +257,12 @@ An existing malformed legacy `identity.json` is retained and rejected, never
 silently replaced with a fresh key. Restore its known backup or request a
 separately approved identity/re-enrollment recovery; a diagnostic read is not
 permission to rotate identity.
+Existing malformed or unsupported `flocks.json` state also fails closed:
+sharing, unsharing and listing must not seed guessed memberships and overwrite
+its prior contents. Valid stored metadata is retained, and normal sharing
+saves replace the file atomically. Restore a known enrollment backup or ask
+Copilot for an explicit local recovery; a read failure is not an enrollment
+reset or a new sharing grant.
 
 **Legacy offline queue evidence:** responses distinguish confirmed Service Bus
 publication from storage in the broker's local file queue. The file fallback
