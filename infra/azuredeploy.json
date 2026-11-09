@@ -1,0 +1,106 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "location": {
+      "type": "string",
+      "defaultValue": "[resourceGroup().location]"
+    },
+    "namePrefix": {
+      "type": "string",
+      "defaultValue": "flock",
+      "minLength": 1,
+      "maxLength": 20,
+      "metadata": { "description": "Alphanumeric prefix for the globally unique resource names." }
+    },
+    "uniqueSuffix": {
+      "type": "string",
+      "defaultValue": "[substring(uniqueString(resourceGroup().id), 0, 6)]",
+      "minLength": 3,
+      "maxLength": 10
+    },
+    "signalrSku": {
+      "type": "string",
+      "defaultValue": "Free_F1",
+      "allowedValues": ["Free_F1", "Standard_S1"]
+    },
+    "serviceBusSku": {
+      "type": "string",
+      "defaultValue": "Standard",
+      "allowedValues": ["Standard"]
+    },
+    "serviceBusTopicName": {
+      "type": "string",
+      "defaultValue": "copilot-bridge-offline"
+    }
+  },
+  "variables": {
+    "signalrName": "[format('{0}-signalr-{1}', parameters('namePrefix'), parameters('uniqueSuffix'))]",
+    "serviceBusNamespaceName": "[format('{0}-sb-{1}', parameters('namePrefix'), parameters('uniqueSuffix'))]"
+  },
+  "resources": [
+    {
+      "type": "Microsoft.SignalRService/signalR",
+      "apiVersion": "2023-02-01",
+      "name": "[variables('signalrName')]",
+      "location": "[parameters('location')]",
+      "sku": {
+        "name": "[parameters('signalrSku')]",
+        "tier": "[if(equals(parameters('signalrSku'), 'Free_F1'), 'Free', 'Standard')]",
+        "capacity": 1
+      },
+      "properties": {
+        "features": [{ "flag": "ServiceMode", "value": "Serverless" }],
+        "cors": { "allowedOrigins": ["*"] }
+      }
+    },
+    {
+      "type": "Microsoft.ServiceBus/namespaces",
+      "apiVersion": "2022-10-01-preview",
+      "name": "[variables('serviceBusNamespaceName')]",
+      "location": "[parameters('location')]",
+      "sku": {
+        "name": "[parameters('serviceBusSku')]",
+        "tier": "[parameters('serviceBusSku')]"
+      },
+      "properties": {}
+    },
+    {
+      "type": "Microsoft.ServiceBus/namespaces/topics",
+      "apiVersion": "2022-10-01-preview",
+      "name": "[format('{0}/{1}', variables('serviceBusNamespaceName'), parameters('serviceBusTopicName'))]",
+      "dependsOn": ["[resourceId('Microsoft.ServiceBus/namespaces', variables('serviceBusNamespaceName'))]"],
+      "properties": {}
+    }
+  ],
+  "outputs": {
+    "signalrName": {
+      "type": "string",
+      "value": "[variables('signalrName')]"
+    },
+    "signalrHostName": {
+      "type": "string",
+      "value": "[reference(resourceId('Microsoft.SignalRService/signalR', variables('signalrName')), '2023-02-01').hostName]"
+    },
+    "signalrConnectionString": {
+      "type": "string",
+      "value": "[listKeys(resourceId('Microsoft.SignalRService/signalR', variables('signalrName')), '2023-02-01').primaryConnectionString]"
+    },
+    "serviceBusNamespaceName": {
+      "type": "string",
+      "value": "[variables('serviceBusNamespaceName')]"
+    },
+    "serviceBusEndpoint": {
+      "type": "string",
+      "value": "[format('sb://{0}.servicebus.windows.net/', variables('serviceBusNamespaceName'))]"
+    },
+    "serviceBusConnectionString": {
+      "type": "string",
+      "value": "[listKeys(resourceId('Microsoft.ServiceBus/namespaces/AuthorizationRules', variables('serviceBusNamespaceName'), 'RootManageSharedAccessKey'), '2022-10-01-preview').primaryConnectionString]"
+    },
+    "serviceBusTopicName": {
+      "type": "string",
+      "value": "[parameters('serviceBusTopicName')]"
+    }
+  }
+}

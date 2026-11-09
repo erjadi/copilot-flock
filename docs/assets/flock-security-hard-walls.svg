@@ -1,0 +1,81 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 440" width="1280" height="440">
+  <defs>
+    <linearGradient id="bgWall" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#faf9f5" />
+      <stop offset="100%" stop-color="#f3f1eb" />
+    </linearGradient>
+  </defs>
+  <rect width="1280" height="440" fill="url(#bgWall)" rx="14" />
+
+  <text x="60" y="50" fill="#0f172a" font-family="Segoe UI, system-ui, sans-serif" font-size="23" font-weight="700">Security Guarantee: Shared Machines ≠ Shared Threads (The 4 Hard Walls)</text>
+  <text x="60" y="75" fill="#475569" font-family="Consolas, monospace" font-size="13">Enrolling a PC into a team flock or issuing a guest pass NEVER exposes your existing personal or work threads</text>
+
+  <!-- Wall 1 -->
+  <g transform="translate(60, 104)">
+    <rect width="275" height="290" rx="12" fill="#ffffff" />
+    <rect width="275" height="48" rx="12" fill="#ecfdf5" />
+    <line x1="0" y1="48" x2="275" y2="48" stroke="#059669" stroke-opacity="0.25" />
+    <rect width="275" height="290" rx="12" fill="none" stroke="#059669" stroke-width="2" />
+    <text x="20" y="30" fill="#064e3b" font-family="Consolas, monospace" font-size="14" font-weight="700">WALL 1 · Per-Flock Hub Isolation</text>
+    <text x="20" y="78" fill="#0f172a" font-family="Segoe UI, system-ui, sans-serif" font-size="14" font-weight="600">Cryptographically Separate Hubs</text>
+    <text x="20" y="104" fill="#334155" font-family="Consolas, monospace" font-size="12">Each flock maps to its own</text>
+    <text x="20" y="122" fill="#334155" font-family="Consolas, monospace" font-size="12">isolated SignalR hub:</text>
+    <rect x="20" y="138" width="235" height="32" rx="6" fill="#f1f5f9" />
+    <text x="32" y="159" fill="#0f172a" font-family="Consolas, monospace" font-size="12">v3_flock_&lt;flockUuid&gt;</text>
+    <text x="20" y="198" fill="#475569" font-family="Segoe UI, system-ui, sans-serif" font-size="12">Short-lived 60-minute JWTs are</text>
+    <text x="20" y="216" fill="#475569" font-family="Segoe UI, system-ui, sans-serif" font-size="12">minted only for hubs where your</text>
+    <text x="20" y="234" fill="#475569" font-family="Segoe UI, system-ui, sans-serif" font-size="12">Ed25519 key is an active member.</text>
+  </g>
+
+  <!-- Wall 2 -->
+  <g transform="translate(355, 104)">
+    <rect width="275" height="290" rx="12" fill="#ffffff" />
+    <rect width="275" height="48" rx="12" fill="#f5f3ff" />
+    <line x1="0" y1="48" x2="275" y2="48" stroke="#6d28d9" stroke-opacity="0.25" />
+    <rect width="275" height="290" rx="12" fill="none" stroke="#6d28d9" stroke-width="2" />
+    <text x="20" y="30" fill="#2e1065" font-family="Consolas, monospace" font-size="14" font-weight="700">WALL 2 · Explicit Thread Opt-In</text>
+    <text x="20" y="78" fill="#0f172a" font-family="Segoe UI, system-ui, sans-serif" font-size="14" font-weight="600">Default Visibility = Zero</text>
+    <text x="20" y="104" fill="#334155" font-family="Consolas, monospace" font-size="12">External flocks see 0 existing</text>
+    <text x="20" y="122" fill="#334155" font-family="Consolas, monospace" font-size="12">threads until you explicitly say:</text>
+    <rect x="20" y="138" width="235" height="48" rx="6" fill="#f5f3ff" />
+    <text x="30" y="158" fill="#5b21b6" font-family="Consolas, monospace" font-size="11">"Share this thread with</text>
+    <text x="30" y="176" fill="#5b21b6" font-family="Consolas, monospace" font-size="11"> erjadi/studio-team"</text>
+    <text x="20" y="214" fill="#475569" font-family="Segoe UI, system-ui, sans-serif" font-size="12">Exports a static owner-approved</text>
+    <text x="20" y="232" fill="#475569" font-family="Segoe UI, system-ui, sans-serif" font-size="12">summary snapshot (read-only) rather</text>
+    <text x="20" y="250" fill="#475569" font-family="Segoe UI, system-ui, sans-serif" font-size="12">than raw local events.jsonl logs.</text>
+  </g>
+
+  <!-- Wall 3 -->
+  <g transform="translate(650, 104)">
+    <rect width="275" height="290" rx="12" fill="#ffffff" />
+    <rect width="275" height="48" rx="12" fill="#f0f9ff" />
+    <line x1="0" y1="48" x2="275" y2="48" stroke="#0284c7" stroke-opacity="0.25" />
+    <rect width="275" height="290" rx="12" fill="none" stroke="#0284c7" stroke-width="2" />
+    <text x="20" y="30" fill="#0c4a6e" font-family="Consolas, monospace" font-size="14" font-weight="700">WALL 3 · boundFlockId Partition</text>
+    <text x="20" y="78" fill="#0f172a" font-family="Segoe UI, system-ui, sans-serif" font-size="14" font-weight="600">No Cross-Flock Pivot</text>
+    <text x="20" y="104" fill="#334155" font-family="Consolas, monospace" font-size="12">Threads created by a team or</text>
+    <text x="20" y="122" fill="#334155" font-family="Consolas, monospace" font-size="12">guest are tagged with:</text>
+    <rect x="20" y="138" width="235" height="32" rx="6" fill="#f0f9ff" />
+    <text x="32" y="159" fill="#0369a1" font-family="Consolas, monospace" font-size="12">boundFlockId = "erjadi/studio-team"</text>
+    <text x="20" y="198" fill="#475569" font-family="Segoe UI, system-ui, sans-serif" font-size="12">A thread bound to Flock B can</text>
+    <text x="20" y="216" fill="#475569" font-family="Segoe UI, system-ui, sans-serif" font-size="12">never query, message, or pivot</text>
+    <text x="20" y="234" fill="#475569" font-family="Segoe UI, system-ui, sans-serif" font-size="12">into Flock A (personal / work).</text>
+  </g>
+
+  <!-- Wall 4 -->
+  <g transform="translate(945, 104)">
+    <rect width="275" height="290" rx="12" fill="#ffffff" />
+    <rect width="275" height="48" rx="12" fill="#fffbeb" />
+    <line x1="0" y1="48" x2="275" y2="48" stroke="#d97706" stroke-opacity="0.25" />
+    <rect width="275" height="290" rx="12" fill="none" stroke="#d97706" stroke-width="2" />
+    <text x="20" y="30" fill="#78350f" font-family="Consolas, monospace" font-size="14" font-weight="700">WALL 4 · Instant Revoke &amp; Expiry</text>
+    <text x="20" y="78" fill="#0f172a" font-family="Segoe UI, system-ui, sans-serif" font-size="14" font-weight="600">Live WebSocket Eviction</text>
+    <text x="20" y="104" fill="#334155" font-family="Consolas, monospace" font-size="12">Guest passes carry a signed</text>
+    <text x="20" y="122" fill="#334155" font-family="Consolas, monospace" font-size="12">expiration timestamp:</text>
+    <rect x="20" y="138" width="235" height="32" rx="6" fill="#fffbeb" />
+    <text x="32" y="159" fill="#b45309" font-family="Consolas, monospace" font-size="12">membershipExpiresAt (e.g. 4h)</text>
+    <text x="20" y="198" fill="#475569" font-family="Segoe UI, system-ui, sans-serif" font-size="12">When time expires or you say</text>
+    <text x="20" y="216" fill="#475569" font-family="Segoe UI, system-ui, sans-serif" font-size="12">"Remove @bob", the broker bumps</text>
+    <text x="20" y="234" fill="#475569" font-family="Segoe UI, system-ui, sans-serif" font-size="12">rosterEpoch and drops WebSockets.</text>
+  </g>
+</svg>

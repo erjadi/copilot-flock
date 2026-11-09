@@ -1,0 +1,123 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 738" width="1280" height="738">
+      <defs>
+        <linearGradient id="bgGrad" x1="0" y1="0" x2="1" y2="1">
+          <stop offset="0%" stop-color="#faf9f5" />
+          <stop offset="100%" stop-color="#f3f1eb" />
+        </linearGradient>
+      </defs>
+      <rect width="1280" height="738" fill="url(#bgGrad)" />
+      <text x="80" y="48" fill="#0f172a" font-family="Segoe UI, sans-serif" font-size="22" font-weight="700">Copilot Flock v3.3.0 — Bipartite Multi-Flock Membership &amp; Overlap Graph</text>
+      <text x="80" y="72" fill="#475569" font-family="Consolas, monospace" font-size="12">Hierarchy: &lt;owner&gt;/&lt;flock&gt;[/&lt;machineId&gt;] · Online: 6/7 · Shared Threads: 0 · Theme: Light (Warm Alabaster)</text>
+
+      <!-- Root Owner Banner -->
+      <g transform="translate(80, 96)">
+        <rect width="1120" height="42" rx="8" fill="#ffffff" stroke="#64748b" stroke-width="1.5" stroke-opacity="0.85" />
+        <text x="18" y="26" fill="#0f172a" font-family="Consolas, monospace" font-size="13">erjadi · owner_root · 7 machines enrolled · segmented node rings indicate multi-flock membership</text>
+      </g>
+
+      <path d="M 310 195 C 406 195, 406 267.1666666666667, 536 267.1666666666667" fill="none" stroke="#059669" stroke-width="2.4" stroke-opacity="0.75"  />
+<path d="M 310 195 C 406 195, 406 339.33333333333337, 536 339.33333333333337" fill="none" stroke="#059669" stroke-width="2.4" stroke-opacity="0.75"  />
+<path d="M 310 195 C 406 195, 406 411.5, 536 411.5" fill="none" stroke="#059669" stroke-width="2.4" stroke-opacity="0.75"  />
+<path d="M 310 195 C 406 195, 406 483.6666666666667, 536 483.6666666666667" fill="none" stroke="#059669" stroke-width="2.4" stroke-opacity="0.75"  />
+<path d="M 310 195 C 406 195, 406 555.8333333333333, 536 555.8333333333333" fill="none" stroke="#059669" stroke-width="2.4" stroke-opacity="0.75"  />
+<path d="M 310 339.33333333333337 C 406 339.33333333333337, 406 195, 536 195" fill="none" stroke="#6d28d9" stroke-width="2.4" stroke-opacity="0.75"  />
+<path d="M 310 339.33333333333337 C 406 339.33333333333337, 406 628, 536 628" fill="none" stroke="#6d28d9" stroke-width="2.4" stroke-opacity="0.4" stroke-dasharray="5 4" />
+<path d="M 310 483.6666666666667 C 406 483.6666666666667, 406 195, 536 195" fill="none" stroke="#0284c7" stroke-width="2.4" stroke-opacity="0.75" stroke-dasharray="6 3" />
+<path d="M 310 483.6666666666667 C 406 483.6666666666667, 406 267.1666666666667, 536 267.1666666666667" fill="none" stroke="#0284c7" stroke-width="2.4" stroke-opacity="0.75" stroke-dasharray="6 3" />
+<path d="M 310 628 C 406 628, 406 195, 536 195" fill="none" stroke="#d97706" stroke-width="2.4" stroke-opacity="0.75" stroke-dasharray="3 3" />
+      
+        <g transform="translate(80, 195)">
+          <rect x="0" y="-28" width="230" height="56" rx="9" fill="#ecfdf5" stroke="#059669" stroke-width="2"  />
+          <circle cx="18" cy="0" r="5.5" fill="#059669" />
+          <text x="34" y="-3" fill="#0f172a" font-family="Consolas, monospace" font-size="14" font-weight="700">erjadi/personal</text>
+          <text x="34" y="15" fill="#475569" font-family="Consolas, monospace" font-size="11">5 machines · owner_scope</text>
+        </g>
+
+        <g transform="translate(80, 339.33333333333337)">
+          <rect x="0" y="-28" width="230" height="56" rx="9" fill="#f5f3ff" stroke="#6d28d9" stroke-width="2"  />
+          <circle cx="18" cy="0" r="5.5" fill="#6d28d9" />
+          <text x="34" y="-3" fill="#0f172a" font-family="Consolas, monospace" font-size="14" font-weight="700">erjadi/work</text>
+          <text x="34" y="15" fill="#475569" font-family="Consolas, monospace" font-size="11">2 machines · owner_scope</text>
+        </g>
+
+        <g transform="translate(80, 483.6666666666667)">
+          <rect x="0" y="-28" width="230" height="56" rx="9" fill="#f0f9ff" stroke="#0284c7" stroke-width="2" stroke-dasharray="6 3" />
+          <circle cx="18" cy="0" r="5.5" fill="#0284c7" />
+          <text x="34" y="-3" fill="#0f172a" font-family="Consolas, monospace" font-size="14" font-weight="700">erjadi/studio-team</text>
+          <text x="34" y="15" fill="#475569" font-family="Consolas, monospace" font-size="11">2 machines · collaborator</text>
+        </g>
+
+        <g transform="translate(80, 628)">
+          <rect x="0" y="-28" width="230" height="56" rx="9" fill="#fffbeb" stroke="#d97706" stroke-width="2" stroke-dasharray="3 3" />
+          <circle cx="18" cy="0" r="5.5" fill="#d97706" />
+          <text x="34" y="-3" fill="#0f172a" font-family="Consolas, monospace" font-size="14" font-weight="700">erjadi/work/CLOUD-DEV-VM</text>
+          <text x="34" y="15" fill="#475569" font-family="Consolas, monospace" font-size="11">1 machines · guest_pass</text>
+        </g>
+      
+        <g transform="translate(560, 195)">
+          <rect x="-24" y="-26" width="664" height="52" rx="9" fill="#ffffff" stroke="#d97706" stroke-width="1.5"  />
+          <circle r="11" fill="#ffffff" stroke="#94a3b8" stroke-width="1.5" />
+          <circle r="15" fill="none" stroke="#6d28d9" stroke-width="3.2" stroke-dasharray="28.4 94.2" transform="rotate(-90)" /><circle r="15" fill="none" stroke="#0284c7" stroke-width="3.2" stroke-dasharray="28.4 94.2" transform="rotate(30)" /><circle r="15" fill="none" stroke="#d97706" stroke-width="3.2" stroke-dasharray="28.4 94.2" transform="rotate(150)" />
+          <circle r="4.5" fill="#d97706" />
+          <text x="28" y="-3" fill="#0f172a" font-family="Consolas, monospace" font-size="14" font-weight="700">erjadi/work/CLOUD-DEV-VM</text>
+          <text x="28" y="15" fill="#475569" font-family="Consolas, monospace" font-size="11">ONLINE · v3.2.0 · Win11 x64 · 64GB · Hyper-V Video · OVERLAP x3</text>
+        </g>
+
+        <g transform="translate(560, 267.1666666666667)">
+          <rect x="-24" y="-26" width="664" height="52" rx="9" fill="#ffffff" stroke="#d97706" stroke-width="1.5"  />
+          <circle r="11" fill="#ffffff" stroke="#94a3b8" stroke-width="1.5" />
+          <circle r="15" fill="none" stroke="#059669" stroke-width="3.2" stroke-dasharray="44.1 94.2" transform="rotate(-90)" /><circle r="15" fill="none" stroke="#0284c7" stroke-width="3.2" stroke-dasharray="44.1 94.2" transform="rotate(90)" />
+          <circle r="4.5" fill="#d97706" />
+          <text x="28" y="-3" fill="#0f172a" font-family="Consolas, monospace" font-size="14" font-weight="700">erjadi/personal/LINUX-GPU-HOST</text>
+          <text x="28" y="15" fill="#475569" font-family="Consolas, monospace" font-size="11">ONLINE · v3.2.0 · Linux · 61GB · RTX 5070 11.9GB (9.2GB free) · OVERLAP x2</text>
+        </g>
+
+        <g transform="translate(560, 339.33333333333337)">
+          <rect x="-24" y="-26" width="664" height="52" rx="9" fill="#ffffff" stroke="#cbd5e1" stroke-width="1.5"  />
+          <circle r="11" fill="#ffffff" stroke="#94a3b8" stroke-width="1.5" />
+          <circle r="15" fill="none" stroke="#059669" stroke-width="3.2" stroke-dasharray="94.2 94.2" transform="rotate(-90)" />
+          <circle r="4.5" fill="#059669" />
+          <text x="28" y="-3" fill="#0f172a" font-family="Consolas, monospace" font-size="14" font-weight="700">erjadi/personal/MAIN-WORKSTATION</text>
+          <text x="28" y="15" fill="#475569" font-family="Consolas, monospace" font-size="11">ONLINE · v3.2.0 · Win11 x64 · 32GB · Iris(R) Plus Graphics 655 1GB</text>
+        </g>
+
+        <g transform="translate(560, 411.5)">
+          <rect x="-24" y="-26" width="664" height="52" rx="9" fill="#ffffff" stroke="#cbd5e1" stroke-width="1.5"  />
+          <circle r="11" fill="#ffffff" stroke="#94a3b8" stroke-width="1.5" />
+          <circle r="15" fill="none" stroke="#059669" stroke-width="3.2" stroke-dasharray="94.2 94.2" transform="rotate(-90)" />
+          <circle r="4.5" fill="#059669" />
+          <text x="28" y="-3" fill="#0f172a" font-family="Consolas, monospace" font-size="14" font-weight="700">erjadi/personal/3D-STUDIO-PC</text>
+          <text x="28" y="15" fill="#475569" font-family="Consolas, monospace" font-size="11">ONLINE · v3.2.0 · Win11 x64 · 64GB · RTX 3070 Ti 8GB (3GB free) + UHD Graphics 1GB</text>
+        </g>
+
+        <g transform="translate(560, 483.6666666666667)">
+          <rect x="-24" y="-26" width="664" height="52" rx="9" fill="#ffffff" stroke="#cbd5e1" stroke-width="1.5"  />
+          <circle r="11" fill="#ffffff" stroke="#94a3b8" stroke-width="1.5" />
+          <circle r="15" fill="none" stroke="#059669" stroke-width="3.2" stroke-dasharray="94.2 94.2" transform="rotate(-90)" />
+          <circle r="4.5" fill="#059669" />
+          <text x="28" y="-3" fill="#0f172a" font-family="Consolas, monospace" font-size="14" font-weight="700">erjadi/personal/MINI-SERVER-PC</text>
+          <text x="28" y="15" fill="#475569" font-family="Consolas, monospace" font-size="11">ONLINE · v3.2.0 · Win11 x64 · 31GB · AMD Radeon(TM) Graphics 0.5GB</text>
+        </g>
+
+        <g transform="translate(560, 555.8333333333333)">
+          <rect x="-24" y="-26" width="664" height="52" rx="9" fill="#ffffff" stroke="#cbd5e1" stroke-width="1.5"  />
+          <circle r="11" fill="#ffffff" stroke="#94a3b8" stroke-width="1.5" />
+          <circle r="15" fill="none" stroke="#059669" stroke-width="3.2" stroke-dasharray="94.2 94.2" transform="rotate(-90)" />
+          <circle r="4.5" fill="#059669" />
+          <text x="28" y="-3" fill="#0f172a" font-family="Consolas, monospace" font-size="14" font-weight="700">erjadi/personal/LINUX-CONSOLE</text>
+          <text x="28" y="15" fill="#475569" font-family="Consolas, monospace" font-size="11">ONLINE · v3.2.0 · Linux · 31GB · Intel Alder Lake-N Graphics</text>
+        </g>
+
+        <g transform="translate(560, 628)">
+          <rect x="-24" y="-26" width="664" height="52" rx="9" fill="#f1f5f9" stroke="#94a3b8" stroke-width="1.5" stroke-dasharray="5 4" />
+          <circle r="11" fill="#ffffff" stroke="#94a3b8" stroke-width="1.5" />
+          <circle r="15" fill="none" stroke="#6d28d9" stroke-width="3.2" stroke-dasharray="94.2 94.2" transform="rotate(-90)" />
+          <circle r="4.5" fill="#94a3b8" />
+          <text x="28" y="-3" fill="#0f172a" font-family="Consolas, monospace" font-size="14" font-weight="700">erjadi/work/ARM64-LAPTOP</text>
+          <text x="28" y="15" fill="#475569" font-family="Consolas, monospace" font-size="11">QUEUED IN SERVICE BUS · v3.1.0 · Win11 ARM64 · 64GB · Qualcomm(R) Adreno(TM) X1-85 GPU</text>
+        </g>
+
+      <g transform="translate(80, 690)">
+        <text x="0" y="18" fill="#64748b" font-family="Consolas, monospace" font-size="11">Shared machines ≠ shared threads (boundFlockId isolation + explicit thread opt-in) · Daemon enforcement authoritative</text>
+      </g>
+    </svg>

@@ -1,0 +1,11 @@
+node_modules/
+viewer/node_modules/
+viewer/dist/
+.env
+*.log
+config.json
+state.json
+inbox.jsonl
+outbox.jsonl
+daemon.pid
+

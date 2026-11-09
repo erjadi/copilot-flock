@@ -1,0 +1,142 @@
+[
+  {
+    "id": "demo-01",
+    "direction": "outbound",
+    "timestamp": "2026-01-15T09:00:00.000Z",
+    "fromMachine": "MAIN-WORKSTATION",
+    "toMachine": "3D-STUDIO-PC",
+    "fromThread": "Rendering pipeline",
+    "toThread": "Lumen shader consultation",
+    "text": "Synthetic demo: compare the Lumen lighting cost of the two material variants in example/render-stage. Return the timing summary; do not change scene assets."
+  },
+  {
+    "id": "demo-02",
+    "direction": "inbound",
+    "timestamp": "2026-01-15T09:01:00.000Z",
+    "fromMachine": "3D-STUDIO-PC",
+    "toMachine": "MAIN-WORKSTATION",
+    "fromThread": "Lumen shader consultation",
+    "toThread": "Rendering pipeline",
+    "text": "Synthetic demo result: variant B uses fewer shader instructions and stays within the frame budget. The comparison report is ready for review."
+  },
+  {
+    "id": "demo-03",
+    "direction": "outbound",
+    "timestamp": "2026-01-15T09:02:00.000Z",
+    "fromMachine": "3D-STUDIO-PC",
+    "toMachine": "LINUX-GPU-HOST",
+    "fromThread": "Beat-synced stage",
+    "toThread": "Robotics simulation",
+    "text": "Synthetic demo: check whether the simulated robot animation aligns with the stage beat markers. Use the simulation only; no physical actuation."
+  },
+  {
+    "id": "demo-04",
+    "direction": "inbound",
+    "timestamp": "2026-01-15T09:03:00.000Z",
+    "fromMachine": "LINUX-GPU-HOST",
+    "toMachine": "3D-STUDIO-PC",
+    "fromThread": "Robotics simulation",
+    "toThread": "Beat-synced stage",
+    "text": "Synthetic demo result: all simulated transitions land within one frame of their beat marker. The GPU worker has capacity for another offline render."
+  },
+  {
+    "id": "demo-05",
+    "direction": "outbound",
+    "timestamp": "2026-01-15T09:04:00.000Z",
+    "fromMachine": "MAIN-WORKSTATION",
+    "toMachine": "MINI-SERVER-PC",
+    "fromThread": "Server migration planning",
+    "toThread": "Storage compatibility",
+    "text": "Synthetic demo: review the migration checklist for the example service at 192.0.2.12. Identify rollback gaps without deploying or transferring private files."
+  },
+  {
+    "id": "demo-06",
+    "direction": "inbound",
+    "timestamp": "2026-01-15T09:05:00.000Z",
+    "fromMachine": "MINI-SERVER-PC",
+    "toMachine": "MAIN-WORKSTATION",
+    "fromThread": "Storage compatibility",
+    "toThread": "Server migration planning",
+    "text": "Synthetic demo result: add a schema compatibility check before switching traffic. The sample network share is mounted read-only and no migration has run."
+  },
+  {
+    "id": "demo-07",
+    "direction": "outbound",
+    "timestamp": "2026-01-15T09:06:00.000Z",
+    "fromMachine": "CLOUD-DEV-VM",
+    "toMachine": "ARM64-LAPTOP",
+    "fromThread": "Cross-OS release review",
+    "toThread": "ARM64 build matrix",
+    "text": "Synthetic demo: review the candidate using the same full commit SHA as the Windows and Linux workers. Report native checks before producing a signed release ballot."
+  },
+  {
+    "id": "demo-08",
+    "direction": "inbound",
+    "timestamp": "2026-01-15T09:07:00.000Z",
+    "fromMachine": "ARM64-LAPTOP",
+    "toMachine": "CLOUD-DEV-VM",
+    "fromThread": "ARM64 build matrix",
+    "toThread": "Cross-OS release review",
+    "text": "Synthetic demo result: ARM64 syntax and unit checks passed. This sample message is not a cryptographic ballot; live voting must verify the registered key and exact candidate."
+  },
+  {
+    "id": "demo-09",
+    "direction": "outbound",
+    "timestamp": "2026-01-15T09:08:00.000Z",
+    "fromMachine": "CLOUD-DEV-VM",
+    "toMachine": "LINUX-CONSOLE",
+    "fromThread": "Cross-OS release review",
+    "toThread": "Headless compatibility",
+    "text": "Synthetic demo: run the sample headless compatibility checks and confirm that the offline queue deduplicates a replayed request."
+  },
+  {
+    "id": "demo-10",
+    "direction": "inbound",
+    "timestamp": "2026-01-15T09:09:00.000Z",
+    "fromMachine": "LINUX-CONSOLE",
+    "toMachine": "CLOUD-DEV-VM",
+    "fromThread": "Headless compatibility",
+    "toThread": "Cross-OS release review",
+    "text": "Synthetic demo result: the persisted dedup claim prevented a second dispatch. Candidate identity must still match across all online release reviewers."
+  },
+  {
+    "id": "demo-11",
+    "direction": "outbound",
+    "timestamp": "2026-01-15T09:10:00.000Z",
+    "fromMachine": "ARM64-LAPTOP",
+    "toMachine": "MAIN-WORKSTATION",
+    "fromThread": "Shared design review",
+    "toThread": "Approved project snapshot",
+    "text": "Synthetic demo: share only the approved design summary with example/studio-team. Existing owner sessions and raw tool logs must stay private."
+  },
+  {
+    "id": "demo-12",
+    "direction": "inbound",
+    "timestamp": "2026-01-15T09:11:00.000Z",
+    "fromMachine": "MAIN-WORKSTATION",
+    "toMachine": "ARM64-LAPTOP",
+    "fromThread": "Approved project snapshot",
+    "toThread": "Shared design review",
+    "text": "Synthetic demo result: the approved summary is visible to the demo team. No additional owner sessions were exported; revocation removes this share."
+  },
+  {
+    "id": "demo-13",
+    "direction": "outbound",
+    "timestamp": "2026-01-15T09:12:00.000Z",
+    "fromMachine": "MAIN-WORKSTATION",
+    "toMachine": "LINUX-GPU-HOST",
+    "fromThread": "GPU scheduling",
+    "toThread": "Render worker status",
+    "text": "Synthetic demo: report free VRAM and the next available worker slot. Do not terminate other jobs or reserve resources without approval."
+  },
+  {
+    "id": "demo-14",
+    "direction": "inbound",
+    "timestamp": "2026-01-15T09:13:00.000Z",
+    "fromMachine": "LINUX-GPU-HOST",
+    "toMachine": "MAIN-WORKSTATION",
+    "fromThread": "Render worker status",
+    "toThread": "GPU scheduling",
+    "text": "Synthetic demo result: the illustrative worker at 192.0.2.13 has enough capacity for the sample render. No job was spawned and no resource lock was acquired."
+  }
+]

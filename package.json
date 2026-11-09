@@ -1,0 +1,30 @@
+{
+  "name": "copilot-flock",
+  "version": "3.3.0",
+  "license": "Apache-2.0",
+  "description": "Zero-dependency cross-machine multi-flock platform for GitHub Copilot Desktop & CLI over Azure SignalR Service (copilot-flock)",
+  "type": "module",
+  "main": "flock.mjs",
+  "bin": {
+    "copilot-flock": "./flock.mjs",
+    "copilot-bridge": "./bridge.mjs"
+  },
+  "scripts": {
+    "start": "node bootstrap-server.mjs",
+    "daemon": "node flock.mjs daemon",
+    "install-flock": "node flock.mjs install",
+    "install-bridge": "node flock.mjs install",
+    "status": "node flock.mjs status",
+    "machines": "node flock.mjs machines",
+    "members": "node flock.mjs members",
+    "specs": "node flock.mjs specs",
+    "sessions": "node flock.mjs sessions",
+    "viewer": "node viewer/viewer-server.mjs",
+    "self-test": "node flock.mjs self-test",
+    "test": "node --test test/flock.test.mjs test/bridge.test.mjs test/setup.test.mjs"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "private": true
+}

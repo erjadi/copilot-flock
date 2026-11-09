@@ -1,0 +1,32 @@
+{
+  "name": "copilot-flock-viewer",
+  "version": "3.1.0",
+  "license": "Apache-2.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "start": "node viewer-server.mjs"
+  },
+  "dependencies": {
+    "@tailwindcss/vite": "^4.1.4",
+    "clsx": "^2.1.1",
+    "lucide-react": "^0.511.0",
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0",
+    "react-markdown": "^10.1.0",
+    "remark-gfm": "^4.0.1",
+    "tailwind-merge": "^3.2.0",
+    "tailwindcss": "^4.1.4",
+    "tw-animate-css": "^1.2.5"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.0",
+    "@types/react": "^19.1.2",
+    "@types/react-dom": "^19.1.2",
+    "@vitejs/plugin-react": "^4.4.1",
+    "typescript": "^5.8.3",
+    "vite": "^6.3.3"
+  }
+}
