@@ -154,10 +154,13 @@ function componentFixture(file, apiOverrides = {}) {
       if (name.endsWith("/seed")) return { fakeEvent: () => [] };
       if (name.endsWith("/governance")) return governance;
       if (name.endsWith("/utils")) return { cn: (...args) => args.filter(Boolean).join(" ") };
-      return new Proxy({}, { get: (_target, key) => String(key) });
+      return new Proxy({}, { get: (_target, key) => key === "rel" ? rel : String(key) });
     },
   });
-  vm.runInContext(code + (file === "Console" ? "\nexports.Connection = ConsoleConnection;" : ""), context);
+  const internal = file === "Console" ? "\nexports.Connection = ConsoleConnection;"
+    : file === "SessionsView" ? "\nexports.TranscriptPane = TranscriptPane;"
+    : file === "TopologyView" ? "\nexports.CorridorInspector = CorridorInspector;" : "";
+  vm.runInContext(code + internal, context);
   return {
     render(name, props = {}) {
       cursor = 0;
@@ -349,6 +352,82 @@ test("viewer overview and send-event attribution use cfg.machineId rather than c
   await f.request({ method: "POST", url: "/api/send", body: { toMachine: "ACTUAL-DISCOVERED", message: "[ping] fixture", dryRun: true, fromMachine: "FICTIONAL-CALLER" } });
   assert.equal(events[0].fromMachine, "SYNTHETIC-SOURCE");
   assert.equal(f.actions.at(-1), "ping");
+});
+
+test("send and broadcast HTTP callbacks never promote RPC success or UNKNOWN into message delivery", async () => {
+  for (const result of [{}, { ok: true }, { status: "unknown", dispatchedToRuntime: false },
+    { status: "delivered", dispatchedToRuntime: false }, { status: "delivered", dispatchedToRuntime: true }]) {
+    const messages = [], events = [];
+    const confirmed = result.status === "delivered" && result.dispatchedToRuntime === true;
+    const f = viewerHttpFixture({
+      invokeRemoteRpc: async () => ({ result }),
+      invokeRemoteRpcBatch: async (_cfg, items) => items.map((item) => ({ item, ok: true, response: { result } })),
+      filterBroadcastTargets: (items) => items,
+      recordCorridorMessage: (message) => messages.push(message),
+      pushWireEvent: (event) => events.push(event),
+    });
+    const single = JSON.parse((await f.request({ method: "POST", url: "/api/send",
+      body: { toMachine: "ACTUAL-DISCOVERED", message: "Synthetic intent" } })).body);
+    assert.equal(single.ok, confirmed);
+    assert.equal(single.admissionStatus, confirmed ? "delivered" : "unknown");
+    const batch = JSON.parse((await f.request({ method: "POST", url: "/api/broadcast",
+      body: { message: "Synthetic broadcast" } })).body);
+    assert.equal(batch.results[0].ok, confirmed);
+    assert.equal(batch.results[0].admissionStatus, confirmed ? "delivered" : "unknown");
+    assert.equal(messages.length, confirmed ? 2 : 0);
+    assert.equal(api.messageAdmissionConfirmed(single), confirmed);
+    if (!confirmed) assert.ok(events.some((event) => /UNKNOWN/.test(event.summary)));
+    const created = JSON.parse((await f.request({ method: "POST", url: "/api/broadcast",
+      body: { message: "Synthetic create", newSession: true } })).body);
+    assert.equal(created.results[0].admissionStatus, "rpc_accepted");
+    assert.equal(created.results[0].ok, false);
+  }
+});
+
+test("session and corridor UI retain UNKNOWN without optimistic transcript or corridor messages", async () => {
+  const events = [], sent = [], bodies = [];
+  let response = { ok: true, status: "unknown", dispatchedToRuntime: false };
+  const ctx = { base: "", mode: "live", data: { hub: { machineId: "ACTUAL-LOCAL" }, sessions: [] },
+    pushEvents: (items) => events.push(...items) };
+  const session = { machineId: "REMOTE-B", session_id: "synthetic-session", title: "Synthetic thread", is_running: false };
+  const post = async (_base, _mode, _path, body) => { bodies.push(body); return response; };
+  const f = componentFixture("SessionsView", { post, fetchTranscript: async () => ({
+    messages: [{ role: "user", messageId: "old", turnId: "old", content: "Prior real text", timestamp: "synthetic" }],
+  }) });
+  let tree = f.render("TranscriptPane", { ctx, s: session, onBack() {} });
+  await Promise.resolve();
+  tree = f.render("TranscriptPane", { ctx, s: session, onBack() {} });
+  elements(tree).find((node) => node.type === "textarea").props.onChange({ target: { value: "New intent" } });
+  tree = f.render("TranscriptPane", { ctx, s: session, onBack() {} });
+  await elements(tree).find((node) => node.type === "Btn" && text(node).trim() === "Send").props.onClick();
+  tree = f.render("TranscriptPane", { ctx, s: session, onBack() {} });
+  assert.match(text(tree), /Admission UNKNOWN/);
+  assert.equal(elements(tree).find((node) => node.type === "textarea").props.value, "New intent");
+  assert.equal(elements(tree).filter((node) => node.type === "Md").length, 1);
+  assert.equal(events.length, 0);
+  response = { status: "delivered", dispatchedToRuntime: true };
+  await elements(tree).find((node) => node.type === "Btn" && text(node).trim() === "Send").props.onClick();
+  tree = f.render("TranscriptPane", { ctx, s: session, onBack() {} });
+  assert.equal(elements(tree).filter((node) => node.type === "Md").length, 2);
+  assert.equal(events.length, 1);
+  f.unmount();
+  response = { ok: true, status: "unknown", dispatchedToRuntime: false };
+  const corridor = componentFixture("TopologyView", { post });
+  const props = { ctx, e: { a: "REMOTE-A", b: "REMOTE-B", ab: 0, ba: 0, rpc: 0, avgLatencyMs: 0, messages: [], threadPairs: [] },
+    extra: [], onClose() {}, onSent: (value) => sent.push(value) };
+  tree = corridor.render("CorridorInspector", props);
+  elements(tree).find((node) => node.type === "Input").props.onChange({ target: { value: "Corridor intent" } });
+  tree = corridor.render("CorridorInspector", props);
+  await elements(tree).find((node) => node.props?.["aria-label"] === "Send corridor message").props.onClick();
+  tree = corridor.render("CorridorInspector", props);
+  assert.match(text(tree), /Admission UNKNOWN/);
+  assert.equal(sent.length, 0);
+  assert.equal(elements(tree).find((node) => node.type === "Input").props.value, "Corridor intent");
+  response = { status: "delivered", dispatchedToRuntime: true };
+  await elements(tree).find((node) => node.props?.["aria-label"] === "Send corridor message").props.onClick();
+  assert.equal(sent[0].from, "ACTUAL-LOCAL");
+  assert.equal(bodies.at(-1).fromMachine, undefined);
+  corridor.unmount();
 });
 
 test("viewer rejects foreign origins and rebinding hosts before private reads or owner RPC dispatch", async () => {

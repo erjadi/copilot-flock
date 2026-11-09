@@ -281,6 +281,10 @@ UNKNOWN/`awaiting_desktop_admission`, with no claimed `deliveredAt` or confirmed
 dispatch. A later matching persisted event can emit a separate admission
 receipt. The initial uncertain response is not permission to resend, and a
 later admission still does not establish task execution.
+The live viewer preserves that distinction: an HTTP/RPC success alone does not
+add a delivered transcript or corridor message. Single sends and broadcasts
+show unconfirmed admission as UNKNOWN; a successful create RPC is not a
+message-delivery receipt. Do not blindly resend an uncertain request.
 
 Both install profiles record `installed-source.json` with the source commit
 when known and checksums of the installed runtime modules. Release reports

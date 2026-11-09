@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { ArrowLeft, Eye, GitBranch, Search, Send, Wrench } from "lucide-react";
 import type { Ctx } from "./Console";
 import type { Session, Transcript } from "@/lib/fleet/types";
-import { envelope, fetchTranscript, post } from "@/lib/fleet/api";
+import { envelope, fetchTranscript, messageAdmissionConfirmed, post } from "@/lib/fleet/api";
 import { Btn, Dot, Input, Md, PageHeading, Panel, Select, SmartMessage, Toggle, rel } from "./ui";
 
 export function SessionsView({ ctx, selected, setSelected }: { ctx: Ctx; selected: Session | null; setSelected: (s: Session | null) => void }) {
@@ -33,7 +33,7 @@ function TranscriptPane({ ctx, s, onBack }: { ctx: Ctx; s: Session; onBack: () =
   const [mode, setMode] = useState<"immediate" | "enqueue">("immediate");
   const [wait, setWait] = useState(false);
   const [busy, setBusy] = useState(false);
-  const [result, setResult] = useState<{ kind: "preview" | "sent" | "error"; text: string } | null>(null);
+  const [result, setResult] = useState<{ kind: "preview" | "sent" | "unknown" | "error"; text: string } | null>(null);
   const pendingTranscript = useRef<{ key: string; promise: Promise<Transcript> } | null>(null);
   useEffect(() => {
     let active = true;
@@ -58,8 +58,11 @@ function TranscriptPane({ ctx, s, onBack }: { ctx: Ctx; s: Session; onBack: () =
       const body = { toMachine: s.machineId, toSession: s.session_id, message: msg, mode, waitForReply: wait, dryRun };
       const r = await post<Record<string, unknown>>(ctx.base, ctx.mode, "/api/send", body, () => dryRun
         ? { envelopePreview: envelope("fleet-console", s.machineId, s.session_id, msg, mode) }
-        : { ok: true, delivered: true, requestId: `req-${Date.now().toString(16)}`, ...(wait ? { reply: "Acknowledged — I'll incorporate that steer on the next turn." } : {}) });
+        : { ok: true, status: "delivered", dispatchedToRuntime: true, requestId: `req-${Date.now().toString(16)}`, ...(wait ? { reply: "Acknowledged — I'll incorporate that steer on the next turn." } : {}) });
       if (dryRun) setResult({ kind: "preview", text: String(r.envelopePreview ?? JSON.stringify(r, null, 2)) });
+      else if (!messageAdmissionConfirmed(r)) {
+        setResult({ kind: "unknown", text: `Admission UNKNOWN; do not blindly resend. No transcript update or task execution is confirmed.\n${JSON.stringify(r, null, 2)}` });
+      }
       else {
         setResult({ kind: "sent", text: JSON.stringify(r, null, 2) });
         ctx.pushEvents([{ id: `evt-${Date.now()}`, timestamp: new Date().toISOString(), type: "outbox", target: s.machineId, fromMachine: ctx.data.hub.machineId, toMachine: s.machineId, action: "send_message", requestId: String(r.requestId ?? ""), summary: `send_message → ${s.machineId} · ${s.title}`, payload: body }]);

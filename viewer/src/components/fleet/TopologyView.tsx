@@ -3,7 +3,7 @@ import { Activity, Crosshair, Grid3x3, History, Maximize2, Minus, Network, Orbit
 import type { Flock } from "@/lib/fleet/flocks";
 import { FlockMembershipGraph } from "./FlockOverlap";
 import type { Ctx } from "./Console";
-import { post } from "@/lib/fleet/api";
+import { messageAdmissionConfirmed, post } from "@/lib/fleet/api";
 import { HUB_ID, deriveTopology, edgeKey, edgeTone, weight, type LinkMessage, type TopoEdge, type TopoNode } from "@/lib/fleet/topology";
 import type { Member, Overview, WireEvent } from "@/lib/fleet/types";
 import { Btn, Dot, GlassPanel, IconBtn, Input, SmartMessage, rel, gpuLabel, ReplayHealth } from "./ui";
@@ -342,22 +342,34 @@ function CorridorInspector({ ctx, e, extra, onClose, onSent }: { ctx: Ctx; e: To
   const [dir, setDir] = useState<"ab" | "ba">("ab");
   const [text, setText] = useState("");
   const [busy, setBusy] = useState(false);
+  const [outcome, setOutcome] = useState<string | null>(null);
   const [from, to] = dir === "ab" ? [e.a, e.b] : [e.b, e.a];
   const msgs = [...extra, ...e.messages].sort((x, y) => y.timestamp.localeCompare(x.timestamp));
   const send = async () => {
     setBusy(true);
     const pair = e.threadPairs[0];
     const target = ctx.data.sessions.find((s) => s.machineId === to && pair && (s.title === pair[0] || s.title === pair[1])) ?? ctx.data.sessions.find((s) => s.machineId === to);
-    const body = { toMachine: to, toSession: target?.session_id, message: text, mode: "immediate", waitForReply: false, dryRun: false, fromMachine: from };
-    await post(ctx.base, ctx.mode, "/api/send", body, () => ({ ok: true, delivered: true }));
-    const msg: LinkMessage = { id: `lm-${Date.now()}`, from, to, fromThread: "Fleet console", toThread: target?.title ?? "—", text, timestamp: new Date().toISOString() };
-    onSent(msg);
-    ctx.pushEvents([{ id: `evt-${Date.now()}`, timestamp: msg.timestamp, type: "outbox", target: to, fromMachine: from, toMachine: to, action: "send_message", summary: `corridor send ${from} → ${to}`, payload: body }]);
-    setText(""); setBusy(false);
+    const body = { toMachine: to, toSession: target?.session_id, message: text, mode: "immediate", waitForReply: false, dryRun: false };
+    try {
+      const result = await post(ctx.base, ctx.mode, "/api/send", body, () => ({ ok: true, status: "delivered", dispatchedToRuntime: true }));
+      if (!messageAdmissionConfirmed(result)) {
+        setOutcome("Admission UNKNOWN; do not blindly resend. No corridor delivery or execution is confirmed.");
+        return;
+      }
+      const source = ctx.mode === "seed" ? from : ctx.data.hub.machineId;
+      const msg: LinkMessage = { id: `lm-${Date.now()}`, from: source, to, fromThread: "Fleet console", toThread: target?.title ?? "—", text, timestamp: new Date().toISOString() };
+      onSent(msg);
+      ctx.pushEvents([{ id: `evt-${Date.now()}`, timestamp: msg.timestamp, type: "outbox", target: to, fromMachine: source, toMachine: to, action: "send_message", summary: `corridor admission ${source} → ${to}`, payload: body }]);
+      setOutcome("Desktop admission confirmed; task execution is not confirmed.");
+      setText("");
+    } catch (error) {
+      setOutcome(`Send outcome unconfirmed; do not blindly resend: ${String(error)}`);
+    } finally { setBusy(false); }
   };
   return <InspectorShell title={`${e.a} ↔ ${e.b}`} subtitle={`${e.ab + e.ba} messages · ${e.rpc} RPC calls`} onClose={onClose}>
     <div className="grid grid-cols-2 gap-5"><div><div className="font-mono text-lg">{e.ab}<span className="ml-1 text-xs text-muted-foreground">/ {e.ba}</span></div><div className="mt-1 text-[9px] uppercase tracking-widest text-muted-foreground">Forward / return</div></div><div><div className="font-mono text-lg">{e.avgLatencyMs}<span className="ml-1 text-xs text-muted-foreground">ms</span></div><div className="mt-1 text-[9px] uppercase tracking-widest text-muted-foreground">Average latency</div></div></div>
     <div className="mt-6"><div className="mb-3 text-[10px] uppercase tracking-widest text-muted-foreground">Send across corridor</div><div className="mb-2 flex gap-1">{(["ab", "ba"] as const).map((d) => <button key={d} onClick={() => setDir(d)} className={`flex-1 truncate rounded-lg px-2 py-2 font-mono text-[9px] ${dir === d ? "bg-accent text-foreground" : "text-muted-foreground"}`}>{d === "ab" ? `${e.a} →` : `${e.b} →`}</button>)}</div><div className="flex gap-2"><Input value={text} onChange={(ev) => setText(ev.target.value)} placeholder={`Message ${to}`} /><Btn variant="primary" disabled={!text || busy} onClick={send} aria-label="Send corridor message"><Send className="h-3.5 w-3.5" /></Btn></div></div>
+    {outcome && <p role="status" className="mt-3 text-xs text-muted-foreground">{outcome}</p>}
     {e.threadPairs.length > 0 && <details className="group mt-6 border-t border-border/60 pt-4"><summary className="cursor-pointer text-xs text-muted-foreground group-open:text-foreground">Thread pairs</summary><div className="mt-3 space-y-2">{e.threadPairs.map(([x, y]) => <div key={x + y} className="text-[11px] leading-5 text-muted-foreground">{x}<br /><span className="text-busy">↕</span> {y}</div>)}</div></details>}
     <details className="group mt-4 border-t border-border/60 pt-4" open={msgs.length < 4}><summary className="cursor-pointer text-xs text-muted-foreground group-open:text-foreground">Recent messages <span className="font-mono text-[10px]">{msgs.length}</span></summary><div className="mt-3 space-y-5">{msgs.map((m) => <article key={m.id} className="min-w-0 border-b border-border/40 pb-4 last:border-0"><div className="flex items-start justify-between gap-2 font-mono text-[9px] text-muted-foreground"><span className="min-w-0 break-words">{m.from} → {m.to}</span><span className="shrink-0">{rel(m.timestamp)}</span></div><div className="mb-3 mt-1.5 text-[10px] leading-4 text-muted-foreground">{m.fromThread} <span className="text-info">→</span> {m.toThread}</div><SmartMessage text={m.text} compact /></article>)}</div></details>
   </InspectorShell>;

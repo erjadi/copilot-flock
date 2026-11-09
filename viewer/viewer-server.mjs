@@ -693,6 +693,10 @@ function guardViewerRequest(req, res) {
   return true;
 }
 
+function messageAdmissionConfirmed(result) {
+  return result?.status === "delivered" && result.dispatchedToRuntime === true;
+}
+
 function readJsonBody(req) {
   return new Promise((resolve) => {
     let raw = "";
@@ -1003,7 +1007,8 @@ const server = http.createServer(async (req, res) => {
       const lat = Math.max(1, Date.now() - t0);
       recordCorridorRpc(fromMachine, toMachine, lat);
 
-      if (!dryRun) {
+      const admitted = messageAdmissionConfirmed(rpcRes.result);
+      if (!dryRun && admitted) {
         recordCorridorMessage({
           id: reqId,
           fromMachine,
@@ -1021,15 +1026,16 @@ const server = http.createServer(async (req, res) => {
         toMachine: fromMachine,
         action: "send_message",
         requestId: reqId,
-        summary: `send_message ${dryRun ? "preview" : "delivered"} · ${lat}ms`,
+        summary: `send_message ${dryRun ? "preview" : admitted ? "delivered" : "UNKNOWN"} · ${lat}ms`,
         payload: { requestId: reqId, latencyMs: lat, result: rpcRes.result },
       });
 
       sendJson(res, 200, {
-        ok: true,
         latencyMs: lat,
         requestId: reqId,
         ...rpcRes.result,
+        ok: dryRun || admitted,
+        admissionStatus: admitted ? "delivered" : "unknown",
         reply: rpcRes.result?.reply?.content || rpcRes.result?.reply || undefined,
       });
     } catch (err) {
@@ -1210,7 +1216,8 @@ const server = http.createServer(async (req, res) => {
       const lat = Math.max(1, Date.now() - t0);
       const mId = o.item.toMachine;
       recordCorridorRpc(cfg.machineId, mId, lat);
-      if (o.ok && message) {
+      const admitted = o.ok && !newSession && messageAdmissionConfirmed(o.response?.result);
+      if (admitted && message) {
         recordCorridorMessage({
           fromMachine: cfg.machineId,
           toMachine: mId,
@@ -1221,13 +1228,12 @@ const server = http.createServer(async (req, res) => {
       }
       return {
         machineId: mId,
-        ok: o.ok,
+        ok: admitted,
+        admissionStatus: admitted ? "delivered" : o.ok && newSession ? "rpc_accepted" : o.ok ? "unknown" : "failed",
         latencyMs: lat,
-        detail: o.ok
-          ? o.response?.result?.targetSessionTitle
-            ? `delivered → "${o.response.result.targetSessionTitle}"`
-            : "delivered"
-          : o.error || "failed",
+        detail: admitted ? "Desktop admission confirmed; execution not confirmed"
+          : o.ok && newSession ? "Create RPC accepted; message admission/execution not confirmed"
+          : o.ok ? "Admission UNKNOWN; do not blindly resend" : o.error || "failed",
       };
     });
 

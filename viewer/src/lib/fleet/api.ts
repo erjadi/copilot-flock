@@ -81,6 +81,11 @@ export async function post<T = Record<string, unknown>>(
 
 export const isExpectedCommit = (value: string) => /^[0-9a-f]{40}$/.test(value);
 
+export function messageAdmissionConfirmed(value: unknown): boolean {
+  return !!value && typeof value === "object" && "status" in value && value.status === "delivered" &&
+    "dispatchedToRuntime" in value && value.dispatchedToRuntime === true;
+}
+
 export interface VoteResult { expectedCommit: string; approvedForMerge: boolean; accepted: number; total: number }
 export function readVoteResult(value: unknown, expectedCommit: string): VoteResult {
   if (!isExpectedCommit(expectedCommit) || !value || typeof value !== "object" ||
