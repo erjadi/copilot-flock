@@ -474,6 +474,47 @@ test("Broadcast preview and send rejections reset busy, retain intent and expose
   }
 });
 
+test("Broadcast clears prior successful preview/results before an unconfirmed attempt without adding events", async () => {
+  for (const priorDryRun of [true, false]) {
+    for (const dryRun of [true, false]) {
+      const events = [];
+      let reject, requests = 0;
+      const pending = new Promise((_resolve, rejectPromise) => { reject = rejectPromise; });
+      const member = { machineId: "SYNTHETIC-TARGET", online: true, scope: "personal",
+        specs: { gpus: [], memory: { totalGb: 16 } } };
+      const ctx = { base: "", mode: "live", scope: "all", data: { hub: { machineId: "ACTUAL-LOCAL" }, members: [member], sessions: [] },
+        pushEvents: (items) => events.push(...items) };
+      const f = componentFixture("BroadcastView", { post: (_base, _mode, _path, body) => {
+        requests++;
+        if (requests > 1) return pending;
+        return Promise.resolve(body.dryRun ? { envelopePreview: "Synthetic previous preview" } :
+          { results: [{ machineId: member.machineId, ok: true, admissionStatus: "delivered", latencyMs: 1, detail: "Synthetic previous admission" }] });
+      } });
+      let tree = f.render("BroadcastView", { ctx });
+      elements(tree).find((node) => node.type === "textarea").props.onChange({ target: { value: "Preserved message" } });
+      tree = f.render("BroadcastView", { ctx });
+      const button = (preview) => elements(tree).find((node) => node.type === "Btn" &&
+        (preview ? text(node).includes("Preview") : text(node).includes("Send to")));
+      await button(priorDryRun).props.onClick();
+      tree = f.render("BroadcastView", { ctx });
+      assert.match(text(tree), priorDryRun ? /Envelope preview/ : /Admission results/);
+      const previousEvents = events.length;
+      const work = button(dryRun).props.onClick();
+      tree = f.render("BroadcastView", { ctx });
+      assert.doesNotMatch(text(tree), /Admission results|Envelope preview/);
+      reject(new Error("Synthetic subsequent outage"));
+      await work;
+      tree = f.render("BroadcastView", { ctx });
+      assert.doesNotMatch(text(tree), /Admission results|Envelope preview/);
+      assert.match(text(tree), dryRun ? /Preview failed/ : /Broadcast admission UNKNOWN; do not blindly retry/);
+      assert.equal(button(dryRun).props.disabled, false);
+      assert.equal(events.length, previousEvents);
+      assert.equal(requests, 2);
+      f.unmount();
+    }
+  }
+});
+
 test("viewer rejects foreign origins and rebinding hosts before private reads or owner RPC dispatch", async () => {
   const f = viewerHttpFixture();
   for (const request of [
