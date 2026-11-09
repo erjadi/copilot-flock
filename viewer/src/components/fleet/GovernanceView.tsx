@@ -1,9 +1,9 @@
 import { useMemo, useState } from "react";
 import { Check, ChevronDown, CircleAlert, GitMerge, KeyRound, LoaderCircle, Play, ShieldCheck, Stethoscope } from "lucide-react";
 import type { Ctx } from "./Console";
-import { post } from "@/lib/fleet/api";
+import { isExpectedCommit, post, readVoteResult } from "@/lib/fleet/api";
 import { GOVERNANCE_ROUNDS, PIPELINE_STAGES, RELEASE, ROLLOUT_HEALTH, getRoundStats, type Ballot, type GovernanceRound } from "@/lib/fleet/governance";
-import { Btn, Dot, PageHeading, Panel, Pill, SmartMessage } from "./ui";
+import { Btn, Dot, Input, PageHeading, Panel, Pill, SmartMessage } from "./ui";
 import { cn } from "@/lib/utils";
 
 interface ActionResult { kind: "vote" | "diagnose"; title: string; body: string; simulated: boolean; error?: boolean }
@@ -12,6 +12,7 @@ export function GovernanceView({ ctx }: { ctx: Ctx }) {
   const [roundNumber, setRoundNumber] = useState(4);
   const [busy, setBusy] = useState<"vote" | "diagnose" | null>(null);
   const [result, setResult] = useState<ActionResult | null>(null);
+  const [expectedCommit, setExpectedCommit] = useState("");
   const round = GOVERNANCE_ROUNDS[roundNumber - 1];
   const stats = getRoundStats(round);
   const finalStats = useMemo(() => getRoundStats(GOVERNANCE_ROUNDS[3]), []);
@@ -19,27 +20,37 @@ export function GovernanceView({ ctx }: { ctx: Ctx }) {
   const run = async (kind: "vote" | "diagnose") => {
     setBusy(kind);
     setResult(null);
-    const machines = round.ballots.filter((ballot) => ballot.vote !== "QUEUED OFFLINE").map((ballot) => ballot.machineId);
+    const commit = ctx.mode === "seed" ? round.sha : expectedCommit.trim();
+    if (kind === "vote" && ctx.mode === "live" && !isExpectedCommit(commit)) {
+      setResult({ kind, title: "Vote blocked", body: "Enter the independently expected full 40-character commit SHA.", simulated: false, error: true });
+      setBusy(null);
+      return;
+    }
+    const machines = ctx.data.members.filter((member) => member.online).map((member) => member.machineId);
     const path = kind === "vote" ? "/api/vote-release" : "/api/diagnose";
     const body = kind === "vote"
-      ? { branch: "main", sha: GOVERNANCE_ROUNDS[3].sha, machines, rpc: "review_release" }
-      : { version: RELEASE.version, fix: false, machines };
+      ? { branch: "main", expectedCommit: commit }
+      : { fix: false };
     try {
-      const response = await post<{ approvedForMerge?: boolean; accepted?: number; total?: number; healthy?: number; results?: { machineId: string; ok: boolean; detail?: string }[] }>(
+      const response = await post<{ expectedCommit?: string; approvedForMerge?: boolean; accepted?: number; total?: number; results?: { machineId: string; ok: boolean; detail?: string }[] }>(
         ctx.base, ctx.mode, path, body,
         () => kind === "vote"
-          ? { approvedForMerge: true, accepted: 6, total: 6, round: 4, sha: GOVERNANCE_ROUNDS[3].sha }
-          : { healthy: 6, results: machines.map((machineId) => ({ machineId, ok: true, detail: "Single daemon · v2.1.0 · key registered · boot persistent · Coordinator + Tracker healthy" })) },
+          ? { expectedCommit: commit, approvedForMerge: stats.approvedForMerge, accepted: stats.accepted, total: stats.online }
+          : { results: machines.map((machineId) => ({ machineId, ok: true, detail: "Fictional preview diagnostic" })) },
+        kind === "vote" ? 900000 : 120000,
       );
-      const healthy = response.results?.filter((item) => item.ok).length;
-      const title = kind === "vote"
-        ? `${response.accepted ?? finalStats.accepted}/${response.total ?? finalStats.online} ACCEPT · ${response.approvedForMerge === false ? "merge blocked" : "quorum reached"}`
-        : `${healthy ?? response.healthy ?? finalStats.online}/${finalStats.online} online nodes verified`;
-      const details = kind === "vote"
-        ? `Signed \`vote-release\` ballots validated for \`${GOVERNANCE_ROUNDS[3].sha}\`. ${response.approvedForMerge === false ? "At least one online voter still blocks merge." : "`approvedForMerge: true` · fast-forward and fleet rollout are permitted."}`
-        : response.results?.map((item) => `- **${item.machineId}:** ${item.ok ? "Healthy" : "Attention required"}${item.detail ? ` — ${item.detail}` : ""}`).join("\n") ?? "Single daemon, version, Ed25519 registration, boot persistence, and both required threads verified.";
+      let title: string, details: string;
+      if (kind === "vote") {
+        const vote = ctx.mode === "live" ? readVoteResult(response, commit) : response;
+        title = `${vote.accepted}/${vote.total} ACCEPT · ${vote.approvedForMerge === true ? "quorum reported" : "merge blocked"}`;
+        details = `Exact candidate: \`${commit}\`. \`approvedForMerge: ${vote.approvedForMerge === true}\`. This does not authorize deployment, restart, provisioning or key operations. Discovery completeness and the same-SHA publication gate still require independent verification.`;
+      } else {
+        if (!Array.isArray(response.results) || response.results.some((item) => typeof item.machineId !== "string" || typeof item.ok !== "boolean")) throw new Error("Incomplete live diagnostic result.");
+        title = `${response.results.filter((item) => item.ok).length}/${response.results.length} diagnostic responses healthy`;
+        details = response.results.map((item) => `- **${item.machineId}:** ${item.ok ? "Healthy" : "Attention required"}${item.detail ? ` — ${item.detail}` : ""}`).join("\n") || "No diagnostic targets responded.";
+      }
       setResult({ kind, title, body: details, simulated: Boolean(response.simulated) });
-      ctx.pushEvents([{ id: `evt-${Date.now()}`, timestamp: new Date().toISOString(), type: "outbox", target: "governance", fromMachine: "LINUX-CONSOLE", toMachine: machines.join(","), action: kind === "vote" ? "vote-release" : "diagnose", summary: title, payload: body }]);
+      ctx.pushEvents([{ id: `evt-${Date.now()}`, timestamp: new Date().toISOString(), type: "outbox", target: "governance", fromMachine: ctx.data.hub.machineId, toMachine: "*", action: kind === "vote" ? "vote-release" : "diagnose", summary: title, payload: body }]);
     } catch (error) {
       setResult({ kind, title: `${kind === "vote" ? "Vote" : "Diagnose"} failed`, body: String(error), simulated: ctx.mode === "seed", error: true });
     } finally { setBusy(null); }
@@ -48,10 +59,11 @@ export function GovernanceView({ ctx }: { ctx: Ctx }) {
   return <div>
     <PageHeading title="Release governance" description="Synthetic preview rounds, not signed release evidence. Live voting requires unanimous exact-candidate consent.">
       <div className="flex flex-wrap gap-2">
-        <Btn variant="outline" disabled={Boolean(busy)} onClick={() => run("vote")}>{busy === "vote" ? <LoaderCircle className="h-3.5 w-3.5 animate-spin" /> : <Play className="h-3.5 w-3.5" />}Run live vote</Btn>
-        <Btn variant="primary" disabled={Boolean(busy)} onClick={() => run("diagnose")}>{busy === "diagnose" ? <LoaderCircle className="h-3.5 w-3.5 animate-spin" /> : <Stethoscope className="h-3.5 w-3.5" />}Run fleet diagnose</Btn>
+        <Btn variant="outline" disabled={Boolean(busy) || (ctx.mode === "live" && !isExpectedCommit(expectedCommit.trim()))} onClick={() => run("vote")}>{busy === "vote" ? <LoaderCircle className="h-3.5 w-3.5 animate-spin" /> : <Play className="h-3.5 w-3.5" />}{ctx.mode === "seed" ? "Simulate vote" : "Run exact-SHA vote"}</Btn>
+        <Btn variant="primary" disabled={Boolean(busy)} onClick={() => run("diagnose")}>{busy === "diagnose" ? <LoaderCircle className="h-3.5 w-3.5 animate-spin" /> : <Stethoscope className="h-3.5 w-3.5" />}{ctx.mode === "seed" ? "Simulate diagnose" : "Run read-only diagnose"}</Btn>
       </div>
     </PageHeading>
+    {ctx.mode === "live" && <div className="mb-4"><label htmlFor="expected-release-sha" className="mb-2 block text-xs">Independently expected full commit SHA (branch: main)</label><Input id="expected-release-sha" className="w-full font-mono" value={expectedCommit} onChange={(event) => setExpectedCommit(event.target.value)} placeholder="40 lowercase hexadecimal characters" /><p className="mt-2 text-xs text-muted-foreground">Uses the helper's complete discovered electorate, not the filtered view or sample rounds. Requires existing local exact-SHA execution approvals; this console cannot grant them.</p></div>}
     <p className="mb-4 text-xs text-muted-foreground">The sample ballots, fingerprints and rollout states below are fictional. No real signatures or captured fleet history are bundled.</p>
 
     <Panel className="overflow-hidden">
@@ -64,7 +76,7 @@ export function GovernanceView({ ctx }: { ctx: Ctx }) {
         </li>)}
       </ol>
       <div className="border-t border-border/55 px-4 py-4 sm:px-5">
-        <div className="flex flex-wrap items-center justify-between gap-2"><div className="flex items-center gap-2 text-xs"><ShieldCheck className="h-4 w-4 text-online" /><span className="font-medium">Unanimous quorum</span></div><span className="font-mono text-[9px] text-muted-foreground sm:text-[10px]">{finalStats.accepted}/{finalStats.online} online ACCEPT · {finalStats.offlineQueued} offline queued</span></div>
+        <div className="flex flex-wrap items-center justify-between gap-2"><div className="flex items-center gap-2 text-xs"><ShieldCheck className="h-4 w-4 text-online" /><span className="font-medium">Fictional preview quorum</span></div><span className="font-mono text-[9px] text-muted-foreground sm:text-[10px]">{finalStats.accepted}/{finalStats.online} example ACCEPT · {finalStats.offlineQueued} example offline</span></div>
         <div className="mt-3 h-0.5 overflow-hidden rounded-full bg-muted" role="progressbar" aria-label="Online release quorum" aria-valuemin={0} aria-valuemax={finalStats.online} aria-valuenow={finalStats.accepted}><div className="h-full rounded-full bg-online transition-all" style={{ width: `${finalStats.accepted / finalStats.online * 100}%` }} /></div>
         <div className="mt-2 truncate font-mono text-[9px] text-muted-foreground">Service Bus · {RELEASE.serviceBus} / {RELEASE.queue}</div>
       </div>

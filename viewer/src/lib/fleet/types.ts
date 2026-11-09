@@ -23,7 +23,7 @@ export interface WireEvent {
   id: string; timestamp: string; type: "bridgePresence" | "bridgeRpcRequest" | "bridgeRpcResponse" | "inbox" | "outbox";
   target: string; fromMachine: string; toMachine: string; action: string; requestId?: string; summary: string; payload: unknown;
 }
-export interface Hub { endpoint: string; hub: string; version: string; viewerHost: string; connected: boolean; lastUpdatedAt: string }
+export interface Hub { machineId: string; endpoint: string; hub: string; version: string; viewerHost: string; connected: boolean; lastUpdatedAt: string }
 export interface Overview { hub: Hub; members: Member[]; sessions: Session[]; events: WireEvent[]; topology?: import("./topology").Topology }
 export interface Message { role: "user" | "assistant"; messageId: string; turnId: string | null; timestamp: string | null; content: string; toolCalls?: string[] }
 export interface Transcript { machineId: string; session: Pick<Session, "session_id" | "title" | "repo" | "branch" | "session_type" | "is_running">; messages: Message[] }

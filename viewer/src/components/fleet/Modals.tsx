@@ -21,7 +21,7 @@ export function NewSessionModal({ ctx, onClose }: { ctx: Ctx; onClose: () => voi
     try {
       const r = await post(ctx.base, ctx.mode, "/api/create-session", body, () => ({ ok: true, session_id: `ses-${Date.now().toString(16)}`, toMachine, title }));
       setOut(JSON.stringify(r, null, 2));
-      ctx.pushEvents([{ id: `evt-${Date.now()}`, timestamp: new Date().toISOString(), type: "outbox", target: toMachine, fromMachine: "LINUX-CONSOLE", toMachine, action: "create_session", summary: `create_session → ${toMachine} · ${title}`, payload: body }]);
+      ctx.pushEvents([{ id: `evt-${Date.now()}`, timestamp: new Date().toISOString(), type: "outbox", target: toMachine, fromMachine: ctx.data.hub.machineId, toMachine, action: "create_session", summary: `create_session → ${toMachine} · ${title}`, payload: body }]);
     } catch (e) { setOut(String(e)); }
     setBusy(false);
   };

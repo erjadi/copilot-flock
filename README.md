@@ -49,11 +49,28 @@ development-origin trust. Vite uses the fixed port5173 and forwards the correct
 backend Host. These browser protections are not LAN user/token authentication
 or a guarantee about every browser's private-network permission behavior.
 
-Live viewer transcript/project failures are visible errors, not synthetic
-working-tree or test-result substitutes. Synthetic content is preview-only;
-inactive views discard late read responses. Overview refreshes reuse an
+The viewer starts in **Live API** mode with no fabricated snapshot. Overview,
+roster, transcript and project failures remain visible errors or explicitly
+stale real data, never an automatic switch to synthetic success. The persistent
+header identifies the selected source and errors. Fictional data and simulated
+writes require selecting **Explicit fictional preview** in Connection settings.
+Changing mode or API base resets the view and discards late old-source results.
+Live event attribution uses the configured local machine ID, not preview labels.
+Overview refreshes reuse an
 in-flight transcript read for the same API source, machine and session, so
 the ten-second overview cadence does not starve slower reads.
+
+Live governance requires independently entering the full40-character expected
+commit SHA. The server forwards it to the canonical exact-source voter using
+its complete discovered electorate, not sample nodes or the filtered view.
+Existing older-peer preflight and local execution-consent gates still apply;
+the viewer cannot grant consent. Only explicit `approvedForMerge: true` with
+valid exact-source response tallies is shown as a reported quorum. Discovery
+completeness and same-SHA publication remain independent gates; ACCEPT never
+authorizes deployment, restart, provisioning or key operations. Diagnose is
+read-only and uses discovered targets. The example rounds remain fictional,
+including when viewing live results. A timed-out browser request does not
+cancel remote work or authorize a blind retry.
 
 ### Retained legacy broker/RPC compatibility
 

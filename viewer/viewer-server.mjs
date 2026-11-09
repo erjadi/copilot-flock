@@ -764,6 +764,7 @@ const server = http.createServer(async (req, res) => {
     const topology = buildTopologySnapshot(fleetCache.members);
     sendJson(res, 200, {
       hub: {
+        machineId: cfg.machineId,
         endpoint: cfg.endpoint,
         hub: cfg.hub,
         version: BRIDGE_VERSION,
@@ -916,7 +917,7 @@ const server = http.createServer(async (req, res) => {
     const mode = body.mode === "enqueue" ? "enqueue" : "immediate";
     const waitForReply = Boolean(body.waitForReply);
     const dryRun = Boolean(body.dryRun);
-    const fromMachine = body.fromMachine || cfg.machineId;
+    const fromMachine = cfg.machineId;
 
     if (!toMachine || !message) {
       sendJson(res, 400, { error: "Missing toMachine or message" });
@@ -1248,14 +1249,27 @@ const server = http.createServer(async (req, res) => {
   if (url.pathname === "/api/vote-release" && req.method === "POST") {
     const body = await readJsonBody(req);
     const branch = String(body.branch || "main").trim();
-    const machines = Array.isArray(body.machines) ? body.machines.join(",") : body.machines || "*";
+    const expectedCommit = body.expectedCommit;
+    if (typeof expectedCommit !== "string" || !/^[0-9a-f]{40}$/.test(expectedCommit)) {
+      sendJson(res, 400, { error: "Independently expected full 40-character commit SHA is required" });
+      return;
+    }
     try {
-      const voteRes = await voteReleaseAcrossFlock(cfg, { branch, machines });
+      const voteRes = await voteReleaseAcrossFlock(cfg, { branch, expectedCommit });
+      if (voteRes.expectedCommit !== expectedCommit || typeof voteRes.approvedForMerge !== "boolean" ||
+          !Number.isSafeInteger(voteRes.acceptCount) || !Number.isSafeInteger(voteRes.onlineVoterCount) ||
+          voteRes.acceptCount < 0 || voteRes.onlineVoterCount < voteRes.acceptCount ||
+          (voteRes.approvedForMerge && (voteRes.onlineVoterCount === 0 || voteRes.acceptCount !== voteRes.onlineVoterCount || voteRes.votersComplete !== true)) ||
+          !Array.isArray(voteRes.votes) || voteRes.votes.length !== voteRes.onlineVoterCount ||
+          voteRes.votes.some((vote) => !vote || typeof vote.machineId !== "string" || !vote.machineId.trim()) ||
+          new Set(voteRes.votes.map((vote) => vote.machineId.toLowerCase())).size !== voteRes.onlineVoterCount) {
+        throw new Error("Malformed or mismatched release vote result; merge remains blocked");
+      }
       pushWireEvent({
         type: "outbox",
         target: "governance",
         fromMachine: cfg.machineId,
-        toMachine: machines,
+        toMachine: voteRes.votes.map((vote) => vote.machineId).join(","),
         action: "review_release",
         summary: `vote-release (${branch}) → ${voteRes.acceptCount}/${voteRes.onlineVoterCount} ACCEPT`,
         payload: voteRes,
@@ -1266,6 +1280,7 @@ const server = http.createServer(async (req, res) => {
         accepted: voteRes.acceptCount,
         total: voteRes.onlineVoterCount,
         branch: voteRes.branch,
+        expectedCommit: voteRes.expectedCommit,
         votes: voteRes.votes,
       });
     } catch (err) {

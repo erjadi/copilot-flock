@@ -24,16 +24,17 @@ export async function req<T>(base: string, path: string, init?: RequestInit, tim
 let seedCache: Overview | null = null;
 export const getSeed = () => (seedCache ??= buildSeed());
 
-export async function fetchOverview(base: string): Promise<{ data: Overview; mode: Mode }> {
-  try {
-    const data = await req<Overview>(base, "/api/overview", undefined, 10000);
-    if (!data?.members) throw new Error("bad");
-    return { data: normalizeLegacyScopes(data), mode: "live" };
-  } catch {
-    const s = getSeed();
-    s.hub.lastUpdatedAt = new Date().toISOString();
-    return { data: { ...s }, mode: "seed" };
-  }
+export function emptyOverview(): Overview {
+  return { hub: { machineId: "", endpoint: "", hub: "", version: "", viewerHost: "", connected: false, lastUpdatedAt: "" }, members: [], sessions: [], events: [] };
+}
+
+export async function fetchOverview(base: string, mode: Mode = "live"): Promise<{ data: Overview; mode: Mode }> {
+  if (mode === "seed") return { data: getSeed(), mode };
+  if (mode !== "live") throw new Error("Select live or explicit preview mode.");
+  const data = await req<Overview>(base, "/api/overview", undefined, 10000);
+  if (!Array.isArray(data?.members) || !Array.isArray(data.sessions) || !Array.isArray(data.events) ||
+      typeof data.hub?.machineId !== "string" || !data.hub.machineId.trim()) throw new Error("Incomplete live overview or missing local machine identity.");
+  return { data: normalizeLegacyScopes(data), mode };
 }
 
 export async function fetchTranscript(base: string, mode: Mode, s: Session) {
@@ -67,13 +68,31 @@ export async function post<T = Record<string, unknown>>(
   mode: Mode,
   path: string,
   body: Record<string, unknown>,
-  simulate: () => T
+  simulate: () => T,
+  timeout = 120000
 ): Promise<T & { simulated?: boolean }> {
   if (mode === "live") {
-    return (await req<T>(base, path, { method: "POST", body: JSON.stringify(body) }, 120000)) as T & { simulated?: boolean };
+    return (await req<T>(base, path, { method: "POST", body: JSON.stringify(body) }, timeout)) as T & { simulated?: boolean };
   }
+  if (mode !== "seed") throw new Error("Simulation requires explicitly selected preview mode.");
   await delay(400 + Math.random() * 600);
   return { ...simulate(), simulated: true };
+}
+
+export const isExpectedCommit = (value: string) => /^[0-9a-f]{40}$/.test(value);
+
+export interface VoteResult { expectedCommit: string; approvedForMerge: boolean; accepted: number; total: number }
+export function readVoteResult(value: unknown, expectedCommit: string): VoteResult {
+  if (!isExpectedCommit(expectedCommit) || !value || typeof value !== "object" ||
+      !("expectedCommit" in value) || value.expectedCommit !== expectedCommit ||
+      !("approvedForMerge" in value) || typeof value.approvedForMerge !== "boolean" ||
+      !("accepted" in value) || typeof value.accepted !== "number" || !Number.isSafeInteger(value.accepted) ||
+      !("total" in value) || typeof value.total !== "number" || !Number.isSafeInteger(value.total) ||
+      value.accepted < 0 || value.total < value.accepted ||
+      (value.approvedForMerge && (value.total === 0 || value.accepted !== value.total))) {
+    throw new Error("Malformed or mismatched exact-source vote result; merge remains blocked.");
+  }
+  return { expectedCommit, approvedForMerge: value.approvedForMerge, accepted: value.accepted, total: value.total };
 }
 
 export function envelope(fromSession: string, toMachine: string, toSession: string, message: string, mode: string) {

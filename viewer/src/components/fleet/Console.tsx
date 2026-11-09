@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Command, Plus, RefreshCw, Settings2, Network, Server, MessagesSquare, Radio, Activity, ShieldCheck, Layers, Sun, Moon } from "lucide-react";
 import { resolveTheme, THEME_KEY, type Theme } from "@/lib/fleet/theme";
-import { fetchOverview, getSeed, normalizeLegacyScopes, type Mode } from "@/lib/fleet/api";
+import { emptyOverview, fetchOverview, getSeed, normalizeLegacyScopes, type Mode } from "@/lib/fleet/api";
 import { fakeEvent } from "@/lib/fleet/seed";
 import type { Overview, Session, WireEvent } from "@/lib/fleet/types";
 import { Btn, Dot, IconBtn, Input, Toggle, Select } from "./ui";
@@ -32,6 +32,11 @@ const TABS = [
 ] as const;
 
 export function Console() {
+  const [source, setSource] = useState<{ base: string; mode: Mode }>({ base: "", mode: "live" });
+  return <ConsoleConnection key={JSON.stringify(source)} {...source} setSource={setSource} />;
+}
+
+function ConsoleConnection({ base, mode, setSource }: { base: string; mode: Mode; setSource: (source: { base: string; mode: Mode }) => void }) {
   const [theme, setTheme] = useState<Theme>("dark");
   useEffect(() => {
     let saved: Theme = "dark";
@@ -47,15 +52,15 @@ export function Console() {
     document.documentElement.classList.add(next);
     try { localStorage.setItem(THEME_KEY, next); } catch { /* The toggle still works without storage. */ }
   };
-  const [flockId, setFlockId] = useState("erjadi");
-  const [flocks, setFlocks] = useState<FlockState>(() => seedFlocks(getSeed().members));
+  const [flockId, setFlockId] = useState(mode === "seed" ? "erjadi" : "");
+  const [flocks, setFlocks] = useState<FlockState>(() => mode === "seed" ? seedFlocks(getSeed().members) : { flocks: [], sharedThreads: [], maintainer: {} });
   const [flockError, setFlockError] = useState<string | null>(null);
   const [clock, setClock] = useState(Date.now());
-  const [base, setBase] = useState("");
-  const [baseDraft, setBaseDraft] = useState("");
-  const [mode, setMode] = useState<Mode>("seed");
-  const [data, setData] = useState<Overview>(() => getSeed());
-  const [events, setEvents] = useState<WireEvent[]>(() => getSeed().events);
+  const [baseDraft, setBaseDraft] = useState(base);
+  const [modeDraft, setModeDraft] = useState(mode);
+  const [data, setData] = useState<Overview>(() => mode === "seed" ? getSeed() : emptyOverview());
+  const [events, setEvents] = useState<WireEvent[]>(() => mode === "seed" ? getSeed().events : []);
+  const [liveError, setLiveError] = useState<string | null>(null);
   const [scope, setScope] = useState<ScopeFilter>("all");
   const [auto, setAuto] = useState(true);
   const [loading, setLoading] = useState(false);
@@ -66,15 +71,23 @@ export function Console() {
   const [settings, setSettings] = useState(false);
   const [sse, setSse] = useState<"connected" | "simulated" | "connecting">("connecting");
   const dataRef = useRef(data); dataRef.current = data;
+  const overviewRequest = useRef(0);
+  const flockRequest = useRef(0);
+  useEffect(() => () => { overviewRequest.current++; flockRequest.current++; }, []);
 
   const pushEvents = useCallback((e: WireEvent[]) => setEvents((p) => [...e, ...p].slice(0, 500)), []);
   const refresh = useCallback(async () => {
+    const request = ++overviewRequest.current;
     setLoading(true);
-    const r = await fetchOverview(base);
-    setMode(r.mode); setData(r.data);
-    if (r.mode === "live") setEvents((p) => { const ids = new Set(p.map((x) => x.id)); return [...r.data.events.filter((x) => !ids.has(x.id)), ...p].slice(0, 500); });
-    setLoading(false);
-  }, [base]);
+    try {
+      const r = await fetchOverview(base, mode);
+      if (request !== overviewRequest.current) return;
+      setData(r.data); setLiveError(null);
+      if (mode === "live") setEvents((p) => { const ids = new Set(p.map((x) => x.id)); return [...r.data.events.filter((x) => !ids.has(x.id)), ...p].slice(0, 500); });
+    } catch (error) {
+      if (request === overviewRequest.current) setLiveError(error instanceof Error ? error.message : String(error));
+    } finally { if (request === overviewRequest.current) setLoading(false); }
+  }, [base, mode]);
 
   useEffect(() => { refresh(); }, [refresh]);
   useEffect(() => { if (!auto) return; const t = setInterval(refresh, 10000); return () => clearInterval(t); }, [auto, refresh]);
@@ -103,8 +116,9 @@ export function Console() {
 
   const refreshFlocks = useCallback(async () => {
     if (mode === "seed") { setFlockError(null); return; }
-    try { const next = await fetchFlocks(base); setFlocks(next); setFlockError(null); setFlockId((current) => next.flocks.some((f) => f.flockId === current) ? current : next.flocks[0]?.flockId ?? ""); }
-    catch (error) { setFlocks(seedFlocks(dataRef.current.members)); setFlockError(`v3 flock data fallback: ${error instanceof Error ? error.message : "request failed"}`); }
+    const request = ++flockRequest.current;
+    try { const next = await fetchFlocks(base); if (request !== flockRequest.current) return; setFlocks(next); setFlockError(null); setFlockId((current) => next.flocks.some((f) => f.flockId === current) ? current : next.flocks[0]?.flockId ?? ""); }
+    catch (error) { if (request === flockRequest.current) setFlockError(`Live flock data unavailable; previous roster may be stale: ${error instanceof Error ? error.message : "request failed"}`); }
   }, [base, mode]);
   useEffect(() => { void refreshFlocks(); }, [refreshFlocks]);
   useEffect(() => { if (mode === "seed") setFlocks(seedFlocks(getSeed().members)); }, [mode, base]);
@@ -117,8 +131,9 @@ export function Console() {
     const active = flocks.flocks.find((f) => f.flockId === flockId) ?? flocks.flocks[0];
     if (!active || active.sessionVisibility !== "all") return [];
     const ids = new Set(view.members.map((m) => m.machineId));
+    ids.add(data.hub.machineId);
     return events.filter((e) => ids.has(e.fromMachine) && (e.toMachine || "").split(",").every((id) => ids.has(id) || id === "*"));
-  }, [events, flocks, flockId, view.members]);
+  }, [events, flocks, flockId, view.members, data.hub.machineId]);
   const online = view.members.filter((m) => m.online).length;
   const ctx: Ctx = { base, mode, flockId, data: view, scope, events: visibleEvents, pushEvents,
     openSession: (s) => { setSelected(s); setTab("sessions"); setInspectId(null); }, inspect: setInspectId };
@@ -156,7 +171,9 @@ export function Console() {
                 <button className="fixed inset-0 z-10 cursor-default" onClick={() => setSettings(false)} aria-label="Close settings" />
                 <div className="glass enter-up fixed right-3 top-[68px] z-20 max-h-[calc(100dvh-152px)] w-[min(320px,calc(100vw-24px))] overflow-y-auto rounded-xl p-4 md:absolute md:right-0 md:top-10">
                   <div className="mb-4 flex items-center justify-between"><div><div className="text-sm font-medium">Connection</div><div className="mt-0.5 text-[11px] text-muted-foreground">{mode === "live" ? "Live hub" : "Preview seed"} · SSE {sse}</div></div><Dot pulse={mode === "live"} tone={mode === "live" ? "online" : "muted"} /></div>
-                  <form onSubmit={(e) => { e.preventDefault(); setBase(baseDraft.trim()); setSettings(false); }}>
+                  <form onSubmit={(e) => { e.preventDefault(); setSource({ base: baseDraft.trim(), mode: modeDraft }); setSettings(false); }}>
+                    <label className="mb-1.5 block text-[10px] uppercase tracking-widest text-muted-foreground" htmlFor="source-mode">Data source</label>
+                    <Select id="source-mode" className="mb-3 w-full" value={modeDraft} onChange={(e) => setModeDraft(e.target.value === "seed" ? "seed" : "live")}><option value="live">Live API</option><option value="seed">Explicit fictional preview</option></Select>
                     <label className="mb-1.5 block text-[10px] uppercase tracking-widest text-muted-foreground" htmlFor="api-base">API base</label>
                     <div className="flex gap-2"><Input id="api-base" placeholder="Relative to this app" value={baseDraft} onChange={(e) => setBaseDraft(e.target.value)} /><Btn variant="outline" type="submit">Set</Btn></div>
                   </form>
@@ -169,6 +186,12 @@ export function Console() {
             </div>
             <Btn variant="primary" onClick={() => setNewOpen(true)} className="ml-1 h-10 min-w-10 md:h-8" aria-label="New session"><Plus className="h-3.5 w-3.5" /><span className="hidden lg:inline">New session</span></Btn>
           </div>
+        </div>
+        <div role={liveError || flockError ? "alert" : "status"} className={`border-t border-border/50 px-4 py-2 text-xs lg:px-6 ${liveError || flockError ? "text-destructive" : "text-muted-foreground"}`}>
+          {mode === "seed" ? "Preview — fictional data; all actions are simulated." : liveError
+            ? `Live unavailable: ${liveError}. ${data.hub.lastUpdatedAt ? `Showing stale snapshot from ${data.hub.lastUpdatedAt}.` : "No live snapshot loaded."} No simulated fallback.`
+            : `Live API · ${data.hub.machineId || "connecting"} · ${loading ? "refreshing" : data.hub.lastUpdatedAt ? `snapshot ${data.hub.lastUpdatedAt}` : "awaiting snapshot"} · stream ${sse}`}
+          {mode === "live" && flockError && <span className="ml-2">{flockError}</span>}
         </div>
       </header>
 

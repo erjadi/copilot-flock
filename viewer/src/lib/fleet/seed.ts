@@ -78,7 +78,7 @@ export function buildSeed(): Overview {
   const events: WireEvent[] = [];
   for (let i = 0; i < 24; i++) events.push(...fakeEvent(members, sessions, 60 - i * 2));
   return {
-    hub: { endpoint: "https://your-signalr.service.signalr.net", hub: "v3_flock_00000000000040008000000000000001", version: "3.1.0", viewerHost: "LINUX-CONSOLE (10.0.0.14)", connected: true, lastUpdatedAt: new Date().toISOString() },
+    hub: { machineId: "LINUX-CONSOLE", endpoint: "https://your-signalr.service.signalr.net", hub: "v3_flock_00000000000040008000000000000001", version: "3.1.0", viewerHost: "LINUX-CONSOLE (10.0.0.14)", connected: true, lastUpdatedAt: new Date().toISOString() },
     members, sessions, events: events.reverse(),
   };
 }

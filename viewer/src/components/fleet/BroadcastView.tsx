@@ -28,7 +28,7 @@ export function BroadcastView({ ctx }: { ctx: Ctx }) {
       ? { envelopePreview: matched.map((m) => envelope("fleet-console", m.machineId, newSession ? "<new>" : toSession || "<coordinator>", message, "immediate")).join("\n\n") }
       : { results: matched.map((m) => ({ machineId: m.machineId, ok: Math.random() > 0.08, latencyMs: 60 + Math.floor(Math.random() * 500), detail: newSession ? `created "${title || "Broadcast session"}"` : wait ? "reply: ack" : "delivered" })) });
     if (dryRun) { setPreview(r.envelopePreview ?? JSON.stringify(r, null, 2)); setRows(null); }
-    else { setRows(r.results ?? []); setPreview(null); ctx.pushEvents([{ id: `evt-${Date.now()}`, timestamp: new Date().toISOString(), type: "outbox", target: "broadcast", fromMachine: "LINUX-CONSOLE", toMachine: matched.map((m) => m.machineId).join(","), action: "send_message", summary: `broadcast → ${matched.length} machines`, payload: body }]); }
+    else { setRows(r.results ?? []); setPreview(null); ctx.pushEvents([{ id: `evt-${Date.now()}`, timestamp: new Date().toISOString(), type: "outbox", target: "broadcast", fromMachine: ctx.data.hub.machineId, toMachine: matched.map((m) => m.machineId).join(","), action: "send_message", summary: `broadcast → ${matched.length} machines`, payload: body }]); }
     setBusy(false);
   };
 

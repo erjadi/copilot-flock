@@ -194,8 +194,8 @@ export function TopologyView({ ctx, flocks, flockError }: { ctx: Ctx; flocks: Fl
     const lat = Math.round(performance.now() - t0);
     const rid = `req-ping-${Date.now()}`;
     ctx.pushEvents([
-      { id: `${rid}-r`, timestamp: new Date().toISOString(), type: "bridgeRpcResponse", target: "LINUX-CONSOLE", fromMachine: id, toMachine: "LINUX-CONSOLE", action: "ping", requestId: rid, summary: `ping ok · ${lat}ms`, payload: { ...r, ok: true, latencyMs: lat } },
-      { id: `${rid}-q`, timestamp: new Date(Date.now() - lat).toISOString(), type: "bridgeRpcRequest", target: id, fromMachine: "LINUX-CONSOLE", toMachine: id, action: "ping", requestId: rid, summary: `ping → ${id}`, payload: { requestId: rid } },
+      { id: `${rid}-r`, timestamp: new Date().toISOString(), type: "bridgeRpcResponse", target: ctx.data.hub.machineId, fromMachine: id, toMachine: ctx.data.hub.machineId, action: "ping", requestId: rid, summary: `ping response · ${lat}ms`, payload: r },
+      { id: `${rid}-q`, timestamp: new Date(Date.now() - lat).toISOString(), type: "bridgeRpcRequest", target: id, fromMachine: ctx.data.hub.machineId, toMachine: id, action: "ping", requestId: rid, summary: `ping → ${id}`, payload: { requestId: rid } },
     ]);
     return lat;
   };

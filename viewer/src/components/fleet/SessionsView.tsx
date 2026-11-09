@@ -62,7 +62,7 @@ function TranscriptPane({ ctx, s, onBack }: { ctx: Ctx; s: Session; onBack: () =
       if (dryRun) setResult({ kind: "preview", text: String(r.envelopePreview ?? JSON.stringify(r, null, 2)) });
       else {
         setResult({ kind: "sent", text: JSON.stringify(r, null, 2) });
-        ctx.pushEvents([{ id: `evt-${Date.now()}`, timestamp: new Date().toISOString(), type: "outbox", target: s.machineId, fromMachine: "LINUX-CONSOLE", toMachine: s.machineId, action: "send_message", requestId: String(r.requestId ?? ""), summary: `send_message → ${s.machineId} · ${s.title}`, payload: body }]);
+        ctx.pushEvents([{ id: `evt-${Date.now()}`, timestamp: new Date().toISOString(), type: "outbox", target: s.machineId, fromMachine: ctx.data.hub.machineId, toMachine: s.machineId, action: "send_message", requestId: String(r.requestId ?? ""), summary: `send_message → ${s.machineId} · ${s.title}`, payload: body }]);
         if (t) setT({ ...t, messages: [...t.messages, { role: "user", messageId: `m${Date.now()}`, turnId: "steer", timestamp: new Date().toISOString(), content: msg }, ...(r.reply ? [{ role: "assistant" as const, messageId: `r${Date.now()}`, turnId: "steer", timestamp: new Date().toISOString(), content: String(r.reply) }] : [])] });
         setMsg("");
       }
