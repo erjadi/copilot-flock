@@ -117,7 +117,9 @@ test("immutable release validation runs in a bounded worker without blocking the
     assert.equal(verifyReleaseCoverage(result), true);
     assert.equal(readExpectedReleaseCoverage({ repoDir: directory, expectedCommit: sha }).coverageHash, result.coverageHash);
     assert.ok(heartbeatTicks >= 2, "Parent event-loop heartbeat must continue during validation");
-    assert.ok(RELEASE_REVIEW_TIMEOUT_MS > 360000, "RPC budget must cover the bounded worker and Git preflight");
+    assert.ok(RELEASE_REVIEW_TIMEOUT_MS > RELEASE_VALIDATION_POLICY.workerTimeoutMs, "RPC budget must cover the bounded worker and Git preflight");
+    assert.equal(RELEASE_VALIDATION_POLICY.testTimeoutMs, 600000);
+    assert.equal(RELEASE_VALIDATION_POLICY.workerTimeoutMs, 660000);
   } finally { clearInterval(timer); }
   await assert.rejects(() => validateReleaseCandidateInWorker({ repoDir: directory, commit: "main" }), /immutable commit SHA/);
   fs.writeFileSync(testPath, 'import test from "node:test"; test("synthetic failure", () => { throw new Error("Synthetic candidate rejection"); });');

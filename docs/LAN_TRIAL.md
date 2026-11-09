@@ -11,22 +11,22 @@ are real work, not a guaranteed quick-start duration.
 It is not a smaller full Flock, an offline cloud replacement or an OS sandbox.
 **The real day-to-day potential comes from deploying full Copilot Flock's
 components:** SignalR Serverless for real-time rendezvous, Service Bus for
-durable offline messages, and the Token Broker for reusable signed enrollment.
-The broker is optional when configuring full Flock directly with credentials;
-deploy it for the owner-once, signed-invites-for-machines-2..N journey.
+durable offline messages, and a signed Pages roster for fresh Zero-Broker
+enrollment. The Token Broker and direct-credential installation are separate
+legacy journeys, not fresh defaults or hidden fallbacks from this trial.
 
-| Daily engineering need | Hubless "Try It Out" trial | Full deployed Flock |
+| Daily engineering need | Hubless "Try It Out" trial | Full deployed Flock (legacy capabilities where labeled) |
 | --- | --- | --- |
 | Connect PCs | Choose private IPv4/ports and run direct listeners; check host firewall policy and consent to specific rules if needed. | Cloud rendezvous avoids peer inbound firewall/NAT forwarding. SignalR uses outbound WSS443; actual Service Bus transport and network policy still matter. |
 | Move between networks | No discovery or traversal; direct routes can fail after roaming, VPN changes, VLAN boundaries or client isolation. | Designed for home/office/hotspot/cloud networks with permitted outbound connectivity; corporate restrictions can still block it. |
 | Message a sleeping PC | No queue. Peer must be reachable and listening; never retry ambiguous delivery blindly. | Service Bus retains/drains offline messages under its configured retention, credentials and deduplication behavior. |
-| Onboard more PCs | Public offer exchange, independent fingerprint verification and reciprocal approvals for each pairing. | Deploy once; broker-issued `copilot-flock-invite-v3` supports one-step Copilot-led enrollment. Timing depends on environment. |
+| Onboard more PCs | Public offer exchange, independent fingerprint verification and reciprocal approvals for each pairing. | Fresh Zero-Broker uses independently pinned signed-roster invites and explicit claims/grants. Legacy broker invites require independent issuer-origin confirmation. Timing depends on environment. |
 | Ask who knows about a topic | Manually pick/share session UUIDs and permissions. | Pass-through coordinator targets a sub-two-second handoff; tracker searches permitted local sessions and synthesizes responses. |
 | Use headless GPU servers | Unsupported: existing Desktop control plane only. | Full runtime includes headless Ubuntu/Debian CLI hosts as well as Desktop x64/ARM64 hosts. |
 | Share across teams | Local per-peer/per-session grants only. | Owner/flock/machine hierarchy, personal/work scopes, collaborator boundaries and expiring guest memberships. External sessions remain opt-in. |
-| Start a worker remotely | Not provided. | Remote session creation and orchestration. |
-| Move files/branches | Not provided. | SHA-256 chunked file and Git-bundle transfer. |
-| Coordinate resources | Not provided. | Distributed resource locks, GPU VRAM telemetry and fleet topology visualization. |
+| Start a worker remotely | Not provided. | Legacy remote session creation/orchestration under its authority rules; not a fresh Zero-Broker capability. |
+| Move files/branches | Not provided. | Legacy SHA-256 chunked file and Git-bundle transfer; not a fresh Zero-Broker capability. |
+| Coordinate resources | Not provided. | Legacy distributed locks, GPU telemetry and topology; fresh Zero-Broker roster membership is not live telemetry. |
 | Govern releases | No release votes. | Signed Ed25519 fleet release voting; the seven baseline tests are coverage, not seven votes or a governance guarantee. |
 | Permissions | No changes to selected existing-session mode/permissions, no privileged CLI fallback. | Broader coordinator/headless capabilities require separate trust/permission review. |
 
@@ -440,7 +440,8 @@ See README's versioned platform matrix: the full runtime's Linux headless
 deployment path is distinct from the trial's Desktop-only adapter; r5's
 Linux/ARM64 isolated tests do not establish live Desktop support there.
 Deploying the full components requires a cost decision: SignalR's Free tier
-has quotas, Service Bus Standard enables topics/subscriptions, and Token Broker
-hosting is separately billed. The deployed design needs no inbound application
+has quotas, Service Bus Standard enables topics/subscriptions, and optional
+legacy Token Broker hosting is separately billed. Fresh Zero-Broker instead
+requires signed Pages roster publication. The deployed design needs no inbound application
 listener, but standard corporate HTTPS/WSS proxy and egress policies still
 apply; the actual Service Bus transport must be allowed too.

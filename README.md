@@ -190,6 +190,9 @@ Git commit in a temporary-profile, bounded worker, without blocking the daemon d
 the full root suite. It checks every `.mjs`, requires the canonical/compatibility
 entry points to match, and requires all seven root suites, including the
 actual legacy RPC security regressions and both Zero-Broker suites.
+The serial 95-test integration took 364 seconds on the validation host, so the
+signed policy bounds tests at ten minutes and the worker at eleven minutes;
+the RPC budget is twelve-and-a-half minutes. No suite or selector gate is weakened.
 The compatibility fast check includes its local fixture dependency and an
 isolated profile; it does not replace full-candidate validation.
 Release requests require the independently expected full SHA, not branch
@@ -373,9 +376,9 @@ Most developers and engineers work across more than one machine: a **work laptop
 
 **Copilot Flock (`copilot-flock`) bridges those islands:**
 - **Talk to Copilot, Not the Terminal**: You never need to memorize CLI flags. Just tell your Copilot *"Ask my home desktop what branch it's on"*, *"Broadcast to all RTX machines to check free VRAM"*, or *"Invite @alice to erjadi/studio-team"*.
-- **Sleeping Laptop? No Problem**: Real-time messages travel over **Azure SignalR WebSockets** (`< 50ms`). If a laptop is asleep or powered off, messages wait safely in **Azure Service Bus** and drain automatically the moment it wakes up.
+- **Online and Offline Transport**: SignalR WebSockets provide real-time routing where network policy permits; latency is not guaranteed. Offline receipts distinguish confirmed Service Bus publication from legacy broker-file persistence and unconfirmed runtime admission. Sleeping-PC delivery depends on retention, credentials, connectivity and reconciliation, not merely an offline badge.
 - **Works Everywhere (GUI + Headless Linux)**: Bridges **GitHub Copilot Desktop** (`ws.port` local control plane on Windows/macOS/Linux) and **headless GitHub Copilot CLI** (`copilot -p --session-id=<uuid> --allow-all` on Ubuntu/Debian/Jetson/SBCs).
-- **100% Private BYO Cloud (Zero Hardcoded Vendor Keys)**: This repository contains zero hardcoded endpoints or credentials. You either join an existing flock with a **1-step Invite JSON** or run your own flock in your own Azure subscription for pennies.
+- **BYO Cloud and Explicit Trust**: Deployment uses your chosen Azure resources and credentials. Confirm invite issuer/root trust independently. SignalR Free has quotas; Service Bus Standard and optional legacy broker hosting have separate charges. Cloud-provider and network-policy boundaries still apply.
 
 ---
 
@@ -536,11 +539,11 @@ Sharing a GPU server or cloud VM with a teammate or guest **never** exposes your
 | :--- | :--- | :--- |
 | **[`AGENTS.md`](./AGENTS.md)** | **AI Copilots** pointed at this repository | Decision tree for **Case 1 (Invite)** vs **Case 2 (BYO Azure)**, routing rules, Two-Coordinator pattern, and pre-merge voting. |
 | **[`docs/JOINING_AND_SHARING_GUIDE.md`](./docs/JOINING_AND_SHARING_GUIDE.md)** | **Humans & Teammates (Case 1)** | Joining via 1-step Invite JSON, adding your own PCs, collaborator flocks (`<owner>/<team>`), 4-hour guest passes, and thread sharing. |
-| **[`docs/BOOTSTRAP_NEW_FLOCK_BYO_AZURE.md`](./docs/BOOTSTRAP_NEW_FLOCK_BYO_AZURE.md)** | **New Flock Owners & DevOps (Case 2)** | Setting up a brand-new flock instance with BYO Azure SignalR (`Serverless`) + Service Bus + optional Token Broker. |
+| **[`docs/BOOTSTRAP_NEW_FLOCK_BYO_AZURE.md`](./docs/BOOTSTRAP_NEW_FLOCK_BYO_AZURE.md)** | **New Flock Owners & DevOps** | Fresh Zero-Broker signed-roster setup, acceptance limits, and separately selected legacy broker/direct-credential reference flows. |
 | **[`skills/flock-topology/SKILL.md`](./skills/flock-topology/SKILL.md)** | **Bundled Topology Skill** | Auto-installed skill teaching Copilot how to render `flowchart LR` Mermaid diagrams, Overlap Matrices, and Dark/Light Bipartite SVGs. |
 | **[`skills/copilot-flock/SKILL.md`](./skills/copilot-flock/SKILL.md)** | **Bundled Cross-Machine Skill** | Auto-installed skill teaching Copilot same-machine vs cross-machine routing and conversational flock management. |
-| **[`docs/V3_MULTI_FLOCK_ARCHITECTURE.md`](./docs/V3_MULTI_FLOCK_ARCHITECTURE.md)** | **Security & Systems Architects** | Deep-dive specification of the `v3` cryptographic envelope, Ed25519 key hierarchy, `/api/v3/*` endpoints, and threat model. |
-| **[`docs/V3_IMPLEMENTATION_AND_TEST_PLAN.md`](./docs/V3_IMPLEMENTATION_AND_TEST_PLAN.md)** | **Contributors & Reviewers** | Test suite coverage (`test/flock.test.mjs`), `--sandbox v3` isolation testing, and adversarial release voting (`vote-release`). |
+| **[`docs/V3_MULTI_FLOCK_ARCHITECTURE.md`](./docs/V3_MULTI_FLOCK_ARCHITECTURE.md)** | **Historical design readers** | Archived legacy v3 RFC; proposals are not current implementation, security guarantees or live authorization. |
+| **[`docs/V3_IMPLEMENTATION_AND_TEST_PLAN.md`](./docs/V3_IMPLEMENTATION_AND_TEST_PLAN.md)** | **Historical design readers** | Archived implementation/test plan, not current test inventory or acceptance evidence. |
 
 ---
 
@@ -557,8 +560,8 @@ Sharing a GPU server or cloud VM with a teammate or guest **never** exposes your
 
 | Question | Answer |
 | :--- | :--- |
-| **What happens if I message a laptop while it is asleep or powered off?** | The message is persisted in **Azure Service Bus** (`Standard` topic `copilot-bridge-offline`) and replayed automatically with write-ahead `inFlightIds` deduplication the moment the laptop wakes up. |
-| **Does it work over corporate VPNs, NordVPN, or OpenVPN?** | Yes. All traffic uses outbound `TCP 443` (`HTTPS`/`WSS`), and the built-in IPv4-first DNS resolver (`ipv4Lookup` + `dns.resolve4` fallback cache) prevents dead VPN IPv6 DNS adapters from blackholing SignalR reconnects. |
+| **What happens if I message a laptop while it is asleep or powered off?** | Check its receipt: confirmed Service Bus publication, legacy broker persistence and unknown runtime admission are different stages. Retention and reconnect/reconciliation must succeed; queue acceptance does not confirm task execution. |
+| **Does it work over corporate VPNs, NordVPN, or OpenVPN?** | Only where routing, proxy and egress policies permit. SignalR uses outbound TCP 443; check the actual Service Bus transport separately. IPv4-first DNS can mitigate broken IPv6 paths, not bypass policy or guarantee VPN reachability. |
 | **How does background boot persistence work on Windows vs. Headless Linux?** | On Windows, `install` registers `copilot-flock.vbs` in your Startup folder (runs at user login). On Linux, `install` enables `~/.config/systemd/user/copilot-flock.service` (run `sudo loginctl enable-linger "$USER"` once on headless servers so it runs at boot without a console login). |
 | **Does giving a teammate or guest access to a machine let them read my other chats or run arbitrary commands?** | **No.** External flocks see `0` existing threads unless you explicitly run `share_thread` (which exports a static, read-only `approved-snapshot` summary). Cross-user/guest callers are restricted to informational queries within `boundFlockId`; `autopilot` + `allow-all` Coordinator/Thread Tracker execution is strictly limited to same-owner flocks. |
-| **How do I check health or repair all machines in my flock?** | Just tell your Copilot: *"Diagnose and repair the flock"* (runs `diagnose_bridge_fleet` with `auto_fix: true`). |
+| **How do I check health or repair all machines in my flock?** | Ask Copilot to diagnose read-only first. Legacy `diagnose_bridge_fleet` uses `fix: false`, not `auto_fix`; unknown probes remain unknown. Review proposed repairs and explicitly authorize changes to sessions, permissions, modes or live services. Zero-Broker uses its native status path, not a legacy fallback. |

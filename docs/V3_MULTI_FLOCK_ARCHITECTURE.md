@@ -1,5 +1,15 @@
 # Copilot SignalR Bridge `v3.0` — Multi-Flock P2P Platform Architecture & RFC
 
+> **Archived historical proposal, not the current security specification.**
+> Original branch names, baseline versions, authority, voucher verification,
+> revocation/rotation and deployment proposals below are retained as history,
+> not evidence that they shipped or permission to operate live services.
+> Profile "sandbox" isolation is not OS isolation. Use the current
+> [README](../README.md), [setup/authority guide](./BOOTSTRAP_NEW_FLOCK_BYO_AZURE.md)
+> and [joining guide](./JOINING_AND_SHARING_GUIDE.md) for implemented boundaries
+> and explicit legacy limitations. Fresh Zero-Broker and the LAN trial are
+> separate journeys; this RFC authorizes neither migration nor release.
+
 - **Status**: Draft RFC for Flock Peer Review (`branch: v3-multi-flock-design`)
 - **Baseline**: `v2.2.0` (`5fc4b3e`)
 - **Platform Maintainer**: `@erjadi` (`your-signalr.service.signalr.net` / `your-flock-bootstrap.azurewebsites.net`)

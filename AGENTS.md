@@ -107,8 +107,8 @@ Before running `install`, determine which of the two bootstrap cases applies:
 ```mermaid
 flowchart LR
   START["🤖 Copilot pointed at<br/><b>copilot-flock</b> repo"] --> CHECK{"Did the user provide an<br/>Invite / Enrollment JSON<br/>(or existing bootstrapUrl)?"}
-  CHECK -- "YES → CASE 1" --> CASE1["🟢 <b>Case 1: Join Existing Flock</b><br/>• bootstrapUrl is inside the Invite JSON<br/>• Zero Azure CLI / cloud setup needed<br/>• Single command:<br/>  node flock.mjs install --invite-file invite.json"]
-  CHECK -- "NO → CASE 2" --> CASE2["🟣 <b>Case 2: New Flock (BYO Azure)</b><br/>• User is starting their own new flock<br/>• Provision or connect BYO Azure SignalR<br/>  (Serverless) + Service Bus (Standard)<br/>• Run: node flock.mjs install --connection-string ..."]
+  CHECK -- "YES → CASE 1" --> CASE1["🟢 <b>Case 1: Legacy Invite</b><br/>• Independently confirm issuer origin first<br/>• Zero Azure CLI / cloud setup needed<br/>• Copilot installs with the confirmed origin pin"]
+  CHECK -- "NO → CASE 2" --> CASE2["🟣 <b>Case 2: Explicit Legacy BYO Azure</b><br/>• Confirm legacy architecture and costs<br/>• Provision or connect SignalR + Service Bus<br/>• Use explicit legacy installation selectors"]
 ```
 
 ### Fresh-Machine Prerequisite Tip (Zero-UAC Node.js `>= 22.5` & Bundled `git`/`gh`)
@@ -123,26 +123,30 @@ flowchart LR
   - This machine already has `~/.copilot/flock/config.json` with a configured `bootstrapUrl` / `connectionString`.
 - **Why zero Azure setup is needed**:
   - The signed Enrollment JSON already contains `"bootstrapUrl": "https://.../api/bootstrap"`.
-- **Exact single command you (Copilot) should run**:
+- **After independent local-user confirmation of the issuer origin, Copilot runs**:
   ```powershell
   # Save the pasted copilot-flock-invite-v3 JSON to a temporary file and run install --invite-file:
   # (Extracts bootstrapUrl from the JSON, generates a local Ed25519 keypair, enrolls via /api/v3/enroll,
   #  and installs the daemon, MCP server, and copilot-flock + flock-topology skills in one step!)
-  node flock.mjs install --invite-file "<path-to-invite.json>"
+  node flock.mjs install --architecture legacy --invite-file "<path-to-invite.json>" --bootstrap-origin-pin "<independently-confirmed-https-origin>"
   ```
   ```bash
   # Linux / macOS equivalent:
-  node ./flock.mjs install --invite-file "<path-to-invite.json>"
+  node ./flock.mjs install --architecture legacy --invite-file "<path-to-invite.json>" --bootstrap-origin-pin "<independently-confirmed-https-origin>"
   ```
-  *(If `copilot-flock` is already installed and running on this PC and you are joining an additional collaborator or guest flock, you can also call the `enroll_from_invite_json` MCP tool or `node "$HOME/.copilot/flock/flock.mjs" join-flock --invite-file "<path-to-invite.json>"`.)*
+  For an existing legacy installation, additional enrollment also requires an
+  independently confirmed saved origin pin or
+  `--bootstrap-origin-pin "<independently-confirmed-https-origin>"` with
+  `join-flock --invite-file "<path-to-invite.json>"`. The invitation itself
+  does not establish issuer trust.
 - See **[`docs/JOINING_AND_SHARING_GUIDE.md`](docs/JOINING_AND_SHARING_GUIDE.md)** for full details on multi-PC vouchers (`maxDevices: 3`), collaborator flocks, and time-bound guest passes (`durationMinutes`).
 
-### Case 2 — The User is Setting Up a Brand-New Flock Instance (BYO Azure SignalR + Service Bus)
+### Case 2 — Explicit Legacy BYO Azure SignalR + Service Bus
 - **When this applies**:
   - The user asks you to *"install Copilot Flock to set up a new instance"* or *"create a new flock for my machines"*, and they do **not** have an invite JSON from an existing flock.
 - **Why BYO Azure SignalR + Service Bus is required**:
   - This repository contains **zero hardcoded vendor URLs, subscription IDs, or keys**. A new standalone flock uses two lightweight resources in the user's own Azure subscription:
-    1. **Azure SignalR Service (`Serverless` mode, `Free_F1` or `Standard_S1`)** — for sub-50ms real-time WebSocket messaging across LANs/VPNs/NATs (`TCP 443`).
+    1. **Azure SignalR Service (`Serverless` mode, `Free_F1` or `Standard_S1`)** — for real-time WebSocket messaging over outbound TCP 443 where network policy permits; latency is not guaranteed.
     2. **Azure Service Bus Namespace (`Standard` SKU with topic `copilot-bridge-offline`)** — for durable topic/subscription offline message queueing when laptops sleep or power off.
     3. *(Optional)* **Bootstrap Token Broker (`bootstrap-server.mjs`)** — a tiny Node.js service on Azure App Service / Container Apps so the owner can generate 1-step Case 1 invite JSONs for their other PCs and guests without copying connection strings.
 - **What you (Copilot) should do for Case 2**:
@@ -150,8 +154,9 @@ flowchart LR
   2. Ask whether they want you to **provision a new Azure SignalR + Service Bus via `az` CLI** or **use existing connection strings**.
   3. For approved provisioning, prefer the managed ARM flow in
      **[`docs/BOOTSTRAP_NEW_FLOCK_BYO_AZURE.md`](docs/BOOTSTRAP_NEW_FLOCK_BYO_AZURE.md)**:
-     run `.\setup.ps1 -ProvisionAzure -Scope <personal|work>` on Windows or
-     `./setup.sh --provision-azure --scope <personal|work>` on Debian/Ubuntu or
+     for this explicitly selected legacy flow, run
+     `.\setup.ps1 -Legacy -ProvisionAzure -Scope <personal|work>` on Windows or
+     `./setup.sh --legacy --provision-azure --scope <personal|work>` on Debian/Ubuntu or
      macOS. Confirm the Azure subscription, region, resource group, tool-install
      consent and Service Bus charges first. The wrappers install Azure CLI if
      needed, authenticate, deploy `infra/azuredeploy.json`, and pass both keys
@@ -163,6 +168,7 @@ flowchart LR
      For an approved existing-credentials setup, run:
      ```powershell
      node flock.mjs install `
+       --architecture legacy `
        --scope <personal|work> `
        --connection-string "<SIGNALR_CONNECTION_STRING>" `
        --servicebus-connection-string "<SERVICEBUS_CONNECTION_STRING>" `
@@ -197,16 +203,17 @@ flowchart LR
 
 ---
 
-## 3. What `node flock.mjs install` Installs Automatically
+## 3. What Explicit Legacy Installation Installs
 
-Running `node flock.mjs install` (zero external npm dependencies; works on Windows 11 x64/ARM64, macOS, and Linux x64/ARM64):
+Running `node flock.mjs install --architecture legacy` uses the retained
+legacy installer. Platform deployment paths are not all-platform live acceptance:
 1. Installs `~/.copilot/flock/flock.mjs` (and legacy compatibility shim `bridge.mjs`).
 2. Writes `~/.copilot/flock/config.json` (`0600` owner-only permissions on POSIX) with `machineId`, `scope` (`"personal"` or `"work"`), `githubUser`, Ed25519 key fingerprint, and probed hardware `specs` (CPU, RAM, all GPUs + live free VRAM, disks).
 3. Registers the `copilot-flock` stdio MCP server in `~/.copilot/mcp-config.json`.
 4. **Automatically installs two bundled skills** into `~/.copilot/skills/` and the Copilot Desktop `app-skills` directory:
    - **`copilot-flock`** (`skills/copilot-flock/SKILL.md`) — Cross-machine routing, invites, and multi-flock thread sharing.
    - **`flock-topology`** (`skills/flock-topology/SKILL.md`) — Live `flowchart LR` Mermaid diagrams, Markdown Overlap Matrices, and Dark / Light Warm-Alabaster Bipartite SVG topology maps.
-5. Configures OS boot persistence (Windows Startup `copilot-flock.vbs` or Linux `systemd --user` `copilot-flock.service`).
+5. Configures Windows user-sign-in persistence (`copilot-flock.vbs`) or Linux `systemd --user` persistence (headless boot requires lingering).
 6. Provisions both local coordinator threads (`Copilot Flock Coordinator` and `Copilot Flock Thread Tracker`) in `autopilot` + `allow-all` mode and verifies a live round-trip SignalR ping.
 
 ---
@@ -238,7 +245,9 @@ Each enrolled machine runs two distinct coordinator threads:
 ## 6. Mandatory Pre-Merge Flock Review & Vote Rule
 
 Before merging or releasing **any** change to `copilot-flock`:
-1. Run `node --test test/flock.test.mjs` locally.
+1. Run the full seven-suite root inventory (`npm test`) and validate the exact
+   immutable candidate with the complete versioned module/test coverage policy.
+   The single `test/flock.test.mjs` suite or compatibility smoke is insufficient.
 2. Run a flock-wide cryptographic release vote across all online members:
    Each voter must first review the exact candidate without executing it and
    obtain local exact-SHA host-code-execution consent. Copilot records that
@@ -251,8 +260,11 @@ Before merging or releasing **any** change to `copilot-flock`:
    ```powershell
    node ~/.copilot/flock/flock.mjs vote-release --branch "<branch>" --commit "<independently-expected-full-sha>"
    ```
-3. Only merge/push to `main` and run `node ~/.copilot/flock/flock.mjs reprovision` after all online members of the flock vote **`ACCEPT`**.
+3. Only merge/push the approved exact candidate to `main` after all online
+   members of the declared discovery snapshot vote **`ACCEPT`**.
    Require version-3 registered-key ballots for that exact expected SHA and
    Git-tree coverage/policy hash. Capability preflight must not send tests to
    older ungated peers. Never merge a different HEAD or infer intent from a
-   unanimous moved branch; live reprovisioning still needs separate consent.
+   unanimous moved branch. ACCEPT does not authorize live reprovisioning,
+   installation, restart, cloud changes or key operations; obtain separate
+   local-user consent for those actions.

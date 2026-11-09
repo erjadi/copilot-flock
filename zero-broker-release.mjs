@@ -6,7 +6,7 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { RELEASE_VALIDATION_POLICY, createReleaseCoverage, verifyReleaseCoverage, releaseTreeFiles } from "./release-policy.mjs";
 
-export const RELEASE_REVIEW_TIMEOUT_MS = 450000;
+export const RELEASE_REVIEW_TIMEOUT_MS = 750000;
 const execFileAsync = promisify(execFile);
 
 function sqliteFlags() {

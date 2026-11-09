@@ -58,7 +58,11 @@ When a flock owner generates an invite, their Copilot produces a **1-step copy-p
 Notice that **`bootstrapUrl` is embedded directly inside the signed JSON**:
 - The recipient **never** needs an Azure subscription, Azure CLI login, or connection string.
 - Even if the recipient hasn't installed `copilot-flock` yet, they simply paste the invite message into their GitHub Copilot chat.
-- Their Copilot clones `https://github.com/erjadi/copilot-flock`, reads `AGENTS.md`, generates a local Ed25519 keypair (`~/.copilot/flock/keys/`), presents the signed voucher + their GitHub identity to `bootstrapUrl` (`/api/v3/enroll`), and receives a scoped 60-minute hub token!
+- After independent issuer-origin confirmation, their Copilot clones
+  `https://github.com/erjadi/copilot-flock`, reads `AGENTS.md`, and uses the
+  legacy `~/.copilot/flock/identity.json` device identity and `flocks.json`
+  membership store. Enrollment presents the voucher and GitHub identity to
+  the confirmed `/api/v3/enroll` issuer for a scoped, expiring hub token.
 
 ---
 
@@ -69,8 +73,10 @@ Whether you are the **flock owner adding your 2nd PC**, a **teammate joining a s
 1. Open **GitHub Copilot Desktop** (or **GitHub Copilot CLI** on a headless Linux server).
 2. Paste the invite message you received (or tell your Copilot):
    > *"Clone `https://github.com/erjadi/copilot-flock`, read `AGENTS.md`, and enroll me using this invite JSON: `<paste JSON>`"*
-3. **Done!** In ~5 seconds, your Copilot:
-   - Installs `~/.copilot/flock/flock.mjs` and configures OS boot persistence (Windows Startup `.vbs` or Linux `systemd --user` `copilot-flock.service`).
+3. Copilot confirms the independent issuer-origin pin and required local
+   permissions, then performs installation and verifies enrollment. Timing
+   depends on dependencies, network policy and approvals; there is no five-second guarantee.
+   - Installs `~/.copilot/flock/flock.mjs` and configures Windows user-sign-in persistence (Startup `.vbs`) or Linux `systemd --user` `copilot-flock.service` (headless boot requires lingering).
    - Enrolls your machine into the target flock (`<owner>/<flock>`) and saves `bootstrapUrl` in `~/.copilot/flock/config.json`.
    - Registers the `copilot-flock` MCP server and installs the `copilot-flock` + `flock-topology` skills.
 

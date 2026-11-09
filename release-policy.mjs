@@ -58,8 +58,8 @@ export const RELEASE_VALIDATION_POLICY = Object.freeze({
   requiredTests: Object.freeze(["bridge", "flock", "setup", "contracts", "rpc-security",
     "zero-broker-roster", "zero-broker-lifecycle"].map((name) => `test/${name}.test.mjs`).sort()),
   environment: "clear_NODE_TEST_selectors_NODE_OPTIONS_coverage_fast_flags_and_cloud_overrides_isolate_COPILOT_HOME",
-  testTimeoutMs: 300000,
-  workerTimeoutMs: 360000,
+  testTimeoutMs: 600000,
+  workerTimeoutMs: 660000,
   localExecutionConsent: "exact_sha_existing_device_signature_30_minutes_before_tests_and_ballot",
 });
 

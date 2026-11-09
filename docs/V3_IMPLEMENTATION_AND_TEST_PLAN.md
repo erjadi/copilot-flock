@@ -1,5 +1,14 @@
 # Copilot SignalR Bridge `v3.0` — Implementation & Test Plan (DevDoc)
 
+> **Archived historical plan, not current test inventory or acceptance proof.**
+> Preserve the original baseline, proposed test paths and release/deployment
+> sequence below as historical decisions, not implemented guarantees. In
+> particular, `test/v3-multi-flock.test.mjs` is not a current suite, profile
+> "sandbox" isolation is not OS isolation, and votes do not authorize deployment
+> or key rotation. Current gates and limitations are in the [README](../README.md),
+> [setup/authority guide](./BOOTSTRAP_NEW_FLOCK_BYO_AZURE.md) and
+> [LAN trial evidence](./LAN_TRIAL.md). No live operation is authorized here.
+
 - **Branch**: `origin/v3-multi-flock-design`
 - **Companion Spec**: [`docs/V3_MULTI_FLOCK_ARCHITECTURE.md`](./V3_MULTI_FLOCK_ARCHITECTURE.md)
 - **Live Production Baseline (Untouched During Preview)**: `v2.2.0` (`5fc4b3e`)

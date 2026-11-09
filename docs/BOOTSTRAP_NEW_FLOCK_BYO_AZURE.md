@@ -159,7 +159,10 @@ registered-key ballots sign both the full SHA and complete validation scope;
 legacy smoke-only ballots and partial voter selections are not merge approval.
 All seven root suites are required, including the retained legacy RPC security
 suite; omission of that suite or a six-suite ballot cannot satisfy the gate.
-Review RPCs allow a bounded seven-and-a-half-minute response window, including
+The full serial 95-test integration took 364 seconds on the validation host.
+The signed policy therefore allows a bounded ten-minute test run and an
+eleven-minute worker, without dropping suites or enabling test selectors.
+Review RPCs allow a bounded twelve-and-a-half-minute response window, including
 the five-minute root-test budget. No live reviewer upgrade, Azure deployment
 or platform acceptance is implied.
 
@@ -201,7 +204,7 @@ and signed `copilot-flock-invite-v3` broker invites retain their original path.
 
 `copilot-flock` contains **zero vendor-hosted cloud servers and zero hardcoded credentials**. When you create a new flock, your machines communicate through two lightweight resources in your own Azure subscription:
 
-1. **Azure SignalR Service (`Serverless` mode)** — Provides real-time, sub-50ms WebSocket routing (`wss://<your-signalr>.service.signalr.net/client/?hub=copilotbridge`) between online machines across LANs, VPNs, and NATs over outbound `TCP 443` without opening any inbound firewall ports.
+1. **Azure SignalR Service (`Serverless` mode)** — Provides real-time WebSocket routing (`wss://<your-signalr>.service.signalr.net/client/?hub=copilotbridge`) between online machines over outbound TCP 443 without a peer inbound application listener. Latency and VPN/proxy reachability depend on the deployed network and are not guaranteed.
    - *Cost*: Works on the **Free (`Free_F1`)** tier (up to 20 concurrent connections / 20,000 messages per day) or **Standard (`Standard_S1`)**.
 2. **Azure Service Bus Namespace (`Standard` SKU + topic `copilot-bridge-offline`)** — Provides durable, at-least-once **offline message queueing** using a Service Bus topic (`copilot-bridge-offline`) and per-machine subscriptions. *(Note: Use `Standard` SKU because Service Bus topics/subscriptions require `Standard`, not `Basic`.)* When your laptop is asleep or powered off, messages and release updates wait safely in Service Bus and drain automatically the moment it wakes up.
 3. **Optional: Bootstrap Token Broker (`bootstrap-server.mjs`)** — A tiny, zero-dependency Node.js HTTP service (runs on a Basic/Standard Azure App Service, Container App, or VM) that verifies Ed25519 signatures and GitHub identities to mint short-lived 60-minute hub JWTs for **1-step pasteable invites**, **collaborator flocks (`<owner>/<team>`)**, and **time-bound guest passes**.
@@ -347,10 +350,10 @@ az webapp config appsettings set --name $WEBAPP --resource-group $RG --settings 
 
 az webapp config set --name $WEBAPP --resource-group $RG --startup-file "node bootstrap-server.mjs"
 
-# Package and deploy bootstrap-server.mjs + package.json, then verify /health
+# Package and deploy bootstrap-server.mjs + package.json, then verify /healthz
 Compress-Archive -Path bootstrap-server.mjs, package.json -DestinationPath bootstrap-deploy.zip -Force
 az webapp deploy --resource-group $RG --name $WEBAPP --src-path bootstrap-deploy.zip --type zip
-Invoke-RestMethod "https://$WEBAPP.azurewebsites.net/health"
+Invoke-RestMethod "https://$WEBAPP.azurewebsites.net/healthz"
 ```
 
 #### Bash (Linux / macOS)
@@ -378,7 +381,7 @@ az webapp config set --name "$WEBAPP" --resource-group "$RG" --startup-file "nod
 
 zip -q bootstrap-deploy.zip bootstrap-server.mjs package.json
 az webapp deploy --resource-group "$RG" --name "$WEBAPP" --src-path bootstrap-deploy.zip --type zip
-curl -fsSL "https://$WEBAPP.azurewebsites.net/health"
+curl -fsSL "https://$WEBAPP.azurewebsites.net/healthz"
 ```
 
 ### 3. Enroll Your First Machine
@@ -418,8 +421,11 @@ node ./flock.mjs install \
 - **Windows Boot Persistence (`copilot-flock.vbs`)**:
   - `node flock.mjs install` places `copilot-flock.vbs` in `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup`, which launches the daemon at user sign-in. On unattended Windows cloud VMs, keep an active user session or configure a Windows Scheduled Task (`ONSTART`).
 - **Outbound Network & VPN Resilience**:
-  - Requires only **outbound TCP `443` (HTTPS / WSS)** to `*.service.signalr.net`, `*.servicebus.windows.net`, and `api.github.com`.
-  - Includes a built-in IPv4-first DNS resolver (`ipv4Lookup` + `dns.resolve4` fallback cache) that prevents disconnected OpenVPN/NordVPN IPv6 adapters from blackholing SignalR reconnects.
+  - SignalR uses outbound TCP 443 (HTTPS/WSS). Check the actual Service Bus
+    client's configured transport and required ports; do not assume all traffic
+    uses 443. GitHub, broker and Azure endpoints must also satisfy local policy.
+  - The IPv4-first resolver (`ipv4Lookup` + `dns.resolve4` fallback cache)
+    mitigates some broken IPv6/DNS paths; it cannot bypass VPN, proxy or egress policy.
 
 Once your first machine is enrolled, simply tell your Copilot:
 > *"Generate an invite for my other personal and work PCs"*
@@ -428,12 +434,13 @@ Your Copilot will call `invite_to_flock` and hand you a **Case 1 Invite JSON** c
 
 ---
 
-## Option C — Direct Connection Strings (Zero Web App / Personal-Only Setup)
+## Option C — Legacy Direct Connection Strings (No Web App / Personal-Only Setup)
 
 If you only want to connect your own computers and prefer not to run a Bootstrap App Service at all, pass your SignalR and Service Bus connection strings directly on each machine:
 
 ```powershell
 node flock.mjs install `
+  --architecture legacy `
   --scope personal `
   --connection-string "$SIGNALR_CONN" `
   --servicebus-connection-string "$SB_CONN"
@@ -443,8 +450,11 @@ All local config is stored at `~/.copilot/flock/config.json` with strict owner-o
 
 ---
 
-## Verifying Your New Flock Instance
+## Verifying the Explicit Legacy Instance
 
 Ask your Copilot in plain English:
-- *"Check flock status and diagnose the flock"* -> Runs `diagnose_bridge_fleet` and confirms the background daemon, MCP server, `Copilot Flock Coordinator`, `Copilot Flock Thread Tracker`, and boot persistence are healthy.
+- *"Check flock status and diagnose the flock without changing anything"* ->
+  Runs legacy `diagnose_bridge_fleet` with `fix: false`. Report unknown or
+  failed probes as such; they do not prove health. Obtain separate consent for
+  repairs, especially session permission/mode changes.
 - *"Show me a flock topology diagram in light mode"* -> Uses the bundled `flock-topology` skill to render your live `flowchart LR` Mermaid graph, Markdown Overlap Matrix, and Warm-Alabaster SVG topology map.
