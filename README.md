@@ -42,7 +42,9 @@ added authentication boundary and must not be exposed to an untrusted network.
 
 Live viewer transcript/project failures are visible errors, not synthetic
 working-tree or test-result substitutes. Synthetic content is preview-only;
-inactive views discard late read responses.
+inactive views discard late read responses. Overview refreshes reuse an
+in-flight transcript read for the same API source, machine and session, so
+the ten-second overview cadence does not starve slower reads.
 
 ## Managed Azure setup: one approved Copilot-led flow
 

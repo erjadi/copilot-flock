@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { ArrowLeft, Eye, GitBranch, Search, Send, Wrench } from "lucide-react";
 import type { Ctx } from "./Console";
 import type { Session, Transcript } from "@/lib/fleet/types";
@@ -34,12 +34,21 @@ function TranscriptPane({ ctx, s, onBack }: { ctx: Ctx; s: Session; onBack: () =
   const [wait, setWait] = useState(false);
   const [busy, setBusy] = useState(false);
   const [result, setResult] = useState<{ kind: "preview" | "sent" | "error"; text: string } | null>(null);
+  const pendingTranscript = useRef<{ key: string; promise: Promise<Transcript> } | null>(null);
   useEffect(() => {
     let active = true;
-    setT(null); setTranscriptError(null);
-    fetchTranscript(ctx.base, ctx.mode, s)
+    const key = JSON.stringify([ctx.base, ctx.mode, s.machineId, s.session_id]);
+    let read = pendingTranscript.current;
+    if (!read || read.key !== key) {
+      setT(null); setTranscriptError(null);
+      read = { key, promise: fetchTranscript(ctx.base, ctx.mode, s) };
+      pendingTranscript.current = read;
+    }
+    const currentRead = read;
+    currentRead.promise
       .then((transcript) => { if (active) setT(transcript); })
-      .catch((error) => { if (active) setTranscriptError(error instanceof Error ? error.message : String(error)); });
+      .catch((error) => { if (active) setTranscriptError(error instanceof Error ? error.message : String(error)); })
+      .finally(() => { if (pendingTranscript.current === currentRead) pendingTranscript.current = null; });
     return () => { active = false; };
   }, [s, ctx.base, ctx.mode]);
 
