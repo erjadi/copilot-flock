@@ -4,6 +4,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROVISION_AZURE=false
 RESOURCE_GROUP="rg-copilot-flock"
 LOCATION="eastus"
+LEGACY=false
+ROSTER_REPOSITORY=""
+PUBLISH_ROSTER=false
+VERIFIED_ROOT_FINGERPRINT=""
+GITHUB_USER=""
 SCOPE="${COPILOT_FLOCK_SCOPE:-${COPILOT_BRIDGE_SCOPE:-}}"
 MACHINE_ID="${COPILOT_FLOCK_MACHINE_ID:-${COPILOT_BRIDGE_MACHINE_ID:-}}"
 INVITE_FILE="${COPILOT_FLOCK_INVITE_FILE:-}"
@@ -19,6 +24,11 @@ require_value() {
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --provision-azure) PROVISION_AZURE=true; shift ;;
+    --legacy) LEGACY=true; shift ;;
+    --roster-repository) require_value "$@"; ROSTER_REPOSITORY="$2"; shift 2 ;;
+    --publish-roster) PUBLISH_ROSTER=true; shift ;;
+    --verified-root-fingerprint) require_value "$@"; VERIFIED_ROOT_FINGERPRINT="$2"; shift 2 ;;
+    --github-user) require_value "$@"; GITHUB_USER="$2"; shift 2 ;;
     --resource-group) require_value "$@"; RESOURCE_GROUP="$2"; shift 2 ;;
     --location) require_value "$@"; LOCATION="$2"; shift 2 ;;
     --scope) require_value "$@"; SCOPE="$2"; shift 2 ;;
@@ -32,8 +42,21 @@ while [[ $# -gt 0 ]]; do
 done
 
 command -v node >/dev/null 2>&1 || fail "Node.js is required before running setup."
+NODE_VERSION="$(node --version)" || fail "Cannot determine Node.js version."
+[[ "$NODE_VERSION" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+) ]] || fail "Node.js >=22.5 is required."
+if (( BASH_REMATCH[1] < 22 || (BASH_REMATCH[1] == 22 && BASH_REMATCH[2] < 5) )); then
+  fail "Node.js >=22.5 is required before setup; no tools or resources were installed."
+fi
 [[ -z "$SCOPE" || "$SCOPE" == work || "$SCOPE" == personal ]] || fail "Scope must be work or personal."
+NODE_FLAGS=()
+if [[ "$LEGACY" == false ]] && (( BASH_REMATCH[1] == 22 && BASH_REMATCH[2] < 13 )); then
+  NODE_FLAGS+=("--experimental-sqlite")
+fi
 if [[ "$PROVISION_AZURE" == true ]]; then
+  [[ "$LEGACY" == true || ! -f "${COPILOT_HOME:-$HOME/.copilot}/flock/config.json" ]] ||
+    fail "Existing Flock configuration must not be replaced by fresh provisioning; no Azure resources were created."
+  [[ "$LEGACY" == true || ( -n "$ROSTER_REPOSITORY" && "$PUBLISH_ROSTER" == true ) ]] ||
+    fail "Fresh Zero-Broker setup requires --roster-repository and explicit --publish-roster consent before provisioning."
   [[ -z "$INVITE_FILE" && -z "$CONNECTION_STRING" && -z "$SERVICEBUS_CONNECTION_STRING" ]] ||
     fail "--provision-azure cannot be combined with an invite or existing connection strings."
   if ! command -v az >/dev/null 2>&1; then
@@ -87,7 +110,17 @@ if [[ "$PROVISION_AZURE" == true ]]; then
   echo "Managed Azure resources are ready; installing full Flock locally."
 fi
 
-ARGS=("$SCRIPT_DIR/flock.mjs" "install")
+ARGS=("${NODE_FLAGS[@]}" "$SCRIPT_DIR/flock.mjs" "install")
+[[ "$LEGACY" == false ]] || ARGS+=("--architecture" "legacy")
+[[ -z "$ROSTER_REPOSITORY" ]] || ARGS+=("--roster-repository" "$ROSTER_REPOSITORY")
+[[ "$PUBLISH_ROSTER" == false ]] || ARGS+=("--publish-roster")
+[[ -z "$VERIFIED_ROOT_FINGERPRINT" ]] || ARGS+=("--verified-root-fingerprint" "$VERIFIED_ROOT_FINGERPRINT")
+[[ -z "$GITHUB_USER" ]] || ARGS+=("--github-user" "$GITHUB_USER")
+if [[ "$PROVISION_AZURE" == true && "$LEGACY" == false ]]; then
+  ARGS+=("--resource-group" "$RESOURCE_GROUP" "--azure-output-stdin")
+  CONNECTION_STRING=""
+  SERVICEBUS_CONNECTION_STRING=""
+fi
 [[ -z "$SCOPE" ]] || ARGS+=("--scope" "$SCOPE")
 [[ -z "$MACHINE_ID" ]] || ARGS+=("--machine-id" "$MACHINE_ID")
 [[ -z "$INVITE_FILE" ]] || ARGS+=("--invite-file" "$INVITE_FILE")
@@ -95,4 +128,8 @@ ARGS=("$SCRIPT_DIR/flock.mjs" "install")
 [[ -z "$CONNECTION_STRING" ]] || ARGS+=("--connection-string" "$CONNECTION_STRING")
 [[ -z "$SERVICEBUS_CONNECTION_STRING" ]] || ARGS+=("--servicebus-connection-string" "$SERVICEBUS_CONNECTION_STRING")
 echo "Installing and starting Copilot Flock..."
-node "${ARGS[@]}"
+if [[ "$PROVISION_AZURE" == true && "$LEGACY" == false ]]; then
+  printf '%s' "$DEPLOYMENT_OUTPUT" | node "${ARGS[@]}"
+else
+  node "${ARGS[@]}"
+fi

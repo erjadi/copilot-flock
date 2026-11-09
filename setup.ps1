@@ -8,7 +8,12 @@ param(
     [string]$ServiceBusConnectionString = $env:SERVICEBUS_CONNECTION_STRING,
     [switch]$ProvisionAzure,
     [string]$ResourceGroup = "rg-copilot-flock",
-    [string]$Location = "eastus"
+    [string]$Location = "eastus",
+    [switch]$Legacy,
+    [string]$RosterRepository,
+    [switch]$PublishRoster,
+    [string]$VerifiedRootFingerprint,
+    [string]$GitHubUser
 )
 
 $ErrorActionPreference = "Stop"
@@ -18,7 +23,23 @@ $FlockScript = Join-Path $ScriptDir "flock.mjs"
 if (-not (Get-Command node -ErrorAction SilentlyContinue)) {
     throw "Node.js is required before running setup."
 }
+$NodeVersion = (& node --version | Out-String).Trim()
+if ($LASTEXITCODE -ne 0 -or $NodeVersion -notmatch '^v(\d+)\.(\d+)\.(\d+)') {
+    throw "Cannot determine Node.js version; Node.js >=22.5 is required."
+}
+if ([int]$Matches[1] -lt 22 -or ([int]$Matches[1] -eq 22 -and [int]$Matches[2] -lt 5)) {
+    throw "Node.js >=22.5 is required before setup; no tools or resources were installed."
+}
+$NodeFlags = @()
+if (-not $Legacy -and [int]$Matches[1] -eq 22 -and [int]$Matches[2] -lt 13) { $NodeFlags += "--experimental-sqlite" }
 if ($ProvisionAzure) {
+    $CopilotHome = if ($env:COPILOT_HOME) { $env:COPILOT_HOME } else { Join-Path $HOME ".copilot" }
+    if (-not $Legacy -and (Test-Path (Join-Path $CopilotHome "flock\config.json"))) {
+        throw "Existing Flock configuration must not be replaced by fresh provisioning; no Azure resources were created."
+    }
+    if (-not $Legacy -and (-not $RosterRepository -or -not $PublishRoster)) {
+        throw "Fresh Zero-Broker setup requires -RosterRepository and explicit -PublishRoster consent before provisioning. Use -Legacy only for the existing broker implementation."
+    }
     if ($InviteFile -or $ConnectionString -or $ServiceBusConnectionString) {
         throw "-ProvisionAzure cannot be combined with an invite or existing connection strings."
     }
@@ -79,7 +100,15 @@ if ($ProvisionAzure) {
     Write-Host "Managed Azure resources are ready; installing full Flock locally." -ForegroundColor Cyan
 }
 
-$ArgsList = @($FlockScript, "install")
+$ArgsList = @($NodeFlags) + @($FlockScript, "install")
+if ($Legacy) { $ArgsList += @("--architecture", "legacy") }
+if ($RosterRepository) { $ArgsList += @("--roster-repository", $RosterRepository) }
+if ($PublishRoster) { $ArgsList += "--publish-roster" }
+if ($VerifiedRootFingerprint) { $ArgsList += @("--verified-root-fingerprint", $VerifiedRootFingerprint) }
+if ($GitHubUser) { $ArgsList += @("--github-user", $GitHubUser) }
+if ($ProvisionAzure -and -not $Legacy) {
+    $ArgsList += @("--resource-group", $ResourceGroup, "--azure-output-stdin")
+}
 if ($Scope) {
     $ArgsList += @("--scope", $Scope)
 }
@@ -92,13 +121,15 @@ if ($InviteFile) {
 if ($BootstrapUrl) {
     $ArgsList += @("--bootstrap-url", $BootstrapUrl)
 }
-if ($ConnectionString) {
+if ($ConnectionString -and (-not $ProvisionAzure -or $Legacy)) {
     $ArgsList += @("--connection-string", $ConnectionString)
 }
-if ($ServiceBusConnectionString) {
+if ($ServiceBusConnectionString -and (-not $ProvisionAzure -or $Legacy)) {
     $ArgsList += @("--servicebus-connection-string", $ServiceBusConnectionString)
 }
 
 Write-Host "Installing and starting Copilot Flock..." -ForegroundColor Cyan
-& node @ArgsList
+if ($ProvisionAzure -and -not $Legacy) {
+    $DeploymentOutput -join "`n" | & node @ArgsList
+} else { & node @ArgsList }
 exit $LASTEXITCODE

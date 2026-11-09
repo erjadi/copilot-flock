@@ -6,7 +6,8 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "vite build",
+    "build": "tsc --noEmit && vite build",
+    "test": "node --test test/*.test.mjs",
     "start": "node viewer-server.mjs"
   },
   "dependencies": {

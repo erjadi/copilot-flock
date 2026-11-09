@@ -9,6 +9,19 @@ Use this skill whenever the user wants to discover, message, coordinate with, in
 
 ## Core Rules
 
+**Architecture boundary:** first inspect local configuration. Fresh Zero-Broker
+setup uses a signed Pages roster and opaque peer IDs; existing legacy
+configurations and broker invites are not migrated. The remaining broad tools
+and bootstrap examples below describe the **legacy profile only**.
+For Zero-Broker use its restricted installed MCP definitions: selected existing
+Desktop sessions, explicit root-session grants and approved summary snapshots.
+Verified same-owner enrollment permits metadata discovery, not arbitrary
+delegate tasks or unrestricted live transcripts. Never use legacy spawning,
+headless permission overrides, topology, transfers, locks or fleet updates as a
+fallback. Vouchers remain provisional until owner approval; verify fingerprints
+independently. Preserve UNKNOWN outcomes without blind retransmission.
+The separate LAN trial has its own entry point/state and is not an Azure fallback.
+
 1. **Copilot is the Interface**:
    - Never ask the human user to type CLI commands manually. Run the `copilot-flock` MCP tools (`flock_status`, `list_flocks`, `invite_to_flock`, `enroll_from_invite_json`, `share_thread`, `unshare_thread`, `list_shared_threads`, `kick_flock_member`, `flock_topology`, `send_remote_session_message`, `broadcast_remote_session_message`) or `node ~/.copilot/flock/flock.mjs ...` on their behalf.
 2. **Same-Machine vs. Cross-Machine**:

@@ -80,8 +80,11 @@ export function PageHeading({ title, description, children }: { title: string; d
   return <div className="mb-5 grid min-w-0 gap-4 lg:mb-7 lg:flex lg:items-end lg:justify-between"><div className="min-w-0"><h2 className="text-xl font-medium">{title}</h2><p className="mt-1 text-xs text-muted-foreground">{description}</p></div>{children}</div>;
 }
 
-export function rel(iso: string) {
-  const s = Math.max(0, (Date.now() - new Date(iso).getTime()) / 1000);
+export function rel(iso: string | null) {
+  if (!iso) return "unknown";
+  const timestamp = Date.parse(iso);
+  if (!Number.isFinite(timestamp)) return "unknown";
+  const s = Math.max(0, (Date.now() - timestamp) / 1000);
   if (s < 60) return `${Math.floor(s)}s ago`;
   if (s < 3600) return `${Math.floor(s / 60)}m ago`;
   if (s < 86400) return `${Math.floor(s / 3600)}h ago`;

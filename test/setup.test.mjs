@@ -65,13 +65,20 @@ function az {
     }
 }
 function node {
+    if ($args[0] -eq "--version") {
+        $global:LASTEXITCODE = 0
+        if ($env:MOCK_NODE_VERSION) { return $env:MOCK_NODE_VERSION }
+        return "v24.0.0"
+    }
     Write-Journal "node" $args
     $global:LASTEXITCODE = 0
 }
 if ($env:MOCK_LEGACY -eq "1") {
-    & $env:MANAGED_SETUP_SCRIPT -Scope personal -MachineId DEMO-PC -ConnectionString $env:MOCK_SIGNALR -ServiceBusConnectionString $env:MOCK_SERVICEBUS
+    & $env:MANAGED_SETUP_SCRIPT -Legacy -Scope personal -MachineId DEMO-PC -ConnectionString $env:MOCK_SIGNALR -ServiceBusConnectionString $env:MOCK_SERVICEBUS
+} elseif ($env:MOCK_ZERO -eq "1") {
+    & $env:MANAGED_SETUP_SCRIPT -ProvisionAzure -ResourceGroup rg-demo -Location eastus -Scope personal -RosterRepository demo-owner/rosters -PublishRoster
 } else {
-    & $env:MANAGED_SETUP_SCRIPT -ProvisionAzure -ResourceGroup rg-demo -Location eastus -Scope personal -MachineId DEMO-PC
+    & $env:MANAGED_SETUP_SCRIPT -Legacy -ProvisionAzure -ResourceGroup rg-demo -Location eastus -Scope personal -MachineId DEMO-PC
 }
 `);
     const result = spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", wrapper], {
@@ -80,13 +87,16 @@ if ($env:MOCK_LEGACY -eq "1") {
       timeout: 30000,
       env: {
         ...cleanEnv,
+        COPILOT_HOME: path.join(directory, "copilot-home"),
         MANAGED_SETUP_SCRIPT: path.join(root, "setup.ps1"),
         SETUP_JOURNAL: journal,
         MOCK_AZ_AVAILABLE: options.available ? "1" : "0",
         MOCK_AUTH: options.authenticated ? "1" : "0",
         MOCK_FAIL: options.fail || "",
         MOCK_LEGACY: options.legacy ? "1" : "0",
+        MOCK_ZERO: options.zero ? "1" : "0",
         MOCK_NATIVE_ACCOUNT_ERROR: options.nativeAccountError ? "1" : "0",
+        MOCK_NODE_VERSION: options.nodeVersion || "",
         MOCK_SIGNALR: fakeSignalr,
         MOCK_SERVICEBUS: fakeServiceBus,
         MOCK_OUTPUT: JSON.stringify({
@@ -112,6 +122,18 @@ test("managed PowerShell setup installs missing CLI, authenticates, deploys and 
   const installed = result.events.find((event) => event.kind === "node");
   assert.ok(installed.args.includes(fakeSignalr) && installed.args.includes(fakeServiceBus));
   assert.ok(!result.stdout.includes(fakeSignalr) && !result.stdout.includes(fakeServiceBus));
+  const older = runPowerShell({ zero: true, nodeVersion: "v22.5.0" });
+  assert.equal(older.status, 0, older.stderr);
+  assert.ok(older.events.find((event) => event.kind === "node").args.includes("--experimental-sqlite"));
+});
+
+test("managed Zero-Broker PowerShell setup forwards secret deployment outputs over stdin, not credential arguments", { skip: process.platform !== "win32" }, () => {
+  const result = runPowerShell({ zero: true });
+  assert.equal(result.status, 0, result.stderr);
+  const installed = result.events.find((event) => event.kind === "node");
+  assert.ok(installed.args.includes("--azure-output-stdin") && installed.args.includes("--publish-roster"));
+  assert.ok(!installed.args.includes(fakeSignalr) && !installed.args.includes(fakeServiceBus));
+  assert.ok(!result.stdout.includes(fakeSignalr) && !result.stdout.includes(fakeServiceBus));
 });
 
 test("PowerShell setup preserves legacy installation and stops before installation on provisioning failures", { skip: process.platform !== "win32" }, () => {
@@ -128,6 +150,12 @@ test("PowerShell setup preserves legacy installation and stops before installati
   }
   const legacy = runPowerShell({ legacy: true });
   assert.equal(legacy.status, 0, legacy.stderr);
+  for (const nodeVersion of ["v18.20.0", "v22.4.0", "invalid"]) {
+    const tooOld = runPowerShell({ nodeVersion });
+    assert.notEqual(tooOld.status, 0);
+    assert.equal(tooOld.events.length, 0);
+  }
+  assert.equal(runPowerShell({ available: true, authenticated: true, nodeVersion: "v22.5.0" }).status, 0);
   assert.deepEqual(legacy.events.map((event) => event.kind), ["node"]);
 });
 
@@ -149,6 +177,7 @@ test("Bash setup uses headless authentication, validates outputs, and preserves 
     fs.writeFileSync(path.join(directory, "wrapper.sh"), `#!/usr/bin/env bash
 set -euo pipefail
 export DEMO_DIR="$(cd "$(dirname "\${BASH_SOURCE[0]}")" && pwd)"
+export COPILOT_HOME="$DEMO_DIR/copilot-home"
 export PATH="$DEMO_DIR/bin:$PATH"
 if command -v cygpath >/dev/null 2>&1; then export REAL_NODE="$(cygpath -u "$REAL_NODE")"; fi
 exec bash "$DEMO_DIR/setup.sh" "$@"
@@ -156,7 +185,8 @@ exec bash "$DEMO_DIR/setup.sh" "$@"
     fs.writeFileSync(path.join(bin, "uname"), "#!/usr/bin/env bash\nprintf 'Linux\\n'\n", { mode: 0o755 });
     fs.writeFileSync(path.join(bin, "az"), '#!/usr/bin/env bash\nexec "$REAL_NODE" "$DEMO_DIR/mock-az.mjs" "$@"\n', { mode: 0o755 });
     fs.writeFileSync(path.join(bin, "node"), `#!/usr/bin/env bash
-if [[ "\${1:-}" == *flock.mjs ]]; then exec "$REAL_NODE" "$DEMO_DIR/mock-node.mjs" "$@"; fi
+if [[ "$*" == *flock.mjs* ]]; then exec "$REAL_NODE" "$DEMO_DIR/mock-node.mjs" "$@"; fi
+if [[ "\${1:-}" == --version && -n "\${MOCK_NODE_VERSION:-}" ]]; then printf '%s\\n' "$MOCK_NODE_VERSION"; exit 0; fi
 exec "$REAL_NODE" "$@"
 `, { mode: 0o755 });
     fs.writeFileSync(path.join(directory, "mock-az.mjs"), `
@@ -176,11 +206,12 @@ fs.appendFileSync(process.env.SETUP_JOURNAL, JSON.stringify({ kind: "node", args
 `);
     const run = (args, settings = {}) => {
       if (fs.existsSync(journal)) fs.unlinkSync(journal);
-      const result = spawnSync("bash", ["--noprofile", "--norc", "wrapper.sh", ...args], {
+      const result = spawnSync("bash", ["--noprofile", "--norc", "wrapper.sh", ...args, ...(settings.zero ? [] : ["--legacy"])], {
         cwd: directory, encoding: "utf8", timeout: 30000,
         env: {
           ...cleanEnv, DISPLAY: "", REAL_NODE: process.execPath, SETUP_JOURNAL: journal,
           MOCK_FAIL: settings.fail || "", MOCK_AUTH: settings.authenticated ? "1" : "0",
+          MOCK_NODE_VERSION: settings.nodeVersion || "",
           MOCK_OUTPUT: JSON.stringify({
             signalrConnectionString: { value: fakeSignalr },
             serviceBusConnectionString: { value: fakeServiceBus },
@@ -195,6 +226,13 @@ fs.appendFileSync(process.env.SETUP_JOURNAL, JSON.stringify({ kind: "node", args
     const installed = managed.events.find((event) => event.kind === "node");
     assert.ok(installed.args.includes(fakeSignalr) && installed.args.includes(fakeServiceBus));
     assert.ok(!managed.stdout.includes(fakeSignalr) && !managed.stdout.includes(fakeServiceBus));
+    const zero = run(["--provision-azure", "--roster-repository", "demo-owner/rosters", "--publish-roster"], { zero: true });
+    assert.equal(zero.status, 0, zero.stderr);
+    assert.ok(zero.events.find((event) => event.kind === "node").args.includes("--azure-output-stdin"));
+    assert.ok(!zero.events.find((event) => event.kind === "node").args.includes(fakeSignalr));
+    const olderZero = run(["--provision-azure", "--roster-repository", "demo-owner/rosters", "--publish-roster"], { zero: true, nodeVersion: "v22.5.0" });
+    assert.equal(olderZero.status, 0, olderZero.stderr);
+    assert.ok(olderZero.events.find((event) => event.kind === "node").args.includes("--experimental-sqlite"));
     for (const fail of ["login", "group", "deployment", "output", "malformed"]) {
       const failed = run(["--provision-azure"], { fail });
       assert.notEqual(failed.status, 0);
@@ -206,6 +244,12 @@ fs.appendFileSync(process.env.SETUP_JOURNAL, JSON.stringify({ kind: "node", args
     const conflict = run(["--provision-azure", "--invite-file", "demo-invite.json"]);
     assert.notEqual(conflict.status, 0);
     assert.equal(conflict.events.length, 0);
+    for (const nodeVersion of ["v18.20.0", "v22.4.0", "invalid"]) {
+      const tooOld = run(["--provision-azure"], { nodeVersion });
+      assert.notEqual(tooOld.status, 0);
+      assert.equal(tooOld.events.length, 0);
+    }
+    assert.equal(run(["--provision-azure"], { authenticated: true, nodeVersion: "v22.5.0" }).status, 0);
   } finally {
     fs.rmSync(directory, { recursive: true, force: true });
   }

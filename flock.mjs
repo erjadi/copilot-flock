@@ -76,6 +76,177 @@ const __dirname = path.dirname(__filename);
 
 export const BRIDGE_VERSION = "3.3.0";
 
+export async function getZeroBrokerApi() {
+  const [major, minor] = process.versions.node.split(".").map(Number);
+  if (major < 22 || (major === 22 && minor < 5)) throw new Error("Zero-Broker requires Node.js >=22.5 for durable SQLite state");
+  const [roster, transport, runtime, lifecycle] = await Promise.all([
+    import("./zero-broker-roster.mjs"), import("./zero-broker-transport.mjs"), import("./zero-broker-runtime.mjs"),
+    import("./zero-broker-lifecycle.mjs"),
+  ]);
+  return { ...roster, ...transport, ...runtime, ...lifecycle };
+}
+
+export function createZeroBrokerNativeHost(cfg) {
+  return {
+    reportError: (event) => console.error(`[zero-broker] ${event.status}: ${event.message}`),
+    listSessions: () => queryLocalSessionsFromDb({ limit: 200, runningOnly: false }),
+    readTranscript: (sessionId, limit) => getLocalSessionTranscriptAsync(sessionId, limit, { maxBytes: 65536 }),
+    sendMessage: async ({ targetSession, sessionId, message, delivery_mode, allowed, expiresAt, fromOpaquePeerId }) => {
+      if (!getLocalWsConnectionInfo()) return { status: "DENIED", result: { reason: "Permission-preserving Desktop adapter unavailable; no headless spawn or fallback" } };
+      if (typeof message !== "string" || !message.trim() || Buffer.byteLength(message) > 32768) return { status: "DENIED", result: { reason: "Message must be nonempty and bounded" } };
+      let sent = false;
+      try {
+        const result = await injectLocalSessionMessage({
+          cfg: { machineId: cfg.machineId, scope: cfg.scope }, targetSession: sessionId || targetSession,
+          message, fromMachine: fromOpaquePeerId, fromScope: cfg.scope,
+          senderVerified: true, trustLevel: "same_user", mode: delivery_mode === "enqueue" ? "enqueue" : "immediate",
+          allowHeadlessFallback: false, allowLateAdmission: false, authorizeDispatch: allowed, strictAdmission: true,
+          onDispatch: () => { sent = true; },
+          dispatchTimeoutMs: Math.max(100, Math.min(8000, expiresAt - Date.now())),
+        });
+        return { status: result.deliveryStage === "admitted_to_events_jsonl" ? "DELIVERED" : "UNKNOWN", result: { admission: result.deliveryStage, sessionId: result.targetSessionId } };
+      } catch (error) {
+        return { status: error.code === "DENIED" && !sent ? "DENIED" : "UNKNOWN", result: { reason: "Native admission not confirmed; no redispatch or permission changes" } };
+      }
+    },
+  };
+}
+
+async function executeZeroBrokerTool(cfg, name, args = {}) {
+  const api = await getZeroBrokerApi();
+  const home = getBridgeHome();
+  if (name === "prepare_zero_broker_enrollment") return api.prepareZeroBrokerEnrollment({ home, flockUuid: args.flock_uuid });
+  if (name === "enroll_from_invite_json") {
+    const invite = typeof args.enrollment_json === "string" ? JSON.parse(args.enrollment_json) : args.enrollment_json;
+    if (invite.type === "copilot-flock-zero-broker-voucher-v1") return api.claimZeroBrokerVoucher({ home, invitation: invite, verifiedRootFingerprint: args.verified_root_fingerprint, githubUser: args.github_user });
+    return api.enrollZeroBrokerDevice({ home, invite, verifiedRootFingerprint: args.verified_root_fingerprint });
+  }
+  const group = cfg.groups.find((entry) => entry.flockUuid === (args.flock || args.target) || entry.label === (args.flock || args.target)) || (!args.flock && !args.target ? cfg.groups[0] : null);
+  if (!group) throw new Error("Select an enrolled Zero-Broker flock explicitly");
+  const service = api.openZeroBrokerGroup({ home, group, host: createZeroBrokerNativeHost(cfg) });
+  try {
+    if (name === "create_zero_broker_shared_flock") {
+      const source = service.configuration();
+      if (!source.issuer) throw new Error("Shared flock provisioning requires a locally configured owner issuer");
+      const current = service.state.get(group.flockUuid);
+      const credentials = api.openSealedBundle({ bundle: current.sealedOwnerVault[service.device.opaquePeerId], recipientEncPrivPem: service.device.encPriv, flockUuid: group.flockUuid, rosterEpoch: current.rosterEpoch, recipientOpaquePeerId: service.device.opaquePeerId, bundleType: "owner-vault" });
+      const enrollmentFile = path.join(home, "zero-broker", group.flockUuid, "enrollment-vault.json");
+      const enrollmentKeys = fs.existsSync(enrollmentFile) ? api.openSealedBundle({ bundle: JSON.parse(fs.readFileSync(enrollmentFile, "utf8")), recipientEncPrivPem: service.device.encPriv, flockUuid: group.flockUuid, rosterEpoch: 1, recipientOpaquePeerId: service.device.opaquePeerId, bundleType: "enrollment-vault" }) : undefined;
+      const updated = await api.initializeZeroBrokerOwner({ home, repository: source.repository, resourceGroup: source.resourceGroup, namespaceName: source.namespaceName, subscriptionId: source.subscriptionId, signalr: credentials.signalr, enrollmentKeys, shared: true, flockName: args.flock_name, scope: cfg.scope, publishConsent: args.publish_roster === true });
+      return { created: updated.groups[updated.groups.length - 1], daemonReload: "next polling cycle" };
+    }
+    if (["flock_status", "bridge_status", "list_flocks"].includes(name)) {
+      const roster = service.state.get(group.flockUuid);
+      return { architecture: "zero-broker", groups: cfg.groups, localOpaquePeerId: service.device.opaquePeerId, rosterEpoch: roster.rosterEpoch, leaseExpiresAt: roster.leaseExpiresAt, leaseFresh: Date.parse(roster.leaseExpiresAt) > Date.now(), nativeAdapter: getLocalWsConnectionInfo() ? "desktop" : "unavailable", members: roster.members.map(({ opaquePeerId, role, membershipExpiresAt }) => ({ opaquePeerId, role, membershipExpiresAt })) };
+    }
+    if (name === "invite_to_flock" && !args.recipient) return service.createVoucher({ role: args.role || "guest", durationMinutes: Number(args.duration_minutes) || 60 });
+    if (name === "invite_to_flock") return service.invite({
+      recipient: typeof args.recipient === "string" ? JSON.parse(args.recipient) : args.recipient,
+      role: args.role || "guest",
+      membershipExpiresAt: args.duration_minutes ? new Date(Date.now() + Number(args.duration_minutes) * 60000).toISOString() : null,
+      verifiedSigningFingerprint: args.verified_signing_fingerprint, verifiedEncFingerprint: args.verified_enc_fingerprint,
+      canMintTokens: args.can_mint_tokens === true, canKick: args.can_kick === true,
+    });
+    if (name === "list_zero_broker_enrollment_claims") return service.pendingClaims();
+    if (name === "approve_zero_broker_enrollment_claim") return service.approveClaim({ claimId: args.claim_id, signingFingerprint: args.verified_signing_fingerprint, encFingerprint: args.verified_enc_fingerprint, durationMinutes: Number(args.duration_minutes) || 60 });
+    if (name === "kick_flock_member") return service.kick(args.opaque_peer_id || args.machine_id);
+    if (name === "share_thread" || name === "unshare_thread") {
+      const grants = service.grants();
+      if (name === "share_thread") {
+        if (typeof args.summary_snapshot !== "string") throw new Error("Sharing requires an explicitly approved summary; live transcript export is disabled");
+        grants.snapshots[args.session_id] = { sessionId: args.session_id, title: args.title || args.session_id, summary: args.summary_snapshot };
+      } else delete grants.snapshots[args.session_id];
+      service.setGrants(grants);
+      return { shared: name === "share_thread", sessionId: args.session_id, flockUuid: group.flockUuid };
+    }
+    if (name === "list_shared_threads") return Object.values(service.grants().snapshots);
+    const actions = { list_remote_machines: "ping", list_remote_sessions: "list_sessions", get_remote_session_transcript: "get_transcript", send_remote_session_message: "send_message" };
+    const action = actions[name];
+    if (!action) return { status: "DENIED", reason: "This Zero-Broker native adapter does not expose remote spawning, shell, files, updates, locks or cross-flock privileged RPC" };
+    const peer = args.opaque_peer_id || args.machine || args.machine_id || args.to_machine;
+    if (!peer) throw new Error("Select an opaque recipient peer ID; no automatic broadcast or cross-flock routing");
+    const timer = setInterval(() => {
+      if (!service.polling) {
+        service.polling = true;
+        void service.poll().catch(() => createZeroBrokerNativeHost(cfg).reportError({ status: "UNKNOWN", message: "Receipt polling failed; durable outbox retained" })).finally(() => { service.polling = false; });
+      }
+    }, 250);
+    try {
+      return await service.runtime.request({
+        toOpaquePeerId: peer, action,
+        params: { ...(args.session_id ? { sessionId: args.session_id } : {}), ...(args.message ? { message: args.message } : {}), ...(args.limit ? { limit: args.limit } : {}), ...(args.delivery_mode ? { delivery_mode: args.delivery_mode } : {}) },
+        timeoutMs: Math.min(15000, Number(args.timeout_ms) || 10000),
+      });
+    } finally {
+      clearInterval(timer);
+      while (service.polling) await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+  } finally { service.close(); }
+}
+
+export function zeroBrokerNodeFlags(version = process.versions.node) {
+  const [major, minor] = version.split(".").map(Number);
+  return major === 22 && minor < 13 ? ["--experimental-sqlite"] : [];
+}
+
+export async function installZeroBrokerIntegration(cfg, { configureStartup = configureBootPersistence, startDaemon = ensureDaemonStarted, skillRoots } = {}) {
+  const home = getBridgeHome();
+  for (const filename of fs.readdirSync(__dirname).filter((name) => name.endsWith(".mjs"))) {
+    const source = path.join(__dirname, filename);
+    const target = path.join(home, filename);
+    if (path.resolve(source) !== path.resolve(target)) fs.copyFileSync(source, target);
+  }
+  const api = await getZeroBrokerApi();
+  const copilotDirectory = getCopilotDir();
+  const mcpFile = path.join(copilotDirectory, "mcp-config.json");
+  const mcp = fs.existsSync(mcpFile) ? JSON.parse(fs.readFileSync(mcpFile, "utf8")) : { mcpServers: {} };
+  mcp.mcpServers ||= {};
+  mcp.mcpServers["copilot-flock"] = { type: "stdio", command: process.execPath, args: [...zeroBrokerNodeFlags(), path.join(home, "flock.mjs"), "mcp"], env: { COPILOT_HOME: copilotDirectory }, tools: ["*"] };
+  api.writePrivateJson(copilotDirectory, "mcp-config.json", mcp);
+  const skill = `---
+name: copilot-flock
+description: Coordinate explicitly enrolled Zero-Broker Flock peers without changing session permissions.
+---
+
+Copilot is the interface. Use native tools for same-machine sessions.
+For other PCs, select an enrolled flock and opaque peer ID with flock_status.
+Zero-Broker uses SignalR Serverless, Service Bus Standard and a signed Pages roster.
+Existing legacy installations are not silently migrated. The separate LAN trial is unchanged.
+Private owner metadata discovery requires verified same-owner enrollment; live messages/transcripts
+require locally selected root-session grants. Non-root delegates cannot dispatch arbitrary tasks.
+Collaborators and guests receive only explicit approved snapshots. Never export keys or unrestricted transcripts.
+Verify pairing fingerprints independently. Owner signing alone never grants Azure issuer keys.
+DELIVERED means confirmed admission, not execution. Keep UNKNOWN; never blindly resend.
+Native messaging requires an existing Desktop session. No privileged headless fallback, remote spawn,
+shell, files, updates, locks or automatic cross-flock routing is exposed.
+Public Pages propagation and accurate clocks bound freshness; no revocation SLA or universal live support.
+`;
+  const roots = skillRoots || [path.join(copilotDirectory, "skills"), path.join(home, "skill")];
+  if (!skillRoots && process.platform === "win32" && process.env.APPDATA) roots.push(path.join(process.env.APPDATA, "com.github.githubapp", "app-skills"));
+  if (!skillRoots && process.platform === "darwin") roots.push(path.join(HOME_DIR, "Library", "Application Support", "com.github.githubapp", "app-skills"));
+  if (!skillRoots && process.platform === "linux") roots.push(path.join(HOME_DIR, ".config", "com.github.githubapp", "app-skills"));
+  for (const root of roots) {
+    const skillDirectory = path.join(root, "copilot-flock");
+    fs.mkdirSync(skillDirectory, { recursive: true });
+    fs.writeFileSync(path.join(skillDirectory, "SKILL.md"), skill);
+    const topology = path.join(root, "flock-topology");
+    fs.mkdirSync(topology, { recursive: true });
+    fs.writeFileSync(path.join(topology, "SKILL.md"), `---\nname: flock-topology\ndescription: Explain topology support for the installed Flock architecture.\n---\n\nThis Zero-Broker native profile exposes signed roster membership through flock_status, not live telemetry or topology.\nDo not invoke legacy topology/fleet discovery or claim roster members are online. The LAN trial has no topology.\nFor an explicitly selected legacy installation, use its bundled legacy topology skill.\n`);
+  }
+  const bootPersistence = configureStartup(path.join(home, "flock.mjs"), { strict: true });
+  if (!bootPersistence) throw new Error("Platform startup persistence unavailable; local initialization retained for explicit integration repair");
+  const daemon = await startDaemon(cfg);
+  return { architecture: cfg.architecture, groups: cfg.groups, bootPersistence, daemon, defaultGrants: "private-owner metadata discovery only; no execution, live transcript or external snapshot grants", nativeAdapter: "existing Desktop sessions only" };
+}
+
+function copyZeroBrokerModules(sourceDirectory, targetDirectory) {
+  for (const filename of fs.readdirSync(sourceDirectory).filter((name) => /^zero-broker-[a-z-]+\.mjs$/.test(name))) {
+    const source = path.join(sourceDirectory, filename);
+    const target = path.join(targetDirectory, filename);
+    if (path.resolve(source) !== path.resolve(target)) fs.copyFileSync(source, target);
+  }
+}
+
 const DEFAULT_AZURE_SUBSCRIPTION = process.env.COPILOT_FLOCK_SUBSCRIPTION || "";
 const DEFAULT_AZURE_RESOURCE_GROUP = process.env.COPILOT_FLOCK_RESOURCE_GROUP || "";
 const DEFAULT_AZURE_SIGNALR_NAME = process.env.COPILOT_FLOCK_SIGNALR_NAME || "";
@@ -1024,6 +1195,14 @@ export function collectLocalMachineSpecs() {
   return base;
 }
 export function loadConfig({ autoFetchAz = true, refreshSpecs = false } = {}) {
+  const zeroConfigPath = getConfigPath();
+  if (fs.existsSync(zeroConfigPath)) {
+    const existing = JSON.parse(fs.readFileSync(zeroConfigPath, "utf8"));
+    if (existing.architecture === "zero-broker") {
+      if (!Array.isArray(existing.groups) || !existing.groups.length) throw new Error("Zero-Broker configuration has no enrolled or provisional flock");
+      return existing;
+    }
+  }
   ensureBridgeDir();
   const activeConfigPath = getConfigPath();
   let cfg = {};
@@ -2445,9 +2624,12 @@ export function getLocalWsConnectionInfo() {
   if (!fs.existsSync(portFile) || !fs.existsSync(tokenFile)) {
     return null;
   }
-  const port = Number(fs.readFileSync(portFile, "utf8").trim().split(/\r?\n/)[0]);
-  const token = fs.readFileSync(tokenFile, "utf8").trim().split(/\r?\n/)[0];
-  if (!port || !token) return null;
+  const portLine = fs.readFileSync(portFile, "utf8").split(/\r?\n/, 1)[0].trim();
+  const token = fs.readFileSync(tokenFile, "utf8").split(/\r?\n/, 1)[0].trim();
+  const port = Number(portLine);
+  if (!/^\d{1,5}$/.test(portLine) || port < 1 || port > 65535 || !token || /[\x00-\x1f\x7f]/.test(token)) {
+    throw new Error("Invalid local Copilot Desktop control files; expected a valid first-line port and token.");
+  }
   return { port, token };
 }
 
@@ -3223,7 +3405,7 @@ export function createIncrementalEventReader(
 
 export function isMatchingDispatchedUserEvent(
   ev,
-  { requestId = null, promptEnvelope = "", displayPrompt = "", message = "" } = {}
+  { requestId = null, promptEnvelope = "", displayPrompt = "", message = "", strictRequestId = false } = {}
 ) {
   if (!ev || ev.type !== "user.message") return false;
   const data = ev.data || {};
@@ -3237,6 +3419,7 @@ export function isMatchingDispatchedUserEvent(
   ) {
     return true;
   }
+  if (strictRequestId) return false;
   if (displayPrompt && (content === displayPrompt || transformed.includes(displayPrompt))) {
     return true;
   }
@@ -3621,9 +3804,15 @@ export async function injectLocalSessionMessage({
   waitTimeoutMs = 90000,
   dispatchTimeoutMs = 8000,
   dispatchPollIntervalMs = 50,
+  allowHeadlessFallback = true,
+  allowLateAdmission = true,
+  authorizeDispatch = null,
+  strictAdmission = false,
+  onDispatch = null,
 }) {
   const wsInfo = getLocalWsConnectionInfo();
   const hasDesktopDb = fs.existsSync(path.join(getCopilotDir(), "data.db"));
+  if (!wsInfo && !allowHeadlessFallback) throw Object.assign(new Error("Permission-preserving Desktop adapter unavailable; no headless fallback"), { code: "DENIED" });
 
   if (!wsInfo && hasDesktopDb) {
     throw new Error(
@@ -3636,7 +3825,8 @@ export async function injectLocalSessionMessage({
   const startByteOffset = fs.existsSync(eventsPath) ? fs.statSync(eventsPath).size : 0;
   const eventReader = createIncrementalEventReader(eventsPath, startByteOffset);
 
-  const promptEnvelope = buildCrossSessionEnvelope({
+  const requestId = crypto.randomUUID();
+  let promptEnvelope = buildCrossSessionEnvelope({
     cfg,
     fromMachine,
     fromScope,
@@ -3650,6 +3840,7 @@ export async function injectLocalSessionMessage({
     trustLevel,
     waitForReply,
   });
+  if (strictAdmission) promptEnvelope += `\n[Copilot Flock local admission ${requestId}]`;
 
   const senderScope = normalizeScope(fromScope, "work");
   const senderGitHubUser = normalizeGitHubUser(fromGitHubUser);
@@ -3658,6 +3849,9 @@ export async function injectLocalSessionMessage({
   }]: ${message}`;
 
   if (!wsInfo) {
+    if (!allowHeadlessFallback) {
+      throw Object.assign(new Error("Permission-preserving Desktop adapter is unavailable; headless fallback is disabled"), { code: "DENIED" });
+    }
     return await injectHeadlessCliSessionMessage({
       cfg,
       resolved,
@@ -3672,7 +3866,6 @@ export async function injectLocalSessionMessage({
     });
   }
 
-  const requestId = crypto.randomUUID();
   const wsUrl = `ws://127.0.0.1:${wsInfo.port}/?token=${encodeURIComponent(wsInfo.token)}`;
   const ws = new RawWebSocketClient(wsUrl, { timeoutMs: 8000 });
 
@@ -3691,6 +3884,9 @@ export async function injectLocalSessionMessage({
 
   await ws.connect();
   try {
+    if (authorizeDispatch && !authorizeDispatch()) {
+      throw Object.assign(new Error("Local authorization changed before Desktop dispatch"), { code: "DENIED" });
+    }
     const frame = {
       type: "send_message",
       session_id: resolved.session_id,
@@ -3704,6 +3900,7 @@ export async function injectLocalSessionMessage({
     };
 
     ws.sendText(JSON.stringify(frame));
+    if (onDispatch) onDispatch();
 
     // IMPORTANT: github.exe cancels an in-flight `send_message` if the originating WebSocket
     // disconnects before `local-session-message-dispatch` finishes MCP warmup and writes `user.message`
@@ -3717,6 +3914,9 @@ export async function injectLocalSessionMessage({
     let trailingEventsAfterDispatch = [];
 
     while (Date.now() < dispatchDeadline) {
+      if (authorizeDispatch && !authorizeDispatch()) {
+        throw Object.assign(new Error("Desktop admission became uncertain after local authorization changed"), { code: "UNKNOWN" });
+      }
       if (wsError) throw wsError;
       const newEvents = eventReader.readNewEvents();
       if (newEvents.length > 0) {
@@ -3726,6 +3926,7 @@ export async function injectLocalSessionMessage({
             promptEnvelope,
             displayPrompt,
             message,
+            strictRequestId: strictAdmission,
           })
         );
         if (matchIdx !== -1) {
@@ -3744,7 +3945,7 @@ export async function injectLocalSessionMessage({
       // the target session may be busy running an active turn or warming up MCP servers.
     // Hold the WebSocket open in the background for up to 60s until events.jsonl records
       // the turn so github.exe does not cancel the queued message on disconnect.
-      if (!waitForReply && effectiveDispatchTimeoutMs >= 3000) {
+      if (allowLateAdmission && !waitForReply && effectiveDispatchTimeoutMs >= 3000) {
         keepWsOpenInBackground = true;
         (async () => {
           const bgDeadline = Date.now() + 60000;
@@ -3761,6 +3962,7 @@ export async function injectLocalSessionMessage({
                     promptEnvelope,
                     displayPrompt,
                     message,
+                    strictRequestId: strictAdmission,
                   })
                 );
                 if (mIdx !== -1) {
@@ -5538,6 +5740,7 @@ export async function handleRpcAction(cfg, req) {
     const compatScript = path.join(getBridgeHome(), "bridge.mjs");
     fs.copyFileSync(updatedRepoScript, targetScript);
     fs.copyFileSync(updatedRepoScript, compatScript);
+    copyZeroBrokerModules(path.dirname(updatedRepoScript), getBridgeHome());
 
     // Spawn `node flock.mjs install` detached after 300ms so the RPC reply returns first
     setTimeout(() => {
@@ -5802,6 +6005,16 @@ export async function handleRpcAction(cfg, req) {
       } catch {}
     }
 
+    checks.modulesSyntaxOk = false;
+    try {
+      const { validateReleaseCandidate } = await import("./zero-broker-release.mjs");
+      const complete = validateReleaseCandidate({ repoDir, commit: candidateCommit });
+      Object.assign(checks, complete);
+    } catch (err) {
+      checks.unitTestsOk = false;
+      issues.push(`complete candidate validation failed: ${err.message}`);
+    }
+
     const vote = issues.length === 0 ? "ACCEPT" : "REJECT";
     const idKey = ensureMachineIdentityKeypair();
     const votePayload = `vote|${cfg.machineId}|${branch}|${candidateCommit}|${vote}`;
@@ -5819,7 +6032,7 @@ export async function handleRpcAction(cfg, req) {
       candidateSha,
       diffStat,
       checks,
-      verificationLevel: "daemon_syntax_unit_tests_and_ed25519_signature",
+      verificationLevel: "complete_candidate_syntax_root_tests_and_ed25519_signature",
       issues,
       vote,
       votePayload,
@@ -6131,6 +6344,9 @@ export async function drainAndProcessOfflineQueue(
           logDaemon(`Offline queue replay error for ${reqId}: ${err.message}`);
           if (reqId) {
             inFlightSet.delete(reqId);
+            ambiguousSet.add(reqId);
+            pendingAckSet.add(reqId);
+            toAckIds.push(reqId);
             persistCurrentState();
           }
         }
@@ -6179,6 +6395,28 @@ export async function drainAndProcessOfflineQueue(
 }
 
 export async function runDaemon(cfg) {
+  if (cfg.architecture === "zero-broker") {
+    const api = await getZeroBrokerApi();
+    const controller = new AbortController();
+    const stop = () => controller.abort();
+    process.once("SIGTERM", stop);
+    process.once("SIGINT", stop);
+    fs.writeFileSync(getDaemonPidPath(), String(process.pid));
+    const groupStates = {};
+    const update = (event) => {
+      if (event.group) groupStates[event.group] = event.status;
+      api.writePrivateJson(getBridgeHome(), "state.json", { status: event.status, architecture: "zero-broker", pid: process.pid, updatedAt: new Date().toISOString(), groups: groupStates });
+    };
+    update({ status: "starting" });
+    try { await api.runZeroBrokerService({ home: getBridgeHome(), config: cfg, host: createZeroBrokerNativeHost(cfg), signal: controller.signal, onStatus: update }); }
+    finally {
+      process.removeListener("SIGTERM", stop);
+      process.removeListener("SIGINT", stop);
+      if (fs.existsSync(getDaemonPidPath()) && fs.readFileSync(getDaemonPidPath(), "utf8").trim() === String(process.pid)) fs.unlinkSync(getDaemonPidPath());
+      api.writePrivateJson(getBridgeHome(), "state.json", { status: "stopped", architecture: "zero-broker", pid: process.pid });
+    }
+    return;
+  }
   ensureBridgeDir();
   const pidPath = getDaemonPidPath();
   const statePath = getStatePath();
@@ -6391,14 +6629,17 @@ export async function ensureDaemonStarted(cfg) {
     : __filename;
 
   const sandboxMode = isSandboxV3Mode();
-  const daemonArgs = sandboxMode ? [scriptToRun, "daemon", "--sandbox", "v3"] : [scriptToRun, "daemon"];
-  const child = spawn(process.execPath, daemonArgs, {
+  const daemonArgs = [...(cfg.architecture === "zero-broker" ? zeroBrokerNodeFlags() : []), scriptToRun, "daemon", ...(sandboxMode ? ["--sandbox", "v3"] : [])];
+  const errorLog = cfg.architecture === "zero-broker" ? fs.openSync(path.join(getBridgeHome(), "daemon-errors.log"), "a", 0o600) : null;
+  let child;
+  try { child = spawn(process.execPath, daemonArgs, {
     detached: true,
-    stdio: "ignore",
+    stdio: errorLog === null ? "ignore" : ["ignore", "ignore", errorLog],
     windowsHide: true,
     env: {
       ...process.env,
-      SIGNALR_CONNECTION_STRING: cfg.connectionString,
+      SIGNALR_CONNECTION_STRING: cfg.architecture === "zero-broker" ? "" : cfg.connectionString,
+      SERVICEBUS_CONNECTION_STRING: cfg.architecture === "zero-broker" ? "" : process.env.SERVICEBUS_CONNECTION_STRING,
       COPILOT_FLOCK_MACHINE_ID: cfg.machineId,
       COPILOT_BRIDGE_MACHINE_ID: cfg.machineId,
       COPILOT_FLOCK_SCOPE: cfg.scope,
@@ -6407,7 +6648,7 @@ export async function ensureDaemonStarted(cfg) {
       COPILOT_BRIDGE_HUB: cfg.hub,
       ...(sandboxMode ? { COPILOT_FLOCK_SANDBOX: "v3", COPILOT_BRIDGE_SANDBOX: "v3" } : {}),
     },
-  });
+  }); } finally { if (errorLog !== null) fs.closeSync(errorLog); }
   child.unref();
   const spawnedPid = child.pid;
   const statePath = getStatePath();
@@ -6419,11 +6660,16 @@ export async function ensureDaemonStarted(cfg) {
     if (fs.existsSync(statePath)) {
       try {
         const st = JSON.parse(fs.readFileSync(statePath, "utf8"));
-        if (st.pid === spawnedPid && st.status === "connected") {
+        if (st.pid === spawnedPid && (st.status === "connected" || cfg.architecture === "zero-broker" && st.status === "ready")) {
           return { running: true, pid: spawnedPid, state: st };
         }
       } catch {}
     }
+  }
+  if (cfg.architecture === "zero-broker") {
+    let running = false;
+    try { process.kill(spawnedPid, 0); running = true; } catch {}
+    return { running, pid: spawnedPid, ready: false, reason: "Cloud receive readiness not confirmed; inspect private daemon-errors.log" };
   }
   return { running: true, pid: spawnedPid };
 }
@@ -6432,7 +6678,7 @@ export async function ensureDaemonStarted(cfg) {
 // 8. Built-in MCP Server (stdio JSON-RPC 2.0)
 // ---------------------------------------------------------------------------
 
-const MCP_TOOLS = [
+export const MCP_TOOLS = [
   {
     name: "flock_status",
     description:
@@ -6454,7 +6700,7 @@ const MCP_TOOLS = [
   {
     name: "list_remote_machines",
     description:
-      "Discover all online Copilot machines connected to the copilot-flock SignalR bridge hub, including their GitHub handle, hardware specs, scope ('work' or 'private'), active session counts, and recent threads.",
+      "Discover all online Copilot machines connected to the copilot-flock SignalR hub, including their GitHub handle, hardware specs, scope ('work' or 'personal'), active session counts, and recent threads.",
     inputSchema: {
       type: "object",
       properties: {
@@ -6464,8 +6710,8 @@ const MCP_TOOLS = [
         },
         scope: {
           type: "string",
-          enum: ["work", "private", "all"],
-          description: "Optional filter by machine scope ('work' or 'private'; omit or 'all' for all machines).",
+          enum: ["work", "personal", "all"],
+          description: "Optional filter by machine scope ('work' or 'personal'; omit or 'all' for all machines).",
         },
         github_user: {
           type: "string",
@@ -6488,9 +6734,9 @@ const MCP_TOOLS = [
         },
         scope: {
           type: "string",
-          enum: ["work", "private", "all"],
+          enum: ["work", "personal", "all"],
           description:
-            "Optional filter by machine scope ('work' or 'private').",
+            "Optional filter by machine scope ('work' or 'personal').",
         },
         query: {
           type: "string",
@@ -6709,8 +6955,8 @@ const MCP_TOOLS = [
         },
         scope: {
           type: "string",
-          enum: ["work", "private", "all"],
-          description: "Optional scope filter ('work' or 'private').",
+          enum: ["work", "personal", "all"],
+          description: "Optional scope filter ('work' or 'personal').",
         },
       },
     },
@@ -6718,7 +6964,7 @@ const MCP_TOOLS = [
   {
     name: "diagnose_bridge_fleet",
     description:
-      "Diagnose (and optionally auto-repair with fix=true) the bridge state of one or all enrolled machines: checks bridge version, single daemon instance, boot persistence, and verifies that both required coordinator threads ('Copilot SignalR Bridge Coordinator' and 'Copilot SignalR Thread Tracker') exist and have mode='autopilot' and permission_mode='allow-all'.",
+      "Diagnose (and optionally auto-repair with fix=true) the Flock state of one or all enrolled machines: checks Flock version, startup persistence, and whether 'Copilot Flock Coordinator' and 'Copilot Flock Thread Tracker' have mode='autopilot' and permission_mode='allow-all'. Unresolved permission observations remain unknown.",
     inputSchema: {
       type: "object",
       properties: {
@@ -6728,8 +6974,8 @@ const MCP_TOOLS = [
         },
         scope: {
           type: "string",
-          enum: ["work", "private", "all"],
-          description: "Optional scope filter ('work' or 'private').",
+          enum: ["work", "personal", "all"],
+          description: "Optional scope filter ('work' or 'personal').",
         },
         fix: {
           type: "boolean",
@@ -6928,7 +7174,7 @@ const MCP_TOOLS = [
   {
     name: "broadcast_remote_session_message",
     description:
-      "Broadcast or selectively broadcast a message (or start a new thread) across all or a filtered subset of online remote Copilot machines in parallel (filterable by scope 'work'|'private', GitHub handle, machine ID/wildcard, GPU/RAM/disk specs, or repo).",
+      "Broadcast or selectively broadcast a message (or start a new thread) across online remote Copilot machines in parallel (filterable by scope 'work'|'personal', GitHub handle, machine ID/wildcard, GPU/RAM/disk specs, or repo).",
     inputSchema: {
       type: "object",
       properties: {
@@ -6943,9 +7189,9 @@ const MCP_TOOLS = [
         },
         scope: {
           type: "string",
-          enum: ["work", "private", "all"],
+          enum: ["work", "personal", "all"],
           description:
-            "Optional scope filter: 'work' or 'private' (omit or 'all' to target all scopes).",
+            "Optional scope filter: 'work' or 'personal' (omit or 'all' to target all scopes).",
         },
         github_user: {
           type: "string",
@@ -7185,7 +7431,34 @@ const MCP_TOOLS = [
   },
 ];
 
+export function getMcpToolDefinitions(cfg) {
+  if (cfg.architecture !== "zero-broker") return MCP_TOOLS;
+  const names = new Set(["flock_status", "bridge_status", "list_flocks", "list_remote_machines", "list_remote_sessions", "get_remote_session_transcript", "send_remote_session_message", "invite_to_flock", "enroll_from_invite_json", "kick_flock_member", "share_thread", "unshare_thread", "list_shared_threads"]);
+  const extra = [
+    { name: "prepare_zero_broker_enrollment", description: "Generate a distinct public device key card for an explicitly selected flock UUID." },
+    { name: "create_zero_broker_shared_flock", description: "Create a separate shared flock using locally authorized owner resources and explicit public Pages publication consent." },
+    { name: "list_zero_broker_enrollment_claims", description: "List provisional claim proofs locally; these are not authenticated GitHub identities or active memberships." },
+    { name: "approve_zero_broker_enrollment_claim", description: "Redeem a provisional claim only after independent verification of both device fingerprints." },
+  ];
+  const fields = {
+    flock: { type: "string" }, flock_uuid: { type: "string" }, flock_name: { type: "string" }, target: { type: "string" },
+    opaque_peer_id: { type: "string" }, session_id: { type: "string" }, message: { type: "string", maxLength: 32768 },
+    delivery_mode: { type: "string", enum: ["immediate", "enqueue"] }, summary_snapshot: { type: "string", maxLength: 32768 },
+    role: { type: "string", enum: ["owner", "collaborator", "guest"] }, duration_minutes: { type: "integer", minimum: 1, maximum: 1440 },
+    recipient: { type: "object" }, enrollment_json: { type: "object" }, github_user: { type: "string" }, claim_id: { type: "string" },
+    verified_root_fingerprint: { type: "string" }, verified_signing_fingerprint: { type: "string" }, verified_enc_fingerprint: { type: "string" },
+    publish_roster: { type: "boolean" }, limit: { type: "integer", minimum: 1, maximum: 30 },
+    title: { type: "string", maxLength: 512 }, timeout_ms: { type: "integer", minimum: 1, maximum: 15000 },
+    can_mint_tokens: { type: "boolean" }, can_kick: { type: "boolean" },
+  };
+  return [...MCP_TOOLS.filter((tool) => names.has(tool.name)), ...extra].map((tool) => ({
+    name: tool.name, description: extra.includes(tool) ? tool.description : `Zero-Broker ${tool.name}: selected opaque peers and current local grants; no legacy cloud or privileged fallback.`,
+    inputSchema: { type: "object", properties: fields, additionalProperties: false },
+  }));
+}
+
 async function executeMcpTool(cfg, name, args = {}) {
+  if (cfg.architecture === "zero-broker") return await executeZeroBrokerTool(loadConfig({ autoFetchAz: false }), name, args);
   if (name === "flock_status" || name === "bridge_status") {
     const daemonStatus = await ensureDaemonStarted(cfg);
     const machines = await discoverMachines(cfg, { includeSelf: true, timeoutMs: 2200 });
@@ -8490,7 +8763,7 @@ export async function runMcpServer(cfg) {
         jsonrpc: "2.0",
         id,
         result: {
-          tools: MCP_TOOLS,
+          tools: getMcpToolDefinitions(cfg),
         },
       });
       return;
@@ -8958,13 +9231,17 @@ export async function updateFleetMachines(
   };
 }
 
-export function configureBootPersistence(targetScript) {
+export function configureBootPersistence(targetScript, { strict = false } = {}) {
+  const nodeFlags = strict ? zeroBrokerNodeFlags() : [];
+  if (strict && [targetScript, process.execPath, getCopilotDir()].some((value) => /[\r\n"%\0]/.test(value))) throw new Error("Startup paths contain unsupported control or interpolation characters");
+  const xml = (value) => value.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;");
   try {
     if (process.platform === "linux") {
       const systemdDir = path.join(HOME_DIR, ".config", "systemd", "user");
       fs.mkdirSync(systemdDir, { recursive: true });
       const legacyUnitPath = path.join(systemdDir, "copilot-signalr-bridge.service");
       const unitPath = path.join(systemdDir, "copilot-flock.service");
+      if (strict && (fs.existsSync(legacyUnitPath) || (fs.existsSync(unitPath) && !fs.readFileSync(unitPath, "utf8").includes(targetScript)))) throw new Error("Existing startup registration belongs to another installation; automatic migration is disabled");
       const unitContent = `[Unit]
 Description=GitHub Copilot Flock Daemon (copilot-flock)
 After=network-online.target
@@ -8974,7 +9251,8 @@ Wants=network-online.target
 Type=simple
 WorkingDirectory=${HOME_DIR}
 Environment=PATH=${path.join(HOME_DIR, ".local", "bin")}:/usr/local/bin:/usr/bin:/bin
-ExecStart=${process.execPath} ${targetScript} daemon
+${strict ? `Environment="COPILOT_HOME=${getCopilotDir()}"` : ""}
+ExecStart="${process.execPath}" ${nodeFlags.join(" ")} "${targetScript}" daemon
 Restart=always
 RestartSec=3
 
@@ -8990,7 +9268,7 @@ WantedBy=default.target
             timeout: 4000,
           });
           fs.unlinkSync(legacyUnitPath);
-        } catch {}
+        } catch (error) { if (strict) throw new Error("Cannot retire the legacy user service; startup file was retained for repair", { cause: error }); }
       }
       try {
         execFileSync("systemctl", ["--user", "daemon-reload"], { stdio: "ignore", timeout: 4000 });
@@ -8998,14 +9276,12 @@ WantedBy=default.target
           stdio: "ignore",
           timeout: 4000,
         });
-      } catch {}
+      } catch (error) { if (strict) throw new Error("Cannot enable the Flock user service; startup file was retained for repair", { cause: error }); }
       try {
         const user = os.userInfo().username;
-        execFileSync("sudo", ["-n", "loginctl", "enable-linger", user], {
-          stdio: "ignore",
-          timeout: 4000,
-        });
-      } catch {}
+        const lingering = strict && execFileSync("loginctl", ["show-user", user, "--property=Linger", "--value"], { encoding: "utf8", timeout: 4000 }).trim() === "yes";
+        if (!lingering) execFileSync("sudo", ["-n", "loginctl", "enable-linger", user], { stdio: "ignore", timeout: 4000 });
+      } catch (error) { if (strict) throw new Error("Cannot enable user-service lingering; local OS consent is required before unattended boot persistence", { cause: error }); }
       return { platform: "linux", type: "systemd-user", path: unitPath };
     }
 
@@ -9020,13 +9296,14 @@ WantedBy=default.target
       );
       if (fs.existsSync(startupDir)) {
         const legacyVbsPath = path.join(startupDir, "copilot-signalr-bridge.vbs");
+        const vbsPath = path.join(startupDir, "copilot-flock.vbs");
+        if (strict && (fs.existsSync(legacyVbsPath) || (fs.existsSync(vbsPath) && !fs.readFileSync(vbsPath, "utf8").includes(targetScript)))) throw new Error("Existing startup registration belongs to another installation; automatic migration is disabled");
         if (fs.existsSync(legacyVbsPath)) {
           try {
             fs.unlinkSync(legacyVbsPath);
           } catch {}
         }
-        const vbsPath = path.join(startupDir, "copilot-flock.vbs");
-        const vbsContent = `Set WshShell = CreateObject("WScript.Shell")\r\nWshShell.Run """${process.execPath}"" ""${targetScript}"" daemon", 0, False\r\n`;
+        const vbsContent = `Set WshShell = CreateObject("WScript.Shell")\r\n${strict ? `WshShell.Environment("Process")("COPILOT_HOME") = "${getCopilotDir()}"\r\n` : ""}WshShell.Run """${process.execPath}"" ${nodeFlags.join(" ")} ""${targetScript}"" daemon", 0, False\r\n`;
         fs.writeFileSync(vbsPath, vbsContent, "utf8");
         return { platform: "win32", type: "startup-vbs", path: vbsPath };
       }
@@ -9036,12 +9313,13 @@ WantedBy=default.target
       const agentsDir = path.join(HOME_DIR, "Library", "LaunchAgents");
       fs.mkdirSync(agentsDir, { recursive: true });
       const legacyPlistPath = path.join(agentsDir, "com.erjadi.copilot-signalr-bridge.plist");
+      const plistPath = path.join(agentsDir, "com.erjadi.copilot-flock.plist");
+      if (strict && (fs.existsSync(legacyPlistPath) || (fs.existsSync(plistPath) && !fs.readFileSync(plistPath, "utf8").includes(targetScript)))) throw new Error("Existing startup registration belongs to another installation; automatic migration is disabled");
       if (fs.existsSync(legacyPlistPath)) {
         try {
           fs.unlinkSync(legacyPlistPath);
         } catch {}
       }
-      const plistPath = path.join(agentsDir, "com.erjadi.copilot-flock.plist");
       const plist = `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0//EN">
 <plist version="1.0">
@@ -9050,10 +9328,12 @@ WantedBy=default.target
   <string>com.erjadi.copilot-flock</string>
   <key>ProgramArguments</key>
   <array>
-    <string>${process.execPath}</string>
-    <string>${targetScript}</string>
+    <string>${xml(process.execPath)}</string>
+    ${nodeFlags.map((flag) => `<string>${flag}</string>`).join("\n    ")}
+    <string>${xml(targetScript)}</string>
     <string>daemon</string>
   </array>
+  ${strict ? `<key>EnvironmentVariables</key><dict><key>COPILOT_HOME</key><string>${xml(getCopilotDir())}</string></dict>` : ""}
   <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>
@@ -9064,7 +9344,7 @@ WantedBy=default.target
       fs.writeFileSync(plistPath, plist, "utf8");
       return { platform: "darwin", type: "launch-agent", path: plistPath };
     }
-  } catch {}
+  } catch (error) { if (strict) throw error; }
   return null;
 }
 
@@ -10285,11 +10565,13 @@ export async function installBridge({
   if (path.resolve(__filename) !== path.resolve(compatScript)) {
     fs.copyFileSync(__filename, compatScript);
   }
+  copyZeroBrokerModules(__dirname, getBridgeHome());
   // Also update legacy ~/.copilot/signalr-bridge/bridge.mjs if that directory exists so running sessions stay in sync
   const legacyScript = path.join(getLegacyBridgeHome(), "bridge.mjs");
   if (fs.existsSync(getLegacyBridgeHome()) && path.resolve(__filename) !== path.resolve(legacyScript)) {
     try {
       fs.copyFileSync(__filename, legacyScript);
+      copyZeroBrokerModules(__dirname, getLegacyBridgeHome());
     } catch {}
   }
 
@@ -10686,8 +10968,122 @@ export function resolveCliMessage(flags = {}, positional = []) {
   return flags.message || flags.prompt || (positional.length > 0 ? positional.join(" ") : "");
 }
 
+export function validateFileTransferCliArgs(command, flags = {}, positional = []) {
+  if (!["send-file", "pull-file"].includes(command)) throw new Error(`Unsupported file-transfer command: ${command}.`);
+  const allowed = command === "send-file"
+    ? ["to-machine", "machine", "file", "local-path", "remote-path"]
+    : ["from-machine", "to-machine", "machine", "remote-path", "file", "local-path"];
+  for (const [key, value] of Object.entries(flags)) {
+    if (!allowed.includes(key)) throw new Error(`Unknown option "--${key}" for ${command}.`);
+    if (typeof value !== "string" || !value.trim()) throw new Error(`Missing value for "--${key}" in ${command}.`);
+  }
+  if (positional.length > 2) throw new Error(`Too many positional arguments for ${command}.`);
+  const source = command === "send-file" ? flags.file || flags["local-path"] || positional[0] : flags["remote-path"] || flags.file || positional[0];
+  if (typeof source !== "string" || !source.trim()) throw new Error(command === "send-file" ? "Missing --file <local-path> for send-file" : "Missing --remote-path <src-path> for pull-file");
+}
+
 async function main() {
   const { command, positional, flags } = parseCliArgs(process.argv.slice(2));
+  if ((command === "send-file" || command === "pull-file") && !flags.help) validateFileTransferCliArgs(command, flags, positional);
+  const savedConfig = fs.existsSync(getConfigPath()) ? JSON.parse(fs.readFileSync(getConfigPath(), "utf8")) : null;
+  if (savedConfig?.architecture === "zero-broker" && command === "install" && (flags.architecture === "legacy" || flags.legacy)) throw new Error("In-place Zero-Broker to legacy migration is unsupported; keep its identity and admission ledger unchanged");
+  if ((!savedConfig || savedConfig.architecture === "zero-broker") && (command === "help" || flags.help)) {
+    console.log(`Copilot Flock ${BRIDGE_VERSION}: Zero-Broker candidate
+Node.js >=22.5; Azure SignalR Serverless + Service Bus Standard + signed Pages.
+Copilot performs setup after scope, subscription, costs and public-publication consent.
+Fresh setup: install --roster-repository <owner/repo> --publish-roster
+  --subscription-id <uuid> --namespace-name <name> --resource-group <group>
+  --azure-output-stdin (approved managed deployment outputs, including issuer keys)
+Enrollment: prepare-enrollment --flock <uuid>; install --invite-file <path>
+  --verified-root-fingerprint <fingerprint> --scope <personal|work>
+Local grants: grant-root --flock <uuid> --sessions <selected-existing-uuids>
+  revoke-root --flock <uuid>
+Lifecycle: status, list-flocks, create-flock, invite, join-flock, enrollment-claims,
+  approve-claim, kick, share-thread, unshare-thread, shared-threads, resume-init
+Remote probes: machines, sessions, transcript, send --flock <uuid> --peer <opaque-id>
+Native messaging requires existing Desktop sessions and current root grants.
+No privileged headless fallback, remote spawn, shell, files or update RPC.
+Legacy configurations/v3 broker invites retain compatibility; do not migrate implicitly.`);
+    return;
+  }
+  const invite = flags["invite-file"] ? JSON.parse(fs.readFileSync(String(flags["invite-file"]), "utf8")) : null;
+  const zeroInstall = command === "install" && flags.architecture !== "legacy" && !flags.legacy && !flags.sandbox &&
+    (savedConfig?.architecture === "zero-broker" || flags.architecture === "zero-broker" || (!savedConfig && !flags["bootstrap-url"] && invite?.type !== "copilot-flock-invite-v3"));
+  if (command === "prepare-enrollment") {
+    const api = await getZeroBrokerApi();
+    console.log(JSON.stringify(api.prepareZeroBrokerEnrollment({ home: getBridgeHome(), flockUuid: flags.flock }), null, 2));
+    return;
+  }
+  if (command === "resume-init") {
+    const api = await getZeroBrokerApi();
+    const cfg = await api.resumeZeroBrokerInitialization({ home: getBridgeHome(), host: createZeroBrokerNativeHost(savedConfig || { scope: "personal" }) });
+    console.log(JSON.stringify(await installZeroBrokerIntegration(cfg), null, 2));
+    return;
+  }
+  if (zeroInstall) {
+    const api = await getZeroBrokerApi();
+    if (savedConfig?.architecture === "zero-broker" && !invite) {
+      if (flags["azure-output-stdin"] || flags["connection-string"]) throw new Error("Existing Zero-Broker identity must not be reinitialized with new issuer inputs; use a separate installation or explicit shared-flock creation");
+      console.log(JSON.stringify(await installZeroBrokerIntegration(savedConfig), null, 2));
+      return;
+    }
+    if (invite) {
+      if (invite.type === "copilot-flock-zero-broker-voucher-v1") {
+        await api.claimZeroBrokerVoucher({ home: getBridgeHome(), invitation: invite, verifiedRootFingerprint: flags["verified-root-fingerprint"], githubUser: flags["github-user"] });
+      } else await api.enrollZeroBrokerDevice({ home: getBridgeHome(), invite, scope: flags.scope || "personal", verifiedRootFingerprint: flags["verified-root-fingerprint"] });
+    } else {
+      const outputs = flags["azure-output-stdin"] ? JSON.parse(fs.readFileSync(0, "utf8").replace(/^\uFEFF/, "")) : {};
+      const connection = outputs.signalrConnectionString?.value || flags["connection-string"];
+      const parts = Object.fromEntries(String(connection || "").split(";").filter(Boolean).map((part) => { const index = part.indexOf("="); return [part.slice(0, index), part.slice(index + 1)]; }));
+      if (!parts.Endpoint || !parts.AccessKey) throw new Error("Zero-Broker owner initialization requires approved SignalR issuer credentials");
+      const namespaceName = outputs.serviceBusNamespaceName?.value || flags["namespace-name"];
+      const enrollmentKeys = outputs.serviceBusSendKey?.value && outputs.serviceBusListenKey?.value ? {
+        namespaceHost: `${namespaceName.toLowerCase()}.servicebus.windows.net`, topicName: outputs.serviceBusTopicName?.value,
+        sendRuleKey: outputs.serviceBusSendKey.value, listenRuleKey: outputs.serviceBusListenKey.value,
+      } : undefined;
+      await api.initializeZeroBrokerOwner({
+        home: getBridgeHome(), repository: flags["roster-repository"], resourceGroup: flags["resource-group"] || "rg-copilot-flock",
+        namespaceName, signalr: { endpoint: parts.Endpoint.replace(/\/$/, ""), accessKey: parts.AccessKey },
+        enrollmentKeys, scope: flags.scope || "personal", publishConsent: flags["publish-roster"] === true,
+        subscriptionId: outputs.subscriptionId?.value || flags["subscription-id"],
+      });
+    }
+    console.log(JSON.stringify(await installZeroBrokerIntegration(loadConfig({ autoFetchAz: false })), null, 2));
+    return;
+  }
+  if (savedConfig?.architecture === "zero-broker" && !["mcp", "daemon", "stop-daemon", "help", "version"].includes(command) && !flags.help && !flags.version && !flags.v) {
+    const api = await getZeroBrokerApi();
+    const cfg = loadConfig({ autoFetchAz: false });
+    if (command === "grant-root" || command === "revoke-root") {
+      const group = cfg.groups.find((entry) => entry.flockUuid === flags.flock || entry.label === flags.flock);
+      if (!group) throw new Error("Local root grants require an explicitly selected flock");
+      const service = api.openZeroBrokerGroup({ home: getBridgeHome(), group, host: createZeroBrokerNativeHost(cfg) });
+      try {
+        const grants = service.grants();
+        grants.rootSessions = command === "revoke-root" ? [] : String(flags.sessions || "").split(",").filter(Boolean);
+        if (command === "grant-root" && !grants.rootSessions.length) throw new Error("Select existing session UUIDs explicitly; no wildcard root grant");
+        service.setGrants(grants);
+        console.log(JSON.stringify({ rootSessions: grants.rootSessions, flockUuid: group.flockUuid }, null, 2));
+      } finally { service.close(); }
+      return;
+    }
+    const tools = { status: "flock_status", "list-flocks": "list_flocks", "create-flock": "create_zero_broker_shared_flock", invite: "invite_to_flock", "join-flock": "enroll_from_invite_json", kick: "kick_flock_member", "share-thread": "share_thread", "unshare-thread": "unshare_thread", "shared-threads": "list_shared_threads", machines: "list_remote_machines", sessions: "list_remote_sessions", transcript: "get_remote_session_transcript", send: "send_remote_session_message", "enrollment-claims": "list_zero_broker_enrollment_claims", "approve-claim": "approve_zero_broker_enrollment_claim" };
+    const tool = tools[command];
+    if (!tool) throw new Error(`Unsupported Zero-Broker command ${command}; legacy cloud, spawning, file and update fallbacks are disabled`);
+    console.log(JSON.stringify(await executeZeroBrokerTool(cfg, tool, {
+      flock: flags.flock, target: flags.target, role: flags.role,
+      opaque_peer_id: flags.peer || flags["to-machine"], session_id: flags.session || flags["to-session"],
+      message: resolveCliMessage(flags, positional), title: flags.title, summary_snapshot: flags.summary, duration_minutes: flags.duration,
+      limit: flags.limit ? Number(flags.limit) : undefined, delivery_mode: flags["delivery-mode"], timeout_ms: flags["timeout-ms"] ? Number(flags["timeout-ms"]) : undefined,
+      recipient: flags["recipient-file"] ? JSON.parse(fs.readFileSync(String(flags["recipient-file"]), "utf8")) : undefined,
+      enrollment_json: invite, github_user: flags["github-user"], verified_root_fingerprint: flags["verified-root-fingerprint"],
+      verified_signing_fingerprint: flags["verified-signing-fingerprint"], verified_enc_fingerprint: flags["verified-enc-fingerprint"],
+      claim_id: flags.claim,
+      flock_name: flags.name, publish_roster: flags["publish-roster"] === true,
+      can_mint_tokens: flags["can-mint-tokens"] === true, can_kick: flags["can-kick"] === true,
+    }), null, 2));
+    return;
+  }
 
   if (command === "help" || flags.help) {
     console.log(`

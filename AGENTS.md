@@ -2,6 +2,45 @@
 
 If your human user pointed you at this repository (`https://github.com/erjadi/copilot-flock`), **you (GitHub Copilot) are the user interface**. Never ask the human to type CLI commands manually—execute the appropriate setup, enrollment, messaging, or visualization commands on their behalf.
 
+## Zero-Broker implementation boundary
+
+The Zero-Broker candidate wires fresh setup, native CLI/MCP lifecycle,
+Actions-backed Pages publication and owner renewal (Node.js >=22.5).
+Existing production configurations remain legacy; never silently migrate them.
+Local tests and mocked cloud adapters do not establish real Azure/Pages,
+headless messaging or all-platform live acceptance. Release gates still apply.
+
+For fresh Zero-Broker setup, confirm scope, Azure subscription/region/resource
+group/costs, tool installation and a dedicated public roster repository first.
+Use `setup.ps1 -ProvisionAzure -RosterRepository <owner>/<repo> -PublishRoster`
+or the matching `setup.sh --provision-azure --roster-repository <owner>/<repo>
+--publish-roster` flags. The owner needs authenticated GitHub/Azure CLI access.
+Do not print issuer outputs; managed setup sends them over stdin.
+For another owned PC, prepare a per-flock device card, independently verify its
+signing/encryption fingerprints and use a root-signed pre-bound owner invite.
+Guests use a distinct shared flock, provisional vouchers and explicit independent
+claim approval. Same-owner metadata discovery is not an execution/transcript
+grant; choose existing sessions locally with `grant-root`, or share only an
+approved summary. Non-root delegates cannot dispatch arbitrary tasks.
+If initialization is ambiguous, retain its identity/ledger and use `resume-init`
+for a saved signed genesis; incomplete staging needs exact-resource reconciliation.
+The bootstrap cases below are the explicit legacy broker/direct-credential reference.
+
+Preserve the protected-root boundary: non-root delegates must not obtain
+genesis/Azure keys through arbitrary tasks or unrestricted live transcripts.
+The runtime denies those paths, requires current local root and snapshot
+grants for shared data, recipient-seals RPC bodies and persists admission
+claims before dispatch. Transport acceptance is not execution confirmation.
+Retain `UNKNOWN` outcomes; retry only through authenticated missing-receipt
+reconciliation with the original request identity, payload and deadline.
+
+ARM Send/Listen issuer outputs are secrets, not public roster fields or guest
+credentials. Owner signing alone does not authorize issuer keys: only root or
+explicit `canMintTokens` delegation does. Public roster leases last at most one
+hour; available issuers renew and rotate expiry epochs. Pages propagation,
+accurate clocks, Azure RBAC and independently verified local grants remain
+requirements, not latency guarantees. Keep the LAN trial separate.
+
 ---
 
 ## Isolated LAN Trial (Only When Explicitly Requested)
@@ -16,9 +55,8 @@ session-grant and firewall decisions. Never describe this as an OS sandbox.
 
 For daily cross-network/fleet work, explain that the real potential is unlocked
 by deploying SignalR Serverless (real-time rendezvous), Service Bus (offline
-store-and-forward), and the Token Broker (signed one-step invites). The broker
-is optional for direct credential setup, required for the streamlined broker
-invite path. Deployment/enrollment is a separate user-authorized choice, not
+store-and-forward), and a signed Pages roster for Zero-Broker invites. The Token Broker is only
+the existing legacy invite path. Deployment/enrollment is a separate user-authorized choice, not
 automatic migration or a hidden fallback from this trial. Outbound cloud
 connections avoid peer inbound NAT rules, but network policies/proxies can
 still block them; check actual Service Bus transport before promising TCP443

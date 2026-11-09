@@ -38,41 +38,24 @@ export async function fetchOverview(base: string): Promise<{ data: Overview; mod
 
 export async function fetchTranscript(base: string, mode: Mode, s: Session) {
   if (mode === "live") {
-    try {
-      return await req<ReturnType<typeof seedTranscript>>(
+    return await req<ReturnType<typeof seedTranscript>>(
         base,
         `/api/transcript?machine=${encodeURIComponent(s.machineId)}&session=${encodeURIComponent(s.session_id)}&limit=20`,
         undefined,
         15000
-      );
-    } catch (err) {
-      const fallback = seedTranscript(s);
-      return {
-        ...fallback,
-        simulated: true,
-        fallbackReason: err instanceof Error ? err.message : String(err),
-      };
-    }
+    );
   }
   return { ...seedTranscript(s), simulated: true };
 }
 
 export async function fetchProjects(base: string, mode: Mode, machineId: string, sessions: Session[], scope: "personal" | "work") {
   if (mode === "live") {
-    try {
-      return await req<ReturnType<typeof seedProjects>>(
+    return await req<ReturnType<typeof seedProjects>>(
         base,
         `/api/projects?machine=${encodeURIComponent(machineId)}`,
         undefined,
         15000
-      );
-    } catch (err) {
-      return {
-        ...seedProjects(machineId, sessions, scope),
-        simulated: true,
-        fallbackReason: err instanceof Error ? err.message : String(err),
-      };
-    }
+    );
   }
   return { ...seedProjects(machineId, sessions, scope), simulated: true };
 }

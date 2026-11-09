@@ -134,6 +134,17 @@ test("managed ARM template deploys Serverless SignalR and Standard Service Bus w
   assert.equal(serviceBus.sku.name, "[parameters('serviceBusSku')]");
   assert.ok(topic.dependsOn.includes("[resourceId('Microsoft.ServiceBus/namespaces', variables('serviceBusNamespaceName'))]"));
   assert.equal(template.parameters.serviceBusTopicName.defaultValue, "copilot-bridge-offline");
+  const rules = template.resources.filter((resource) => resource.type === "Microsoft.ServiceBus/namespaces/topics/authorizationRules");
+  assert.equal(rules.length, 2);
+  for (const [name, right] of [["FlockSendRule", "Send"], ["FlockListenRule", "Listen"]]) {
+    const rule = rules.find((entry) => entry.name.includes(`/${name}`));
+    assert.deepEqual(rule?.properties.rights, [right]);
+    assert.ok(rule.dependsOn.includes("[resourceId('Microsoft.ServiceBus/namespaces/topics', variables('serviceBusNamespaceName'), parameters('serviceBusTopicName'))]"));
+  }
+  for (const name of ["serviceBusSendKey", "serviceBusListenKey", "serviceBusSendConnectionString", "serviceBusListenConnectionString"]) {
+    assert.equal(template.outputs[name].type, "string");
+    assert.match(template.outputs[name].value, /^\[listKeys\(/);
+  }
   for (const name of ["signalrConnectionString", "serviceBusConnectionString"]) {
     assert.equal(template.outputs[name].type, "string");
     assert.match(template.outputs[name].value, /^\[listKeys\(/);
@@ -917,7 +928,14 @@ test("injectLocalSessionMessage rejects unrelated user.message events, never rep
     );
 
     let mode = "unrelated-only";
+    let dispatchedFrame = null;
     wsServer = await startMockCopilotWsServer((frame, client) => {
+      dispatchedFrame = frame;
+      if (mode === "strict-admission") {
+        fs.appendFileSync(eventsPath, JSON.stringify({ type: "user.message", data: { content: frame.prompt } }) + "\n");
+      } else if (mode === "same-text") {
+        fs.appendFileSync(eventsPath, JSON.stringify({ type: "user.message", data: { content: frame.display_prompt } }) + "\n");
+      }
       if (mode === "unrelated-only") {
         // Append only an unrelated user.message and a tool output mentioning "user.message"
         setTimeout(() => {
@@ -1000,6 +1018,26 @@ test("injectLocalSessionMessage rejects unrelated user.message events, never rep
 
     await new Promise((r) => setTimeout(r, 150));
     assert.equal(wsServer.getActiveCount(), 0, "WebSocket must be closed after WS error frame");
+    mode = "same-text";
+    await assert.rejects(injectLocalSessionMessage({
+      cfg, targetSession: sessionId, message: "Repeated message",
+      strictAdmission: true, allowHeadlessFallback: false, allowLateAdmission: false,
+      authorizeDispatch: () => true, dispatchTimeoutMs: 220, dispatchPollIntervalMs: 25,
+    }), /Timed out/);
+    mode = "strict-admission";
+    const admitted = await injectLocalSessionMessage({
+      cfg, targetSession: sessionId, message: "Verified admission",
+      strictAdmission: true, allowHeadlessFallback: false, allowLateAdmission: false,
+      authorizeDispatch: () => true, dispatchTimeoutMs: 2000, dispatchPollIntervalMs: 25,
+    });
+    assert.equal(admitted.deliveryStage, "admitted_to_events_jsonl");
+    assert.equal(dispatchedFrame.type, "send_message");
+    assert.equal(dispatchedFrame.permission_mode, undefined);
+    assert.equal(dispatchedFrame.auto_approve, undefined);
+    await assert.rejects(injectLocalSessionMessage({
+      cfg, targetSession: sessionId, message: "Revoked",
+      strictAdmission: true, allowHeadlessFallback: false, authorizeDispatch: () => false,
+    }), /grant|authorization|denied/i);
   } finally {
     if (wsServer) await wsServer.close();
     if (prevCopilotHome === undefined) delete process.env.COPILOT_HOME;

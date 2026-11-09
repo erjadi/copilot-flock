@@ -71,9 +71,27 @@
       "name": "[format('{0}/{1}', variables('serviceBusNamespaceName'), parameters('serviceBusTopicName'))]",
       "dependsOn": ["[resourceId('Microsoft.ServiceBus/namespaces', variables('serviceBusNamespaceName'))]"],
       "properties": {}
+    },
+    {
+      "type": "Microsoft.ServiceBus/namespaces/topics/authorizationRules",
+      "apiVersion": "2022-10-01-preview",
+      "name": "[format('{0}/{1}/FlockSendRule', variables('serviceBusNamespaceName'), parameters('serviceBusTopicName'))]",
+      "dependsOn": ["[resourceId('Microsoft.ServiceBus/namespaces/topics', variables('serviceBusNamespaceName'), parameters('serviceBusTopicName'))]"],
+      "properties": { "rights": ["Send"] }
+    },
+    {
+      "type": "Microsoft.ServiceBus/namespaces/topics/authorizationRules",
+      "apiVersion": "2022-10-01-preview",
+      "name": "[format('{0}/{1}/FlockListenRule', variables('serviceBusNamespaceName'), parameters('serviceBusTopicName'))]",
+      "dependsOn": ["[resourceId('Microsoft.ServiceBus/namespaces/topics', variables('serviceBusNamespaceName'), parameters('serviceBusTopicName'))]"],
+      "properties": { "rights": ["Listen"] }
     }
   ],
   "outputs": {
+    "subscriptionId": {
+      "type": "string",
+      "value": "[subscription().subscriptionId]"
+    },
     "signalrName": {
       "type": "string",
       "value": "[variables('signalrName')]"
@@ -101,6 +119,22 @@
     "serviceBusTopicName": {
       "type": "string",
       "value": "[parameters('serviceBusTopicName')]"
+    },
+    "serviceBusSendKey": {
+      "type": "string",
+      "value": "[listKeys(resourceId('Microsoft.ServiceBus/namespaces/topics/authorizationRules', variables('serviceBusNamespaceName'), parameters('serviceBusTopicName'), 'FlockSendRule'), '2022-10-01-preview').primaryKey]"
+    },
+    "serviceBusListenKey": {
+      "type": "string",
+      "value": "[listKeys(resourceId('Microsoft.ServiceBus/namespaces/topics/authorizationRules', variables('serviceBusNamespaceName'), parameters('serviceBusTopicName'), 'FlockListenRule'), '2022-10-01-preview').primaryKey]"
+    },
+    "serviceBusSendConnectionString": {
+      "type": "string",
+      "value": "[listKeys(resourceId('Microsoft.ServiceBus/namespaces/topics/authorizationRules', variables('serviceBusNamespaceName'), parameters('serviceBusTopicName'), 'FlockSendRule'), '2022-10-01-preview').primaryConnectionString]"
+    },
+    "serviceBusListenConnectionString": {
+      "type": "string",
+      "value": "[listKeys(resourceId('Microsoft.ServiceBus/namespaces/topics/authorizationRules', variables('serviceBusNamespaceName'), parameters('serviceBusTopicName'), 'FlockListenRule'), '2022-10-01-preview').primaryConnectionString]"
     }
   }
 }

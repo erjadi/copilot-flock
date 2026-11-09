@@ -40,7 +40,17 @@ export function NewSessionModal({ ctx, onClose }: { ctx: Ctx; onClose: () => voi
 export function InspectDrawer({ ctx, machineId, onClose }: { ctx: Ctx; machineId: string; onClose: () => void }) {
   const m = ctx.data.members.find((x) => x.machineId === machineId);
   const [projects, setProjects] = useState<Project[] | null>(null);
-  useEffect(() => { if (m) fetchProjects(ctx.base, ctx.mode, machineId, ctx.data.sessions, m.scope).then((r) => setProjects(r.projects)); }, [machineId]); // eslint-disable-line react-hooks/exhaustive-deps
+  const [projectsError, setProjectsError] = useState<string | null>(null);
+  const scope = m?.scope;
+  const previewSessions = ctx.mode === "seed" ? ctx.data.sessions : null;
+  useEffect(() => {
+    let active = true;
+    setProjects(null); setProjectsError(null);
+    if (scope) fetchProjects(ctx.base, ctx.mode, machineId, previewSessions ?? [], scope)
+      .then((result) => { if (active) setProjects(result.projects); })
+      .catch((error) => { if (active) setProjectsError(error instanceof Error ? error.message : String(error)); });
+    return () => { active = false; };
+  }, [machineId, ctx.base, ctx.mode, scope, previewSessions]);
   if (!m) return null;
   const sessions = ctx.data.sessions.filter((s) => s.machineId === machineId);
   return <div className="fixed inset-0 z-50 flex justify-end bg-background/60 backdrop-blur-sm" onClick={onClose}>
@@ -49,7 +59,7 @@ export function InspectDrawer({ ctx, machineId, onClose }: { ctx: Ctx; machineId
       <p className="mt-2 pl-4 text-xs text-muted-foreground">{m.specs.model} · {m.specs.os}</p>
       <div className="mt-8 grid grid-cols-3 gap-5 border-y border-border/60 py-5"><div><div className="font-mono text-lg">{m.specs.memory.totalGb}<span className="text-xs text-muted-foreground"> GB</span></div><div className="mt-1 text-[9px] uppercase tracking-widest text-muted-foreground">Memory</div></div><div><div className="font-mono text-lg">{m.specs.cpu.logicalCores}</div><div className="mt-1 text-[9px] uppercase tracking-widest text-muted-foreground">Threads</div></div><div><div className="font-mono text-lg">{sessions.length}</div><div className="mt-1 text-[9px] uppercase tracking-widest text-muted-foreground">Sessions</div></div></div>
       <section className="mt-7"><div className="mb-3 text-[10px] uppercase tracking-widest text-muted-foreground">Active sessions</div><div className="space-y-1">{sessions.map((s) => <button key={s.session_id} onClick={() => ctx.openSession(s)} className="flex w-full items-center gap-3 rounded-lg px-2 py-2.5 text-left hover:bg-accent/40"><Dot tone={s.is_running ? "busy" : "muted"} /><span className="truncate text-xs">{s.title}</span><span className="ml-auto font-mono text-[9px] text-muted-foreground">{s.branch}</span></button>)}</div></section>
-      <section className="mt-8"><div className="mb-3 text-[10px] uppercase tracking-widest text-muted-foreground">Git projects</div>{!projects ? <div className="text-xs text-muted-foreground">Loading projects…</div> : <div className="space-y-4">{projects.map((p) => <div key={p.project_id} className="border-l border-border pl-4"><div className="flex min-w-0 items-center gap-2 text-xs"><FolderGit2 className="h-3.5 w-3.5 text-muted-foreground" /><span className="min-w-0 truncate">{p.name}</span><span className="ml-auto font-mono text-[9px] text-muted-foreground">{p.default_branch}</span></div><div className="mt-1.5 break-all font-mono text-[9px] leading-5 text-muted-foreground">{p.repo}<br />{p.path}</div></div>)}</div>}</section>
+      <section className="mt-8"><div className="mb-3 text-[10px] uppercase tracking-widest text-muted-foreground">Git projects</div>{projectsError ? <div role="alert" className="text-xs text-destructive">Unable to load projects: {projectsError}</div> : !projects ? <div className="text-xs text-muted-foreground">Loading projects…</div> : <div className="space-y-4">{projects.map((p) => <div key={p.project_id} className="border-l border-border pl-4"><div className="flex min-w-0 items-center gap-2 text-xs"><FolderGit2 className="h-3.5 w-3.5 text-muted-foreground" /><span className="min-w-0 truncate">{p.name}</span><span className="ml-auto font-mono text-[9px] text-muted-foreground">{p.default_branch}</span></div><div className="mt-1.5 break-all font-mono text-[9px] leading-5 text-muted-foreground">{p.repo}<br />{p.path}</div></div>)}</div>}</section>
       <div className="mt-8 font-mono text-[9px] text-muted-foreground">v{m.version}{m.specs.keyFingerprint ? ` · ed25519:${m.specs.keyFingerprint.slice(0, 12)}…` : ""} · registered {rel(m.registeredAt)}</div>
     </aside>
   </div>;

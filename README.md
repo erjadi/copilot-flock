@@ -4,16 +4,30 @@ Licensed under [Apache-2.0](./LICENSE). Copyright 2026 Eric Jadi.
 Viewer preview data, hostnames, network addresses and governance examples are
 synthetic, not captured conversations or real signed release evidence.
 
-**Connect all of your GitHub Copilot computers—Windows desktops, ARM64 laptops, headless Linux GPU servers, and cloud VMs—into one real-time, peer-to-peer flock.**
+**Zero-Broker candidate:** this checkout wires fresh installation, scoped
+enrollment, CLI/MCP operations, Pages publication and owner renewal to the
+signed-roster implementation (Node.js >=22.5). Release approval and real
+Azure/Pages acceptance are still required; production installations are
+unchanged. Existing legacy configurations and `copilot-flock-invite-v3`
+broker invites retain their original path. No silent migration is performed.
 
-Ask your laptop's Copilot what your home desktop is building, dispatch a task to your Linux RTX workstation, or give a teammate a 4-hour guest pass to inspect a shared machine—**entirely in plain English**.
+Node 22.5-22.12 requires `--experimental-sqlite`; setup, installed MCP and
+daemon/startup commands propagate it. Prefer Node 22.13+ for unflagged startup.
+This candidate was exercised on Node 24, not every supported Node/platform pair.
+Fresh provisioning rejects an existing configuration before creating Azure
+resources. Re-running installation for an existing Zero-Broker identity repairs
+local integration without generating new keys or reinitializing its roster.
 
-For example: *"Ask my Linux GPU server's Copilot to check whether its worker is
-ready for this build, and bring the answer back here."* Full deployed Flock
-routes that request to the remote coordinator, hands deeper discovery to its
-tracker, and returns permitted findings to the requesting session. The hubless
-trial demonstrates the simpler first step: delivering a benign message to an
-explicitly selected existing Desktop session on another LAN PC.
+**Coordinate enrolled Copilot computers through your own Azure resources,
+with encrypted messages and explicit local authority.**
+
+Ask Copilot to inspect permitted owner metadata, message a selected existing
+Desktop session, or share an approved summary with a time-bound guest.
+The Zero-Broker native profile does not expose privileged headless spawning.
+
+For example: *"Message the existing Desktop session I granted on my other PC."*
+`DELIVERED` means confirmed session admission, not completion of its task.
+`UNKNOWN` is retained across crashes/timeouts and must not trigger a blind resend.
 
 | Your Situation | Copy & Paste This Single Prompt into Your GitHub Copilot Chat |
 | :--- | :--- |
@@ -24,31 +38,102 @@ The viewer's local server binds to `127.0.0.1` by default. `VIEWER_HOST` is an
 explicit opt-in to another bind address; this administrative viewer has no
 added authentication boundary and must not be exposed to an untrusted network.
 
+Live viewer transcript/project failures are visible errors, not synthetic
+working-tree or test-result substitutes. Synthetic content is preview-only;
+inactive views discard late read responses.
+
 ## Managed Azure setup: one approved Copilot-led flow
 
 Tell Copilot: *"Set up a new full Flock using the managed ARM template. Confirm
 my Azure subscription, resource group, region, scope and costs first."*
-Copilot can run `.\setup.ps1 -ProvisionAzure -Scope personal` on Windows or
-`./setup.sh --provision-azure --scope personal` on Debian/Ubuntu or macOS.
+Copilot selects a dedicated public roster repository and obtains publication
+consent before running the wrapper. On Windows it adds `-RosterRepository
+<owner>/<roster-repo> -PublishRoster` to `.\setup.ps1 -ProvisionAzure -Scope
+personal`; on Debian/Ubuntu or macOS it adds `--roster-repository
+<owner>/<roster-repo> --publish-roster` to `./setup.sh --provision-azure
+--scope personal`.
 Optional resource-group and region settings are `-ResourceGroup` / `-Location`
 or `--resource-group` / `--location` (defaults: `rg-copilot-flock`, `eastus`).
 
 The wrappers install Azure CLI if missing, authenticate if needed, deploy
 [`infra/azuredeploy.json`](./infra/azuredeploy.json), and pass the resulting
-connection strings directly into the full Flock installer. Windows CLI
+issuer outputs privately over stdin into owner initialization. Windows CLI
 installation can require UAC; Debian/Ubuntu can require `sudo`; macOS requires
 existing Homebrew. Headless Linux uses device-code login. Node.js must already
-be available. Without the provisioning flag, existing invite/direct-string
-installation remains unchanged and no Azure resources are provisioned.
+be available. GitHub CLI authentication and repository/Pages/workflow permissions
+are required for the owner. Other devices use pinned pre-bound invites or
+provisional vouchers; guests receive no raw Azure keys. `-Legacy` / `--legacy`
+explicitly selects the old setup. Do not provision Azure for an invite or LAN trial.
 
 The template creates **SignalR Serverless (Free_F1 by default), Service Bus
 Standard and the offline topic**. Service Bus is billed; quotas, regional
 availability and subscription policy can reject deployment. It does **not**
-deploy the optional Token Broker; add that component separately for signed
-one-step invites and collaborator/guest onboarding. Connection-string outputs
+deploy a Token Broker, and Zero-Broker does not need one. Connection-string outputs
 are sensitive Azure deployment records, not publishable setup logs. This is
 managed provisioning of your own components, not a vendor-hosted service.
 See the [managed setup guide](./docs/BOOTSTRAP_NEW_FLOCK_BYO_AZURE.md).
+
+### Two Azure resources and a signed public roster
+
+The candidate uses **Azure SignalR Serverless + Azure Service Bus
+Standard + a signed `github.io` roster**, with no hosted token broker.
+The ARM template now also defines topic-level `FlockSendRule` (Send only)
+and `FlockListenRule` (Listen only), with sensitive issuer-key/connection-string
+outputs. Owner initialization configures an Actions-backed Pages repository,
+archives signed history and publishes the latest roster with GitHub SHA CAS.
+Each epoch stages a separate topic with exactly those two rules and
+recipient-filtered subscriptions. GitHub publication is not proof that the
+public Pages deployment is already visible.
+
+**Encrypted Identities & Pseudonymous Public Metadata:** per-flock public
+records contain opaque peer IDs and public keys, not member GitHub handles or
+hostnames. Member transport credentials and authorized owner vaults are
+recipient-sealed. RPC bodies are additionally recipient-sealed inside the
+signed group envelope, so possessing the group key does not expose another
+recipient's payload. Hosting-account URLs, membership counts, public-key
+relationships and update timing remain observable; this is not zero metadata
+leakage.
+
+**Bounded Revocation & Automatic Epoch Cutover:** tested kick/expiry helpers
+advance the signed epoch, replace the group key and isolate hubs/topics/
+subscriptions. Receivers reject older verified epochs and expired signed
+leases. The maximum signed lease is one hour and assumes accurate clocks. An online,
+authorized issuer renews when one-third of the lease remains and polls for
+expired members. Close requests are reconciled from a private persisted
+cutover proposal; uncertain publication never causes blind cleanup.
+Root-signed genesis checkpoints support new-device bootstrap without
+unbounded history downloads. No sub-second revocation SLA is claimed.
+
+The RPC runtime denies non-root arbitrary execution and unrestricted
+transcripts. Even a genesis signer needs a current local execution/live-data
+grant; a roster role does not grant OS authority. Verified private owner
+metadata discovery is distinct from execution/transcript grants. Shared
+flocks only permit locally approved snapshots. Desktop admission is tested
+against a fake Desktop control endpoint; cloud provisioning, Pages builds
+and multi-PC Zero-Broker cloud delivery have not had live acceptance.
+The isolated LAN trial is unchanged.
+
+Use Copilot to prepare a per-flock key card, independently verify both device
+fingerprints, and obtain a pre-bound owner invite. Voucher recipients remain
+non-executing until the owner verifies their fingerprints and publishes
+one-time redemption. On the receiver, Copilot uses `grant-root --flock
+<uuid> --sessions <selected-uuids>` only with local user approval; `revoke-root`
+removes those live grants. `share_thread` requires an explicit bounded summary,
+not an automatic transcript export. Private state lives under
+`~/.copilot/flock/zero-broker/<uuid>`; never recreate a missing admission ledger
+under an existing device key. `resume-init` reconciles a saved signed genesis
+after ambiguous publication; incomplete Azure staging requires reconciliation
+of the exact reported resource, not a new identity.
+
+**Capacity and compatibility:** SignalR Free has limited connections and a
+20,000-message/day allowance measured in outbound 2 KiB units. This transport
+publishes to the epoch hub, so recipient-sealed RPC still incurs connected
+recipient fan-out. Requests, receipts, reconciliation and payload size all
+count; do not infer that a six-PC workload fits Free. Zero-Broker does not use
+the legacy 45-second presence broadcast. Service Bus Standard operations and
+GitHub Actions/Pages limits remain separate constraints. No paid SKU change
+or live load acceptance is implied. The administrative viewer and legacy
+topology/fleet/update tools remain legacy-only, not Zero-Broker native tools.
 
 ## Try it out hubless; deploy the components for the real potential
 
@@ -66,15 +151,14 @@ permission to trust remote prompts. The trial has its own entry point, state,
 keys and `copilot-lan-trial` MCP name. It passed a bounded Windows two-PC live
 acceptance run and independent code reviews, not universal live-platform tests.
 
-**Deploy Azure SignalR Serverless and Azure Service Bus, plus the Token Broker
-for signed one-step enrollment, to unlock day-to-day fleet collaboration.**
+**The Zero-Broker candidate uses Azure SignalR Serverless, Service Bus Standard
+and signed Pages publication; it does not deploy a Token Broker.**
 SignalR provides real-time cloud rendezvous; Service Bus supplies durable
-offline delivery; the broker makes the owner's deployment reusable by invited
-machines. Deploy once, then invite machines 2..N rather than pair every LAN
-endpoint manually. The broker is optional for direct connection-string setup,
-but is the component that enables the streamlined invite journey.
+offline transport. Pre-bound invites or independently approved voucher claims
+enroll further PCs. The following comparison describes the existing legacy
+deployment's broader capabilities, not the narrower Zero-Broker native profile.
 
-### Capability comparison: "Try It Out" vs. full deployed Flock
+### Legacy capability comparison: "Try It Out" vs. existing deployed Flock
 
 | Capability | Hubless LAN-Direct Trial (`lan-trial`) | Full deployed Copilot Flock (`flock.mjs`) |
 | --- | --- | --- |
@@ -121,7 +205,7 @@ switchboard does not bypass explicit sharing or flock boundaries.
 
 Azure SignalR offers a Free tier usable with Serverless mode, subject to its
 connection/message limits. Service Bus **Standard** supplies the required
-topics/subscriptions; broker hosting is a separate resource. Budget for their
+topics/subscriptions; broker hosting on the legacy path is separate. Budget for their
 published capacity/usage charges and monitoring rather than assuming the
 whole deployment is free or promising a fixed price. Small deployments can
 use low-cost hosting, but actual cost depends on region, traffic and sizing.
@@ -150,6 +234,19 @@ privileged fallback to make a trial acceptance test appear to pass.
 *(Prefer dark mode? View the [Dark-Mode Bipartite SVG Topology Map](./docs/assets/flock-topology-dark.svg) or ask your Copilot: `"Show me a flock topology diagram"`.)*
 
 ---
+
+## Legacy platform reference
+
+The remaining architecture, coordinator, topology, viewer, file-transfer and
+headless examples document the existing legacy deployment. Fresh Zero-Broker
+setup uses the native profile above, not these privileged legacy capabilities.
+Direct legacy installation must explicitly select `--architecture legacy`
+(`-Legacy` / `--legacy` in setup wrappers). Existing legacy configurations
+and signed v3 broker invites retain their original behavior. Trusted legacy
+`owner_root` / `owner_scope` discovery does not require external sharing;
+collaborator/guest session access remains explicit, even for same-owner identities.
+The viewer now handles repo-less chats and unknown timestamps and its build
+requires TypeScript checking.
 
 ## Why Copilot Flock Exists
 

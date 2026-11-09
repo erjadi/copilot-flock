@@ -4,6 +4,24 @@
 
 This guide covers **Case 1**: joining an **existing Copilot Flock** via a pasteable invite, adding your own additional computers, creating shared collaborator flocks (`<owner>/<team>`), issuing time-bound guest passes (`<owner>/<flock>/<machineId>`), and sharing specific threads safely.
 
+## Choose the invite's architecture first
+
+Fresh Zero-Broker enrollments use a signed Pages roster, independently pinned
+root fingerprint, and per-flock opaque device identity. Copilot either prepares
+an enrollment card for a pre-bound invitation or submits a recipient-sealed
+provisional voucher claim. An online authorized owner must approve an unbound
+claim and publish the signed roster before it can execute anything. There is no
+broker URL, guest Azure key, automatic session creation or privileged headless
+fallback. Copilot confirms the scope and local grants; verified private-owner
+metadata discovery is distinct from selected root-session/live-transcript grants.
+External members receive only explicitly approved summaries.
+
+The `copilot-flock-invite-v3` JSON, bootstrap endpoints and broader capabilities
+below are **legacy-only compatibility instructions**. They do not describe
+Zero-Broker enrollment and must not be used to migrate an existing installation
+silently. See [the Zero-Broker setup and authority guide](./BOOTSTRAP_NEW_FLOCK_BYO_AZURE.md)
+for candidate/live-acceptance limits. The LAN trial remains separate.
+
 ---
 
 ## 1. How Case 1 Works: Why Invitees Need Zero Azure Setup

@@ -4,6 +4,13 @@
 
 This guide covers **Case 2**: when you are setting up a **brand-new, independent Copilot Flock instance** for yourself or your organization using your own Azure resources (**Bring Your Own Azure SignalR + Service Bus**).
 
+> **Zero-Broker release candidate:** fresh setup now routes to SignalR
+> Serverless + Service Bus Standard + a signed `github.io` roster. This
+> checkout wires installation, CLI/MCP enrollment, Pages publication and the
+> owner-renewal/expiry loop. Mocked cloud and Desktop-control tests are not
+> live Azure/Pages or all-platform acceptance. Production remains unchanged
+> until release approval and separately authorized installation.
+
 > **Joining someone else's existing flock instead?**
 > If you received an invite message or signed `copilot-flock-invite-v3` JSON from a flock owner, you do **not** need to create any Azure resources! The `bootstrapUrl` is already embedded inside your invite JSON. Jump straight to **[Joining & Sharing Guide (Case 1)](./JOINING_AND_SHARING_GUIDE.md)**.
 
@@ -17,13 +24,26 @@ charges before installing tools or creating anything."* Copilot executes the
 wrapper for you; you do not need to copy connection strings or run a sequence
 of cloud commands manually.
 
-On Windows the managed entry point is `.\setup.ps1 -ProvisionAzure`
+Copilot must first confirm a dedicated public roster repository and consent
+to public pseudonymous metadata/history. On Windows the managed entry point
+is `.\setup.ps1 -ProvisionAzure -RosterRepository <owner>/<roster-repo> -PublishRoster`
 (optionally `-Scope personal -ResourceGroup rg-copilot-flock -Location eastus`).
-On Debian/Ubuntu or macOS it is `./setup.sh --provision-azure`
+On Debian/Ubuntu or macOS it is `./setup.sh --provision-azure
+--roster-repository <owner>/<roster-repo> --publish-roster`
 (optionally `--scope personal --resource-group rg-copilot-flock --location eastus`).
 Do not use this path for an existing invite or for the separate hubless LAN trial.
 
-The wrappers require Node.js already installed and perform these steps:
+The wrappers require Node.js >=22.5 already installed and perform these steps:
+
+For Node 22.5-22.12 they propagate `--experimental-sqlite` to setup, MCP and
+managed daemon/startup commands; prefer Node 22.13+ for unflagged use. Validation
+here used Node 24. Select a dedicated **project-site** repository (not
+`<owner>.github.io`). Fresh provisioning stops before Azure changes if a local
+Flock configuration already exists; use the explicit legacy path for legacy
+work, not automatic migration. Existing Zero-Broker installation can repair
+local integration without reissuing genesis. Startup failures are explicit and
+retain initialized identity/state for repair; Linux lingering requires local OS
+consent for unattended boots.
 
 1. Find Azure CLI; if missing, use Windows `winget` (possible UAC),
    Debian/Ubuntu's official installer (`sudo` unless already root), or macOS
@@ -35,8 +55,11 @@ The wrappers require Node.js already installed and perform these steps:
 3. Create the requested resource group and deploy
    [`infra/azuredeploy.json`](../infra/azuredeploy.json). Resource names are
    deterministic for that group, using a prefix plus a unique suffix.
-4. Capture the two connection-string outputs without printing them, then call
-   `flock.mjs install` with both. Failures stop before local installation.
+4. Capture issuer outputs without printing them and pass the deployment JSON
+   over stdin to `flock.mjs install`. Pin its subscription ID; stage the first
+   epoch topic, rules and subscriptions; publish signed genesis/history.
+   Configure MCP, skills and startup without spawning privileged coordinator
+   sessions. Report cloud readiness separately from process startup.
 
 The ARM parameters are `location`, `namePrefix`, `uniqueSuffix`, `signalrSku`
 (`Free_F1` or `Standard_S1`), `serviceBusSku` (`Standard` only) and
@@ -46,8 +69,44 @@ configuration. Outputs include resource names/endpoints, the topic name and
 both connection strings. **These string outputs are retained in Azure deployment
 history and contain resource-level keys.** Restrict deployment-history access;
 never paste outputs into an issue, transcript, screenshot or public artifact.
-The existing installer receives them as process arguments and persists its
-protected local config, so use a trusted installation machine.
+The new managed path forwards these over stdin, not credential-bearing
+process arguments. Use a trusted owner machine and protect deployment records.
+
+The template additionally defines exactly two topic-level authorization
+rules: `FlockSendRule` with `Send` and `FlockListenRule` with `Listen`. Its
+`serviceBusSendKey`, `serviceBusListenKey`, `serviceBusSendConnectionString`
+and `serviceBusListenConnectionString` outputs are **owner-only secrets**,
+also retained in deployment history. Managed initialization consumes them
+as private enrollment issuer material; never copy raw keys into guest invites.
+GitHub CLI authentication needs contents/Pages/workflow publication permissions.
+Azure CLI needs management rights on the pinned subscription/resources, even
+when existing signing keys are available. Granting `canMintTokens` does not
+create Azure RBAC or GitHub access on another PC.
+
+The Zero-Broker adapters stage a separate per-flock/epoch topic with those
+two rights and recipient-filtered `sub-<opaque-peer>-e<epoch>` subscriptions.
+Send SAS scopes name the normalized topic URI without `/messages`; Listen
+SAS scopes name the exact subscription. An ambiguous topic-create result
+reports the specific candidate resource for reconciliation, rather than
+claiming creation failed or deleting an unrelated resource.
+
+The signed-roster target provides **Encrypted Identities & Pseudonymous Public
+Metadata**, not invisible hosting accounts or membership topology. Root
+fingerprints must be pinned independently; unbound claims require independent
+device-key verification and explicit signed approval. Owner vaults exclude
+genesis signing private keys and are sealed only to the root and explicitly
+mint-capable delegates.
+
+**Bounded Revocation & Automatic Epoch Cutover** requires an available,
+authorized owner issuer, correctly configured Pages publication and accurate
+clocks. The maximum signed lease is one hour and fails closed when stale. An online
+issuer renews when one-third remains and rotates membership expiry epochs;
+issuers handling removals also need kick permission. A genesis-root publisher
+adds signed bootstrap checkpoints. Pages publication uses GitHub Actions on
+`gh-pages`; deployment latency, caching, Actions capacity and clock accuracy
+still matter. A committed roster does not prove public Pages freshness. Compromised delegates'
+Azure/GitHub administrative grants also require separate revocation; rotating
+protocol credentials does not remove external RBAC access.
 
 The template deploys SignalR in **Serverless** mode and Service Bus **Standard**
 with the offline topic. SignalR Free has quotas; Service Bus Standard is paid.
@@ -55,14 +114,42 @@ Subscription/RBAC permissions, provider registration, policy, existing resource
 names and regional quotas can cause a deployment failure. The wrappers do not
 delete a resource group or roll back unrelated resources on failure.
 
-**The Token Broker is not part of this initial template.** Continue with the
-broker deployment recipe below to unlock signed one-step enrollment for
-additional PCs, collaborators and guests; direct connection-string installation
-is not that broker-backed onboarding journey. The ARM structure and wrapper
+**Zero-Broker does not require a Token Broker.** Copilot prepares per-flock
+device key cards for owned PCs and independently verifies both fingerprints
+before root-signed pre-bound enrollment. Explicit mint-enabled delegates
+receive recipient-sealed issuer/control metadata, never genesis signing keys.
+External guests use a separate shared flock and a provisional voucher; the
+owner independently verifies and approves the signed claim before CAS redemption.
+The claim's GitHub username is self-asserted, not GitHub authentication.
+Native messaging targets existing Desktop sessions with local root grants;
+other identities receive no automatic owner discovery, and shared access is
+approved summaries only. Headless privileged spawning is explicitly denied. The ARM structure and wrapper
 flows have local syntax/unit/mock coverage; a real Azure deployment still
-requires an authorized subscription and has not been validated by those mocks.
+requires separate authorization and has not been validated by those mocks.
+
+State is private under `~/.copilot/flock/zero-broker/<uuid>`, including
+per-flock device keys, SQLite trust/admission/outbox state and local grants.
+Do not reconstruct a missing ledger using old keys. `resume-init` reconciles
+the exact saved signed genesis after uncertain publication. If staging did
+not produce genesis, inspect the reported candidate resource rather than
+blindly retrying, deleting resources or generating another identity.
+
+SignalR [Free](https://azure.microsoft.com/en-us/pricing/details/signalr-service/)
+allows 20 connections and 20,000 messages/day. Hub publication incurs outbound
+recipient fan-out and 2 KiB payload billing units, even though RPC is
+recipient-sealed. This profile has no legacy 45-second presence broadcast,
+but requests, receipts and reconciliation still consume quota. Service Bus
+operations, epoch topics/subscriptions and GitHub Actions limits are separate.
+No workload/SKU acceptance or paid upgrade is implied by the unit tests.
 
 ---
+
+## Legacy broker reference (explicit compatibility only)
+
+Everything below describes the existing broker/direct-string deployment,
+not fresh Zero-Broker setup. Select `--architecture legacy` for direct
+installation, or `-Legacy` / `--legacy` in wrappers. Existing configurations
+and signed `copilot-flock-invite-v3` broker invites retain their original path.
 
 ## Who Is This Guide For?
 

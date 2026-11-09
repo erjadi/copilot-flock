@@ -1,0 +1,493 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import crypto from "node:crypto";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import * as zb from "../zero-broker-roster.mjs";
+import { createZeroBrokerRuntime, isVerifiedZeroBrokerContext } from "../zero-broker-runtime.mjs";
+import { cloudRequest, createGitHubRosterRepository, peekLockEncryptedPacket, stageEpochResources } from "../zero-broker-transport.mjs";
+import { getZeroBrokerApi as flockApi } from "../flock.mjs";
+import { getZeroBrokerApi as bridgeApi } from "../bridge.mjs";
+
+function fixture(t) {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "flock-zb-test-"));
+  let state;
+  let receiverState;
+  const cleanups = [];
+  t.after(() => { for (const cleanup of cleanups.reverse()) cleanup(); state?.close(); receiverState?.close(); fs.rmSync(directory, { recursive: true, force: true }); });
+  const flockUuid = crypto.randomUUID();
+  const owner = zb.createDeviceKeys({ directory: path.join(directory, "owner"), flockUuid });
+  const peer = zb.createDeviceKeys({ directory: path.join(directory, "peer"), flockUuid });
+  state = zb.createRosterState({ directory: path.join(directory, "owner") });
+  receiverState = zb.createRosterState({ directory: path.join(directory, "peer") });
+  const nowMs = Date.now();
+  function credentials(epoch) {
+    return {
+      signalr: { endpoint: "https://demo.service.signalr.net", accessKey: `synthetic-signalr-key-${epoch}` },
+      serviceBus: { namespaceHost: "demo.servicebus.windows.net", topicName: `offline-f${flockUuid.replaceAll("-", "")}-e${epoch}-${crypto.randomBytes(6).toString("hex")}`, sendRuleKey: `synthetic-send-key-${epoch}`, listenRuleKey: `synthetic-listen-key-${epoch}` },
+    };
+  }
+
+  const genesis = zb.createGenesisRoster({ owner, ownerCredentials: credentials(1), nowMs });
+  const trust = (store, initial = genesis, transitions = []) => zb.verifyRosterChain(initial, transitions, nowMs, { state: store, pinnedRootFingerprint: genesis.rootFingerprint });
+  trust(state);
+  trust(receiverState);
+  function memberBundle(roster, device) {
+    return zb.openSealedBundle({
+      bundle: roster.members.find((member) => member.opaquePeerId === device.opaquePeerId).sealedMemberBundle,
+      recipientEncPrivPem: device.encPriv, flockUuid, rosterEpoch: roster.rosterEpoch,
+      recipientOpaquePeerId: device.opaquePeerId, bundleType: "member",
+    });
+  }
+  return { directory, flockUuid, owner, peer, state, receiverState, genesis, nowMs, credentials, trust, memberBundle, trackCleanup: (cleanup) => cleanups.push(cleanup) };
+}
+
+test("both full entry points expose the same lazy Zero-Broker API without installing or provisioning", async () => {
+  const [flock, bridge] = await Promise.all([flockApi(), bridgeApi()]);
+  for (const name of ["createDeviceKeys", "sealBundle", "verifyRosterChain", "createZeroBrokerRuntime", "stageEpochResources"]) {
+    assert.equal(flock[name], bridge[name]);
+    assert.equal(typeof flock[name], "function");
+  }
+});
+
+test("per-flock pseudonymous keys persist privately; sealed bundles bind every context field and reject bad keys", (t) => {
+  const f = fixture(t);
+  assert.deepEqual(zb.createDeviceKeys({ directory: path.join(f.directory, "owner"), flockUuid: f.flockUuid }), f.owner);
+  assert.notEqual(f.owner.opaquePeerId, f.peer.opaquePeerId);
+  const context = { flockUuid: f.flockUuid, rosterEpoch: 1, recipientOpaquePeerId: f.peer.opaquePeerId, bundleType: "member" };
+  const bundle = zb.sealBundle({ payload: { message: "Private synthetic payload" }, recipientEncPubPem: f.peer.encPub, ...context });
+  assert.deepEqual(zb.openSealedBundle({ bundle, recipientEncPrivPem: f.peer.encPriv, ...context }), { message: "Private synthetic payload" });
+  assert.throws(() => zb.openSealedBundle({ bundle, recipientEncPrivPem: f.owner.encPriv, ...context }));
+  for (const changed of [{ flockUuid: crypto.randomUUID() }, { rosterEpoch: 2 }, { recipientOpaquePeerId: f.owner.opaquePeerId }, { bundleType: "owner-vault" }]) {
+    assert.throws(() => zb.openSealedBundle({ bundle, recipientEncPrivPem: f.peer.encPriv, ...context, ...changed }), /context mismatch/);
+  }
+  assert.throws(() => zb.openSealedBundle({ bundle: { ...bundle, tag: Buffer.alloc(16).toString("base64") }, recipientEncPrivPem: f.peer.encPriv, ...context }));
+  assert.throws(() => zb.sealBundle({ payload: {}, recipientEncPubPem: f.peer.signingPub, ...context }), /x25519/);
+  const lowOrder = crypto.createPublicKey({ key: { kty: "OKP", crv: "X25519", x: Buffer.alloc(32).toString("base64url") }, format: "jwk" }).export({ type: "spki", format: "pem" });
+  assert.throws(() => zb.sealBundle({ payload: {}, recipientEncPubPem: lowOrder, ...context }));
+  if (process.platform !== "win32") {
+    const file = path.join(f.directory, "owner", `flock-${f.flockUuid}`, "device.json");
+    assert.equal(fs.statSync(file).mode & 0o777, 0o600);
+  }
+});
+
+test("group messages are signed inside authenticated encryption; durable nonce and replay claims reject reuse", (t) => {
+  const f = fixture(t);
+  const roster = zb.createPreBoundInvite({ roster: f.genesis, actor: f.owner, recipient: f.peer, role: "guest", ownerCredentials: f.credentials(2), nowMs: f.nowMs });
+  f.trust(f.state, f.genesis, [roster]);
+  f.trust(f.receiverState, f.genesis, [roster]);
+  const key = Buffer.from(f.memberBundle(roster, f.owner).flockKey, "base64");
+  const options = { roster, state: f.state, flockKey: key, signingPriv: f.owner.signingPriv, action: "ping", fromOpaquePeerId: f.owner.opaquePeerId, toOpaquePeerId: f.peer.opaquePeerId, body: { text: "Synthetic message" }, nowMs: f.nowMs };
+  const encrypted = zb.encryptFlockEnvelope(options);
+  const decrypted = zb.decryptFlockEnvelope({ envelope: encrypted, roster, state: f.receiverState, flockKey: key, recipientOpaquePeerId: f.peer.opaquePeerId, nowMs: f.nowMs });
+  assert.deepEqual(decrypted.body, options.body);
+  assert.throws(() => zb.decryptFlockEnvelope({ envelope: encrypted, roster, state: f.receiverState, flockKey: key, recipientOpaquePeerId: f.peer.opaquePeerId, nowMs: f.nowMs }), /Replay/);
+  assert.throws(() => zb.encryptFlockEnvelope({ ...options, messageId: encrypted.messageId, body: { text: "Different" } }), /reused/);
+  assert.throws(() => zb.encryptFlockEnvelope({ ...options, fromOpaquePeerId: f.peer.opaquePeerId, signingPriv: f.peer.signingPriv, toOpaquePeerId: f.owner.opaquePeerId, action: "send_message" }), /denied/);
+  assert.throws(() => zb.encryptFlockEnvelope({ ...options, signingPriv: f.peer.signingPriv }), /key mismatch/);
+  const second = zb.encryptFlockEnvelope(options);
+  assert.notEqual(second.ciphertext, encrypted.ciphertext);
+  assert.throws(() => zb.decryptFlockEnvelope({ envelope: { ...second, toOpaquePeerId: f.owner.opaquePeerId }, roster, state: f.receiverState, flockKey: key, recipientOpaquePeerId: f.peer.opaquePeerId, nowMs: f.nowMs }), /wrong-recipient/);
+  assert.throws(() => zb.decryptFlockEnvelope({ envelope: second, roster, state: f.receiverState, flockKey: key, recipientOpaquePeerId: f.peer.opaquePeerId, nowMs: f.nowMs + zb.MAX_LEASE_MS }), /lease expired/);
+  assert.throws(() => zb.encryptFlockEnvelope({ ...options, roster: f.genesis }), /durably verified/);
+});
+
+test("SignalR JWTs and Service Bus SAS have exact audiences, UTF-8 signing keys and epoch-scoped subscriptions", (t) => {
+  const f = fixture(t);
+  const member = f.memberBundle(f.genesis, f.owner);
+  const transport = member.transport;
+  const jwtPayload = (token) => JSON.parse(Buffer.from(token.split(".")[1], "base64url"));
+  assert.equal(jwtPayload(transport.wsClientJwt).aud, `${transport.endpoint}/client/?hub=${transport.hubName}`);
+  assert.equal(jwtPayload(transport.wsClientJwt).nameid, f.owner.opaquePeerId);
+  assert.equal(jwtPayload(transport.hubPublishJwt).aud, `${transport.endpoint}/api/v1/hubs/${transport.hubName}`);
+  const send = new URLSearchParams(transport.sbSendSas.slice("SharedAccessSignature ".length));
+  const listen = new URLSearchParams(transport.sbListenSas.slice("SharedAccessSignature ".length));
+  assert.equal(send.get("sr"), `https://demo.servicebus.windows.net/${transport.topicName}`);
+  assert.ok(!send.get("sr").endsWith("/messages"));
+  assert.equal(listen.get("sr"), `${send.get("sr")}/subscriptions/sub-${f.owner.opaquePeerId}-e1`);
+  const expected = crypto.createHmac("sha256", "synthetic-send-key-1").update(`${encodeURIComponent(send.get("sr"))}\n${send.get("se")}`).digest("base64");
+  assert.equal(send.get("sig"), expected);
+  const close = zb.buildSignalRCloseUserConnectionsRequest({ endpoint: transport.endpoint, accessKey: "synthetic-signalr-key", hubName: transport.hubName, opaquePeerId: f.owner.opaquePeerId, nowMs: f.nowMs });
+  assert.equal(close.method, "POST");
+  assert.ok(close.url.endsWith(`/${f.owner.opaquePeerId}/:closeConnections?api-version=2024-12-01`));
+  assert.equal(jwtPayload(close.headers.Authorization.slice(7)).aud, close.url.split("?")[0]);
+});
+
+test("genesis-root protects governance; non-minting delegates receive no Azure vault and cannot rotate or downgrade owners", (t) => {
+  const f = fixture(t);
+  const delegated = zb.createPreBoundInvite({
+    roster: f.genesis, actor: f.owner, recipient: f.peer, role: "owner",
+    ownerPermissions: { canKick: true, canModifyOwners: false, canMintTokens: false },
+    ownerCredentials: f.credentials(2), nowMs: f.nowMs,
+  });
+  assert.equal(delegated.sealedOwnerVault[f.peer.opaquePeerId], undefined);
+  assert.throws(() => zb.rotateRosterEpoch({ roster: delegated, actor: f.peer, ownerCredentials: f.credentials(3), nowMs: f.nowMs }), /authorized token issuer/);
+  const mutable = zb.createPreBoundInvite({
+    roster: f.genesis, actor: f.owner, recipient: f.peer, role: "owner",
+    ownerPermissions: { canKick: true, canModifyOwners: false, canMintTokens: true },
+    ownerCredentials: f.credentials(2), nowMs: f.nowMs,
+  });
+  const next = zb.rotateRosterEpoch({ roster: mutable, actor: f.peer, ownerCredentials: f.credentials(3), nowMs: f.nowMs });
+  assert.equal(zb.validateRosterTransition(mutable, next, f.nowMs), next);
+  const modified = structuredClone(next);
+  modified.ownerSigners.find((signer) => signer.opaquePeerId === f.peer.opaquePeerId).permissions.canKick = false;
+  assert.throws(() => zb.validateRosterTransition(mutable, zb.signRoster(modified, f.peer), f.nowMs), /Only genesis root/);
+  const missingRoot = structuredClone(next);
+  missingRoot.members = missingRoot.members.filter((member) => member.opaquePeerId !== f.owner.opaquePeerId);
+  assert.throws(() => zb.validateRosterTransition(mutable, zb.signRoster(missingRoot, f.peer), f.nowMs), /owner member identity/);
+  const recovered = zb.recoverFromCompromisedDelegate({ roster: mutable, actor: f.owner, delegateOpaquePeerId: f.peer.opaquePeerId, rotatedOwnerCredentials: f.credentials(3), nowMs: f.nowMs });
+  assert.ok(!recovered.members.some((member) => member.opaquePeerId === f.peer.opaquePeerId));
+  assert.equal(recovered.sealedOwnerVault[f.peer.opaquePeerId], undefined);
+});
+
+test("vouchers require pinned keys or signed independent owner approval, and CAS-published consumption is one time", (t) => {
+  const f = fixture(t);
+  const invite = zb.createInviteVoucher({ roster: f.genesis, actor: f.owner, rosterUrl: "https://demo.github.io/flock/flock-roster.json", enrollmentSbSendSas: "SharedAccessSignature synthetic-provisional-token", expiresAt: new Date(f.nowMs + 60000).toISOString(), nowMs: f.nowMs });
+  assert.equal(invite.voucher.invitePriv, undefined);
+  assert.equal(invite.voucher.flockKey, undefined);
+  const pending = zb.rotateRosterEpoch({ roster: f.genesis, actor: f.owner, ownerCredentials: f.credentials(2), nowMs: f.nowMs, mutate: (next) => { next.pendingVouchers[invite.voucher.voucherId] = invite.pendingRecord; } });
+  const claim = zb.createEnrollmentClaim({ voucher: invite.voucher, device: f.peer, githubUser: "demo-user" });
+  const options = { roster: pending, voucher: invite.voucher, claim, actor: f.owner, ownerCredentials: f.credentials(3), nowMs: f.nowMs };
+  assert.throws(() => zb.redeemEnrollmentClaim(options), /independently verified owner approval/);
+  const approval = zb.approveEnrollmentClaim({ claim, actor: f.owner, verifiedSigningFingerprint: zb.keyFingerprint(f.peer.signingPub), verifiedEncFingerprint: zb.keyFingerprint(f.peer.encPub) });
+  const redeemed = zb.redeemEnrollmentClaim({ ...options, approval });
+  assert.ok(redeemed.members.some((member) => member.opaquePeerId === f.peer.opaquePeerId));
+  assert.ok(redeemed.consumedVouchers[claim.voucherId]);
+  assert.throws(() => zb.redeemEnrollmentClaim({ ...options, roster: redeemed, approval, ownerCredentials: f.credentials(4) }), /consumed/);
+  assert.ok(!JSON.stringify(redeemed).includes("demo-user"));
+  assert.ok(!JSON.stringify(redeemed).includes("synthetic-provisional-token"));
+});
+
+test("explicit kick and scheduled expiry rotate keys, hubs, tokens and epoch topics", (t) => {
+  const f = fixture(t);
+  const joined = zb.createPreBoundInvite({ roster: f.genesis, actor: f.owner, recipient: f.peer, membershipExpiresAt: new Date(f.nowMs + 1000).toISOString(), ownerCredentials: f.credentials(2), nowMs: f.nowMs });
+  const prior = f.memberBundle(joined, f.owner);
+  const kicked = zb.kickMemberFromRoster({ roster: joined, actor: f.owner, opaquePeerId: f.peer.opaquePeerId, ownerCredentials: f.credentials(3), nowMs: f.nowMs });
+  const renewed = f.memberBundle(kicked, f.owner);
+  assert.notEqual(prior.flockKey, renewed.flockKey);
+  assert.notEqual(prior.transport.hubName, renewed.transport.hubName);
+  assert.notEqual(prior.transport.topicName, renewed.transport.topicName);
+  assert.notEqual(prior.transport.subscriptionName, renewed.transport.subscriptionName);
+  const expired = zb.pruneExpiredMembersAndRotate({ roster: joined, actor: f.owner, ownerCredentials: f.credentials(3), nowMs: f.nowMs + 2000 });
+  assert.equal(expired.rosterEpoch, 3);
+  assert.equal(expired.members.length, 1);
+  assert.equal(zb.pruneExpiredMembersAndRotate({ roster: joined, actor: f.owner, nowMs: f.nowMs }), joined);
+});
+
+test("persistent anchors reject rollback/forks and durable application claims survive an epoch cutover without redispatch", (t) => {
+  const f = fixture(t);
+  const joined = zb.createPreBoundInvite({ roster: f.genesis, actor: f.owner, recipient: f.peer, ownerCredentials: f.credentials(2), nowMs: f.nowMs });
+  f.trust(f.state, f.genesis, [joined]);
+  const request = { roster: joined, sender: f.owner.opaquePeerId, recipient: f.peer.opaquePeerId, requestId: crypto.randomUUID(), payload: { action: "ping" }, expiresAt: f.nowMs + 3600000, nowMs: f.nowMs };
+  assert.equal(f.state.admitRequest(request).dispatch, true);
+  const renewed = zb.rotateRosterEpoch({ roster: joined, actor: f.owner, ownerCredentials: f.credentials(3), nowMs: f.nowMs });
+  zb.verifyRosterChain(joined, [renewed], f.nowMs, { state: f.state });
+  assert.deepEqual(f.state.admitRequest({ ...request, roster: renewed }), { dispatch: false, status: "UNKNOWN", result: null });
+  assert.throws(() => f.state.admitRequest({ ...request, roster: renewed, payload: { action: "different" } }), /different payload/);
+  assert.throws(() => f.state.acceptVerifiedRoster(f.genesis), /rollback/);
+  assert.throws(() => f.state.acceptVerifiedRoster({ ...renewed, issuedAt: new Date(f.nowMs - 1).toISOString() }), /fork/);
+  const queue = { flockUuid: f.flockUuid, sender: f.owner.opaquePeerId, recipient: f.peer.opaquePeerId, requestId: crypto.randomUUID(), payload: { message: "Synthetic offline work" }, expiresAt: f.nowMs + 3600000, nowMs: f.nowMs };
+  f.state.queue(queue);
+  const reopened = zb.createRosterState({ directory: path.join(f.directory, "owner") });
+  try {
+    assert.equal(reopened.get(f.flockUuid).rosterEpoch, 3);
+    assert.deepEqual(reopened.pendingOutbox(f.flockUuid)[0].payload, queue.payload);
+    assert.equal(reopened.admitRequest({ ...request, roster: renewed }).dispatch, false);
+  } finally { reopened.close(); }
+});
+
+test("a CAS conflict discards only that staged candidate and retries against newly verified history", async (t) => {
+  const f = fixture(t);
+  const competing = zb.rotateRosterEpoch({ roster: f.genesis, actor: f.owner, ownerCredentials: f.credentials(2), nowMs: f.nowMs });
+  let puts = 0;
+  let discarded = 0;
+  const result = await zb.publishRosterWithCas({
+    trustedRoster: f.genesis, state: f.state, nowMs: () => f.nowMs,
+    readLatest: async (current) => ({ sha: `blob-${puts}`, transitions: puts === 0 ? [] : current.rosterEpoch === 1 ? [competing] : [] }),
+    prepare: async (current) => ({ roster: zb.rotateRosterEpoch({ roster: current, actor: f.owner, ownerCredentials: f.credentials(current.rosterEpoch + 1), nowMs: f.nowMs }) }),
+    put: async ({ sha }) => { assert.equal(sha, `blob-${puts}`); puts++; return { status: puts === 1 ? 409 : 200 }; },
+    discard: async () => { discarded++; },
+  });
+  assert.equal(discarded, 1);
+  assert.equal(result.rosterEpoch, 3);
+  assert.equal(result.prevRosterHash, zb.hashRoster(competing));
+});
+
+test("offline peers verify expired intermediate history, but execution still requires a fresh final lease", async (t) => {
+  const f = fixture(t);
+  const second = zb.rotateRosterEpoch({ roster: f.genesis, actor: f.owner, ownerCredentials: f.credentials(2), nowMs: f.nowMs });
+  const later = f.nowMs + zb.MAX_LEASE_MS + 1000;
+  const third = zb.rotateRosterEpoch({ roster: second, actor: f.owner, ownerCredentials: f.credentials(3), nowMs: later });
+  assert.equal(zb.verifyRosterChain(f.genesis, [second, third], later, { state: f.receiverState }).rosterEpoch, 3);
+  assert.throws(() => zb.verifyRosterChain(f.genesis, [], later, { state: f.state }), /lease expired/);
+  const renewed = await zb.publishRosterWithCas({
+    trustedRoster: f.genesis, state: f.state, nowMs: () => later,
+    readLatest: async () => ({ sha: "synthetic-blob", transitions: [] }),
+    prepare: async (current) => ({ roster: zb.rotateRosterEpoch({ roster: current, actor: f.owner, ownerCredentials: f.credentials(2), nowMs: later }) }),
+    put: async () => ({ status: 200 }),
+    discard: async () => assert.fail("Confirmed renewal must not be discarded"),
+  });
+  assert.equal(renewed.rosterEpoch, 2);
+});
+
+test("root recovery checkpoints are signed and cannot resurrect consumed vouchers; vaults reject extra secrets", (t) => {
+  const f = fixture(t);
+  const second = zb.rotateRosterEpoch({ roster: f.genesis, actor: f.owner, ownerCredentials: f.credentials(2), nowMs: f.nowMs });
+  const third = zb.rotateRosterEpoch({ roster: second, actor: f.owner, ownerCredentials: f.credentials(3), nowMs: f.nowMs });
+  const checkpoint = zb.createRecoveryCheckpoint({ trustedRoster: f.genesis, nextRoster: third, actor: f.owner, nowMs: f.nowMs });
+  assert.equal(zb.verifyRosterChain(f.genesis, [checkpoint], f.nowMs, { state: f.state }).rosterEpoch, 3);
+  const changed = structuredClone(checkpoint);
+  changed.recoveryCheckpoint.baseRosterHash = "0".repeat(64);
+  assert.throws(() => zb.verifyRosterChain(f.genesis, [zb.signRoster(changed, f.owner)], f.nowMs, { state: f.receiverState }), /checkpoint/);
+  assert.throws(() => zb.createGenesisRoster({ owner: f.owner, ownerCredentials: { ...f.credentials(1), rootSigningPriv: f.owner.signingPriv }, nowMs: f.nowMs }), /only Azure/);
+  assert.throws(() => zb.validateRosterDocument({ ...f.genesis, githubUser: "synthetic-private-identity" }), /public roster metadata/);
+  const privatePem = structuredClone(f.genesis);
+  privatePem.members[0].signingPub = f.owner.signingPriv;
+  assert.throws(() => zb.validateRosterDocument(privatePem), /never private key/);
+  const voucherId = crypto.randomUUID();
+  const consumedGenesis = zb.signRoster({ ...f.genesis, consumedVouchers: { [voucherId]: { opaquePeerId: f.peer.opaquePeerId, claimHash: "a".repeat(64) } } }, f.owner);
+  assert.throws(() => zb.createRecoveryCheckpoint({ trustedRoster: consumedGenesis, nextRoster: third, actor: f.owner, nowMs: f.nowMs }), /Consumed vouchers/);
+  const { signature, ...unsignedThird } = third;
+  const checkpointBody = { baseEpoch: 1, baseRosterHash: zb.hashRoster(consumedGenesis), nextRosterHash: crypto.createHash("sha256").update(zb.canonicalJson(unsignedThird)).digest("hex") };
+  const malicious = zb.signRoster({ ...third, recoveryCheckpoint: { ...checkpointBody, signature: crypto.sign(null, Buffer.from(zb.canonicalJson(checkpointBody)), f.owner.signingPriv).toString("base64") } }, f.owner);
+  assert.throws(() => zb.verifyRosterChain(consumedGenesis, [malicious], f.nowMs, { pinnedRootFingerprint: f.genesis.rootFingerprint }), /Consumed vouchers/);
+});
+
+test("a group-key holder cannot forge the signed plaintext or poison the original message replay claim", (t) => {
+  const f = fixture(t);
+  const key = Buffer.from(f.memberBundle(f.genesis, f.owner).flockKey, "base64");
+  const envelope = zb.encryptFlockEnvelope({ roster: f.genesis, state: f.state, flockKey: key, signingPriv: f.owner.signingPriv, action: "ping", fromOpaquePeerId: f.owner.opaquePeerId, toOpaquePeerId: f.owner.opaquePeerId, body: { value: "original" }, nowMs: f.nowMs });
+  const material = Buffer.from(crypto.hkdfSync("sha256", key, Buffer.from(`${envelope.fromOpaquePeerId}:${envelope.messageId}`), Buffer.from(`copilot-flock-v3-msg|${f.flockUuid}|1`), 44));
+  const aad = Buffer.from(`${f.flockUuid}|1|${envelope.fromOpaquePeerId}|${envelope.toOpaquePeerId}|${envelope.messageId}`);
+  const decipher = crypto.createDecipheriv("aes-256-gcm", material.subarray(0, 32), material.subarray(32));
+  decipher.setAAD(aad);
+  decipher.setAuthTag(Buffer.from(envelope.tag, "base64"));
+  const inner = JSON.parse(Buffer.concat([decipher.update(Buffer.from(envelope.ciphertext, "base64")), decipher.final()]).toString("utf8"));
+  inner.body = { value: "forged" };
+  inner.bodySha256 = crypto.createHash("sha256").update(zb.canonicalJson(inner.body)).digest("hex");
+  const cipher = crypto.createCipheriv("aes-256-gcm", material.subarray(0, 32), material.subarray(32));
+  cipher.setAAD(aad);
+  const forged = { ...envelope, ciphertext: Buffer.concat([cipher.update(zb.canonicalJson(inner)), cipher.final()]).toString("base64"), tag: cipher.getAuthTag().toString("base64") };
+  const options = { roster: f.genesis, state: f.receiverState, flockKey: key, recipientOpaquePeerId: f.owner.opaquePeerId, nowMs: f.nowMs };
+  assert.throws(() => zb.decryptFlockEnvelope({ ...options, envelope: forged }), /Invalid envelope signature/);
+  assert.equal(zb.decryptFlockEnvelope({ ...options, envelope }).body.value, "original");
+  key.fill(0);
+  material.fill(0);
+});
+
+test("application claims fail closed at capacity, preserve deadlines and cannot overwrite a terminal admission", (t) => {
+  const f = fixture(t);
+  const limited = zb.createRosterState({ directory: path.join(f.directory, "limited"), capacity: 1 });
+  f.trackCleanup(() => limited.close());
+  f.trust(limited);
+  const coordinates = { roster: f.genesis, sender: f.owner.opaquePeerId, recipient: f.owner.opaquePeerId, requestId: crypto.randomUUID(), payload: { action: "ping" }, expiresAt: f.nowMs + 1000, nowMs: f.nowMs };
+  limited.admitRequest(coordinates);
+  assert.throws(() => limited.admitRequest({ ...coordinates, requestId: crypto.randomUUID() }), /capacity/);
+  limited.finishRequest({ flockUuid: f.flockUuid, sender: coordinates.sender, recipient: coordinates.recipient, requestId: coordinates.requestId, status: "DELIVERED", result: { admitted: true } });
+  assert.throws(() => limited.finishRequest({ flockUuid: f.flockUuid, sender: coordinates.sender, recipient: coordinates.recipient, requestId: coordinates.requestId, status: "UNKNOWN", result: null }), /unclaimed/);
+  const queue = { flockUuid: f.flockUuid, sender: f.owner.opaquePeerId, recipient: f.owner.opaquePeerId, requestId: crypto.randomUUID(), payload: {}, expiresAt: f.nowMs + 1000, nowMs: f.nowMs };
+  limited.queue(queue);
+  assert.throws(() => limited.queue({ ...queue, expiresAt: f.nowMs + 2000 }), /different payload/);
+  assert.throws(() => limited.queue({ ...queue, requestId: crypto.randomUUID() }), /capacity/);
+});
+
+function runtimeFixture(t, { dispatch, readSnapshot, role = "owner" } = {}) {
+  const f = fixture(t);
+  const roster = zb.createPreBoundInvite({
+    roster: f.genesis, actor: f.owner, recipient: f.peer, role,
+    ...(role === "owner" ? { ownerPermissions: { canKick: false, canModifyOwners: false, canMintTokens: false } } : {}),
+    ownerCredentials: f.credentials(2), nowMs: f.nowMs,
+  });
+  f.trust(f.state, f.genesis, [roster]);
+  f.trust(f.receiverState, f.genesis, [roster]);
+  const peers = new Map();
+  const packets = [];
+  const errors = [];
+  let offline = false;
+  let grants = false;
+  let rootGrants = true;
+  let calls = 0;
+  const sendPacket = async ({ envelope }) => {
+    packets.push(envelope);
+    if (offline) throw Object.assign(new Error("Synthetic offline transport"), { ambiguous: true });
+    await peers.get(envelope.toOpaquePeerId).receive(envelope);
+    return { admittedToTransport: true };
+  };
+  const options = {
+    sendPacket,
+    reportError: (error) => errors.push(error),
+    authorizeRoot: async () => rootGrants,
+    authorizeSnapshot: async () => grants,
+    readSnapshot: readSnapshot || (async () => ({ status: "DELIVERED", result: { approvedSnapshot: true, summary: "Synthetic approved summary" } })),
+    dispatch: async (request, context) => {
+      assert.ok(isVerifiedZeroBrokerContext(context));
+      assert.ok(isVerifiedZeroBrokerContext(context, request));
+      assert.equal(isVerifiedZeroBrokerContext(context, { ...request, action: "create_session" }), false);
+      assert.equal(context.mode, "ROOT");
+      calls++;
+      return dispatch ? await dispatch(request, context) : { status: "DELIVERED", result: { admitted: true } };
+    },
+  };
+  const ownerRuntime = createZeroBrokerRuntime({ ...options, device: f.owner, state: f.state });
+  const peerRuntime = createZeroBrokerRuntime({ ...options, device: f.peer, state: f.receiverState });
+  peers.set(f.owner.opaquePeerId, ownerRuntime);
+  peers.set(f.peer.opaquePeerId, peerRuntime);
+  f.trackCleanup(() => { ownerRuntime.close(); peerRuntime.close(); });
+  return { ...f, ownerRuntime, peerRuntime, packets, errors, calls: () => calls, setOffline: (value) => { offline = value; }, setGrants: (value) => { grants = value; }, setRootGrants: (value) => { rootGrants = value; } };
+}
+
+test("mock-adapter RPC confirms admission once, seals recipients and rejects delegate execution before transport", async (t) => {
+  const f = runtimeFixture(t);
+  assert.equal(isVerifiedZeroBrokerContext({ mode: "ROOT" }), false);
+  const options = { toOpaquePeerId: f.peer.opaquePeerId, action: "send_message", params: { targetSession: "synthetic-session", message: "Synthetic task" }, requestId: crypto.randomUUID(), expiresAt: f.nowMs + 60000 };
+  assert.equal((await f.ownerRuntime.request(options)).status, "DELIVERED");
+  assert.equal((await f.ownerRuntime.request(options)).status, "DELIVERED");
+  assert.equal(f.calls(), 1);
+  f.setRootGrants(false);
+  assert.equal((await f.ownerRuntime.request({ toOpaquePeerId: f.peer.opaquePeerId, action: "send_message", params: { message: "No local execution grant" } })).status, "DENIED");
+  assert.equal(f.calls(), 1);
+  f.setRootGrants(true);
+  const before = f.packets.length;
+  assert.equal((await f.peerRuntime.request({ toOpaquePeerId: f.owner.opaquePeerId, action: "send_message", params: { message: "Denied task" } })).status, "DENIED");
+  assert.equal(f.packets.length, before);
+  const inspectionState = zb.createRosterState({ directory: path.join(f.directory, "inspection") });
+  f.trackCleanup(() => inspectionState.close());
+  f.trust(inspectionState, f.genesis, [f.state.get(f.flockUuid)]);
+  const roster = f.state.get(f.flockUuid);
+  const key = Buffer.from(f.memberBundle(roster, f.owner).flockKey, "base64");
+  const decrypted = zb.decryptFlockEnvelope({ envelope: f.packets[0], roster, state: inspectionState, flockKey: key, recipientOpaquePeerId: f.peer.opaquePeerId });
+  assert.throws(() => zb.openSealedBundle({ bundle: decrypted.body.sealedRpcBody, recipientEncPrivPem: f.owner.encPriv, flockUuid: f.flockUuid, rosterEpoch: roster.rosterEpoch, recipientOpaquePeerId: f.peer.opaquePeerId, bundleType: "rpc-body" }));
+  key.fill(0);
+});
+
+test("authenticated missing-receipt reconciliation preserves offline work without blind redispatch of UNKNOWN", async (t) => {
+  const f = runtimeFixture(t);
+  const request = { toOpaquePeerId: f.peer.opaquePeerId, action: "send_message", params: { message: "Synthetic queued task" }, requestId: crypto.randomUUID(), expiresAt: f.nowMs + 60000 };
+  f.setOffline(true);
+  assert.equal((await f.ownerRuntime.request(request)).status, "UNKNOWN");
+  assert.equal(f.state.pendingOutbox(f.flockUuid)[0].attempted, 1);
+  assert.equal(f.calls(), 0);
+  f.setOffline(false);
+  await f.ownerRuntime.reconcilePending();
+  assert.equal(f.calls(), 1);
+  assert.equal(f.state.pendingOutbox(f.flockUuid).length, 0);
+  assert.equal((await f.ownerRuntime.request(request)).status, "DELIVERED");
+  assert.equal(f.calls(), 1);
+});
+
+test("ambiguous adapter admissions remain durably UNKNOWN; shared groups only expose current approved snapshots", async (t) => {
+  const f = runtimeFixture(t, { dispatch: async () => { throw new Error("Synthetic crash after admission"); } });
+  const request = { toOpaquePeerId: f.peer.opaquePeerId, action: "send_message", params: {}, requestId: crypto.randomUUID(), expiresAt: f.nowMs + 60000 };
+  assert.equal((await f.ownerRuntime.request(request)).status, "UNKNOWN");
+  assert.equal((await f.ownerRuntime.request(request)).status, "UNKNOWN");
+  assert.equal(f.calls(), 1);
+  await f.ownerRuntime.reconcilePending();
+  assert.equal(f.calls(), 1);
+  assert.equal(f.state.pendingOutbox(f.flockUuid).length, 1);
+  const shared = runtimeFixture(t, { role: "guest" });
+  assert.equal((await shared.ownerRuntime.request({ toOpaquePeerId: shared.peer.opaquePeerId, action: "send_message", params: { message: "Do not leak this denied task" } })).status, "DENIED");
+  assert.equal(shared.packets.length, 0);
+  const query = { toOpaquePeerId: shared.owner.opaquePeerId, action: "get_transcript", params: { session: "synthetic-session" } };
+  assert.equal((await shared.peerRuntime.request(query)).status, "DENIED");
+  shared.setGrants(true);
+  const result = await shared.peerRuntime.request(query);
+  assert.equal(result.status, "DELIVERED");
+  assert.equal(result.result.approvedSnapshot, true);
+  assert.equal(shared.calls(), 0);
+});
+
+test("snapshot revocation during an awaited read denies disclosure and never invokes privileged dispatch", async (t) => {
+  let started;
+  let release;
+  const ready = new Promise((resolve) => { started = resolve; });
+  const gate = new Promise((resolve) => { release = resolve; });
+  const f = runtimeFixture(t, {
+    role: "guest",
+    readSnapshot: async () => {
+      started();
+      await gate;
+      return { status: "DELIVERED", result: { summary: "Synthetic revoked content" } };
+    },
+  });
+  f.setGrants(true);
+  const request = f.peerRuntime.request({ toOpaquePeerId: f.owner.opaquePeerId, action: "get_transcript", params: { session: "synthetic-session" } });
+  await ready;
+  f.setGrants(false);
+  release();
+  const result = await request;
+  assert.equal(result.status, "DENIED");
+  assert.equal(result.result, null);
+  assert.equal(f.calls(), 0);
+});
+
+test("cloud HTTP is bounded, HTTPS-only and does not follow credential-bearing redirects", async () => {
+  await assert.rejects(cloudRequest("http://synthetic.invalid"), /HTTPS/);
+  let calls = 0;
+  const fetchImpl = async (url, options) => {
+    calls++;
+    assert.equal(options.redirect, "error");
+    assert.ok(options.signal);
+    return new Response("synthetic", { status: 200 });
+  };
+  assert.equal((await cloudRequest("https://synthetic.invalid", { fetchImpl })).text, "synthetic");
+  await assert.rejects(cloudRequest("https://synthetic.invalid", { fetchImpl, body: "x".repeat(1048577) }), /request exceeds/);
+  assert.equal(calls, 1);
+  await assert.rejects(cloudRequest("https://synthetic.invalid", { fetchImpl: async () => new Response("x".repeat(1048577)) }), /response exceeds/);
+});
+
+test("mock Azure staging uses exactly Send/Listen rules and unique recipient-filtered epoch resources", async () => {
+  const calls = [];
+  const options = { flockUuid: crypto.randomUUID(), rosterEpoch: 2, opaquePeerIds: [`peer_${"a".repeat(24)}`], resourceGroup: "synthetic-rg", namespaceName: "synthetic-namespace", signalr: { endpoint: "https://demo.service.signalr.net", accessKey: "synthetic-key" } };
+  const staged = await stageEpochResources({ ...options, runAz: (args) => {
+    calls.push(args);
+    return args.includes("keys") ? { primaryKey: "synthetic-rule-key" } : null;
+  } });
+  assert.equal(calls.filter((args) => args.includes("authorization-rule") && args.includes("create")).length, 2);
+  assert.ok(calls.some((args) => args.includes("RecipientOnly") && args.includes(`toOpaquePeerId = '${options.opaquePeerIds[0]}'`)));
+  assert.ok(calls.some((args) => args.includes("$Default")));
+  await staged.discard();
+  const count = calls.length;
+  await staged.discard();
+  assert.equal(calls.length, count);
+  assert.ok(calls.at(-1).includes(staged.topicName));
+  assert.equal(staged.ownerCredentials.serviceBus.namespaceHost, "synthetic-namespace.servicebus.windows.net");
+});
+
+test("GitHub genesis history is immutable and archived before the latest roster SHA-precondition write", async (t) => {
+  const f = fixture(t);
+  const calls = [];
+  const repository = createGitHubRosterRepository({
+    repository: "synthetic-owner/synthetic-roster", token: "synthetic-token",
+    request: async (url, options) => {
+      calls.push({ url, body: JSON.parse(options.body) });
+      return { status: 201 };
+    },
+  });
+  await repository.publishGenesis(f.genesis);
+  assert.ok(calls[0].url.endsWith("/history/genesis.json"));
+  assert.ok(calls[1].url.endsWith(`/history/${zb.hashRoster(f.genesis)}.json`));
+  assert.ok(calls[2].url.endsWith("/flock-roster.json"));
+  assert.ok(calls.every((call) => !Object.hasOwn(call.body, "sha")));
+  const second = zb.rotateRosterEpoch({ roster: f.genesis, actor: f.owner, ownerCredentials: f.credentials(2), nowMs: f.nowMs });
+  await repository.put({ roster: second, sha: "a".repeat(40) });
+  assert.equal(calls.at(-1).body.sha, "a".repeat(40));
+  const decoded = Buffer.from(calls.at(-1).body.content, "base64").toString("utf8");
+  assert.ok(!decoded.includes("synthetic-signalr-key"));
+});
+
+test("Service Bus acknowledgements reject lock URLs outside the exact subscription and occur only explicitly", async () => {
+  const transport = { namespaceHost: "synthetic.servicebus.windows.net", topicName: "synthetic-topic", subscriptionName: `sub-peer_${"a".repeat(24)}-e1`, sbListenSas: "synthetic-listen-token" };
+  const base = `https://${transport.namespaceHost}/${transport.topicName}/subscriptions/${transport.subscriptionName}/messages/`;
+  for (const location of ["https://synthetic.invalid/stolen", `${base}lock#fragment`, `${base}../outside`]) {
+    await assert.rejects(peekLockEncryptedPacket({ transport, request: async () => ({ status: 201, text: "{}", headers: new Headers({ location }) }) }), /out-of-scope/);
+  }
+  const calls = [];
+  const received = await peekLockEncryptedPacket({ transport, request: async (url, options) => {
+    calls.push(options.method);
+    return options.method === "POST" ? { status: 201, text: "{}", headers: new Headers({ location: `${base}synthetic-message/synthetic-lock` }) } : { status: 204 };
+  } });
+  assert.deepEqual(calls, ["POST"]);
+  await received.acknowledge();
+  assert.deepEqual(calls, ["POST", "DELETE"]);
+});
