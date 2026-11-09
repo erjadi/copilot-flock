@@ -93,8 +93,12 @@ export async function post<T = Record<string, unknown>>(
   return { ...simulate(), simulated: true };
 }
 
-export function envelope(fromSession: string, toMachine: string, toSession: string, message: string, mode: string) {
-  return `<cross_session_message from_machine="LINUX-CONSOLE" from_session="${fromSession}" to_machine="${toMachine}" to_session="${toSession}" delivery="${mode}" sent_at="${new Date().toISOString()}">\n${message}\n</cross_session_message>`;
+export function viewerMachine(viewerHost?: string) {
+  return (viewerHost || "").trim().split(/\s+/)[0] || "LINUX-CONSOLE";
+}
+
+export function envelope(fromSession: string, toMachine: string, toSession: string, message: string, mode: string, fromMachine = "LINUX-CONSOLE") {
+  return `<cross_session_message from_machine="${fromMachine}" from_session="${fromSession}" to_machine="${toMachine}" to_session="${toSession}" delivery="${mode}" sent_at="${new Date().toISOString()}">\n${message}\n</cross_session_message>`;
 }
 
 /** Normalize only scope fields; raw technical payloads and unrelated prose remain intact. */

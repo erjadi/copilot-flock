@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { ArrowLeft, Eye, GitBranch, Search, Send, Wrench } from "lucide-react";
 import type { Ctx } from "./Console";
 import type { Session, Transcript } from "@/lib/fleet/types";
-import { envelope, fetchTranscript, post } from "@/lib/fleet/api";
+import { envelope, fetchTranscript, post, viewerMachine } from "@/lib/fleet/api";
 import { Btn, Dot, Input, Md, PageHeading, Panel, Select, SmartMessage, Toggle, rel } from "./ui";
 
 export function SessionsView({ ctx, selected, setSelected }: { ctx: Ctx; selected: Session | null; setSelected: (s: Session | null) => void }) {
@@ -37,15 +37,16 @@ function TranscriptPane({ ctx, s, onBack }: { ctx: Ctx; s: Session; onBack: () =
 
   const send = async (dryRun: boolean) => {
     setBusy(true); setResult(null);
+    const fromHost = viewerMachine(ctx.data.hub.viewerHost);
     try {
       const body = { toMachine: s.machineId, toSession: s.session_id, message: msg, mode, waitForReply: wait, dryRun };
       const r = await post<Record<string, unknown>>(ctx.base, ctx.mode, "/api/send", body, () => dryRun
-        ? { envelopePreview: envelope("fleet-console", s.machineId, s.session_id, msg, mode) }
+        ? { envelopePreview: envelope("fleet-console", s.machineId, s.session_id, msg, mode, fromHost) }
         : { ok: true, delivered: true, requestId: `req-${Date.now().toString(16)}`, ...(wait ? { reply: "Acknowledged — I'll incorporate that steer on the next turn." } : {}) });
       if (dryRun) setResult({ kind: "preview", text: String(r.envelopePreview ?? JSON.stringify(r, null, 2)) });
       else {
         setResult({ kind: "sent", text: JSON.stringify(r, null, 2) });
-        ctx.pushEvents([{ id: `evt-${Date.now()}`, timestamp: new Date().toISOString(), type: "outbox", target: s.machineId, fromMachine: "LINUX-CONSOLE", toMachine: s.machineId, action: "send_message", requestId: String(r.requestId ?? ""), summary: `send_message → ${s.machineId} · ${s.title}`, payload: body }]);
+        ctx.pushEvents([{ id: `evt-${Date.now()}`, timestamp: new Date().toISOString(), type: "outbox", target: s.machineId, fromMachine: fromHost, toMachine: s.machineId, action: "send_message", requestId: String(r.requestId ?? ""), summary: `send_message → ${s.machineId} · ${s.title}`, payload: body }]);
         if (t) setT({ ...t, messages: [...t.messages, { role: "user", messageId: `m${Date.now()}`, turnId: "steer", timestamp: new Date().toISOString(), content: msg }, ...(r.reply ? [{ role: "assistant" as const, messageId: `r${Date.now()}`, turnId: "steer", timestamp: new Date().toISOString(), content: String(r.reply) }] : [])] });
         setMsg("");
       }

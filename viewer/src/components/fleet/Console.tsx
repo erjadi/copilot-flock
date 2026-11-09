@@ -77,6 +77,11 @@ export function Console() {
   }, [base]);
 
   useEffect(() => { refresh(); }, [refresh]);
+  useEffect(() => {
+    if (data.hub?.viewerHost) {
+      document.title = `Copilot Flock Console · ${data.hub.viewerHost}`;
+    }
+  }, [data.hub?.viewerHost]);
   useEffect(() => { if (!auto) return; const t = setInterval(refresh, 10000); return () => clearInterval(t); }, [auto, refresh]);
   useEffect(() => {
     if (mode === "live") {

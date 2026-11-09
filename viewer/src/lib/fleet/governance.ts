@@ -41,16 +41,16 @@ export interface RolloutHealth {
 }
 
 export const RELEASE = {
-  candidate: "v3.1.0-rc",
-  version: "v3.1.0",
-  previousVersion: "v3.0.0",
-  branch: "v3.1.0-rc",
+  candidate: "v3.3.0-rc",
+  version: "v3.3.0",
+  previousVersion: "v3.2.0",
+  branch: "v3.3.0-rc",
   serviceBus: "your-servicebus.servicebus.windows.net",
   queue: "copilot-bridge-offline",
 };
 
 export const PIPELINE_STAGES = [
-  { title: "Candidate Branch", short: "Candidate", detail: "origin/v3.1.0-rc · main untouched" },
+  { title: "Candidate Branch", short: "Candidate", detail: "origin/v3.3.0-rc · main untouched" },
   { title: "Ed25519 Daemon Check", short: "Daemon", detail: "flock.mjs + bootstrap syntax + signed vote" },
   { title: "Flock Peer Vote", short: "Peer vote", detail: "Adversarial review · 100% online ACCEPT" },
   { title: "Self-Update Rollout", short: "Rollout", detail: "Fast-forward main + update --all" },

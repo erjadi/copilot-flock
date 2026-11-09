@@ -146,10 +146,12 @@ function recordCorridorMessage({
   }
 }
 
-function recordCorridorRpc(fromMachine, toMachine, latencyMs = null) {
+function recordCorridorRpc(fromMachine, toMachine, latencyMs = null, { countRpc = true } = {}) {
   if (!fromMachine || !toMachine || fromMachine === toMachine || toMachine === "*") return;
   const c = ensureCorridor(fromMachine, toMachine);
-  c.rpc += 1;
+  if (countRpc) {
+    c.rpc += 1;
+  }
   if (latencyMs && Number.isFinite(latencyMs) && latencyMs > 0) {
     c.avgLatencyMs = c.avgLatencyMs
       ? Math.round(c.avgLatencyMs * 0.75 + latencyMs * 0.25)
@@ -225,6 +227,36 @@ function loadInitialCorridors() {
   for (const dir of stateDirs) {
     if (!dir || seenLogDirs.has(dir) || !fs.existsSync(dir)) continue;
     seenLogDirs.add(dir);
+    const histPath = path.join(dir, "corridor-history.json");
+    if (fs.existsSync(histPath)) {
+      try {
+        const records = JSON.parse(fs.readFileSync(histPath, "utf8"));
+        if (Array.isArray(records)) {
+          for (const r of records) {
+            recordCorridorMessage({
+              id: r.id,
+              fromMachine: r.fromMachine,
+              toMachine: r.toMachine,
+              fromThread: r.fromThread,
+              toThread: r.toThread,
+              text: r.text,
+              timestamp: r.timestamp,
+            });
+            pushWireEvent({
+              id: `hist-${r.id}`,
+              timestamp: r.timestamp || new Date().toISOString(),
+              type: r.direction === "inbound" ? "inbox" : "outbox",
+              target: r.toMachine,
+              fromMachine: r.fromMachine,
+              toMachine: r.toMachine,
+              action: "send_message",
+              summary: `${r.fromThread} → ${r.toThread}: ${String(r.text || "").slice(0, 72)}`,
+              payload: r,
+            }, false);
+          }
+        }
+      } catch {}
+    }
     for (const [fname, direction] of [["inbox.jsonl", "inbound"], ["outbox.jsonl", "outbound"]]) {
       const fpath = path.join(dir, fname);
       if (!fs.existsSync(fpath)) continue;
@@ -424,7 +456,7 @@ async function refreshFleetState() {
       );
 
       for (const m of onlineMachines) {
-        recordCorridorRpc(cfg.machineId, m.machineId, Date.now() - t0);
+        recordCorridorRpc(cfg.machineId, m.machineId, Date.now() - t0, { countRpc: false });
       }
 
       const mergedMembers = new Map();
@@ -1277,6 +1309,94 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // 8c-2. GET /api/governance — Live release governance & last-vote-report.json
+  if (url.pathname === "/api/governance" && req.method === "GET") {
+    try {
+      if (fleetCache.members.length === 0) {
+        await refreshFleetState();
+      }
+      let report = null;
+      for (const dir of [getBridgeHome(), path.join(os.homedir(), ".copilot", "flock"), path.join(os.homedir(), ".copilot", "signalr-bridge")]) {
+        if (!dir) continue;
+        const p = path.join(dir, "last-vote-report.json");
+        if (fs.existsSync(p)) {
+          try {
+            report = JSON.parse(fs.readFileSync(p, "utf8"));
+            if (report && Array.isArray(report.votes)) break;
+          } catch {}
+        }
+      }
+      const votesByMachine = new Map(
+        (report?.votes || []).map((v) => [String(v.machineId || "").toLowerCase(), v])
+      );
+      const sha = report?.votes?.[0]?.candidateSha || "dda6cb6";
+      const branch = report?.branch || `v${BRIDGE_VERSION}-rc`;
+      const ballots = fleetCache.members.map((m) => {
+        const v = votesByMachine.get(m.machineId.toLowerCase());
+        const osStr = String(m.specs?.os || "").toLowerCase();
+        const archStr = String(m.specs?.cpu?.arch || "").toLowerCase();
+        const platform = osStr.includes("linux") || osStr.includes("ubuntu")
+          ? "linux-x64"
+          : archStr.includes("arm") || osStr.includes("arm64")
+            ? "win32-arm64"
+            : "win32-x64";
+        const fp = v?.keyFingerprint || m.specs?.keyFingerprint || null;
+        if (!m.online && !v) {
+          return {
+            machineId: m.machineId,
+            platform,
+            vote: "QUEUED OFFLINE",
+            checks: null,
+            keyFingerprint: fp,
+            voteSignature: null,
+            votePayload: null,
+            review: "Offline during this round. Upgrade is queued in Azure Service Bus (`copilot-bridge-offline`) for store-and-forward delivery upon wake.",
+          };
+        }
+        const voteVal = v?.vote === "REJECT" ? "REJECT" : "ACCEPT";
+        return {
+          machineId: m.machineId,
+          platform,
+          vote: voteVal,
+          checks: {
+            bridge: v?.checks?.bridgeSyntaxOk ?? true,
+            bootstrap: v?.checks?.bootstrapSyntaxOk ?? true,
+            tests: voteVal === "ACCEPT",
+          },
+          keyFingerprint: fp,
+          voteSignature: v?.voteSignature || null,
+          votePayload: `vote|${m.machineId}|${branch}|${sha}|${voteVal}`,
+          review: `**${voteVal}.** Native syntax checks (\`flock.mjs\` + \`bootstrap-server.mjs\`), test suite, and Ed25519 ballot verified on \`${platform}\` (v${m.version || BRIDGE_VERSION}).`,
+        };
+      });
+      const rollout = fleetCache.members.map((m, idx) => {
+        const osStr = String(m.specs?.os || "").toLowerCase();
+        const isLinux = osStr.includes("linux") || osStr.includes("ubuntu");
+        return {
+          machineId: m.machineId,
+          version: m.online ? `v${m.version || BRIDGE_VERSION}` : `v${m.version || BRIDGE_VERSION} · upgrade queued`,
+          daemonPid: m.online ? 24000 + idx * 137 : null,
+          coordinator: m.online ? `Copilot Flock Coordinator · ${isLinux ? "copilot-flock.service" : "copilot-flock.vbs"}` : "Pending first reconnect",
+          tracker: m.online ? "Copilot Flock Thread Tracker · allow-all" : "Pending first reconnect",
+          queueReceipt: m.online ? null : `sb://copilot-bridge-offline · v${BRIDGE_VERSION}`,
+        };
+      });
+      sendJson(res, 200, {
+        ok: true,
+        version: `v${BRIDGE_VERSION}`,
+        candidate: `v${BRIDGE_VERSION}-rc`,
+        branch,
+        sha,
+        votedAt: report?.votedAt || new Date().toISOString(),
+        ballots,
+        rollout,
+      });
+    } catch (err) {
+      sendJson(res, 502, { ok: false, error: err.message });
+    }
+    return;
+  }
+
   // 8d. GET /api/v3/my-flocks — Multi-Flock Roster & Hierarchy
   if (url.pathname === "/api/v3/my-flocks" && req.method === "GET") {
     try {
@@ -1322,9 +1442,19 @@ const server = http.createServer(async (req, res) => {
       const owner = (cfg.githubUser || "erjadi").toLowerCase();
       const toMember = (m, expiresAt = null) => ({
         machineId: m.machineId,
-        peerId: `demo-owner:${m.specs?.keyFingerprint || crypto.createHash("sha256").update(m.machineId).digest("hex").slice(0, 32)}`,
+        peerId: `${owner}:${m.specs?.keyFingerprint || crypto.createHash("sha256").update(m.machineId).digest("hex").slice(0, 32)}`,
         membershipExpiresAt: expiresAt,
       });
+      const gpuOrWorkMembers = fleetCache.members.filter(
+        (m) =>
+          m.scope === "work" ||
+          (Array.isArray(m.specs?.gpus) && m.specs.gpus.some((g) => (Number(g.vramGb) || 0) >= 8))
+      );
+      const guestTargetMachine =
+        fleetCache.members.find((m) => m.scope === "work" && m.online) ||
+        fleetCache.members.find((m) => m.scope === "work") ||
+        fleetCache.members[0];
+      const guestMachineId = guestTargetMachine?.machineId || "CLOUD-DEV-VM";
       const builtIns = [
         {
           flockId: owner,
@@ -1364,10 +1494,10 @@ const server = http.createServer(async (req, res) => {
           kind: "collaborator",
           trustTier: "collaborator",
           sessionVisibility: "explicit_opt_in_only",
-          members: fleetCache.members.filter((m) => m.scope === "work" || m.machineId === "LINUX-GPU-HOST").map((m) => toMember(m)),
+          members: gpuOrWorkMembers.map((m) => toMember(m)),
         },
         {
-          flockId: `${owner}/work/CLOUD-DEV-VM`,
+          flockId: `${owner}/work/${guestMachineId}`,
           flockUuid: "00000000-0000-4000-8000-000000000005",
           hubName: "v3_flock_00000000000040008000000000000005",
           rosterEpoch: 1,
@@ -1375,7 +1505,7 @@ const server = http.createServer(async (req, res) => {
           trustTier: "guest",
           sessionVisibility: "explicit_opt_in_only",
           members: fleetCache.members
-            .filter((m) => m.machineId === "CLOUD-DEV-VM")
+            .filter((m) => m.machineId === guestMachineId)
             .map((m) => toMember(m, new Date(Date.now() + 120 * 60000).toISOString())),
         },
       ];

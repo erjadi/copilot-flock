@@ -7,7 +7,8 @@ import { Btn, Input, PageHeading, Pill, Select } from "./ui";
 import { FlockOverlapMatrix } from "./FlockOverlap";
 
 export function FlocksView({ ctx, state, setState, refresh, error }: { ctx: Ctx; state: FlockState; setState: (state: FlockState) => void; refresh: () => Promise<void>; error: string | null }) {
-  const [path, setPath] = useState("example/studio-team");
+  const defaultOwner = (ctx.flockId.split("/")[0] || "example").trim();
+  const [path, setPath] = useState(`${defaultOwner}/studio-team`);
   const [handle, setHandle] = useState("");
   const [duration, setDuration] = useState(0);
   const [devices, setDevices] = useState(3);
@@ -20,7 +21,7 @@ export function FlocksView({ ctx, state, setState, refresh, error }: { ctx: Ctx;
   const run = async (key: string, action: () => Promise<void>) => { setBusy(key); setNotice(null); try { await action(); } catch (e) { setNotice(e instanceof Error ? e.message : "Request failed"); } finally { setBusy(null); } };
 
   return <div className="min-w-0">
-    <PageHeading title="Flocks" description="v3.1.0 · Copilot Flock Multi-Flock P2P Platform · <owner>/<flock>[/<machineId>]"><Pill tone={ctx.mode === "live" ? "online" : "muted"}>{ctx.mode === "live" ? "Live flock" : "Preview simulation"}</Pill></PageHeading>
+    <PageHeading title="Flocks" description={`v${ctx.data.hub.version || "3.3.0"} · Copilot Flock Multi-Flock P2P Platform · <owner>/<flock>[/<machineId>]`}><Pill tone={ctx.mode === "live" ? "online" : "muted"}>{ctx.mode === "live" ? "Live flock" : "Preview simulation"}</Pill></PageHeading>
     {(notice || error) && <div role="status" className="mb-5 break-words text-xs text-busy">{notice || error}</div>}
     <FlockOverlapMatrix flocks={state.flocks} error={error} />
     <section aria-labelledby="flocks-heading">

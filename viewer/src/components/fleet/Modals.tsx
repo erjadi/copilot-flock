@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { FolderGit2, Plus, X } from "lucide-react";
 import type { Ctx } from "./Console";
-import { fetchProjects, post } from "@/lib/fleet/api";
+import { fetchProjects, post, viewerMachine } from "@/lib/fleet/api";
 import type { Project } from "@/lib/fleet/types";
 import { Btn, Dot, GlassPanel, IconBtn, Input, Label, Select, Toggle, rel } from "./ui";
 
@@ -17,11 +17,12 @@ export function NewSessionModal({ ctx, onClose }: { ctx: Ctx; onClose: () => voi
   const [out, setOut] = useState<string | null>(null);
   const submit = async () => {
     setBusy(true);
+    const fromHost = viewerMachine(ctx.data.hub.viewerHost);
     const body = { toMachine, title, repo, workspaceType, branch, message, waitForReply: wait };
     try {
       const r = await post(ctx.base, ctx.mode, "/api/create-session", body, () => ({ ok: true, session_id: `ses-${Date.now().toString(16)}`, toMachine, title }));
       setOut(JSON.stringify(r, null, 2));
-      ctx.pushEvents([{ id: `evt-${Date.now()}`, timestamp: new Date().toISOString(), type: "outbox", target: toMachine, fromMachine: "LINUX-CONSOLE", toMachine, action: "create_session", summary: `create_session → ${toMachine} · ${title}`, payload: body }]);
+      ctx.pushEvents([{ id: `evt-${Date.now()}`, timestamp: new Date().toISOString(), type: "outbox", target: toMachine, fromMachine: fromHost, toMachine, action: "create_session", summary: `create_session → ${toMachine} · ${title}`, payload: body }]);
     } catch (e) { setOut(String(e)); }
     setBusy(false);
   };

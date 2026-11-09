@@ -2,7 +2,7 @@ import { useState } from "react";
 import { ChevronDown, Eye, Radio, Send } from "lucide-react";
 import type { Ctx } from "./Console";
 import { matchMembers, type BroadcastFilter } from "@/lib/fleet/match";
-import { envelope, post } from "@/lib/fleet/api";
+import { envelope, post, viewerMachine } from "@/lib/fleet/api";
 import { Btn, Dot, Input, Label, PageHeading, Panel, SmartMessage, Toggle, gpuLabel } from "./ui";
 
 interface Row { machineId: string; ok: boolean; latencyMs: number; detail: string }
@@ -23,12 +23,13 @@ export function BroadcastView({ ctx }: { ctx: Ctx }) {
 
   const run = async (dryRun: boolean) => {
     setBusy(true);
+    const fromHost = viewerMachine(ctx.data.hub.viewerHost);
     const body = { ...f, machines: f.machines || "*", toSession, newSession, title, repo, message, dryRun, waitForReply: wait };
     const r = await post<{ results?: Row[]; envelopePreview?: string }>(ctx.base, ctx.mode, "/api/broadcast", body, () => dryRun
-      ? { envelopePreview: matched.map((m) => envelope("fleet-console", m.machineId, newSession ? "<new>" : toSession || "<coordinator>", message, "immediate")).join("\n\n") }
+      ? { envelopePreview: matched.map((m) => envelope("fleet-console", m.machineId, newSession ? "<new>" : toSession || "<coordinator>", message, "immediate", fromHost)).join("\n\n") }
       : { results: matched.map((m) => ({ machineId: m.machineId, ok: Math.random() > 0.08, latencyMs: 60 + Math.floor(Math.random() * 500), detail: newSession ? `created "${title || "Broadcast session"}"` : wait ? "reply: ack" : "delivered" })) });
     if (dryRun) { setPreview(r.envelopePreview ?? JSON.stringify(r, null, 2)); setRows(null); }
-    else { setRows(r.results ?? []); setPreview(null); ctx.pushEvents([{ id: `evt-${Date.now()}`, timestamp: new Date().toISOString(), type: "outbox", target: "broadcast", fromMachine: "LINUX-CONSOLE", toMachine: matched.map((m) => m.machineId).join(","), action: "send_message", summary: `broadcast → ${matched.length} machines`, payload: body }]); }
+    else { setRows(r.results ?? []); setPreview(null); ctx.pushEvents([{ id: `evt-${Date.now()}`, timestamp: new Date().toISOString(), type: "outbox", target: "broadcast", fromMachine: fromHost, toMachine: matched.map((m) => m.machineId).join(","), action: "send_message", summary: `broadcast → ${matched.length} machines`, payload: body }]); }
     setBusy(false);
   };
 

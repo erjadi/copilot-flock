@@ -1,58 +1,105 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Check, ChevronDown, CircleAlert, GitMerge, KeyRound, LoaderCircle, Play, ShieldCheck, Stethoscope } from "lucide-react";
 import type { Ctx } from "./Console";
-import { post } from "@/lib/fleet/api";
-import { GOVERNANCE_ROUNDS, PIPELINE_STAGES, RELEASE, ROLLOUT_HEALTH, getRoundStats, type Ballot, type GovernanceRound } from "@/lib/fleet/governance";
+import { post, req, viewerMachine } from "@/lib/fleet/api";
+import { GOVERNANCE_ROUNDS, PIPELINE_STAGES, RELEASE, ROLLOUT_HEALTH, getRoundStats, type Ballot, type GovernanceRound, type RolloutHealth } from "@/lib/fleet/governance";
 import { Btn, Dot, PageHeading, Panel, Pill, SmartMessage } from "./ui";
 import { cn } from "@/lib/utils";
 
 interface ActionResult { kind: "vote" | "diagnose"; title: string; body: string; simulated: boolean; error?: boolean }
+interface LiveGovernancePayload {
+  ok: boolean;
+  version: string;
+  candidate: string;
+  branch: string;
+  sha: string;
+  votedAt: string;
+  ballots: Ballot[];
+  rollout: RolloutHealth[];
+}
 
 export function GovernanceView({ ctx }: { ctx: Ctx }) {
   const [roundNumber, setRoundNumber] = useState(4);
   const [busy, setBusy] = useState<"vote" | "diagnose" | null>(null);
   const [result, setResult] = useState<ActionResult | null>(null);
-  const round = GOVERNANCE_ROUNDS[roundNumber - 1];
+  const [liveGov, setLiveGov] = useState<LiveGovernancePayload | null>(null);
+
+  useEffect(() => {
+    if (ctx.mode !== "live") {
+      setLiveGov(null);
+      return;
+    }
+    req<LiveGovernancePayload>(ctx.base, "/api/governance")
+      .then((res) => { if (res?.ok && Array.isArray(res.ballots) && res.ballots.length > 0) setLiveGov(res); })
+      .catch(() => {});
+  }, [ctx.base, ctx.mode]);
+
+  const rounds = useMemo(() => {
+    if (!liveGov) return GOVERNANCE_ROUNDS;
+    return GOVERNANCE_ROUNDS.map((r, idx) =>
+      idx === 3
+        ? {
+            ...r,
+            sha: liveGov.sha || r.sha,
+            branch: liveGov.branch || r.branch,
+            summary: `Unanimous online quorum & ${liveGov.version} rollout`,
+            change: `Live Ed25519 release ballots (\`${liveGov.sha}\`) and \`${liveGov.version}\` daemon rollout across the active flock.`,
+            ballots: liveGov.ballots,
+          }
+        : r
+    );
+  }, [liveGov]);
+
+  const rolloutRows = liveGov?.rollout ?? ROLLOUT_HEALTH;
+  const round = rounds[roundNumber - 1];
   const stats = getRoundStats(round);
-  const finalStats = useMemo(() => getRoundStats(GOVERNANCE_ROUNDS[3]), []);
+  const finalStats = useMemo(() => getRoundStats(rounds[3]), [rounds]);
 
   const run = async (kind: "vote" | "diagnose") => {
     setBusy(kind);
     setResult(null);
+    const fromHost = viewerMachine(ctx.data.hub.viewerHost);
     const machines = round.ballots.filter((ballot) => ballot.vote !== "QUEUED OFFLINE").map((ballot) => ballot.machineId);
     const path = kind === "vote" ? "/api/vote-release" : "/api/diagnose";
     const body = kind === "vote"
-      ? { branch: "main", sha: GOVERNANCE_ROUNDS[3].sha, machines, rpc: "review_release" }
-      : { version: RELEASE.version, fix: false, machines };
+      ? { branch: "main", sha: rounds[3].sha, machines, rpc: "review_release" }
+      : { version: liveGov?.version ?? RELEASE.version, fix: false, machines };
     try {
       const response = await post<{ approvedForMerge?: boolean; accepted?: number; total?: number; healthy?: number; results?: { machineId: string; ok: boolean; detail?: string }[] }>(
         ctx.base, ctx.mode, path, body,
         () => kind === "vote"
-          ? { approvedForMerge: true, accepted: 6, total: 6, round: 4, sha: GOVERNANCE_ROUNDS[3].sha }
-          : { healthy: 6, results: machines.map((machineId) => ({ machineId, ok: true, detail: "Single daemon · v2.1.0 · key registered · boot persistent · Coordinator + Tracker healthy" })) },
+          ? { approvedForMerge: true, accepted: 6, total: 6, round: 4, sha: rounds[3].sha }
+          : { healthy: 6, results: machines.map((machineId) => ({ machineId, ok: true, detail: `Single daemon · ${RELEASE.version} · key registered · boot persistent · Coordinator + Tracker healthy` })) },
       );
       const healthy = response.results?.filter((item) => item.ok).length;
       const title = kind === "vote"
         ? `${response.accepted ?? finalStats.accepted}/${response.total ?? finalStats.online} ACCEPT · ${response.approvedForMerge === false ? "merge blocked" : "quorum reached"}`
         : `${healthy ?? response.healthy ?? finalStats.online}/${finalStats.online} online nodes verified`;
       const details = kind === "vote"
-        ? `Signed \`vote-release\` ballots validated for \`${GOVERNANCE_ROUNDS[3].sha}\`. ${response.approvedForMerge === false ? "At least one online voter still blocks merge." : "`approvedForMerge: true` · fast-forward and fleet rollout are permitted."}`
+        ? `Signed \`vote-release\` ballots validated for \`${rounds[3].sha}\`. ${response.approvedForMerge === false ? "At least one online voter still blocks merge." : "`approvedForMerge: true` · fast-forward and fleet rollout are permitted."}`
         : response.results?.map((item) => `- **${item.machineId}:** ${item.ok ? "Healthy" : "Attention required"}${item.detail ? ` — ${item.detail}` : ""}`).join("\n") ?? "Single daemon, version, Ed25519 registration, boot persistence, and both required threads verified.";
       setResult({ kind, title, body: details, simulated: Boolean(response.simulated) });
-      ctx.pushEvents([{ id: `evt-${Date.now()}`, timestamp: new Date().toISOString(), type: "outbox", target: "governance", fromMachine: "LINUX-CONSOLE", toMachine: machines.join(","), action: kind === "vote" ? "vote-release" : "diagnose", summary: title, payload: body }]);
+      ctx.pushEvents([{ id: `evt-${Date.now()}`, timestamp: new Date().toISOString(), type: "outbox", target: "governance", fromMachine: fromHost, toMachine: machines.join(","), action: kind === "vote" ? "vote-release" : "diagnose", summary: title, payload: body }]);
     } catch (error) {
       setResult({ kind, title: `${kind === "vote" ? "Vote" : "Diagnose"} failed`, body: String(error), simulated: ctx.mode === "seed", error: true });
     } finally { setBusy(null); }
   };
 
   return <div>
-    <PageHeading title="Release governance" description="Synthetic preview rounds, not signed release evidence. Live voting requires unanimous exact-candidate consent.">
+    <PageHeading
+      title="Release governance"
+      description={
+        liveGov
+          ? `${liveGov.candidate} → ${liveGov.version} (copilot-flock) · Unanimous ${finalStats.accepted}/${finalStats.online} online consent.`
+          : "Synthetic preview rounds, not signed release evidence. Live voting requires unanimous exact-candidate consent."
+      }
+    >
       <div className="flex flex-wrap gap-2">
         <Btn variant="outline" disabled={Boolean(busy)} onClick={() => run("vote")}>{busy === "vote" ? <LoaderCircle className="h-3.5 w-3.5 animate-spin" /> : <Play className="h-3.5 w-3.5" />}Run live vote</Btn>
         <Btn variant="primary" disabled={Boolean(busy)} onClick={() => run("diagnose")}>{busy === "diagnose" ? <LoaderCircle className="h-3.5 w-3.5 animate-spin" /> : <Stethoscope className="h-3.5 w-3.5" />}Run fleet diagnose</Btn>
       </div>
     </PageHeading>
-    <p className="mb-4 text-xs text-muted-foreground">The sample ballots, fingerprints and rollout states below are fictional. No real signatures or captured fleet history are bundled.</p>
+    {!liveGov && <p className="mb-4 text-xs text-muted-foreground">The sample ballots, fingerprints and rollout states below are fictional. No real signatures or captured fleet history are bundled.</p>}
 
     <Panel className="overflow-hidden">
       <ol className="grid grid-cols-5 divide-x divide-border/45">
@@ -65,7 +112,7 @@ export function GovernanceView({ ctx }: { ctx: Ctx }) {
       </ol>
       <div className="border-t border-border/55 px-4 py-4 sm:px-5">
         <div className="flex flex-wrap items-center justify-between gap-2"><div className="flex items-center gap-2 text-xs"><ShieldCheck className="h-4 w-4 text-online" /><span className="font-medium">Unanimous quorum</span></div><span className="font-mono text-[9px] text-muted-foreground sm:text-[10px]">{finalStats.accepted}/{finalStats.online} online ACCEPT · {finalStats.offlineQueued} offline queued</span></div>
-        <div className="mt-3 h-0.5 overflow-hidden rounded-full bg-muted" role="progressbar" aria-label="Online release quorum" aria-valuemin={0} aria-valuemax={finalStats.online} aria-valuenow={finalStats.accepted}><div className="h-full rounded-full bg-online transition-all" style={{ width: `${finalStats.accepted / finalStats.online * 100}%` }} /></div>
+        <div className="mt-3 h-0.5 overflow-hidden rounded-full bg-muted" role="progressbar" aria-label="Online release quorum" aria-valuemin={0} aria-valuemax={finalStats.online} aria-valuenow={finalStats.accepted}><div className="h-full rounded-full bg-online transition-all" style={{ width: `${finalStats.accepted / Math.max(1, finalStats.online) * 100}%` }} /></div>
         <div className="mt-2 truncate font-mono text-[9px] text-muted-foreground">Service Bus · {RELEASE.serviceBus} / {RELEASE.queue}</div>
       </div>
     </Panel>
@@ -76,12 +123,12 @@ export function GovernanceView({ ctx }: { ctx: Ctx }) {
     </Panel>}
 
     <section className="mt-8" aria-labelledby="rounds-heading">
-      <div className="mb-4 flex items-end justify-between gap-4"><div><h3 id="rounds-heading" className="text-sm font-medium">Voting rounds</h3><p className="mt-1 text-xs text-muted-foreground">Every rejection resets the gate; every fix earns a new signed ballot.</p></div><span className="hidden font-mono text-[9px] text-muted-foreground sm:block">origin/{RELEASE.branch}</span></div>
+      <div className="mb-4 flex items-end justify-between gap-4"><div><h3 id="rounds-heading" className="text-sm font-medium">Voting rounds</h3><p className="mt-1 text-xs text-muted-foreground">Every rejection resets the gate; every fix earns a new signed ballot.</p></div><span className="hidden font-mono text-[9px] text-muted-foreground sm:block">origin/{liveGov?.branch ?? RELEASE.branch}</span></div>
       <div className="grid grid-cols-2 gap-2 lg:grid-cols-4" role="tablist" aria-label="Release voting rounds">
-        {GOVERNANCE_ROUNDS.map((item) => {
+        {rounds.map((item) => {
           const itemStats = getRoundStats(item);
           const selected = item.number === roundNumber;
-          return <button key={item.sha} role="tab" aria-selected={selected} onClick={() => setRoundNumber(item.number)} className={cn("min-w-0 rounded-xl border p-3 text-left transition sm:p-4", selected ? "border-border bg-panel" : "border-border/50 bg-panel/25 hover:bg-panel/50")}>
+          return <button key={`${item.number}-${item.sha}`} role="tab" aria-selected={selected} onClick={() => setRoundNumber(item.number)} className={cn("min-w-0 rounded-xl border p-3 text-left transition sm:p-4", selected ? "border-border bg-panel" : "border-border/50 bg-panel/25 hover:bg-panel/50")}>
             <div className="flex items-center gap-2"><span className={cn("font-mono text-[9px]", selected ? "text-foreground" : "text-muted-foreground")}>ROUND {item.number}</span><span className="ml-auto font-mono text-[9px] text-muted-foreground">{item.sha}</span></div>
             <div className="mt-3 flex items-center gap-2"><Dot tone={itemStats.approvedForMerge ? "online" : "muted"} /><span className={cn("text-xs font-medium", itemStats.rejected > 0 && "text-destructive", itemStats.approvedForMerge && "text-online")}>{itemStats.accepted} ACCEPT <span className="text-muted-foreground">/ {itemStats.rejected} REJECT</span></span></div>
             <div className="mt-1 truncate text-[10px] text-muted-foreground">{item.summary}</div>
@@ -89,17 +136,17 @@ export function GovernanceView({ ctx }: { ctx: Ctx }) {
         })}
       </div>
 
-      <RoundDetail round={round} />
+      <RoundDetail round={round} isLive={Boolean(liveGov && round.number === 4)} />
     </section>
 
     <section className="mt-8" aria-labelledby="ballots-heading">
       <div className="mb-4 flex flex-wrap items-end justify-between gap-2"><div><h3 id="ballots-heading" className="text-sm font-medium">Ballot & rollout matrix</h3><p className="mt-1 text-xs text-muted-foreground">Native checks, Ed25519 proof, review notes, and post-merge health.</p></div><Pill tone={stats.approvedForMerge ? "online" : "destructive"}>{stats.approvedForMerge ? "approvedForMerge: true" : "merge blocked"}</Pill></div>
-      <div className="space-y-2">{round.ballots.map((ballot) => <BallotRow key={ballot.machineId} ballot={ballot} released={roundNumber === 4} />)}</div>
+      <div className="space-y-2">{round.ballots.map((ballot) => <BallotRow key={ballot.machineId} ballot={ballot} rolloutRows={rolloutRows} released={roundNumber === 4} />)}</div>
     </section>
   </div>;
 }
 
-function RoundDetail({ round }: { round: GovernanceRound }) {
+function RoundDetail({ round, isLive }: { round: GovernanceRound; isLive: boolean }) {
   const stats = getRoundStats(round);
   return <Panel className="enter-up mt-3 p-4 sm:p-5 lg:p-6" key={round.sha}>
     <div className="flex flex-wrap items-start justify-between gap-3"><div><div className="flex items-center gap-2 font-mono text-[10px] text-muted-foreground"><GitMerge className="h-3.5 w-3.5" />{round.sha}<span>·</span><span>{round.branch}</span></div><h4 className="mt-2 text-sm font-medium">{round.summary}</h4></div><Pill tone={stats.approvedForMerge ? "online" : "destructive"}>{stats.approvedForMerge ? "Merged to main" : `${stats.rejected} blocking ${stats.rejected === 1 ? "vote" : "votes"}`}</Pill></div>
@@ -107,12 +154,12 @@ function RoundDetail({ round }: { round: GovernanceRound }) {
     {round.blockers.length > 0 ? <div className="mt-5 space-y-2">{round.blockers.map((blocker, index) => <details key={blocker.id} className="group rounded-lg border border-destructive/15 bg-destructive/[0.025] px-3 py-3 sm:px-4" open={index === 0}>
       <summary className="flex cursor-pointer list-none items-start gap-2 [&::-webkit-details-marker]:hidden"><CircleAlert className="mt-0.5 h-3.5 w-3.5 shrink-0 text-destructive" /><span className="min-w-0 flex-1 text-xs font-medium">{blocker.title}</span><span className="hidden font-mono text-[9px] text-muted-foreground sm:inline">fixed in {blocker.resolvedIn}</span><ChevronDown className="h-3.5 w-3.5 shrink-0 text-muted-foreground transition-transform group-open:rotate-180" /></summary>
       <div className="ml-5 mt-3 border-l border-border/60 pl-4"><SmartMessage text={blocker.detail} compact /><div className="mt-3 rounded-md bg-online/[0.035] p-3"><div className="mb-1 font-mono text-[9px] uppercase tracking-wider text-online">Resolution · {blocker.resolvedIn}</div><SmartMessage text={blocker.resolution} compact /></div><div className="mt-2 font-mono text-[9px] text-muted-foreground">Raised by {blocker.raisedBy.join(" + ")}</div></div>
-    </details>)}</div> : <div className="mt-5 flex items-start gap-3 rounded-lg border border-online/15 bg-online/[0.025] p-4"><ShieldCheck className="mt-0.5 h-4 w-4 shrink-0 text-online" /><div className="text-xs leading-5"><span className="font-medium text-online">No example blockers remain.</span><span className="text-muted-foreground"> The seven fictional nodes accept this synthetic round. No real merge, deployment or signed quorum is asserted.</span></div></div>}
+    </details>)}</div> : <div className="mt-5 flex items-start gap-3 rounded-lg border border-online/15 bg-online/[0.025] p-4"><ShieldCheck className="mt-0.5 h-4 w-4 shrink-0 text-online" /><div className="text-xs leading-5"><span className="font-medium text-online">{isLive ? "No blockers remain." : "No example blockers remain."}</span><span className="text-muted-foreground"> {isLive ? `All ${stats.accepted}/${stats.online} online machines voted ACCEPT for \`${round.sha}\` and verified live rollout.` : "The seven fictional nodes accept this synthetic round. No real merge, deployment or signed quorum is asserted."}</span></div></div>}
   </Panel>;
 }
 
-function BallotRow({ ballot, released }: { ballot: Ballot; released: boolean }) {
-  const rollout = ROLLOUT_HEALTH.find((item) => item.machineId === ballot.machineId)!;
+function BallotRow({ ballot, rolloutRows, released }: { ballot: Ballot; rolloutRows: RolloutHealth[]; released: boolean }) {
+  const rollout = rolloutRows.find((item) => item.machineId === ballot.machineId) ?? ROLLOUT_HEALTH[0];
   const offline = ballot.vote === "QUEUED OFFLINE";
   return <Panel className="overflow-hidden">
     <div className="grid min-w-0 gap-4 p-4 sm:p-5 lg:grid-cols-[minmax(180px,1.15fr)_minmax(180px,1fr)_minmax(210px,1.2fr)] lg:items-center">

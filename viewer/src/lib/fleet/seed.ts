@@ -70,7 +70,7 @@ export function buildSeed(): Overview {
     }));
     sessions.push(...ms);
     return {
-      machineId: d.machineId, online: d.machineId !== "MINI-SERVER-PC", githubUser: "erjadi", githubName: "Demo Developer", scope: d.scope, version: "3.1.0",
+      machineId: d.machineId, online: d.machineId !== "MINI-SERVER-PC", githubUser: "erjadi", githubName: "Demo Developer", scope: d.scope, version: "3.3.0",
       copilotDesktopRunning: d.desktop, wsPort: d.wsPort, activeSessionCount: ms.length, registeredAt: ago(60 * 24 * (30 - mi * 4)),
       lastSeenAt: ago(0.2 + mi * 0.1), recentSessions: ms.slice(0, 4).map((s) => ({ session_id: s.session_id, title: s.title })), specs: d.specs, offlineReplay: { processedCount: 24 + mi, pendingAckCount: 0, inFlightCount: 0, ambiguousCount: 0 },
     };
@@ -78,7 +78,7 @@ export function buildSeed(): Overview {
   const events: WireEvent[] = [];
   for (let i = 0; i < 24; i++) events.push(...fakeEvent(members, sessions, 60 - i * 2));
   return {
-    hub: { endpoint: "https://your-signalr.service.signalr.net", hub: "v3_flock_00000000000040008000000000000001", version: "3.1.0", viewerHost: "LINUX-CONSOLE (10.0.0.14)", connected: true, lastUpdatedAt: new Date().toISOString() },
+    hub: { endpoint: "https://your-signalr.service.signalr.net", hub: "v3_flock_00000000000040008000000000000001", version: "3.3.0", viewerHost: "LINUX-CONSOLE (10.0.0.14)", connected: true, lastUpdatedAt: new Date().toISOString() },
     members, sessions, events: events.reverse(),
   };
 }

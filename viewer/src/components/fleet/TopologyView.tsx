@@ -3,7 +3,7 @@ import { Activity, Crosshair, Grid3x3, History, Maximize2, Minus, Network, Orbit
 import type { Flock } from "@/lib/fleet/flocks";
 import { FlockMembershipGraph } from "./FlockOverlap";
 import type { Ctx } from "./Console";
-import { post } from "@/lib/fleet/api";
+import { post, viewerMachine } from "@/lib/fleet/api";
 import { HUB_ID, deriveTopology, edgeKey, edgeTone, weight, type LinkMessage, type TopoEdge, type TopoNode } from "@/lib/fleet/topology";
 import type { Member, Overview, WireEvent } from "@/lib/fleet/types";
 import { Btn, Dot, GlassPanel, IconBtn, Input, SmartMessage, rel, gpuLabel, ReplayHealth } from "./ui";
@@ -193,9 +193,10 @@ export function TopologyView({ ctx, flocks, flockError }: { ctx: Ctx; flocks: Fl
     const r = await post(ctx.base, ctx.mode, "/api/send", { toMachine: id, toSession: s?.session_id, message: "[ping] Fleet console test pulse", mode: "immediate", waitForReply: false, dryRun: true }, () => ({ ok: true }));
     const lat = Math.round(performance.now() - t0);
     const rid = `req-ping-${Date.now()}`;
+    const fromHost = viewerMachine(ctx.data.hub.viewerHost);
     ctx.pushEvents([
-      { id: `${rid}-r`, timestamp: new Date().toISOString(), type: "bridgeRpcResponse", target: "LINUX-CONSOLE", fromMachine: id, toMachine: "LINUX-CONSOLE", action: "ping", requestId: rid, summary: `ping ok · ${lat}ms`, payload: { ...r, ok: true, latencyMs: lat } },
-      { id: `${rid}-q`, timestamp: new Date(Date.now() - lat).toISOString(), type: "bridgeRpcRequest", target: id, fromMachine: "LINUX-CONSOLE", toMachine: id, action: "ping", requestId: rid, summary: `ping → ${id}`, payload: { requestId: rid } },
+      { id: `${rid}-r`, timestamp: new Date().toISOString(), type: "bridgeRpcResponse", target: fromHost, fromMachine: id, toMachine: fromHost, action: "ping", requestId: rid, summary: `ping ok · ${lat}ms`, payload: { ...r, ok: true, latencyMs: lat } },
+      { id: `${rid}-q`, timestamp: new Date(Date.now() - lat).toISOString(), type: "bridgeRpcRequest", target: id, fromMachine: fromHost, toMachine: id, action: "ping", requestId: rid, summary: `ping → ${id}`, payload: { requestId: rid } },
     ]);
     return lat;
   };

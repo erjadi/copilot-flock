@@ -10,7 +10,7 @@ export interface Topology { nodes: TopoNode[]; edges: TopoEdge[] }
 
 export const HUB_ID = "copilot-flock";
 export const edgeKey = (a: string, b: string) => [a, b].sort().join("|");
-export const weight = (e: TopoEdge) => e.ab + e.ba + e.rpc * 0.5;
+export const weight = (e: TopoEdge) => (e.ab + e.ba) * 3 + Math.min(40, e.rpc) * 0.4;
 
 type Seed = [string, string, number, number, number, number, [string, string][]];
 const SEED: Seed[] = [
