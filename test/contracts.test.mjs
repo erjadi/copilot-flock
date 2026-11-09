@@ -195,12 +195,12 @@ test("release consent expiry before each launch prevents smoke or worker executi
     const importExpression = 'await import("./zero-broker-release.mjs")';
     assert.equal(handler.split(importExpression).length, 2);
     const coverage = createReleaseCoverage([...RELEASE_VALIDATION_POLICY.requiredModules, ...RELEASE_VALIDATION_POLICY.requiredTests]);
-    for (const expireAt of ["never", "before-smoke", "before-worker", "during-worker"]) {
+    for (const expireAt of ["never", "before-smoke", "before-worker", "during-import", "during-worker"]) {
       let now = Date.now();
       const approval = api.approveLocalReleaseExecution(cfg, commit, { ackReviewedHostCode: true, now });
       let smokeCalls = 0;
       let workerCalls = 0;
-      const run = () => vm.runInNewContext(`(async () => { ${handler.replace(importExpression, "releaseWorkerFixture")} })()`, {
+      const run = () => vm.runInNewContext(`(async () => { ${handler.replace(importExpression, "await releaseWorkerFixture")} })()`, {
         action: "review_release", params: { branch: "reviewed-branch", expectedCommit: commit }, cfg, fs, path, os, process, crypto, Buffer,
         assertExpectedReleaseCommit: api.assertExpectedReleaseCommit,
         resolveExpectedReleaseCommit: () => commit,
@@ -208,13 +208,16 @@ test("release consent expiry before each launch prevents smoke or worker executi
         getInstalledSourceProvenance: () => ({ sourceCommit: null, status: "unrecorded" }),
         assertLocalReleaseExecutionApproved: (config, sha) => api.assertLocalReleaseExecutionApproved(config, sha, now),
         releaseVoteSigningPayload: api.releaseVoteSigningPayload,
-        releaseWorkerFixture: { validateReleaseCandidateInWorker: async () => {
-          workerCalls++;
-          if (expireAt === "during-worker") now = approval.expiresAt;
-          return { ...coverage, modulesSyntaxOk: true, unitTestsOk: true,
-            moduleCount: coverage.coverage.modules.length, testFileCount: coverage.coverage.testFiles.length,
-            candidateCommit: commit, verificationLevel: "complete_candidate_syntax_and_root_tests" };
-        } },
+        releaseWorkerFixture: Promise.resolve().then(() => {
+          if (expireAt === "during-import") now = approval.expiresAt;
+          return { validateReleaseCandidateInWorker: async () => {
+            workerCalls++;
+            if (expireAt === "during-worker") now = approval.expiresAt;
+            return { ...coverage, modulesSyntaxOk: true, unitTestsOk: true,
+              moduleCount: coverage.coverage.modules.length, testFileCount: coverage.coverage.testFiles.length,
+              candidateCommit: commit, verificationLevel: "complete_candidate_syntax_and_root_tests" };
+          } };
+        }),
         execFileSync: (program, args) => {
           if (program === "git") {
             if (expireAt === "before-smoke" && args.some((arg) => arg.endsWith(":test/local-rpc-fixture.mjs"))) now = approval.expiresAt;
