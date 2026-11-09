@@ -129,7 +129,21 @@ approved summaries only. Headless privileged spawning is explicitly denied. The 
 flows have local syntax/unit/mock coverage; a real Azure deployment still
 requires separate authorization and has not been validated by those mocks.
 
-Release review uses exact-commit extraction and a bounded validation worker.
+Release review requires local source review and exact-SHA host-code-execution
+consent on each voter before smoke or worker tests. Copilot records this through
+the local-only `approve-release-execution --commit <full-sha>
+--ack-reviewed-host-code` command from independently reviewed installed/pinned
+issuer code, never from the unapproved candidate itself (its top level executes
+before argument handling). Existing-device signatures bind the SHA,
+machine and 30-minute expiry; missing/expired approval denies execution and
+approval is checked again before ballot signing. No RPC/MCP tool, branch/origin,
+incoming request or peer ballot can grant it. No key creation or repair occurs.
+Tests retain the host account's filesystem/network privileges: temporary HOME,
+timeouts and environment filtering are not an OS sandbox. Consent to execute
+reviewed code is not release ACCEPT or permission to upgrade live reviewers.
+Older ungated reviewers must not execute unreviewed source.
+
+Release review then uses exact-commit extraction and a bounded validation worker.
 The worker clears inherited Node test selectors and isolates `COPILOT_HOME`,
 so focused parent tests cannot silently skip candidate tests. Version-2
 registered-key ballots sign both the full SHA and complete validation scope;

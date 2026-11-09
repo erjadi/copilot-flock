@@ -240,6 +240,14 @@ Each enrolled machine runs two distinct coordinator threads:
 Before merging or releasing **any** change to `copilot-flock`:
 1. Run `node --test test/flock.test.mjs` locally.
 2. Run a flock-wide cryptographic release vote across all online members:
+   Each voter must first review the exact candidate without executing it and
+   obtain local exact-SHA host-code-execution consent. Copilot records that
+   consent through the local-only `approve-release-execution --commit <full-sha>
+   --ack-reviewed-host-code` command from independently reviewed installed or
+   pinned issuer code, never the unapproved candidate itself. It expires after 30 minutes and does not
+   mean release ACCEPT. Incoming requests, origin/branch trust and peer ballots
+   do not authorize this command. Temporary profiles are not an OS sandbox;
+   never run unreviewed source through an older ungated reviewer.
    ```powershell
    node ~/.copilot/flock/flock.mjs vote-release --branch "<branch>"
    ```

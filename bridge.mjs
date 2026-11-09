@@ -851,6 +851,68 @@ function readExistingRpcIdentity() {
   return identity;
 }
 
+const RELEASE_EXECUTION_APPROVAL_TTL_MS = 30 * 60 * 1000;
+
+function releaseExecutionApprovalPayload(approval) {
+  if (approval?.version !== 1 || !/^[0-9a-f]{40}$/.test(approval.commit) ||
+      typeof approval.machineId !== "string" || !approval.machineId ||
+      !/^[0-9a-f]{32}$/.test(approval.fingerprint) ||
+      approval.ackReviewedHostCode !== true ||
+      !Number.isSafeInteger(approval.issuedAt) || !Number.isSafeInteger(approval.expiresAt) ||
+      approval.expiresAt - approval.issuedAt !== RELEASE_EXECUTION_APPROVAL_TTL_MS) {
+    throw rpcSecurityError("RELEASE_EXECUTION_NOT_APPROVED", "Invalid local release execution approval.");
+  }
+  return JSON.stringify(["copilot-flock-local-release-execution-v1", approval.version,
+    approval.commit, approval.machineId, approval.fingerprint, approval.issuedAt,
+    approval.expiresAt, approval.ackReviewedHostCode]);
+}
+
+function releaseExecutionIdentity(cfg) {
+  if (!cfg?.machineId || cfg.architecture === "zero-broker") {
+    throw rpcSecurityError("RELEASE_EXECUTION_NOT_APPROVED", "Legacy release execution requires an existing local legacy identity; no Zero-Broker fallback.");
+  }
+  const identity = readExistingRpcIdentity();
+  const fingerprint = crypto.createHash("sha256").update(identity.publicKey.trim()).digest("hex").slice(0, 32);
+  if (identity.fingerprint !== fingerprint) {
+    throw rpcSecurityError("RPC_LOCAL_IDENTITY_INVALID", "Existing identity fingerprint does not match its key; no repair performed.");
+  }
+  return identity;
+}
+
+function releaseExecutionApprovalPath(commit) {
+  if (!/^[0-9a-f]{40}$/.test(commit)) throw rpcSecurityError("RELEASE_EXECUTION_NOT_APPROVED", "Release execution requires a full immutable SHA.");
+  return path.join(getBridgeHome(), "release-execution-approvals", `${commit}.json`);
+}
+
+export function approveLocalReleaseExecution(cfg, commit, { ackReviewedHostCode = false, now = Date.now() } = {}) {
+  if (ackReviewedHostCode !== true) {
+    throw rpcSecurityError("RELEASE_EXECUTION_NOT_APPROVED", "Locally review the exact code and explicitly acknowledge execution with host privileges before approving it.");
+  }
+  const identity = releaseExecutionIdentity(cfg);
+  const approval = { version: 1, commit, machineId: cfg.machineId, fingerprint: identity.fingerprint,
+    issuedAt: now, expiresAt: now + RELEASE_EXECUTION_APPROVAL_TTL_MS, ackReviewedHostCode: true };
+  approval.signature = crypto.sign(null, Buffer.from(releaseExecutionApprovalPayload(approval)), identity.privateKey).toString("base64");
+  writeConfigFileSecure(approval, releaseExecutionApprovalPath(commit));
+  return approval;
+}
+
+export function assertLocalReleaseExecutionApproved(cfg, commit, now = Date.now()) {
+  if (!Number.isSafeInteger(now)) throw rpcSecurityError("RELEASE_EXECUTION_NOT_APPROVED", "Invalid local approval clock.");
+  let approval;
+  try { approval = JSON.parse(fs.readFileSync(releaseExecutionApprovalPath(commit), "utf8")); } catch {
+    throw rpcSecurityError("RELEASE_EXECUTION_NOT_APPROVED", `No readable local source-execution approval for ${commit}; review this exact SHA locally before approving host-privileged tests.`);
+  }
+  const identity = releaseExecutionIdentity(cfg);
+  const payload = releaseExecutionApprovalPayload(approval);
+  if (approval.commit !== commit || approval.machineId !== cfg.machineId ||
+      approval.fingerprint !== identity.fingerprint || approval.issuedAt > now ||
+      approval.expiresAt <= now || typeof approval.signature !== "string" ||
+      !crypto.verify(null, Buffer.from(payload), identity.publicKey, Buffer.from(approval.signature, "base64"))) {
+    throw rpcSecurityError("RELEASE_EXECUTION_NOT_APPROVED", "Local release execution approval is expired, mismatched or unauthenticated.");
+  }
+  return identity;
+}
+
 export async function loadTrustedRpcContext(cfg, { authority = null, identity = null, localFlocks = null, source = "network" } = {}) {
   if (!["network", "offline"].includes(source)) throw rpcSecurityError("RPC_CONTEXT_INVALID", "Invalid RPC receiver context source.");
   validatePinnedBootstrapOrigin(cfg?.bootstrapUrl || DEFAULT_BOOTSTRAP_URL, cfg?.bootstrapOriginPin || DEFAULT_BOOTSTRAP_ORIGIN);
@@ -6345,6 +6407,7 @@ export async function handleRpcAction(cfg, req, context = null) {
 
     // Extract candidate bridge.mjs, bootstrap-server.mjs, and test/bridge.test.mjs to temp files,
     // validate syntax (`node --check`), and run the fast unit test suite (`BRIDGE_FAST_VOTE_TEST=1`)
+    assertLocalReleaseExecutionApproved(cfg, candidateCommit);
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-vote-"));
     const checks = { bridgeSyntaxOk: false, bootstrapSyntaxOk: false, unitTestsOk: false };
     const issues = [];
@@ -6444,7 +6507,7 @@ export async function handleRpcAction(cfg, req, context = null) {
     }
 
     const vote = issues.length === 0 ? "ACCEPT" : "REJECT";
-    const idKey = ensureMachineIdentityKeypair();
+    const idKey = assertLocalReleaseExecutionApproved(cfg, candidateCommit);
     const evidence = {
       machineId: cfg.machineId, branch, candidateCommit, vote, checks,
       voteSignatureVersion: 2,
@@ -7511,7 +7574,7 @@ export const MCP_TOOLS = [
   {
     name: "vote_bridge_release",
     description:
-      "Pre-merge governance: every online voter validates the immutable full candidate, all .mjs syntax and all root suites including legacy RPC security and Zero-Broker, then returns a registered-key v2 Ed25519 ballot binding the full SHA and coverage. Legacy smoke-only ballots cannot approve a merge.",
+      "Pre-merge governance: each voter must first approve the exact reviewed SHA locally for host-privileged code execution; missing approval denies tests. Every online voter then validates all .mjs and root suites and returns a registered-key v2 ballot binding SHA and coverage. Temporary profiles are not an OS sandbox; smoke-only ballots cannot approve a merge.",
     inputSchema: {
       type: "object",
       properties: {
@@ -11330,6 +11393,16 @@ async function main() {
   const { command, positional, flags } = parseCliArgs(process.argv.slice(2));
   if ((command === "send-file" || command === "pull-file") && !flags.help) validateFileTransferCliArgs(command, flags, positional);
   const savedConfig = fs.existsSync(getConfigPath()) ? JSON.parse(fs.readFileSync(getConfigPath(), "utf8")) : null;
+  if (command === "approve-release-execution") {
+    if (flags.help) {
+      console.log("Local only: approve-release-execution --commit <full-sha> --ack-reviewed-host-code\nReview this exact source locally first. Tests execute with host privileges, not in an OS sandbox.\nSigned approval expires after 30 minutes; it is not a release ACCEPT vote or deployment authorization.");
+      return;
+    }
+    console.log(JSON.stringify(approveLocalReleaseExecution(savedConfig, flags.commit, {
+      ackReviewedHostCode: flags["ack-reviewed-host-code"] === true,
+    }), null, 2));
+    return;
+  }
   if (savedConfig?.architecture === "zero-broker" && command === "install" && (flags.architecture === "legacy" || flags.legacy)) throw new Error("In-place Zero-Broker to legacy migration is unsupported; keep its identity and admission ledger unchanged");
   if (flags.architecture !== "legacy" && !flags.legacy && (!savedConfig || savedConfig.architecture === "zero-broker") && (command === "help" || flags.help)) {
     console.log(`Copilot Flock ${BRIDGE_VERSION}: Zero-Broker candidate

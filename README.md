@@ -162,8 +162,22 @@ GitHub Actions/Pages limits remain separate constraints. No paid SKU change
 or live load acceptance is implied. The administrative viewer and legacy
 topology/fleet/update tools remain legacy-only, not Zero-Broker native tools.
 
-**Release validation:** the legacy release-review RPC validates an immutable
-Git commit in an isolated, bounded worker, without blocking the daemon during
+**Release validation:** before either smoke tests or full worker execution,
+each voter requires explicit **local approval of the exact reviewed SHA**.
+Ask that PC's Copilot to review the source without running it, then approve
+host-privileged execution of that SHA. Copilot uses the local-only
+`approve-release-execution --commit <full-sha> --ack-reviewed-host-code` command.
+Run this issuer only from independently reviewed installed or pinned code
+outside the unapproved candidate. **Never launch candidate `flock.mjs` to
+approve itself**: importing its top-level code already executes code.
+Approval is signed with the existing device identity, bound to its machine
+and SHA, expires after 30 minutes, and is rechecked before signing a ballot.
+Missing, expired, modified or mismatched approval denies execution; no identity
+is created or repaired. Branch/origin trust, an incoming request, or a peer's
+ballot is **not** local approval. No RPC or MCP tool grants this permission.
+
+The legacy release-review RPC then validates the immutable
+Git commit in a temporary-profile, bounded worker, without blocking the daemon during
 the full root suite. It checks every `.mjs`, requires the canonical/compatibility
 entry points to match, and requires all seven root suites, including the
 actual legacy RPC security regressions and both Zero-Broker suites.
@@ -174,6 +188,12 @@ Missing voters, selected subsets, unregistered keys and legacy smoke-only
 ballots cannot approve a merge. Older ballots remain diagnostically verifiable,
 not full-scope approval. LAN and viewer checks remain separate release evidence;
 these changes neither upgrade live reviewers nor authorize deployment.
+Temporary `COPILOT_HOME`, environment filtering and timeouts are **not an OS
+sandbox**: approved tests run with the host account's filesystem and network
+privileges. Local source-execution consent is not an ACCEPT ballot or rollout
+consent. Do not execute unreviewed peer-supplied source through an older reviewer
+that lacks this gate; a separately reviewed local helper also requires explicit
+local code-execution consent before tests.
 
 **Legacy upgrades and source evidence:** ask Copilot to upgrade the approved
 legacy installation. It fetches the canonical release into a dedicated Git ref,

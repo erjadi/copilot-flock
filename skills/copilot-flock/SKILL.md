@@ -35,3 +35,4 @@ The separate LAN trial has its own entry point/state and is not an Azure fallbac
    - `<owner>/<flock>/<machineId>` — Specific machine or single-PC time-bound guest pass (e.g. `erjadi/work/CLOUD-DEV-VM`).
 4. **4 Anti-Leakage Hard Walls (`Shared machines ≠ shared threads`)**:
    - Joining an external/collaborator flock or issuing a guest pass never exposes existing local threads. External callers can only access threads explicitly opted in via `share_thread` (with `approved-snapshot` transcript redaction) or new threads created for that `boundFlockId`.
+   - Trusted owner-root and owner-scope (`personal` / `work`) views intentionally discover the owner's session metadata without `share_thread`. `sharedCount: 0` means no external thread grants, not that same-owner discovery is denied. Discovery alone is not an execution or unrestricted transcript grant. Never apply this owner exception to collaborator or guest flocks.

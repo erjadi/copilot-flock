@@ -9,6 +9,118 @@ import { fileURLToPath } from "node:url";
 import * as flock from "../flock.mjs";
 import * as bridge from "../bridge.mjs";
 import * as broker from "../bootstrap-server.mjs";
+import crypto from "node:crypto";
+
+test("local release execution approval binds reviewed host code to exact SHA, device, key and expiry", (t) => {
+  const root = temporary(t);
+  const now = Date.now();
+  const commit = "a".repeat(40);
+  for (const [index, api] of [flock, bridge].entries()) {
+    process.env.COPILOT_HOME = path.join(root, String(index));
+    const cfg = { machineId: "SYNTHETIC-PC", architecture: "legacy" };
+    const approvalPath = path.join(api.getBridgeHome(), "release-execution-approvals", `${commit}.json`);
+    assert.throws(() => api.approveLocalReleaseExecution(cfg, commit), { code: "RELEASE_EXECUTION_NOT_APPROVED" });
+    assert.throws(() => api.approveLocalReleaseExecution(cfg, commit, { ackReviewedHostCode: true }), { code: "RPC_LOCAL_ENROLLMENT_REQUIRED" });
+    assert.equal(fs.existsSync(api.getBridgeHome()), false);
+    const identity = api.ensureMachineIdentityKeypair();
+    const identityPath = path.join(api.getBridgeHome(), "identity.json");
+    const originalIdentity = fs.readFileSync(identityPath);
+    const approval = api.approveLocalReleaseExecution(cfg, commit, { ackReviewedHostCode: true, now });
+    assert.equal(api.assertLocalReleaseExecutionApproved(cfg, commit, now).publicKey, identity.publicKey);
+    assert.throws(() => api.assertLocalReleaseExecutionApproved(cfg, "b".repeat(40), now), { code: "RELEASE_EXECUTION_NOT_APPROVED" });
+    assert.throws(() => api.assertLocalReleaseExecutionApproved({ ...cfg, machineId: "OTHER-PC" }, commit, now), { code: "RELEASE_EXECUTION_NOT_APPROVED" });
+    assert.throws(() => api.assertLocalReleaseExecutionApproved({ ...cfg, architecture: "zero-broker" }, commit, now), { code: "RELEASE_EXECUTION_NOT_APPROVED" });
+    assert.throws(() => api.assertLocalReleaseExecutionApproved(cfg, commit, now - 1), { code: "RELEASE_EXECUTION_NOT_APPROVED" });
+    assert.throws(() => api.assertLocalReleaseExecutionApproved(cfg, commit, approval.expiresAt), { code: "RELEASE_EXECUTION_NOT_APPROVED" });
+    assert.throws(() => api.assertLocalReleaseExecutionApproved(cfg, commit, NaN), { code: "RELEASE_EXECUTION_NOT_APPROVED" });
+    for (const patch of [{ commit: "b".repeat(40) }, { issuedAt: now + 1, expiresAt: approval.expiresAt + 1 },
+      { ackReviewedHostCode: false }, { signature: Buffer.alloc(64).toString("base64") },
+      { signature: crypto.sign(null, Buffer.from("a release ballot is not an execution approval"), identity.privateKey).toString("base64") }]) {
+      fs.writeFileSync(approvalPath, JSON.stringify({ ...approval, ...patch }));
+      assert.throws(() => api.assertLocalReleaseExecutionApproved(cfg, commit, now), { code: "RELEASE_EXECUTION_NOT_APPROVED" });
+    }
+    fs.writeFileSync(approvalPath, JSON.stringify(approval));
+    fs.writeFileSync(identityPath, "{}");
+    assert.throws(() => api.assertLocalReleaseExecutionApproved(cfg, commit, now), { code: "RPC_LOCAL_IDENTITY_INVALID" });
+    assert.equal(fs.readFileSync(identityPath, "utf8"), "{}");
+    fs.writeFileSync(identityPath, originalIdentity);
+    assert.deepEqual(fs.readFileSync(identityPath), originalIdentity);
+    assert.equal(api.MCP_TOOLS.some((tool) => /approve.*release.*execution/.test(tool.name)), false);
+  }
+});
+
+test("actual release handler denies smoke and worker execution before local exact-source approval", async (t) => {
+  const root = temporary(t);
+  for (const [index, api] of [flock, bridge].entries()) {
+    process.env.COPILOT_HOME = path.join(root, String(index));
+    const source = fs.readFileSync(new URL(`../${index ? "bridge" : "flock"}.mjs`, import.meta.url), "utf8");
+    const from = source.indexOf('  if (action === "review_release")');
+    const to = source.indexOf('  throw new Error(`Unsupported bridge RPC action:', from);
+    assert.ok(from > 0 && to > from);
+    const commit = "a".repeat(40);
+    const cfg = { machineId: "SYNTHETIC-PC", architecture: "legacy" };
+    let executions = 0;
+    const run = () => vm.runInNewContext(`(async () => { ${source.slice(from, to)} })()`, {
+      action: "review_release", params: { branch: "untrusted-branch" }, cfg, fs, path, os, process, crypto, Buffer,
+      resolveOrFindBridgeGitRepo: () => root,
+      getInstalledSourceProvenance: () => ({ sourceCommit: null, status: "unrecorded" }),
+      assertLocalReleaseExecutionApproved: api.assertLocalReleaseExecutionApproved,
+      releaseVoteSigningPayload: api.releaseVoteSigningPayload,
+      execFileSync: (program, args) => {
+        if (program !== "git") { executions++; return ""; }
+        if (args.includes("rev-parse")) return commit;
+        if (args.includes("show")) return "// Synthetic candidate; never executed\n";
+        return "";
+      },
+    });
+    await assert.rejects(run, { code: "RELEASE_EXECUTION_NOT_APPROVED" });
+    assert.equal(executions, 0);
+    assert.equal(fs.existsSync(api.getBridgeHome()), false);
+    api.ensureMachineIdentityKeypair();
+    api.approveLocalReleaseExecution(cfg, commit, { ackReviewedHostCode: true });
+    const result = await run();
+    assert.ok(executions > 0);
+    assert.equal(result.candidateCommit, commit);
+    // The synthetic VM does not load the real worker; incomplete evidence cannot ACCEPT.
+    assert.equal(result.vote, "REJECT");
+  }
+});
+
+test("release execution CLI refuses unacknowledged or missing identity without profile initialization", (t) => {
+  const root = temporary(t);
+  for (const script of ["flock.mjs", "bridge.mjs"]) {
+    const profile = path.join(root, script);
+    const args = [fileURLToPath(new URL(`../${script}`, import.meta.url)), "approve-release-execution", "--commit", "a".repeat(40)];
+    const env = { ...process.env, COPILOT_HOME: profile };
+    for (const flags of [[], ["--ack-reviewed-host-code"]]) {
+      const result = spawnSync(process.execPath, [...args, ...flags], { env, encoding: "utf8", timeout: 5000 });
+      assert.notEqual(result.status, 0);
+      assert.match(result.stderr, /explicitly acknowledge|existing local legacy identity/);
+      assert.equal(fs.existsSync(profile), false);
+    }
+    const help = spawnSync(process.execPath, [...args, "--help"], { env, encoding: "utf8", timeout: 5000 });
+    assert.equal(help.status, 0, help.stderr);
+    assert.match(help.stdout, /not in an OS sandbox/);
+    assert.equal(fs.existsSync(profile), false);
+    const home = path.join(profile, "flock");
+    fs.mkdirSync(home, { recursive: true });
+    const keys = crypto.generateKeyPairSync("ed25519", {
+      publicKeyEncoding: { type: "spki", format: "pem" }, privateKeyEncoding: { type: "pkcs8", format: "pem" },
+    });
+    const identity = { ...keys, fingerprint: crypto.createHash("sha256").update(keys.publicKey.trim()).digest("hex").slice(0, 32) };
+    fs.writeFileSync(path.join(home, "config.json"), JSON.stringify({ architecture: "legacy", machineId: "SYNTHETIC-PC" }));
+    fs.writeFileSync(path.join(home, "identity.json"), JSON.stringify(identity));
+    const before = fs.readFileSync(path.join(home, "identity.json"));
+    const approved = spawnSync(process.execPath, [...args, "--ack-reviewed-host-code"], { env, encoding: "utf8", timeout: 5000 });
+    assert.equal(approved.status, 0, approved.stderr);
+    const record = JSON.parse(approved.stdout);
+    assert.equal(record.commit, "a".repeat(40));
+    assert.equal(record.ackReviewedHostCode, true);
+    assert.ok(fs.existsSync(path.join(home, "release-execution-approvals", `${record.commit}.json`)));
+    assert.deepEqual(fs.readFileSync(path.join(home, "identity.json")), before);
+    assert.equal(fs.existsSync(path.join(profile, "mcp-config.json")), false);
+  }
+});
 import { materializeReleaseCandidate } from "../zero-broker-release.mjs";
 
 function git(directory, ...args) {
