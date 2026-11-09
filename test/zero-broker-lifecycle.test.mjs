@@ -227,6 +227,11 @@ test("two distinct owner PCs preserve selected-session grants and confirm one du
   const peer = f.open("peer", group, { ...f.host, sendMessage: async ({ allowed }) => { assert.equal(allowed(), true); admissions++; return { status: "DELIVERED", result: { admitted: true } }; } });
   assert.equal(peer.state.get(group.flockUuid).sealedOwnerVault[peer.device.opaquePeerId], undefined);
   peer.setGrants({ rootSessions: [sessionId], snapshots: {} });
+  const initialGrantRevision = peer.grants().revision;
+  assert.match(initialGrantRevision, /^[0-9a-f-]{36}$/);
+  peer.setGrants({ ...peer.grants(), revision: "caller-cannot-reuse-this-revision" });
+  assert.notEqual(peer.grants().revision, initialGrantRevision);
+  assert.notEqual(peer.grants().revision, "caller-cannot-reuse-this-revision");
   const ownerDaemon = f.open("owner", group);
   assert.notEqual(ownerDaemon.runtime, owner.runtime);
   let polling = Promise.resolve();

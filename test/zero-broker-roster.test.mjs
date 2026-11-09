@@ -4,6 +4,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import * as zb from "../zero-broker-roster.mjs";
 import { createZeroBrokerRuntime, isVerifiedZeroBrokerContext } from "../zero-broker-runtime.mjs";
 import { cloudRequest, createGitHubRosterRepository, peekLockEncryptedPacket, stageEpochResources } from "../zero-broker-transport.mjs";
@@ -183,7 +184,7 @@ test("persistent anchors reject rollback/forks and durable application claims su
   assert.equal(f.state.admitRequest(request).dispatch, true);
   const renewed = zb.rotateRosterEpoch({ roster: joined, actor: f.owner, ownerCredentials: f.credentials(3), nowMs: f.nowMs });
   zb.verifyRosterChain(joined, [renewed], f.nowMs, { state: f.state });
-  assert.deepEqual(f.state.admitRequest({ ...request, roster: renewed }), { dispatch: false, status: "UNKNOWN", result: null });
+  assert.deepEqual(f.state.admitRequest({ ...request, roster: renewed }), { dispatch: false, status: "UNKNOWN", result: null, authorization: null });
   assert.throws(() => f.state.admitRequest({ ...request, roster: renewed, payload: { action: "different" } }), /different payload/);
   assert.throws(() => f.state.acceptVerifiedRoster(f.genesis), /rollback/);
   assert.throws(() => f.state.acceptVerifiedRoster({ ...renewed, issuedAt: new Date(f.nowMs - 1).toISOString() }), /fork/);
@@ -292,7 +293,41 @@ test("application claims fail closed at capacity, preserve deadlines and cannot 
   assert.throws(() => limited.queue({ ...queue, requestId: crypto.randomUUID() }), /capacity/);
 });
 
-function runtimeFixture(t, { dispatch, readSnapshot, role = "owner", canMintTokens = false } = {}) {
+test("admission authorization schema upgrades in place without resetting existing claims or identity", (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "flock-zb-ledger-upgrade-"));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const stateDirectory = path.join(directory, "roster-state");
+  fs.mkdirSync(stateDirectory);
+  const file = path.join(stateDirectory, "state.sqlite");
+  fs.closeSync(fs.openSync(file, "wx", 0o600));
+  const identity = path.join(directory, "synthetic-existing-identity.json");
+  fs.writeFileSync(identity, "Synthetic existing identity must remain unchanged");
+  const original = new DatabaseSync(file);
+  try {
+    original.exec("CREATE TABLE admissions (flock TEXT NOT NULL,sender TEXT NOT NULL,recipient TEXT NOT NULL,request TEXT NOT NULL,digest TEXT NOT NULL,expiry INTEGER NOT NULL,status TEXT NOT NULL,result TEXT,PRIMARY KEY(flock,sender,recipient,request))");
+    original.prepare("INSERT INTO admissions VALUES (?,?,?,?,?,?,?,?)").run(
+      "synthetic-flock", "synthetic-sender", "synthetic-recipient", "synthetic-request",
+      "synthetic-digest", 123456789, "DELIVERED", '{"transcript":"Synthetic retained private receipt"}');
+  } finally { original.close(); }
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const upgraded = zb.createRosterState({ directory });
+    upgraded.close();
+  }
+  const inspected = new DatabaseSync(file);
+  try {
+    assert.ok(inspected.prepare("PRAGMA table_info(admissions)").all().some((column) => column.name === "authorization"));
+    const rows = inspected.prepare("SELECT * FROM admissions").all();
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].digest, "synthetic-digest");
+    assert.equal(rows[0].expiry, 123456789);
+    assert.equal(rows[0].status, "DELIVERED");
+    assert.equal(rows[0].result, '{"transcript":"Synthetic retained private receipt"}');
+    assert.equal(rows[0].authorization, null);
+    assert.equal(fs.readFileSync(identity, "utf8"), "Synthetic existing identity must remain unchanged");
+  } finally { inspected.close(); }
+});
+
+function runtimeFixture(t, { dispatch, readSnapshot, role = "owner", canMintTokens = false, captureResponses = false } = {}) {
   const f = fixture(t);
   const roster = zb.createPreBoundInvite({
     roster: f.genesis, actor: f.owner, recipient: f.peer, role,
@@ -307,10 +342,13 @@ function runtimeFixture(t, { dispatch, readSnapshot, role = "owner", canMintToke
   let offline = false;
   let grants = false;
   let rootGrants = true;
+  let grantRevision = 0;
+  let summary = "Synthetic approved summary";
   let calls = 0;
   const sendPacket = async ({ envelope }) => {
     packets.push(envelope);
     if (offline) throw Object.assign(new Error("Synthetic offline transport"), { ambiguous: true });
+    if (captureResponses && envelope.fromOpaquePeerId === f.peer.opaquePeerId) return { admittedToTransport: true };
     await peers.get(envelope.toOpaquePeerId).receive(envelope);
     return { admittedToTransport: true };
   };
@@ -319,7 +357,8 @@ function runtimeFixture(t, { dispatch, readSnapshot, role = "owner", canMintToke
     reportError: (error) => errors.push(error),
     authorizeRoot: async () => rootGrants,
     authorizeSnapshot: async () => grants,
-    readSnapshot: readSnapshot || (async () => ({ status: "DELIVERED", result: { approvedSnapshot: true, summary: "Synthetic approved summary" } })),
+    getAuthorizationRevision: () => String(grantRevision),
+    readSnapshot: readSnapshot || (async () => ({ status: "DELIVERED", result: { approvedSnapshot: true, summary } })),
     dispatch: async (request, context) => {
       assert.ok(isVerifiedZeroBrokerContext(context));
       assert.ok(isVerifiedZeroBrokerContext(context, request));
@@ -334,8 +373,185 @@ function runtimeFixture(t, { dispatch, readSnapshot, role = "owner", canMintToke
   peers.set(f.owner.opaquePeerId, ownerRuntime);
   peers.set(f.peer.opaquePeerId, peerRuntime);
   f.trackCleanup(() => { ownerRuntime.close(); peerRuntime.close(); });
-  return { ...f, ownerRuntime, peerRuntime, packets, errors, calls: () => calls, setOffline: (value) => { offline = value; }, setGrants: (value) => { grants = value; }, setRootGrants: (value) => { rootGrants = value; } };
+  return { ...f, ownerRuntime, peerRuntime, packets, errors, calls: () => calls,
+    setOffline: (value) => { offline = value; },
+    setGrants: (value) => { grants = value; grantRevision++; },
+    setRootGrants: (value) => { rootGrants = value; grantRevision++; },
+    setSummary: (value) => { summary = value; grantRevision++; },
+    summary: () => summary,
+  };
 }
+
+async function deliverRootApplication(f, request, kind = "request") {
+  const roster = f.state.get(f.flockUuid);
+  const key = Buffer.from(f.memberBundle(roster, f.owner).flockKey, "base64");
+  try {
+    const sealedRpcBody = zb.sealBundle({
+      payload: { kind, request }, recipientEncPubPem: f.peer.encPub,
+      flockUuid: f.flockUuid, rosterEpoch: roster.rosterEpoch,
+      recipientOpaquePeerId: f.peer.opaquePeerId, bundleType: "rpc-body",
+    });
+    const envelope = zb.encryptFlockEnvelope({
+      roster, state: f.state, flockKey: key, signingPriv: f.owner.signingPriv,
+      fromOpaquePeerId: f.owner.opaquePeerId, toOpaquePeerId: f.peer.opaquePeerId,
+      action: kind === "reconcile" ? "ping" : request.action,
+      body: { sealedRpcBody }, nowMs: f.nowMs,
+    });
+    await f.peerRuntime.receive(envelope);
+    const authenticated = zb.decryptFlockEnvelope({
+      envelope: f.packets.at(-1), roster, state: f.state, flockKey: key,
+      recipientOpaquePeerId: f.owner.opaquePeerId, nowMs: f.nowMs,
+    });
+    return zb.openSealedBundle({
+      bundle: authenticated.body.sealedRpcBody, recipientEncPrivPem: f.owner.encPriv,
+      flockUuid: f.flockUuid, rosterEpoch: roster.rosterEpoch,
+      recipientOpaquePeerId: f.owner.opaquePeerId, bundleType: "rpc-body",
+    });
+  } finally { key.fill(0); }
+}
+
+test("ROOT transcript downgrade discloses only the retained current snapshot on normal and reconciled duplicates", async (t) => {
+  const secret = "Synthetic ROOT transcript not authorized by the retained summary";
+  const f = runtimeFixture(t, {
+    captureResponses: true,
+    dispatch: async () => ({ status: "DELIVERED", result: { transcript: secret } }),
+  });
+  const request = { requestId: crypto.randomUUID(), action: "get_transcript",
+    params: { sessionId: crypto.randomUUID() }, expiresAt: f.nowMs + 60000 };
+  assert.deepEqual((await deliverRootApplication(f, request)).result, { transcript: secret });
+  assert.equal(f.calls(), 1);
+  f.setRootGrants(false);
+  f.setGrants(true);
+  f.setSummary("Current approved summary, not the ROOT transcript");
+  for (const kind of ["request", "reconcile", "request"]) {
+    const response = await deliverRootApplication(f, request, kind);
+    assert.equal(response.status, "DELIVERED");
+    assert.deepEqual(response.result, { approvedSnapshot: true, summary: f.summary() });
+    assert.equal(JSON.stringify(response).includes(secret), false);
+    assert.equal(f.calls(), 1, "Privacy projection must never redispatch the original ROOT action");
+  }
+  const before = f.state.get(f.flockUuid);
+  const next = zb.rotateRosterEpoch({ roster: before, actor: f.owner,
+    ownerCredentials: f.credentials(before.rosterEpoch + 1), nowMs: f.nowMs });
+  f.trust(f.state, before, [next]);
+  f.trust(f.receiverState, before, [next]);
+  assert.deepEqual((await deliverRootApplication(f, request)).result,
+    { approvedSnapshot: true, summary: f.summary() });
+  assert.equal(f.calls(), 1);
+});
+
+test("ROOT read downgraded during await never discloses its newly computed privileged result", async (t) => {
+  let started;
+  let release;
+  const ready = new Promise((resolve) => { started = resolve; });
+  const gate = new Promise((resolve) => { release = resolve; });
+  const f = runtimeFixture(t, { dispatch: async () => {
+    started();
+    await gate;
+    return { status: "DELIVERED", result: { transcript: "Synthetic never-disclosed ROOT content" } };
+  } });
+  const pending = f.ownerRuntime.request({ toOpaquePeerId: f.peer.opaquePeerId,
+    action: "get_transcript", params: { sessionId: crypto.randomUUID() } });
+  await ready;
+  f.setRootGrants(false);
+  f.setGrants(true);
+  release();
+  const response = await pending;
+  assert.equal(response.status, "DELIVERED");
+  assert.deepEqual(response.result, { approvedSnapshot: true, summary: f.summary() });
+  assert.equal(f.calls(), 1);
+});
+
+test("nonempty snapshot replacement during await rejects the earlier authorization revision", async (t) => {
+  let started;
+  let release;
+  const ready = new Promise((resolve) => { started = resolve; });
+  const gate = new Promise((resolve) => { release = resolve; });
+  const f = runtimeFixture(t, {
+    role: "guest",
+    readSnapshot: async () => {
+      const summary = f.summary();
+      started();
+      await gate;
+      return { status: "DELIVERED", result: { approvedSnapshot: true, summary } };
+    },
+  });
+  f.setGrants(true);
+  const pending = f.peerRuntime.request({ toOpaquePeerId: f.owner.opaquePeerId,
+    action: "get_transcript", params: { sessionId: crypto.randomUUID() } });
+  await ready;
+  f.setSummary("Replacement summary remains nonempty and approved");
+  release();
+  const response = await pending;
+  assert.equal(response.status, "DENIED");
+  assert.equal(response.result, null);
+  assert.equal(f.calls(), 0);
+});
+
+test("ROOT cached admissions bind grant revisions and roster epochs without redispatching reads or side effects", async (t) => {
+  for (const action of ["get_transcript", "send_message"]) {
+    const f = runtimeFixture(t, {
+      captureResponses: true,
+      dispatch: async () => ({ status: "DELIVERED", result: { privateResult: "Synthetic ROOT-only result" } }),
+    });
+    const request = { requestId: crypto.randomUUID(), action, params: {}, expiresAt: f.nowMs + 60000 };
+    assert.equal((await deliverRootApplication(f, request)).status, "DELIVERED");
+    f.setRootGrants(false);
+    f.setRootGrants(true);
+    for (const kind of ["request", "reconcile"]) {
+      const response = await deliverRootApplication(f, request, kind);
+      assert.equal(response.status, action === "send_message" ? "UNKNOWN" : "DENIED");
+      assert.equal(response.result, null);
+      assert.equal(f.calls(), 1);
+    }
+    const before = f.state.get(f.flockUuid);
+    const next = zb.rotateRosterEpoch({ roster: before, actor: f.owner,
+      ownerCredentials: f.credentials(before.rosterEpoch + 1), nowMs: f.nowMs });
+    f.trust(f.state, before, [next]);
+    f.trust(f.receiverState, before, [next]);
+    const response = await deliverRootApplication(f, request);
+    assert.equal(response.status, action === "send_message" ? "UNKNOWN" : "DENIED");
+    assert.equal(response.result, null);
+    assert.equal(f.calls(), 1, "An incompatible receipt must not reset its durable application claim");
+  }
+});
+
+test("unbound pre-upgrade admission receipts remain claimed but cannot disclose ROOT data", async (t) => {
+  const f = runtimeFixture(t, { captureResponses: true });
+  const roster = f.receiverState.get(f.flockUuid);
+  const request = { requestId: crypto.randomUUID(), action: "get_transcript", params: {}, expiresAt: f.nowMs + 60000 };
+  const claim = { roster, sender: f.owner.opaquePeerId, recipient: f.peer.opaquePeerId,
+    requestId: request.requestId, payload: request, expiresAt: request.expiresAt, nowMs: f.nowMs };
+  f.receiverState.admitRequest(claim);
+  f.receiverState.finishRequest({ flockUuid: f.flockUuid, sender: claim.sender, recipient: claim.recipient,
+    requestId: request.requestId, status: "DELIVERED", result: { transcript: "Synthetic pre-upgrade private content" } });
+  for (const kind of ["request", "reconcile"]) {
+    const response = await deliverRootApplication(f, request, kind);
+    assert.equal(response.status, "DENIED");
+    assert.equal(response.result, null);
+    assert.equal(f.calls(), 0);
+  }
+  f.setRootGrants(false);
+  f.setGrants(true);
+  const projected = await deliverRootApplication(f, request);
+  assert.deepEqual(projected.result, { approvedSnapshot: true, summary: f.summary() });
+  assert.equal(f.calls(), 0);
+});
+
+test("grant changes after possible dispatch preserve UNKNOWN through reconciliation without redispatch", async (t) => {
+  const f = runtimeFixture(t, { dispatch: async () => {
+    f.setRootGrants(false);
+    return { status: "DELIVERED", result: { admitted: true } };
+  } });
+  const request = { toOpaquePeerId: f.peer.opaquePeerId, action: "send_message", params: {},
+    requestId: crypto.randomUUID(), expiresAt: f.nowMs + 60000 };
+  assert.equal((await f.ownerRuntime.request(request)).status, "UNKNOWN");
+  assert.equal(f.calls(), 1);
+  await f.ownerRuntime.reconcilePending();
+  assert.equal((await f.ownerRuntime.request(request)).status, "UNKNOWN");
+  assert.equal(f.state.pendingOutbox(f.flockUuid).length, 1);
+  assert.equal(f.calls(), 1);
+});
 
 test("mock-adapter RPC confirms admission once, seals recipients and rejects delegate execution before transport", async (t) => {
   const f = runtimeFixture(t);

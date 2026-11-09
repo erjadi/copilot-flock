@@ -23,14 +23,16 @@ export function isVerifiedZeroBrokerContext(context, request) {
 }
 
 export function createZeroBrokerRuntime({
-  device, state, dispatch, authorizeRoot, authorizeSnapshot, readSnapshot,
+  device, state, dispatch, authorizeRoot, authorizeSnapshot, readSnapshot, getAuthorizationRevision,
   refreshRoster = async () => [],
   sendPacket = sendEncryptedPacket,
   now = Date.now,
   reportError,
   capacity = 32,
 }) {
-  requireValue(typeof dispatch === "function" && typeof authorizeRoot === "function" && typeof authorizeSnapshot === "function" && typeof reportError === "function", "Runtime requires dispatch, local root/snapshot authorization and explicit error reporting");
+  requireValue(typeof dispatch === "function" && typeof authorizeRoot === "function" && typeof authorizeSnapshot === "function" &&
+    typeof getAuthorizationRevision === "function" && typeof reportError === "function",
+    "Runtime requires dispatch, local root/snapshot authorization, receiver-owned grant revisions and explicit error reporting");
   requireValue(Number.isSafeInteger(capacity) && capacity > 0 && capacity <= 256, "Invalid runtime capacity");
   const waiters = new Map();
   const responsesInFlight = new Set();
@@ -76,6 +78,8 @@ export function createZeroBrokerRuntime({
     flockKey.fill(0);
     const sender = roster.members.find((member) => member.opaquePeerId === senderId);
     if (!sender || (sender.membershipExpiresAt && Date.parse(sender.membershipExpiresAt) <= now())) deny("Sender membership expired or revoked");
+    const grantRevision = getAuthorizationRevision();
+    requireValue(typeof grantRevision === "string" && grantRevision.length > 0 && grantRevision.length <= 128, "Invalid receiver-owned grant revision");
     const rootSender = roster.ownerSigners.some((signer) => signer.opaquePeerId === senderId && signer.role === "genesis-root");
     const privateOwnerGroup = roster.members.every((member) => member.role === "owner");
     let mode;
@@ -88,13 +92,41 @@ export function createZeroBrokerRuntime({
       if (typeof readSnapshot !== "function" || !await authorizeSnapshot({ request, sender, roster })) deny("No current local approved-snapshot adapter or grant");
       mode = "SNAPSHOT";
     }
+    if (getAuthorizationRevision() !== grantRevision) deny("Local authorization changed during grant evaluation");
+    state.assertRoster(roster);
     const context = Object.freeze({
       roster, sender, recipientOpaquePeerId: device.opaquePeerId, mode,
+      authorization: Object.freeze({ mode, grantRevision, rosterEpoch: roster.rosterEpoch }),
       requestDigest: crypto.createHash("sha256").update(canonicalJson(request)).digest("hex"),
       dispatchExpiresAt: Math.min(request.expiresAt, envelopeExpiresAt),
     });
     VERIFIED_CONTEXTS.add(context);
     return context;
+  }
+
+  function sameAuthorization(first, second) {
+    return first && second && canonicalJson(first) === canonicalJson(second);
+  }
+
+  function assertSameAuthorization(before, after) {
+    if (!sameAuthorization(before.authorization, after.authorization)) deny("Local authorization changed before disclosure");
+    state.assertRoster(after.roster);
+  }
+
+  function validateOutcome(outcome) {
+    requireValue(outcome && TERMINAL_STATUSES.has(outcome.status) && Object.hasOwn(outcome, "result"), "Adapter must return an explicit admission status, not execution success");
+    requireValue(Buffer.byteLength(canonicalJson(outcome)) <= REQUEST_LIMIT - 1024, "RPC result exceeds recipient-sealed transport limit");
+  }
+
+  function deniedRequestStatus(request, sender, receipt) {
+    if (request.action === "ping" || SNAPSHOT_ACTIONS.has(request.action)) return "DENIED";
+    if (!receipt) {
+      const current = snapshot();
+      current.flockKey.fill(0);
+      receipt = state.readRequestReceipt({ roster: current.roster, sender, recipient: device.opaquePeerId,
+        requestId: request.requestId, payload: request, expiresAt: request.expiresAt, nowMs: now() });
+    }
+    return ["NOT_ADMITTED", "DENIED"].includes(receipt.status) ? "DENIED" : "UNKNOWN";
   }
 
   async function emit(toOpaquePeerId, body, action = "ping") {
@@ -189,54 +221,76 @@ export function createZeroBrokerRuntime({
       requireValue(authenticated.action === (body.kind === "reconcile" ? "ping" : body.request.action), "RPC action does not match signed envelope");
       const request = body.request;
       const sender = authenticated.fromOpaquePeerId;
+      const sideEffecting = request.action !== "ping" && !SNAPSHOT_ACTIONS.has(request.action);
       let context;
       try { context = await authorize(request, sender, Date.parse(authenticated.expiresAt)); }
       catch (err) {
         if (err.code !== "DENIED") throw err;
-        await emit(sender, { kind: "response", requestId: request.requestId, status: "DENIED", result: null });
-        return { status: "DENIED" };
+        const status = deniedRequestStatus(request, sender);
+        await emit(sender, { kind: "response", requestId: request.requestId, status, result: null });
+        return { status };
       }
       let receipt;
-      const claim = { roster: context.roster, sender, recipient: device.opaquePeerId, requestId: request.requestId, payload: request, expiresAt: request.expiresAt, nowMs: now() };
+      const claim = { roster: context.roster, sender, recipient: device.opaquePeerId, requestId: request.requestId,
+        payload: request, expiresAt: request.expiresAt, authorization: context.authorization, nowMs: now() };
       if (body.kind === "reconcile") {
         receipt = state.readRequestReceipt(claim);
       } else {
         const admission = state.admitRequest(claim);
         receipt = admission;
         if (admission.dispatch) {
+          let dispatchStarted = false;
           try {
-            context = await authorize(request, sender, Date.parse(authenticated.expiresAt));
-            state.assertRoster(context.roster);
+            const beforeDispatch = await authorize(request, sender, Date.parse(authenticated.expiresAt));
+            assertSameAuthorization(context, beforeDispatch);
+            context = beforeDispatch;
             requireValue(request.expiresAt > now() && Date.parse(authenticated.expiresAt) > now(), "Request authority expired before dispatch");
-            const outcome = context.mode === "PRESENCE"
-              ? { status: "DELIVERED", result: { opaquePeerId: device.opaquePeerId, rosterEpoch: context.roster.rosterEpoch, status: "online" } }
-              : await (context.mode === "SNAPSHOT" ? readSnapshot : dispatch)(request, context);
+            let outcome;
+            if (context.mode === "PRESENCE") {
+              outcome = { status: "DELIVERED", result: { opaquePeerId: device.opaquePeerId, rosterEpoch: context.roster.rosterEpoch, status: "online" } };
+            } else if (context.mode === "SNAPSHOT") {
+              outcome = { status: "DELIVERED", result: null };
+            } else {
+              dispatchStarted = true;
+              outcome = await dispatch(request, context);
+            }
             requireValue(!closed, "Runtime closed before admission confirmation");
-            requireValue(outcome && TERMINAL_STATUSES.has(outcome.status) && Object.hasOwn(outcome, "result"), "Adapter must return an explicit admission status, not execution success");
-            requireValue(Buffer.byteLength(canonicalJson(outcome)) <= REQUEST_LIMIT - 1024, "RPC result exceeds recipient-sealed transport limit");
-            state.finishRequest({ flockUuid: device.flockUuid, sender, recipient: device.opaquePeerId, requestId: request.requestId, ...outcome });
-            receipt = outcome;
+            validateOutcome(outcome);
+            await refresh();
+            const afterDispatch = await authorize(request, sender, Date.parse(authenticated.expiresAt));
+            assertSameAuthorization(context, afterDispatch);
+            state.finishRequest({ flockUuid: device.flockUuid, sender, recipient: device.opaquePeerId,
+              requestId: request.requestId, authorization: claim.authorization, status: outcome.status, result: outcome.result });
+            receipt = { status: outcome.status, result: outcome.result, authorization: claim.authorization };
           } catch (err) {
             if (closed) return { status: "UNKNOWN" };
-            const status = err.code === "DENIED" ? "DENIED" : "UNKNOWN";
-            error(status, status === "DENIED" ? "Authorization changed before dispatch" : "Dispatch outcome unconfirmed; no automatic redispatch", request.requestId);
-            state.finishRequest({ flockUuid: device.flockUuid, sender, recipient: device.opaquePeerId, requestId: request.requestId, status, result: null });
-            receipt = { status, result: null };
+            const status = err.code === "DENIED" && !(dispatchStarted && sideEffecting) ? "DENIED" : "UNKNOWN";
+            error(status, status === "DENIED" ? "Authorization changed before disclosure" : "Dispatch outcome unconfirmed; no automatic redispatch", request.requestId);
+            state.finishRequest({ flockUuid: device.flockUuid, sender, recipient: device.opaquePeerId,
+              requestId: request.requestId, authorization: claim.authorization, status, result: null });
+            receipt = { status, result: null, authorization: claim.authorization };
           }
         }
       }
       await refresh();
-      try { context = await authorize(request, sender, Date.parse(authenticated.expiresAt)); }
+      try {
+        context = await authorize(request, sender, Date.parse(authenticated.expiresAt));
+        if (context.mode === "SNAPSHOT" && receipt.status !== "NOT_ADMITTED") {
+          const beforeRead = context;
+          receipt = await readSnapshot(request, context);
+          validateOutcome(receipt);
+          await refresh();
+          context = await authorize(request, sender, Date.parse(authenticated.expiresAt));
+          assertSameAuthorization(beforeRead, context);
+        } else if (receipt.status !== "NOT_ADMITTED" && !sameAuthorization(receipt.authorization, context.authorization)) {
+          receipt = { status: deniedRequestStatus(request, sender, receipt), result: null };
+        }
+      }
       catch (err) {
         if (err.code !== "DENIED") throw err;
-        const status = request.action === "send_message" && !["NOT_ADMITTED", "DENIED"].includes(receipt.status) ? "UNKNOWN" : "DENIED";
+        const status = deniedRequestStatus(request, sender, receipt);
         await emit(sender, { kind: "response", requestId: request.requestId, status, result: null });
         return { status };
-      }
-      if (body.kind === "reconcile" && context.mode === "SNAPSHOT" && receipt.status === "DELIVERED") {
-        receipt = await readSnapshot(request, context);
-        requireValue(receipt?.status === "DELIVERED", "Snapshot receipt must be regenerated under the current grant");
-        await authorize(request, sender);
       }
       await emit(sender, { kind: "response", requestId: request.requestId, status: receipt.status, result: receipt.result });
       return { status: receipt.status };

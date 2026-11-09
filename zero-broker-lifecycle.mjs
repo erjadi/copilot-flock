@@ -65,6 +65,10 @@ export function openZeroBrokerGroup({ home, group, host, request = cloudRequest,
   }
   const configuration = () => rosterApi.readPrivateJson(directory, "configuration.json");
   const grants = () => fs.existsSync(path.join(directory, "grants.json")) ? rosterApi.readPrivateJson(directory, "grants.json") : { discovery: false, rootSessions: [], snapshots: {} };
+  const sessionBindings = () => fs.existsSync(path.join(home, "session-bindings.json")) ? rosterApi.readPrivateJson(home, "session-bindings.json") : {};
+  const grantRevision = () => crypto.createHash("sha256").update(rosterApi.canonicalJson({
+    grants: grants(), sessionBindings: sessionBindings(),
+  })).digest("hex");
   let closed = false;
   let disposed = false;
   let lastFetch = 0;
@@ -109,7 +113,7 @@ export function openZeroBrokerGroup({ home, group, host, request = cloudRequest,
   const runtime = createZeroBrokerRuntime({
     device, state, now, refreshRoster, reportError,
     sendPacket: (packet) => import("./zero-broker-transport.mjs").then(({ sendEncryptedPacket }) => sendEncryptedPacket({ ...packet, request })),
-    authorizeRoot: rootGrant, authorizeSnapshot: snapshotGrant,
+    authorizeRoot: rootGrant, authorizeSnapshot: snapshotGrant, getAuthorizationRevision: grantRevision,
     readSnapshot: async (rpc) => {
       const snapshots = grants().snapshots;
       const result = rpc.action === "get_transcript"
@@ -120,13 +124,14 @@ export function openZeroBrokerGroup({ home, group, host, request = cloudRequest,
     dispatch: async (rpc, context) => {
       check(isVerifiedZeroBrokerContext(context, rpc) && context.mode === "ROOT", "Native dispatch requires a request-bound verified root capability");
       const allowed = () => !closed && rootGrant({ request: rpc, roster: state.get(group.flockUuid) }) &&
+        grantRevision() === context.authorization.grantRevision &&
         state.get(group.flockUuid).rosterEpoch === context.roster.rosterEpoch &&
         now() < Math.min(context.dispatchExpiresAt, Date.parse(state.get(group.flockUuid).leaseExpiresAt));
       check(allowed(), "Local root grant changed before native dispatch");
       if (rpc.action === "list_sessions") {
         const configured = grants();
         const ids = new Set(configured.rootSessions);
-        const bindings = fs.existsSync(path.join(home, "session-bindings.json")) ? rosterApi.readPrivateJson(home, "session-bindings.json") : {};
+        const bindings = sessionBindings();
         return { status: "DELIVERED", result: host.listSessions().filter((session) => (configured.discovery === true || ids.has(session.session_id)) && (!bindings[session.session_id] || bindings[session.session_id] === group.flockUuid)).slice(0, 100) };
       }
       if (rpc.action === "get_transcript") return { status: "DELIVERED", result: await host.readTranscript(rpc.params.sessionId || rpc.params.targetSession, Math.min(30, Number(rpc.params.limit) || 10)) };
@@ -345,7 +350,7 @@ export function openZeroBrokerGroup({ home, group, host, request = cloudRequest,
     const existing = new Set(host.listSessions().map((session) => session.session_id));
     check(Array.isArray(value.rootSessions) && value.rootSessions.length <= 100 && value.rootSessions.every((id) => UUID.test(id) && existing.has(id)), "Root grants require selected existing session UUIDs");
     check(value.snapshots && Object.getPrototypeOf(value.snapshots) === Object.prototype && Object.keys(value.snapshots).length <= 100, "Invalid snapshot grants");
-    const bindings = fs.existsSync(path.join(home, "session-bindings.json")) ? rosterApi.readPrivateJson(home, "session-bindings.json") : {};
+    const bindings = sessionBindings();
     for (const id of value.rootSessions) {
       check(!bindings[id] || bindings[id] === group.flockUuid, "Session is already bound to another flock; use a new session or an approved snapshot");
       bindings[id] = group.flockUuid;
@@ -365,7 +370,7 @@ export function openZeroBrokerGroup({ home, group, host, request = cloudRequest,
       }
     }
     rosterApi.writePrivateJson(home, "session-bindings.json", bindings);
-    rosterApi.writePrivateJson(directory, "grants.json", value);
+    rosterApi.writePrivateJson(directory, "grants.json", { ...value, revision: crypto.randomUUID() });
   }
 
   return {

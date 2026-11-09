@@ -28,6 +28,22 @@ function digest(value) {
   return crypto.createHash("sha256").update(value).digest("hex");
 }
 
+function admissionAuthorization(value, rosterEpoch) {
+  if (value === undefined || value === null) return null;
+  requireValue(value && Object.getPrototypeOf(value) === Object.prototype &&
+    Object.keys(value).sort().join(",") === "grantRevision,mode,rosterEpoch" &&
+    ["PRESENCE", "ROOT", "SNAPSHOT"].includes(value.mode) &&
+    typeof value.grantRevision === "string" && value.grantRevision.length > 0 && value.grantRevision.length <= 128 &&
+    Number.isSafeInteger(value.rosterEpoch) && value.rosterEpoch > 0 &&
+    (rosterEpoch === undefined || value.rosterEpoch === rosterEpoch), "Invalid admission authorization binding");
+  return canonicalJson(value);
+}
+
+function admissionReceipt(row, authorization) {
+  return { status: row.status, authorization: row.authorization === null ? null : JSON.parse(row.authorization),
+    result: row.authorization === authorization && row.result !== null ? JSON.parse(row.result) : null };
+}
+
 function withoutSignature(value) {
   const { signature, ...unsigned } = value;
   return unsigned;
@@ -184,6 +200,7 @@ export function createRosterState({ directory, capacity = 100000 }) {
   const db = new DatabaseSync(file);
   db.exec("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA busy_timeout=1000; CREATE TABLE IF NOT EXISTS rosters (flock TEXT PRIMARY KEY, epoch INTEGER NOT NULL, hash TEXT NOT NULL, document TEXT NOT NULL); CREATE TABLE IF NOT EXISTS claims (direction TEXT NOT NULL, flock TEXT NOT NULL, epoch INTEGER NOT NULL, sender TEXT NOT NULL, message TEXT NOT NULL, expiry INTEGER NOT NULL, PRIMARY KEY(direction,flock,epoch,sender,message)); CREATE TABLE IF NOT EXISTS admissions (flock TEXT NOT NULL, sender TEXT NOT NULL, recipient TEXT NOT NULL, request TEXT NOT NULL, digest TEXT NOT NULL, expiry INTEGER NOT NULL, status TEXT NOT NULL, result TEXT, PRIMARY KEY(flock,sender,recipient,request)); CREATE TABLE IF NOT EXISTS outbox (flock TEXT NOT NULL, sender TEXT NOT NULL, recipient TEXT NOT NULL, request TEXT NOT NULL, digest TEXT NOT NULL, expiry INTEGER NOT NULL, document TEXT NOT NULL, PRIMARY KEY(flock,sender,recipient,request));");
   if (!db.prepare("PRAGMA table_info(outbox)").all().some((column) => column.name === "attempted")) db.exec("ALTER TABLE outbox ADD COLUMN attempted INTEGER NOT NULL DEFAULT 0");
+  if (!db.prepare("PRAGMA table_info(admissions)").all().some((column) => column.name === "authorization")) db.exec("ALTER TABLE admissions ADD COLUMN authorization TEXT");
   db.exec("CREATE TABLE IF NOT EXISTS receipts (flock TEXT NOT NULL,sender TEXT NOT NULL,recipient TEXT NOT NULL,request TEXT NOT NULL,digest TEXT NOT NULL,status TEXT NOT NULL,result TEXT NOT NULL,PRIMARY KEY(flock,sender,recipient,request))");
   function transaction(fn) {
     db.exec("BEGIN IMMEDIATE");
@@ -248,7 +265,7 @@ export function createRosterState({ directory, capacity = 100000 }) {
     }),
     markOutboxAttempt: ({ flockUuid, sender, recipient, requestId }) => db.prepare("UPDATE outbox SET attempted=1 WHERE flock=? AND sender=? AND recipient=? AND request=? AND attempted=0").run(flockUuid, sender, recipient, requestId).changes === 1,
     acknowledgeOutbox: ({ flockUuid, sender, recipient, requestId }) => db.prepare("DELETE FROM outbox WHERE flock=? AND sender=? AND recipient=? AND request=?").run(flockUuid, sender, recipient, requestId),
-    readRequestReceipt: ({ roster, sender, recipient, requestId, payload, expiresAt, nowMs = Date.now() }) => {
+    readRequestReceipt: ({ roster, sender, recipient, requestId, payload, expiresAt, authorization, nowMs = Date.now() }) => {
       const trusted = db.prepare("SELECT epoch,hash FROM rosters WHERE flock=?").get(roster.flockUuid);
       requireValue(trusted && trusted.epoch === roster.rosterEpoch && trusted.hash === hashRoster(roster), "Stale roster at receipt disclosure");
       checkLease(roster, nowMs);
@@ -256,11 +273,11 @@ export function createRosterState({ directory, capacity = 100000 }) {
       activeMember(roster, recipient, nowMs);
       requireValue(/^[A-Za-z0-9_-]{16,128}$/.test(requestId) && Number.isSafeInteger(expiresAt), "Invalid receipt coordinates");
       const row = db.prepare("SELECT * FROM admissions WHERE flock=? AND sender=? AND recipient=? AND request=?").get(roster.flockUuid, sender, recipient, requestId);
-      if (!row) return { status: "NOT_ADMITTED", result: null };
+      if (!row) return { status: "NOT_ADMITTED", result: null, authorization: null };
       requireValue(row.digest === digest(canonicalJson({ payload, expiresAt })), "Receipt request ID reused with different payload");
-      return { status: row.status, result: row.result === null ? null : JSON.parse(row.result) };
+      return admissionReceipt(row, admissionAuthorization(authorization, roster.rosterEpoch));
     },
-    admitRequest: ({ roster, sender, recipient, requestId, payload, expiresAt, nowMs = Date.now() }) => transaction(() => {
+    admitRequest: ({ roster, sender, recipient, requestId, payload, expiresAt, authorization, nowMs = Date.now() }) => transaction(() => {
       const trusted = db.prepare("SELECT epoch,hash FROM rosters WHERE flock=?").get(roster.flockUuid);
       requireValue(trusted && trusted.epoch === roster.rosterEpoch && trusted.hash === hashRoster(roster), "Stale roster before application admission");
       checkLease(roster, nowMs);
@@ -268,20 +285,21 @@ export function createRosterState({ directory, capacity = 100000 }) {
       activeMember(roster, recipient, nowMs);
       requireValue(Number.isSafeInteger(expiresAt) && expiresAt > nowMs && /^[A-Za-z0-9_-]{16,128}$/.test(requestId), "Request expired or invalid");
       const hash = digest(canonicalJson({ payload, expiresAt }));
+      const binding = admissionAuthorization(authorization, roster.rosterEpoch);
       const row = db.prepare("SELECT * FROM admissions WHERE flock=? AND sender=? AND recipient=? AND request=?").get(roster.flockUuid, sender, recipient, requestId);
       if (row) {
         requireValue(row.digest === hash, "Admission request ID reused with different payload");
-        return { dispatch: false, status: row.status, result: row.result === null ? null : JSON.parse(row.result) };
+        return { dispatch: false, ...admissionReceipt(row, binding) };
       }
       requireValue(db.prepare("SELECT COUNT(*) AS count FROM admissions").get().count < capacity, "Admission storage capacity exhausted");
-      db.prepare("INSERT INTO admissions VALUES (?,?,?,?,?,?,'UNKNOWN',NULL)").run(roster.flockUuid, sender, recipient, requestId, hash, expiresAt);
-      return { dispatch: true, status: "UNKNOWN", result: null };
+      db.prepare("INSERT INTO admissions(flock,sender,recipient,request,digest,expiry,status,result,authorization) VALUES (?,?,?,?,?,?,'UNKNOWN',NULL,?)").run(roster.flockUuid, sender, recipient, requestId, hash, expiresAt, binding);
+      return { dispatch: true, status: "UNKNOWN", result: null, authorization: authorization || null };
     }),
-    finishRequest: ({ flockUuid, sender, recipient, requestId, status, result }) => {
+    finishRequest: ({ flockUuid, sender, recipient, requestId, status, result, authorization }) => {
       requireValue(["DELIVERED", "DENIED", "UNKNOWN", "OFFLINE", "BUSY"].includes(status), "Invalid admission result status");
       const document = canonicalJson(result);
       requireValue(Buffer.byteLength(document) <= MAX_ENVELOPE_BYTES, "Admission result exceeds size limit");
-      const changed = db.prepare("UPDATE admissions SET status=?,result=? WHERE flock=? AND sender=? AND recipient=? AND request=? AND status='UNKNOWN'").run(status, document, flockUuid, sender, recipient, requestId);
+      const changed = db.prepare("UPDATE admissions SET status=?,result=? WHERE flock=? AND sender=? AND recipient=? AND request=? AND status='UNKNOWN' AND authorization IS ?").run(status, document, flockUuid, sender, recipient, requestId, admissionAuthorization(authorization));
       requireValue(changed.changes === 1, "Cannot complete an unclaimed request");
     },
     claim: (direction, roster, sender, message, expiresAt, nowMs) => transaction(() => {

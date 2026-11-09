@@ -214,6 +214,17 @@ modified or unavailable installed baselines remain explicitly unknown.
 This local disk-runtime record is informational, not signed voter authority,
 proof of a running daemon's resident code, a release ballot, or live acceptance.
 
+**Zero-Broker receipt privacy:** durable application admissions also bind their
+disclosure view to the receiver's authorization mode, local grant revision and
+roster epoch. Removing a live ROOT grant while retaining an approved snapshot
+never exposes the earlier full transcript through a normal duplicate or
+reconciliation response. Snapshot replies are rebuilt from the current local
+summary; a changed revision or epoch during an awaited read denies that view.
+Incompatible ROOT receipts remain claimed but disclose no cached payload and
+never redispatch the original action. Older unbound receipt rows are extended
+in place and fail closed for ROOT disclosure; do not rebuild their ledger or
+reuse old device keys to recover them. This cannot retract data already delivered.
+
 ## Try it out hubless; deploy the components for the real potential
 
 **The Hubless LAN-Direct Trial is a "Try It Out" onboarding sandbox, not the
