@@ -294,6 +294,48 @@ become a terminal DENIED/no-admission claim or expose a cached result before
 current authority is checked. Definitely never-attempted work can still be
 denied; do not re-sign, rebind or blindly resend uncertain work.
 
+**Legacy mutation admission is a coherent candidate protocol upgrade.**
+Mutating RPC signatures now bind the
+`copilot-flock/legacy-mutation-admission/v1` domain and a random receiver-owned
+ledger incarnation UUID. The UUID is a replay generation, not independent
+authorization: current enrolled keys, membership, flock, role, target and
+deadline checks remain mandatory. Single and batch senders obtain a
+nonce/context-matched registered-key-signed ping proof, never presence or
+caller registry authority. Verified public binding proofs are retained for
+offline sending while those enrolled keys remain current. A never-contacted
+offline peer cannot supply a new binding, so no mutation or fictitious queue
+success is produced in that case.
+
+Online and offline mutations share durable key/flock/receiver/signer/request
+claims before side effects. An exception/crash stays UNKNOWN; handler
+completion is not proof of task execution. A duplicate never redispatches or
+returns a cached private result. The bounded ledger retains every claim
+through its signed deadline plus the five-minute clock allowance, fails
+closed at capacity or on storage/corruption/clock rollback, and is protected
+from ordinary file-transfer RPC. The complete package includes
+`legacy-rpc-admissions.mjs`; the local helper uses built-in SQLite with the
+supported Node flags, not a new dependency.
+
+During an explicitly approved local install, a fresh identity or a detected
+prior-protocol installation initializes anchored state before new-domain
+code is published. Normal updates retain the same state and UUID. Read-only
+hardened V3 requests remain compatible, but old-domain or missing-UUID
+mutations have no fallback; their senders and receivers need the coherent
+code upgrade. Ordinary receives never initialize a missing ledger, and an
+existing anchor with missing/corrupt state always denies. No identity,
+membership or hub rotation is introduced by this source change.
+
+Lost-state recovery is a separate local approval, not a remote grant. Quiesce
+old dispatch first; never treat an incomplete/stale backup as recovered
+side-effect history. Approved recovery may create a new incarnation without
+claiming that history is known. Captured requests with the old UUID then
+reject, including queued packets, which keep their original UUID, signature,
+request ID, digest and deadline. Do not rediscover/re-sign old queued
+authority. Explicitly verified public-binding refresh is for new user intent
+after recovery, not an automatic retry of uncertain work. This candidate
+implementation is not execution consent, a release ballot or permission for
+live initialization, recovery, deployment or re-enrollment.
+
 ## Try it out hubless; deploy the components for the real potential
 
 **The Hubless LAN-Direct Trial is a "Try It Out" onboarding sandbox, not the

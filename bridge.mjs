@@ -78,6 +78,12 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 export const BRIDGE_VERSION = "3.3.0";
+export const LEGACY_MUTATION_PROTOCOL = "copilot-flock/legacy-mutation-admission/v1";
+const LEGACY_READ_ONLY_ACTIONS = new Set(["ping", "list_sessions", "get_transcript", "list_projects", "list_locks", "pull_file_chunk"]);
+
+export function isLegacyRpcMutation({ action, params = {} }) {
+  return !LEGACY_READ_ONLY_ACTIONS.has(action) && !(action === "diagnose" && !params.fix);
+}
 
 export async function getZeroBrokerApi() {
   const [major, minor] = process.versions.node.split(".").map(Number);
@@ -244,7 +250,8 @@ Public Pages propagation and accurate clocks bound freshness; no revocation SLA 
 }
 
 function copyZeroBrokerModules(sourceDirectory, targetDirectory) {
-  for (const filename of fs.readdirSync(sourceDirectory).filter((name) => /^zero-broker-[a-z-]+\.mjs$/.test(name) || name === "release-policy.mjs")) {
+  for (const filename of fs.readdirSync(sourceDirectory).filter((name) =>
+    /^zero-broker-[a-z-]+\.mjs$/.test(name) || ["release-policy.mjs", "legacy-rpc-admissions.mjs"].includes(name))) {
     const source = path.join(sourceDirectory, filename);
     const target = path.join(targetDirectory, filename);
     if (path.resolve(source) !== path.resolve(target)) fs.copyFileSync(source, target);
@@ -282,6 +289,7 @@ function getIdentityKeyPath() {
 
 let cachedIdentityKeypair = null;
 let cachedIdentityKeyPath = null;
+const freshLegacyIdentityKeys = new Set();
 
 export function ensureMachineIdentityKeypair() {
   ensureBridgeDir();
@@ -316,6 +324,7 @@ export function ensureMachineIdentityKeypair() {
     fingerprint,
     createdAt: new Date().toISOString(),
   };
+  freshLegacyIdentityKeys.add(legacyIdentityHash(record));
   fs.writeFileSync(keyPath, JSON.stringify(record, null, 2), { encoding: "utf8", mode: 0o600 });
   cachedIdentityKeypair = record;
   cachedIdentityKeyPath = keyPath;
@@ -915,6 +924,162 @@ export function assertLocalReleaseExecutionApproved(cfg, commit, now = Date.now(
   return identity;
 }
 
+function legacyIdentityHash(identity) {
+  return crypto.createHash("sha256").update(crypto.createPublicKey(identity.publicKey)
+    .export({ type: "spki", format: "der" })).digest("hex");
+}
+
+function localLegacyAdmissionOperation(input) {
+  const helper = path.join(__dirname, "legacy-rpc-admissions.mjs");
+  if (!fs.existsSync(helper)) throw rpcSecurityError("RPC_ADMISSION_HELPER_MISSING", "Complete candidate installation is required; no mutation was dispatched");
+  const output = execFileSync(process.execPath, [...zeroBrokerNodeFlags(), helper], {
+    input: JSON.stringify(input), encoding: "utf8", stdio: ["pipe", "pipe", "pipe"], windowsHide: true,
+    timeout: 10000, maxBuffer: 32768, env: { ...process.env, NODE_OPTIONS: "", NODE_V8_COVERAGE: "",
+      GH_TOKEN: "", GITHUB_TOKEN: "", SIGNALR_CONNECTION_STRING: "", SERVICEBUS_CONNECTION_STRING: "" },
+  });
+  const result = JSON.parse(output);
+  if (result.ok !== true) throw rpcSecurityError(result.code || "RPC_ADMISSION_STORAGE_ERROR",
+    result.error || "Durable admission could not be established; no mutation was dispatched");
+  return result;
+}
+
+export function initializeLegacyRpcAdmissions(identity = readExistingRpcIdentity(), { allowFirstInitialization = false } = {}) {
+  ensureBridgeDir();
+  const receiverKey = legacyIdentityHash(identity);
+  const result = localLegacyAdmissionOperation({ operation: "initialize", home: fs.realpathSync(getBridgeHome()),
+    receiverKey, allowFirstInitialization });
+  freshLegacyIdentityKeys.delete(receiverKey);
+  return result;
+}
+
+export function prepareLegacyRpcAdmissionUpgrade(identity = readExistingRpcIdentity()) {
+  const previousScript = [path.join(getBridgeHome(), "flock.mjs"), path.join(getBridgeHome(), "bridge.mjs")]
+    .find((file) => fs.existsSync(file));
+  const previousProtocol = previousScript && fs.readFileSync(previousScript, "utf8").includes(LEGACY_MUTATION_PROTOCOL);
+  return initializeLegacyRpcAdmissions(identity, {
+    allowFirstInitialization: freshLegacyIdentityKeys.has(legacyIdentityHash(identity)) || Boolean(previousScript && !previousProtocol),
+  });
+}
+
+function inspectLegacyRpcAdmissions(identity) {
+  return localLegacyAdmissionOperation({ operation: "inspect", home: fs.realpathSync(getBridgeHome()),
+    receiverKey: legacyIdentityHash(identity) });
+}
+
+function legacyAdmissionAdvertisement(identity) {
+  try { return { ...inspectLegacyRpcAdmissions(identity), ready: true }; }
+  catch (error) {
+    if (!String(error.code || "").startsWith("RPC_ADMISSION_")) throw error;
+    return { protocol: LEGACY_MUTATION_PROTOCOL, ready: false, code: error.code };
+  }
+}
+
+function legacyReceiverMember(context, toMachine) {
+  const found = context.members.filter((member) => String(member.machineId).toLowerCase() === String(toMachine).toLowerCase());
+  if (found.length !== 1) throw rpcSecurityError("RPC_RECIPIENT_NOT_ENROLLED", "Mutation requires one current enrolled receiver");
+  return assertActiveRpcMember(found[0]);
+}
+
+function verifyLegacyReceiverBinding(context, toMachine, proof) {
+  const receiver = legacyReceiverMember(context, toMachine);
+  const { request, response } = proof || {};
+  const advertisement = response?.result?.legacyAdmission;
+  if (request?.action !== "ping" || request.params?.includeAdmission !== true ||
+      typeof request.toMachine !== "string" || typeof request.fromMachine !== "string" ||
+      typeof response?.fromMachine !== "string" || typeof request.auth?.publicKey !== "string" || typeof response.auth?.publicKey !== "string" ||
+      request.flockId !== context.policy.flockId || request.toMachine?.toLowerCase() !== receiver.machineId.toLowerCase() ||
+      request.fromMachine?.toLowerCase() !== context.localMember.machineId.toLowerCase() ||
+      request.auth?.fromPeerId !== context.localMember.peerId || request.auth?.toPeerId !== receiver.peerId ||
+      response?.requestId !== request.requestId || response.auth?.fromPeerId !== receiver.peerId ||
+      response.fromMachine?.toLowerCase() !== receiver.machineId.toLowerCase() ||
+      response.auth?.toPeerId !== context.localMember.peerId || request.auth.rosterEpoch !== response.auth.rosterEpoch ||
+      request.auth.publicKey?.trim() !== context.localMember.publicKey.trim() ||
+      response.auth.publicKey?.trim() !== receiver.publicKey.trim() ||
+      !Number.isSafeInteger(request.auth.rosterEpoch) || request.auth.rosterEpoch > context.policy.rosterEpoch ||
+      request.sentAt !== request.auth.timestamp || response.respondedAt !== response.auth.timestamp || response.error ||
+      advertisement?.protocol !== LEGACY_MUTATION_PROTOCOL || advertisement.ready !== true ||
+      !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(advertisement.ledgerId)) {
+    throw rpcSecurityError("RPC_ADMISSION_BINDING_INVALID", "Receiver admission binding is not an authenticated context-matched ping proof");
+  }
+  // This is a historical public incarnation binding, never current permission or membership authority.
+  const signedRequest = verifyV3RpcEnvelope({
+    envelope: request.auth, expectedFlockUuid: context.policy.flockUuid, minRosterEpoch: 1,
+    requestId: request.requestId, actionOrStatus: "ping", payload: rpcRequestSigningPayload(request),
+    publicKey: context.localMember.publicKey, nowMs: Date.parse(request.sentAt),
+  });
+  const signedResponse = verifyV3RpcEnvelope({
+    envelope: response.auth, expectedFlockUuid: context.policy.flockUuid, minRosterEpoch: 1,
+    requestId: request.requestId, actionOrStatus: "ok", payload: rpcResponseSigningPayload(response, request.replyUserId),
+    publicKey: receiver.publicKey, nowMs: Date.parse(response.respondedAt),
+  });
+  if (!signedRequest.valid || !signedResponse.valid || request.auth.kind !== "req" || response.auth.kind !== "res") {
+    throw rpcSecurityError("RPC_ADMISSION_BINDING_INVALID", "Receiver incarnation proof signature is invalid against current enrolled keys");
+  }
+  return advertisement.ledgerId;
+}
+
+export async function getLegacyReceiverBinding(cfg, context, toMachine, { fetchProof, forceRefresh = false } = {}) {
+  const receiver = legacyReceiverMember(context, toMachine);
+  const key = crypto.createHash("sha256").update(JSON.stringify([
+    context.policy.flockUuid, context.localMember.peerId, context.localMember.publicKey,
+    receiver.peerId, receiver.publicKey,
+  ])).digest("hex");
+  const directory = path.join(getBridgeHome(), "legacy-rpc-bindings");
+  const filename = path.join(directory, `${key}.json`);
+  if (fs.existsSync(directory) && fs.lstatSync(directory).isSymbolicLink()) {
+    throw rpcSecurityError("RPC_ADMISSION_BINDING_INVALID", "Receiver binding cache cannot be a symbolic link");
+  }
+  if (!forceRefresh && fs.existsSync(filename)) {
+    if (fs.lstatSync(filename).isSymbolicLink() || fs.statSync(filename).size > 262144) {
+      throw rpcSecurityError("RPC_ADMISSION_BINDING_INVALID", "Local receiver binding cache is invalid; explicit verified refresh is required");
+    }
+    let proof;
+    try { proof = JSON.parse(fs.readFileSync(filename, "utf8")); }
+    catch {
+      throw rpcSecurityError("RPC_ADMISSION_BINDING_INVALID", "Local receiver binding cache could not be read; existing state was retained");
+    }
+    return verifyLegacyReceiverBinding(context, toMachine, proof);
+  }
+  if (typeof fetchProof !== "function") throw rpcSecurityError("RPC_ADMISSION_HANDSHAKE_REQUIRED", "No signed receiver incarnation proof is available");
+  let proof;
+  try { proof = await fetchProof(); }
+  catch (error) {
+    throw rpcSecurityError("RPC_ADMISSION_HANDSHAKE_FAILED", `Receiver incarnation was not verified (${error?.code || "transport_unconfirmed"}); mutation was not sent or queued`);
+  }
+  const ledgerId = verifyLegacyReceiverBinding(context, toMachine, proof);
+  const document = JSON.stringify(proof);
+  if (Buffer.byteLength(document) > 262144) throw rpcSecurityError("RPC_ADMISSION_BINDING_INVALID", "Receiver incarnation proof exceeds the bounded cache size");
+  fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+  if (fs.lstatSync(directory).isSymbolicLink()) throw rpcSecurityError("RPC_ADMISSION_BINDING_INVALID", "Receiver binding cache cannot be a symbolic link");
+  if (process.platform !== "win32") fs.chmodSync(directory, 0o700);
+  const temporary = path.join(directory, `${key}.${crypto.randomUUID()}.tmp`);
+  try {
+    fs.writeFileSync(temporary, document, { mode: 0o600, flag: "wx" });
+    fs.renameSync(temporary, filename);
+  } finally { if (fs.existsSync(temporary)) fs.unlinkSync(temporary); }
+  return ledgerId;
+}
+
+function claimLegacyRpcAdmission(req, context) {
+  const sender = assertActiveRpcMember(context.members.find((member) => member.peerId === req.auth.fromPeerId));
+  const ticket = {
+    home: fs.realpathSync(getBridgeHome()), receiverKey: legacyIdentityHash(context.identity),
+    ledgerId: req.admissionLedgerId, flock: context.policy.flockUuid, receiver: context.localMember.peerId,
+    sender: `${sender.peerId}|${crypto.createHash("sha256").update(crypto.createPublicKey(sender.publicKey)
+      .export({ type: "spki", format: "der" })).digest("hex")}`,
+    request: req.requestId, action: req.action,
+    digest: crypto.createHash("sha256").update(buildCanonicalV3RpcSigningString({
+      kind: "req", flockUuid: req.auth.flockUuid, rosterEpoch: req.auth.rosterEpoch,
+      requestId: req.requestId, timestamp: req.auth.timestamp, expiresAt: req.auth.expiresAt,
+      fromPeerId: req.auth.fromPeerId, toPeerId: req.auth.toPeerId, actionOrStatus: req.action,
+      payload: rpcRequestSigningPayload(req),
+    })).digest("hex"),
+    deadline: Date.parse(req.auth.expiresAt),
+  };
+  localLegacyAdmissionOperation({ ...ticket, operation: "claim" });
+  return ticket;
+}
+
 export async function loadTrustedRpcContext(cfg, { authority = null, identity = null, localFlocks = null, source = "network" } = {}) {
   if (!["network", "offline"].includes(source)) throw rpcSecurityError("RPC_CONTEXT_INVALID", "Invalid RPC receiver context source.");
   validatePinnedBootstrapOrigin(cfg?.bootstrapUrl || DEFAULT_BOOTSTRAP_URL, cfg?.bootstrapOriginPin || DEFAULT_BOOTSTRAP_ORIGIN);
@@ -998,13 +1163,14 @@ function rejectRpcAuthorityInputs(req) {
 
 function rpcRequestSigningPayload(req) {
   return {
+    ...(isLegacyRpcMutation(req) ? { admissionProtocol: LEGACY_MUTATION_PROTOCOL, admissionLedgerId: req.admissionLedgerId } : {}),
     flockId: req.flockId, fromMachine: req.fromMachine, toMachine: req.toMachine,
     replyUserId: req.replyUserId, sentAt: req.sentAt, params: req.params || {},
   };
 }
 
 export function createSignedRpcRequest(cfg, context, { toMachine = "*", action, params = {}, requestId = crypto.randomUUID(),
-  replyUserId = `rpc-${requestId}`, lifetimeMs = 86400000 } = {}) {
+  replyUserId = `rpc-${requestId}`, lifetimeMs = 86400000, admissionLedgerId } = {}) {
   if (!context?.policy?.flockId || !context.identity || !context.localMember) {
     throw rpcSecurityError("RPC_CONTEXT_REQUIRED", "A trusted enrolled signing context is required.");
   }
@@ -1024,6 +1190,12 @@ export function createSignedRpcRequest(cfg, context, { toMachine = "*", action, 
     fromMachine: own.machineId, toMachine: toMachine === "all" ? "*" : toMachine,
     action, params, sentAt: new Date(nowMs).toISOString(),
   };
+  if (isLegacyRpcMutation(req)) {
+    if (target === "*" || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(admissionLedgerId)) {
+      throw rpcSecurityError("RPC_ADMISSION_HANDSHAKE_REQUIRED", "A key-verified recipient-bound admission incarnation is required before signing a mutation");
+    }
+    req.admissionLedgerId = admissionLedgerId;
+  }
   req.auth = signV3RpcEnvelope({
     flockUuid: context.policy.flockUuid, rosterEpoch: context.policy.rosterEpoch,
     requestId, timestamp: req.sentAt, expiresAt: new Date(expiresMs).toISOString(),
@@ -4961,13 +5133,20 @@ export async function invokeRemoteRpc(
     timeoutMs = 8000,
     collectAll = false,
     contextProvider = loadTrustedRpcContext,
+    returnRequest = false,
   }
 ) {
   const requestId = crypto.randomUUID();
   const replyUserId = `rpc-${requestId}`;
   const responses = [];
   const context = await contextProvider(cfg);
-  const rpcPayload = createSignedRpcRequest(cfg, context, { toMachine, action, params, requestId, replyUserId });
+  const admissionLedgerId = isLegacyRpcMutation({ action, params })
+    ? await getLegacyReceiverBinding(cfg, context, toMachine, {
+        fetchProof: () => invokeRemoteRpc(cfg, { toMachine, action: "ping", params: { includeAdmission: true },
+          timeoutMs: Math.min(timeoutMs, 8000), contextProvider, returnRequest: true }),
+      })
+    : undefined;
+  const rpcPayload = createSignedRpcRequest(cfg, context, { toMachine, action, params, requestId, replyUserId, admissionLedgerId });
 
   let resolveFirst, rejectFirst;
   const firstPromise = new Promise((res, rej) => {
@@ -5023,7 +5202,7 @@ export async function invokeRemoteRpc(
     if (winner.error) {
       throw new Error(`Remote machine "${winner.fromMachine}" returned error: ${winner.error}`);
     }
-    return winner;
+    return returnRequest ? { request: rpcPayload, response: winner } : winner;
   } catch (err) {
     err.rpcPayload = rpcPayload;
     throw err;
@@ -5062,35 +5241,39 @@ export async function invokeRemoteRpcBatch(cfg, items, timeoutMs = 18000, { cont
   });
 
   try {
-    const promises = items.map((item) => {
+    const promises = items.map(async (item) => {
       const requestId = crypto.randomUUID();
-      const rpcPayload = createSignedRpcRequest(cfg, context, {
-        toMachine: item.toMachine, action: item.action, params: item.params || {}, requestId, replyUserId,
-      });
-      const responsePromise = new Promise((resolve, reject) => {
-        const timer = setTimeout(() => {
-          pending.delete(requestId);
-          reject(
-            new Error(
-              `Timed out after ${timeoutMs}ms waiting for response from machine "${item.toMachine}" (action: ${item.action}).`
-            )
-          );
-        }, timeoutMs);
-        pending.set(requestId, { resolve, reject, timer, request: rpcPayload });
-      });
-
-      return Promise.all([sendSignalRToUser(cfg, item.toMachine, "bridgeRpcRequest", rpcPayload), responsePromise])
-        .then(([, winner]) => {
-          if (winner.error) {
-            throw new Error(`Remote machine "${winner.fromMachine}" returned error: ${winner.error}`);
-          }
-          return { ok: true, response: winner, item };
-        })
-        .catch((err) => {
-          const entry = pending.get(requestId);
-          if (entry) { clearTimeout(entry.timer); pending.delete(requestId); }
-          return { ok: false, error: err.message, item, request: rpcPayload };
+      let rpcPayload;
+      try {
+        const admissionLedgerId = isLegacyRpcMutation(item)
+          ? await getLegacyReceiverBinding(cfg, context, item.toMachine, {
+              fetchProof: () => invokeRemoteRpc(cfg, { toMachine: item.toMachine, action: "ping",
+                params: { includeAdmission: true }, timeoutMs: Math.min(timeoutMs, 8000), contextProvider, returnRequest: true }),
+            })
+          : undefined;
+        rpcPayload = createSignedRpcRequest(cfg, context, {
+          toMachine: item.toMachine, action: item.action, params: item.params || {}, requestId, replyUserId, admissionLedgerId,
         });
+        const responsePromise = new Promise((resolve, reject) => {
+          const timer = setTimeout(() => {
+            pending.delete(requestId);
+            reject(
+              new Error(
+                `Timed out after ${timeoutMs}ms waiting for response from machine "${item.toMachine}" (action: ${item.action}).`
+              )
+            );
+          }, timeoutMs);
+          pending.set(requestId, { resolve, reject, timer, request: rpcPayload });
+        });
+
+        const [, winner] = await Promise.all([sendSignalRToUser(cfg, item.toMachine, "bridgeRpcRequest", rpcPayload), responsePromise]);
+        if (winner.error) throw new Error(`Remote machine "${winner.fromMachine}" returned error: ${winner.error}`);
+        return { ok: true, response: winner, item };
+      } catch (err) {
+        const entry = pending.get(requestId);
+        if (entry) { clearTimeout(entry.timer); pending.delete(requestId); }
+        return { ok: false, error: err.message, item, request: rpcPayload || null };
+      }
     });
 
     return await Promise.all(promises);
@@ -5401,7 +5584,7 @@ export async function prepareBridgeReleaseSource(repoDir, { exec = execFileSync 
       exec(process.execPath, ["--check", filename], options);
     }
     const runtimeHashes = Object.fromEntries(release.files
-      .filter((file) => path.dirname(file) === release.directory && /^(?:flock|bridge|release-policy|zero-broker-[a-z-]+)\.mjs$/.test(path.basename(file)))
+      .filter((file) => path.dirname(file) === release.directory && /^(?:flock|bridge|release-policy|legacy-rpc-admissions|zero-broker-[a-z-]+)\.mjs$/.test(path.basename(file)))
       .map((file) => [path.basename(file), crypto.createHash("sha256").update(fs.readFileSync(file)).digest("hex")]));
     fs.writeFileSync(path.join(release.directory, "release-source.json"),
       JSON.stringify({ schema: 1, sourceCommit: commit, scope: "runtime_modules_only", runtimeHashes }) + "\n");
@@ -5414,7 +5597,7 @@ export async function prepareBridgeReleaseSource(repoDir, { exec = execFileSync 
 
 function runtimeSourceHashes(directory) {
   return Object.fromEntries(fs.readdirSync(directory)
-    .filter((name) => /^(?:flock|bridge|release-policy|zero-broker-[a-z-]+)\.mjs$/.test(name))
+    .filter((name) => /^(?:flock|bridge|release-policy|legacy-rpc-admissions|zero-broker-[a-z-]+)\.mjs$/.test(name))
     .sort().map((name) => [name, crypto.createHash("sha256").update(fs.readFileSync(path.join(directory, name))).digest("hex")]));
 }
 
@@ -5441,7 +5624,7 @@ export function getInstalledSourceProvenance(directory = getBridgeHome(), { exec
     if (!/^[0-9a-f]{40}$/.test(commit)) throw new Error("Invalid source repository commit");
     const names = Object.keys(runtimeHashes);
     const tracked = exec("git", ["-C", directory, "ls-tree", "--name-only", commit], options)
-      .split(/\r?\n/).filter((name) => /^(?:flock|bridge|release-policy|zero-broker-[a-z-]+)\.mjs$/.test(name)).sort();
+      .split(/\r?\n/).filter((name) => /^(?:flock|bridge|release-policy|legacy-rpc-admissions|zero-broker-[a-z-]+)\.mjs$/.test(name)).sort();
     const unchanged = JSON.stringify(names) === JSON.stringify(tracked) &&
       exec("git", ["-C", directory, "diff", "--numstat", commit, "--", ...names], options).trim() === "";
     return { status: unchanged ? "tracked_clean_runtime" : "modified_runtime",
@@ -5555,7 +5738,7 @@ export function assertSafeTransferFilePath(targetPath) {
     throw new Error(`Security policy: path traversal ('..') is forbidden in file transfer: ${raw}`);
   }
   const forbiddenPattern =
-    /(?:^|[\\/])(?:\.git|\.ssh)(?:[\\/]|$)|(?:signalr-bridge|flock)[\\/](?:config\.json|identity\.json|flock\.mjs|bridge\.mjs|daemon\.pid)|Start Menu[\\/]Programs[\\/]Startup|LaunchAgents|systemd[\\/]user|mcp-config\.json|hosts\.yml|(?:^|[\\/])\.env(?:\.|$)/i;
+    /(?:^|[\\/])(?:\.git|\.ssh|legacy-rpc-admissions|legacy-rpc-admission-anchors|legacy-rpc-bindings)(?:[\\/]|$)|(?:signalr-bridge|flock)[\\/](?:config\.json|identity\.json|flock\.mjs|bridge\.mjs|daemon\.pid)|Start Menu[\\/]Programs[\\/]Startup|LaunchAgents|systemd[\\/]user|mcp-config\.json|hosts\.yml|(?:^|[\\/])\.env(?:\.|$)/i;
   if (forbiddenPattern.test(norm)) {
     throw new Error(
       `Security policy: file transfer to/from protected config, credential, or startup path is forbidden: ${raw}`
@@ -5808,6 +5991,18 @@ export function listLocalResourceLocks(cfg) {
 }
 
 export async function handleRpcAction(cfg, req, context = null) {
+  const sender = resolveVerifiedSenderIdentity(cfg, req, context);
+  enforceCrossUserInformationalPolicy(cfg, req, sender);
+  enforceFlockPolicyAndWalls(cfg, context.policy, req, sender);
+  if (context.source === "local" || !isLegacyRpcMutation(req)) return await dispatchAuthorizedRpcAction(cfg, req, context);
+  const ticket = claimLegacyRpcAdmission(req, context);
+  const result = await dispatchAuthorizedRpcAction(cfg, req, context);
+  const uncertain = ["unknown", "updating", "reprovisioning", "queued_offline"].includes(String(result?.status || "").toLowerCase());
+  localLegacyAdmissionOperation({ ...ticket, operation: "complete", outcome: uncertain ? "UNKNOWN" : "COMPLETED" });
+  return result;
+}
+
+async function dispatchAuthorizedRpcAction(cfg, req, context) {
   const { action, params = {} } = req;
   const senderIdentity = resolveVerifiedSenderIdentity(cfg, req, context);
   enforceCrossUserInformationalPolicy(cfg, req, senderIdentity);
@@ -5851,6 +6046,9 @@ export async function handleRpcAction(cfg, req, context = null) {
   }
 
   if (action === "ping") {
+    if (params.includeAdmission === true) {
+      return { machineId: cfg.machineId, legacyAdmission: legacyAdmissionAdvertisement(context.identity) };
+    }
     const wsInfo = getLocalWsConnectionInfo();
     const sessionLimit = params.includeSessions ? Math.max(8, Number(params.sessionLimit) || 25) : 8;
     let sessions = queryLocalSessionsFromDb({ limit: sessionLimit });
@@ -9998,6 +10196,7 @@ export async function reprovisionLocalBridge(cfg, { syncInstall = false } = {}) 
 
     // 4. Generate fresh Ed25519 keypair and install the prepared immutable source.
     const freshKey = ensureMachineIdentityKeypair();
+    initializeLegacyRpcAdmissions(freshKey, { allowFirstInitialization: freshLegacyIdentityKeys.has(legacyIdentityHash(freshKey)) });
     if (syncInstall) {
       const installRes = installPreparedBridgeRelease(release, cfg);
       return {
@@ -10959,6 +11158,8 @@ export async function installBridge({
   }
 
   const cfg = loadConfig({ autoFetchAz: true, refreshSpecs: true });
+  const admissionIdentity = ensureMachineIdentityKeypair();
+  prepareLegacyRpcAdmissionUpgrade(admissionIdentity);
   loadLocalFlocksConfig(cfg);
 
   // Register member metadata (machineId, githubUser, scope, version, specs) with bootstrap server

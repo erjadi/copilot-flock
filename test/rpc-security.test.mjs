@@ -5,8 +5,12 @@ import os from "node:os";
 import path from "node:path";
 import crypto from "node:crypto";
 import vm from "node:vm";
+import { spawn } from "node:child_process";
+import { fileURLToPath } from "node:url";
+import { DatabaseSync } from "node:sqlite";
 import * as flock from "../flock.mjs";
 import * as bridge from "../bridge.mjs";
+import { legacyAdmissionOperation, LEGACY_ADMISSION_CAPACITY, LEGACY_REPLAY_CLOCK_ALLOWANCE_MS } from "../legacy-rpc-admissions.mjs";
 
 function identity(fingerprint) {
   return { ...crypto.generateKeyPairSync("ed25519", {
@@ -58,9 +62,16 @@ async function fixture(api, { shared = false, expired = false, target = null } =
     sendResponse: async (replyUserId, response) => replies.push({ replyUserId, response }),
     logger: (code) => rejected.push(code),
   });
+  let admissionLedgerId = crypto.randomUUID();
+  const initializeAdmissions = () => {
+    const initialized = api.initializeLegacyRpcAdmissions(receiverKey, { allowFirstInitialization: true });
+    admissionLedgerId = initialized.ledgerId;
+    return initialized;
+  };
   const request = (action = "acquire_lock", params = { resource: "synthetic-dummy-lock" }) =>
-    api.createSignedRpcRequest({ ...cfg, machineId: "ORIGIN" }, sending, { toMachine: "VICTIM", action, params });
-  return { cfg, receiving, sending, senderKey, receiverKey, attackerKey, request, callback, replies, rejected };
+    api.createSignedRpcRequest({ ...cfg, machineId: "ORIGIN" }, sending, { toMachine: "VICTIM", action, params, admissionLedgerId });
+  return { cfg, receiving, sending, senderKey, receiverKey, attackerKey, request, callback, replies, rejected,
+    initializeAdmissions, get admissionLedgerId() { return admissionLedgerId; } };
 }
 
 test("actual network callback rejects caller authority and unbound identities before dummy lock dispatch", async () => {
@@ -104,6 +115,7 @@ test("actual network callback rejects caller authority and unbound identities be
       assert.equal(api.listLocalResourceLocks(f.cfg).locks.length, 0);
       await assert.rejects(() => api.handleRpcAction(f.cfg,
         { action: "acquire_lock", params: { resource: "missing-context" } }), { code: "RPC_CONTEXT_REQUIRED" });
+      f.initializeAdmissions();
       const accepted = await f.callback(f.request());
       assert.equal(accepted.status, "accepted");
       assert.equal(accepted.result.acquired, true);
@@ -118,6 +130,281 @@ test("actual network callback rejects caller authority and unbound identities be
     else process.env.COPILOT_HOME = previousHome;
     fs.rmSync(root, { recursive: true, force: true });
   }
+});
+
+test("accepted signed privileged RPC cannot be replayed against a later resource lease", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "flock-rpc-replay-"));
+  const previous = process.env.COPILOT_HOME;
+  process.env.COPILOT_HOME = root;
+  try {
+    for (const api of [flock, bridge]) {
+      const f = await fixture(api);
+      f.initializeAdmissions();
+      const resource = "synthetic-replay-resource";
+      api.acquireLocalResourceLock(f.cfg, { resource, ownerMachine: "FIRST-OWNER", ttlSeconds: 60 });
+      const request = f.request("release_lock", { resource, force: true });
+      assert.equal((await f.callback(request)).status, "accepted");
+      api.acquireLocalResourceLock(f.cfg, { resource, ownerMachine: "LATER-OWNER", ttlSeconds: 60 });
+      assert.equal((await f.callback(request)).status, "rejected");
+      assert.equal(api.listLocalResourceLocks(f.cfg).locks.length, 1);
+      api.releaseLocalResourceLock(f.cfg, { resource, force: true });
+    }
+  } finally {
+    if (previous === undefined) delete process.env.COPILOT_HOME;
+    else process.env.COPILOT_HOME = previous;
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+function isolatedProfile(t, prefix) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+  const previous = process.env.COPILOT_HOME;
+  process.env.COPILOT_HOME = root;
+  t.after(() => {
+    if (previous === undefined) delete process.env.COPILOT_HOME;
+    else process.env.COPILOT_HOME = previous;
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+  return root;
+}
+
+test("registered-owner pre-domain mutations reject cryptographically before any new admission", async (t) => {
+  isolatedProfile(t, "flock-old-domain-");
+  for (const api of [flock, bridge]) {
+    const f = await fixture(api);
+    f.initializeAdmissions();
+    const old = f.request("release_lock", { resource: "old-domain", force: true });
+    delete old.admissionLedgerId;
+    const payload = { flockId: old.flockId, fromMachine: old.fromMachine, toMachine: old.toMachine,
+      replyUserId: old.replyUserId, sentAt: old.sentAt, params: old.params };
+    old.auth = api.signV3RpcEnvelope({
+      flockUuid: f.sending.policy.flockUuid, rosterEpoch: f.sending.policy.rosterEpoch,
+      requestId: old.requestId, timestamp: old.sentAt, expiresAt: old.auth.expiresAt,
+      fromPeerId: f.sending.localMember.peerId, toPeerId: f.receiving.localMember.peerId,
+      actionOrStatus: old.action, payload, identity: f.senderKey,
+    });
+    assert.equal(api.verifyV3RpcEnvelope({ envelope: old.auth, requestId: old.requestId,
+      actionOrStatus: old.action, payload, publicKey: f.senderKey.publicKey }).valid, true);
+    const rejected = await f.callback(old);
+    assert.equal(rejected.status, "rejected");
+    assert.equal(rejected.code, "RPC_SIGNATURE_INVALID");
+    const read = f.request("list_locks", {});
+    assert.equal(read.admissionLedgerId, undefined);
+    assert.equal((await f.callback(read)).status, "accepted");
+    const missing = f.request("release_lock", { resource: "missing-incarnation", force: true });
+    delete missing.admissionLedgerId;
+    missing.auth = api.signV3RpcEnvelope({
+      flockUuid: f.sending.policy.flockUuid, rosterEpoch: f.sending.policy.rosterEpoch,
+      requestId: missing.requestId, timestamp: missing.sentAt, expiresAt: missing.auth.expiresAt,
+      fromPeerId: f.sending.localMember.peerId, toPeerId: f.receiving.localMember.peerId,
+      actionOrStatus: missing.action, payload: { admissionProtocol: api.LEGACY_MUTATION_PROTOCOL,
+        flockId: missing.flockId, fromMachine: missing.fromMachine, toMachine: missing.toMachine,
+        replyUserId: missing.replyUserId, sentAt: missing.sentAt, params: missing.params },
+      identity: f.senderKey,
+    });
+    assert.equal((await f.callback(missing)).code, "RPC_ADMISSION_INPUT_INVALID");
+  }
+});
+
+test("legacy admissions survive callback restart and concurrent online/offline delivery with independent ACK recovery", async (t) => {
+  const root = isolatedProfile(t, "flock-cross-delivery-");
+  for (const [index, api] of [flock, bridge].entries()) {
+    const f = await fixture(api);
+    f.initializeAdmissions();
+    const resource = `cross-${index}`;
+    api.acquireLocalResourceLock(f.cfg, { resource, ownerMachine: "FIRST-OWNER", ttlSeconds: 60 });
+    const request = f.request("release_lock", { resource, force: true });
+    const both = await Promise.all([
+      f.callback(request),
+      api.handleRpcAction(f.cfg, request, { ...f.receiving, source: "offline" })
+        .then(() => ({ status: "accepted" }), (error) => ({ status: "rejected", code: error.code })),
+    ]);
+    assert.equal(both.filter((result) => result.status === "accepted").length, 1);
+    assert.equal(both.filter((result) => result.code === "RPC_REQUEST_REPLAY").length, 1);
+    api.acquireLocalResourceLock(f.cfg, { resource, ownerMachine: "LATER-OWNER", ttlSeconds: 60 });
+    const restarted = api.createRpcInvocationHandler(f.cfg, {
+      contextProvider: async () => f.receiving, logger() {}, sendResponse: async () => {},
+    });
+    assert.equal((await restarted(request)).code, "RPC_REQUEST_REPLAY");
+    const statePath = path.join(root, `offline-${index}.json`);
+    let handling = 0;
+    const options = {
+      statePath, drainFn: async () => ({ messages: [{ requestId: request.requestId, rpcPayload: request }] }),
+      ackFn: async () => ({ ok: false }),
+      handleFn: async (req) => { handling++; return await api.handleRpcAction(f.cfg, req, { ...f.receiving, source: "offline" }); },
+    };
+    await api.drainAndProcessOfflineQueue(f.cfg, options);
+    await api.drainAndProcessOfflineQueue(f.cfg, options);
+    assert.equal(handling, 1);
+    assert.ok(api.loadProcessedOfflineState(statePath).ambiguousIds.includes(request.requestId));
+    assert.ok(api.loadProcessedOfflineState(statePath).pendingAckIds.includes(request.requestId));
+    await api.drainAndProcessOfflineQueue(f.cfg, { ...options, ackFn: async () => ({ ok: true }) });
+    assert.equal(handling, 1);
+    assert.equal(api.listLocalResourceLocks(f.cfg).locks.length, 1);
+    api.releaseLocalResourceLock(f.cfg, { resource, force: true });
+  }
+});
+
+function admissionChild(input) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [...flock.zeroBrokerNodeFlags(),
+      fileURLToPath(new URL("../legacy-rpc-admissions.mjs", import.meta.url))], {
+      stdio: ["pipe", "pipe", "pipe"], windowsHide: true,
+    });
+    let stdout = "", stderr = "";
+    child.stdout.on("data", (chunk) => { stdout += chunk; });
+    child.stderr.on("data", (chunk) => { stderr += chunk; });
+    child.once("error", reject);
+    child.once("close", (code) => {
+      if (code !== 0) return reject(new Error(`Synthetic admission helper failed: ${stderr}`));
+      try { resolve(JSON.parse(stdout)); } catch (error) { reject(error); }
+    });
+    child.stdin.end(JSON.stringify(input));
+  });
+}
+
+function primitiveAdmission(root) {
+  const receiverKey = crypto.createHash("sha256").update("Synthetic receiver key").digest("hex");
+  const initialized = legacyAdmissionOperation({ operation: "initialize", home: root, receiverKey, allowFirstInitialization: true });
+  const nowMs = Date.now();
+  return { home: root, receiverKey, ledgerId: initialized.ledgerId, flock: crypto.randomUUID(),
+    receiver: "synthetic-receiver", sender: "synthetic-owner-key", request: crypto.randomUUID(),
+    action: "release_lock", digest: "a".repeat(64), deadline: nowMs + 3600000, nowMs };
+}
+
+test("atomic legacy cross-process claims preserve crash UNKNOWN and reject changed signed intent", async (t) => {
+  const root = isolatedProfile(t, "flock-admission-processes-");
+  const input = primitiveAdmission(root);
+  const results = await Promise.all(Array.from({ length: 4 }, () => admissionChild({ ...input, operation: "claim" })));
+  assert.equal(results.filter((result) => result.ok && result.admitted).length, 1);
+  assert.equal(results.filter((result) => result.code === "RPC_REQUEST_REPLAY").length, 3, JSON.stringify(results));
+  const restarted = await admissionChild({ ...input, operation: "claim" });
+  assert.equal(restarted.code, "RPC_REQUEST_REPLAY");
+  assert.match(restarted.error, /UNKNOWN/);
+  const changed = await admissionChild({ ...input, operation: "claim", digest: "b".repeat(64) });
+  assert.equal(changed.code, "RPC_ADMISSION_ID_REUSED");
+  assert.equal((await admissionChild({ ...input, operation: "complete", outcome: "COMPLETED" })).ok, true);
+  assert.match((await admissionChild({ ...input, operation: "claim" })).error, /COMPLETED/);
+});
+
+test("legacy admission capacity retains every unexpired claim through signed deadline and clock allowance", (t) => {
+  const root = isolatedProfile(t, "flock-admission-capacity-");
+  const input = primitiveAdmission(root);
+  const file = path.join(root, "legacy-rpc-admissions", input.receiverKey, "state.sqlite");
+  const db = new DatabaseSync(file);
+  try {
+    db.prepare(`WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<?)
+      INSERT INTO admissions SELECT 'f','r','s',printf('synthetic-%d',i),'release_lock','digest',?,?, 'UNKNOWN' FROM n`)
+      .run(LEGACY_ADMISSION_CAPACITY, input.deadline, input.deadline + LEGACY_REPLAY_CLOCK_ALLOWANCE_MS);
+  } finally { db.close(); }
+  assert.throws(() => legacyAdmissionOperation({ ...input, operation: "claim" }), { code: "RPC_ADMISSION_CAPACITY" });
+  assert.throws(() => legacyAdmissionOperation({ ...input, operation: "claim",
+    nowMs: input.deadline + 1, deadline: input.deadline + 60000 }), { code: "RPC_ADMISSION_CAPACITY" });
+  legacyAdmissionOperation({ ...input, operation: "claim", nowMs: input.deadline + LEGACY_REPLAY_CLOCK_ALLOWANCE_MS + 1,
+    deadline: input.deadline + LEGACY_REPLAY_CLOCK_ALLOWANCE_MS + 60000 });
+  const inspected = new DatabaseSync(file);
+  try { assert.equal(inspected.prepare("SELECT COUNT(*) AS count FROM admissions").get().count, 1); }
+  finally { inspected.close(); }
+  assert.throws(() => legacyAdmissionOperation({ ...input, operation: "claim", request: crypto.randomUUID() }),
+    { code: "RPC_ADMISSION_CLOCK_ROLLBACK" });
+});
+
+test("legacy missing or corrupt anchored ledger never recreates and receiver incarnation rejects old captures after synthetic recovery", async (t) => {
+  const root = isolatedProfile(t, "flock-admission-loss-");
+  const f = await fixture(flock);
+  f.initializeAdmissions();
+  const home = flock.getBridgeHome();
+  const receiverKey = crypto.createHash("sha256").update(crypto.createPublicKey(f.receiverKey.publicKey)
+    .export({ type: "spki", format: "der" })).digest("hex");
+  const directory = path.join(home, "legacy-rpc-admissions", receiverKey);
+  const anchor = path.join(home, "legacy-rpc-admission-anchors", `${receiverKey}.json`);
+  const file = path.join(directory, "state.sqlite");
+  const request = f.request("release_lock", { resource: "recovery-resource", force: true });
+  const originalPacket = JSON.stringify(request);
+  assert.equal((await f.callback(request)).status, "accepted");
+  const originalId = f.admissionLedgerId;
+  const backup = fs.readFileSync(file);
+  fs.unlinkSync(file);
+  assert.equal((await f.callback(request)).code, "RPC_ADMISSION_STATE_REQUIRED");
+  assert.equal(fs.existsSync(file), false);
+  assert.throws(() => f.initializeAdmissions(), { code: "RPC_ADMISSION_STATE_REQUIRED" });
+  fs.writeFileSync(file, "Synthetic corrupt SQLite state");
+  const corrupt = fs.readFileSync(file);
+  assert.equal((await f.callback(request)).code, "RPC_ADMISSION_STORAGE_ERROR");
+  assert.deepEqual(fs.readFileSync(file), corrupt);
+  fs.writeFileSync(file, backup);
+  assert.equal((await f.callback(request)).code, "RPC_REQUEST_REPLAY");
+  fs.unlinkSync(anchor);
+  fs.rmSync(directory, { recursive: true });
+  assert.equal((await f.callback(request)).code, "RPC_ADMISSION_STATE_REQUIRED");
+  f.initializeAdmissions();
+  assert.notEqual(f.admissionLedgerId, originalId);
+  flock.acquireLocalResourceLock(f.cfg, { resource: "recovery-resource", ownerMachine: "LATER-OWNER", ttlSeconds: 60 });
+  assert.equal((await f.callback(request)).code, "RPC_ADMISSION_LEDGER_CHANGED");
+  await assert.rejects(() => flock.handleRpcAction(f.cfg, request, { ...f.receiving, source: "offline" }),
+    { code: "RPC_ADMISSION_LEDGER_CHANGED" });
+  assert.equal(JSON.stringify(request), originalPacket, "Queued authority must never be rebound or re-signed after recovery");
+  assert.equal(flock.listLocalResourceLocks(f.cfg).locks.length, 1);
+  assert.equal((await f.callback(f.request("release_lock", { resource: "recovery-resource", force: true }))).status, "accepted");
+  assert.equal(flock.listLocalResourceLocks(f.cfg).locks.length, 0);
+  assert.ok(root);
+});
+
+test("coherent install gates the new mutation domain without changing prior profile bytes or normal incarnation", async (t) => {
+  const root = isolatedProfile(t, "flock-admission-upgrade-");
+  const f = await fixture(flock);
+  const home = flock.getBridgeHome();
+  fs.mkdirSync(home, { recursive: true });
+  const sentinels = ["identity.json", "flocks.json", "config.json", "mcp-config.json"];
+  for (const name of sentinels) fs.writeFileSync(path.join(home, name), `Synthetic original ${name} bytes`);
+  assert.throws(() => flock.prepareLegacyRpcAdmissionUpgrade(f.receiverKey), { code: "RPC_ADMISSION_STATE_REQUIRED" });
+  fs.writeFileSync(path.join(home, "flock.mjs"), "// Synthetic prior legacy source without the new domain\n");
+  const initialized = flock.prepareLegacyRpcAdmissionUpgrade(f.receiverKey);
+  fs.writeFileSync(path.join(home, "flock.mjs"), `// ${flock.LEGACY_MUTATION_PROTOCOL}\n`);
+  assert.equal(flock.prepareLegacyRpcAdmissionUpgrade(f.receiverKey).ledgerId, initialized.ledgerId);
+  for (const name of sentinels) assert.equal(fs.readFileSync(path.join(home, name), "utf8"), `Synthetic original ${name} bytes`);
+  for (const privatePath of ["legacy-rpc-admissions", "legacy-rpc-admission-anchors", "legacy-rpc-bindings"]) {
+    assert.throws(() => flock.assertSafeTransferFilePath(path.join(home, privatePath, "state.json")), /Security policy/);
+  }
+  assert.ok(root);
+});
+
+test("receiver incarnation proof is signed, context matched and persisted for offline use without authority promotion", async (t) => {
+  isolatedProfile(t, "flock-admission-proof-");
+  const f = await fixture(flock);
+  f.initializeAdmissions();
+  async function proof() {
+    const request = f.request("ping", { includeAdmission: true });
+    const before = f.replies.length;
+    assert.equal((await f.callback(request)).status, "accepted");
+    return { request, response: f.replies[before].response };
+  }
+  const valid = await proof();
+  const origin = { ...f.cfg, machineId: "ORIGIN" };
+  const binding = await flock.getLegacyReceiverBinding(origin, f.sending, "VICTIM", { fetchProof: async () => valid });
+  assert.equal(binding, f.admissionLedgerId);
+  assert.equal(await flock.getLegacyReceiverBinding(origin, f.sending, "VICTIM", {
+    fetchProof: async () => assert.fail("Known signed incarnation must be usable while the receiver is offline"),
+  }), binding);
+  for (const mutate of [
+    (value) => { value.response.requestId = "wrong-request"; },
+    (value) => { value.request.replyUserId = "rpc-wrong-audience"; },
+    (value) => { value.response.auth.fromPeerId = "1001:wrong-receiver"; },
+    (value) => { value.response.auth.publicKey = f.attackerKey.publicKey; },
+    (value) => { value.response.result.legacyAdmission.ledgerId = crypto.randomUUID(); },
+    (value) => { value.request.flockId = "different/flock"; },
+  ]) {
+    const changed = structuredClone(valid);
+    mutate(changed);
+    await assert.rejects(() => flock.getLegacyReceiverBinding(origin, f.sending, "VICTIM", {
+      forceRefresh: true, fetchProof: async () => changed,
+    }), { code: "RPC_ADMISSION_BINDING_INVALID" });
+  }
+  assert.equal(await flock.getLegacyReceiverBinding(origin, f.sending, "VICTIM"), binding);
+  await assert.rejects(() => flock.getLegacyReceiverBinding(origin, f.sending, "VICTIM", {
+    forceRefresh: true, fetchProof: async () => { throw new Error("Synthetic offline receiver"); },
+  }), { code: "RPC_ADMISSION_HANDSHAKE_FAILED" });
+  assert.equal(await flock.getLegacyReceiverBinding(origin, f.sending, "VICTIM"), binding);
 });
 
 test("expired/wrong-target context and absent authority fail closed; guest grants are exact static summaries", async () => {
@@ -226,6 +513,7 @@ test("actual single/batch sender functions round-trip context-bound signed reque
   try {
     for (const [filename, api] of [["flock.mjs", flock], ["bridge.mjs", bridge]]) {
       const f = await fixture(api);
+      f.initializeAdmissions();
       const clients = new Map(), seen = [];
       let closed = 0;
       const callback = api.createRpcInvocationHandler(f.cfg, {
@@ -237,6 +525,8 @@ test("actual single/batch sender functions round-trip context-bound signed reque
         loadTrustedRpcContext: async () => f.sending,
         createSignedRpcRequest: api.createSignedRpcRequest,
         verifySignedRpcResponse: api.verifySignedRpcResponse,
+        isLegacyRpcMutation: api.isLegacyRpcMutation,
+        getLegacyReceiverBinding: api.getLegacyReceiverBinding,
         logDaemon() {},
         connectSignalRClient: async (_cfg, options) => {
           clients.set(options.userId, options.onInvocation);
@@ -261,11 +551,13 @@ test("actual single/batch sender functions round-trip context-bound signed reque
       const batch = await sandbox.invokeRemoteRpcBatch(originCfg, [
         { toMachine: "VICTIM", action: "list_locks", params: {} },
         { toMachine: "VICTIM", action: "list_locks", params: {} },
+        { toMachine: "VICTIM", action: "acquire_lock", params: { resource: `batch-${filename}` } },
       ], 100);
-      assert.equal(batch.length, 2);
+      assert.equal(batch.length, 3);
       assert.ok(batch.every((entry) => entry.ok && entry.response.auth.v === 3));
-      assert.equal(seen.length, 3);
-      assert.equal(closed, 2);
+      assert.equal(seen.length, 5);
+      assert.ok(seen.filter((packet) => api.isLegacyRpcMutation(packet)).every((packet) => packet.admissionLedgerId === f.admissionLedgerId));
+      assert.equal(closed, 3);
     }
   } finally {
     if (previousHome === undefined) delete process.env.COPILOT_HOME;

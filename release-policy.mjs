@@ -52,7 +52,7 @@ export const RELEASE_VALIDATION_POLICY = Object.freeze({
   syntax: "every_tracked_mjs",
   tests: "every_top_level_test_dot_test_mjs_serial",
   canonicalEntryPoints: Object.freeze(["bridge.mjs", "flock.mjs"]),
-  requiredModules: Object.freeze(["bridge.mjs", "flock.mjs", "bootstrap-server.mjs", "release-policy.mjs",
+  requiredModules: Object.freeze(["bridge.mjs", "flock.mjs", "bootstrap-server.mjs", "release-policy.mjs", "legacy-rpc-admissions.mjs",
     "zero-broker-roster.mjs", "zero-broker-transport.mjs", "zero-broker-runtime.mjs",
     "zero-broker-lifecycle.mjs", "zero-broker-enrollment.mjs", "zero-broker-release.mjs"].sort()),
   requiredTests: Object.freeze(["bridge", "flock", "setup", "contracts", "rpc-security",
