@@ -285,6 +285,8 @@ The live viewer preserves that distinction: an HTTP/RPC success alone does not
 add a delivered transcript or corridor message. Single sends and broadcasts
 show unconfirmed admission as UNKNOWN; a successful create RPC is not a
 message-delivery receipt. Do not blindly resend an uncertain request.
+Broadcast preview/send failures remain visible, preserve the draft and targets,
+and release the busy controls without inventing result rows or delivery events.
 
 Both install profiles record `installed-source.json` with the source commit
 when known and checksums of the installed runtime modules. Release reports

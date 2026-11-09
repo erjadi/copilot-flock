@@ -11,7 +11,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { createServer } from "vite";
 import ts from "typescript";
 
-let server, rel, SessionsView, api, flocks, governance;
+let server, rel, gpuLabel, SessionsView, api, flocks, governance, match;
 before(async () => {
   const root = fileURLToPath(new URL("../", import.meta.url));
   server = await createServer({
@@ -19,11 +19,12 @@ before(async () => {
     server: { middlewareMode: true, hmr: false, watch: null },
     optimizeDeps: { noDiscovery: true, include: [] }, appType: "custom",
   });
-  ({ rel } = await server.ssrLoadModule(path.join(root, "src", "components", "fleet", "ui.tsx")));
+  ({ rel, gpuLabel } = await server.ssrLoadModule(path.join(root, "src", "components", "fleet", "ui.tsx")));
   ({ SessionsView } = await server.ssrLoadModule(path.join(root, "src", "components", "fleet", "SessionsView.tsx")));
   api = await server.ssrLoadModule(path.join(root, "src", "lib", "fleet", "api.ts"));
   flocks = await server.ssrLoadModule(path.join(root, "src", "lib", "fleet", "flocks.ts"));
   governance = await server.ssrLoadModule(path.join(root, "src", "lib", "fleet", "governance.ts"));
+  match = await server.ssrLoadModule(path.join(root, "src", "lib", "fleet", "match.ts"));
 });
 after(async () => { await server?.close(); });
 
@@ -153,8 +154,9 @@ function componentFixture(file, apiOverrides = {}) {
       if (name.endsWith("/theme")) return { resolveTheme: () => "dark", THEME_KEY: "synthetic-theme" };
       if (name.endsWith("/seed")) return { fakeEvent: () => [] };
       if (name.endsWith("/governance")) return governance;
+      if (name.endsWith("/match")) return match;
       if (name.endsWith("/utils")) return { cn: (...args) => args.filter(Boolean).join(" ") };
-      return new Proxy({}, { get: (_target, key) => key === "rel" ? rel : String(key) });
+      return new Proxy({}, { get: (_target, key) => key === "rel" ? rel : key === "gpuLabel" ? gpuLabel : String(key) });
     },
   });
   const internal = file === "Console" ? "\nexports.Connection = ConsoleConnection;"
@@ -428,6 +430,48 @@ test("session and corridor UI retain UNKNOWN without optimistic transcript or co
   assert.equal(sent[0].from, "ACTUAL-LOCAL");
   assert.equal(bodies.at(-1).fromMachine, undefined);
   corridor.unmount();
+});
+
+test("Broadcast preview and send rejections reset busy, retain intent and expose unconfirmed errors without synthetic results", async () => {
+  for (const dryRun of [true, false]) {
+    for (const failure of [new Error("503"), new TypeError("Synthetic network failure"), Object.assign(new Error("Synthetic abort"), { name: "AbortError" })]) {
+      const events = [], calls = [];
+      let reject;
+      const pending = new Promise((_resolve, rejectPromise) => { reject = rejectPromise; });
+      const member = { machineId: "SYNTHETIC-TARGET", online: true, scope: "personal",
+        specs: { gpus: [], memory: { totalGb: 16 } } };
+      const ctx = { base: "", mode: "live", scope: "all", data: { hub: { machineId: "ACTUAL-LOCAL" }, members: [member], sessions: [] },
+        pushEvents: (items) => events.push(...items) };
+      const f = componentFixture("BroadcastView", { post: (_base, mode, _path, body) => {
+        calls.push({ mode, body }); return pending;
+      } });
+      let tree = f.render("BroadcastView", { ctx });
+      elements(tree).find((node) => node.type === "textarea").props.onChange({ target: { value: "Preserved broadcast intent" } });
+      elements(tree).find((node) => node.type === "Input" && node.props.placeholder === "All machines").props.onChange({ target: { value: "SYNTHETIC-*" } });
+      tree = f.render("BroadcastView", { ctx });
+      const button = () => elements(tree).find((node) => node.type === "Btn" &&
+        (dryRun ? text(node).includes("Preview") : text(node).includes("Send to")));
+      assert.equal(button().props.disabled, false);
+      const work = button().props.onClick();
+      tree = f.render("BroadcastView", { ctx });
+      assert.equal(button().props.disabled, true);
+      reject(failure);
+      await work;
+      tree = f.render("BroadcastView", { ctx });
+      assert.equal(button().props.disabled, false);
+      assert.match(text(tree), dryRun ? /Preview failed/ : /Broadcast admission UNKNOWN; do not blindly retry/);
+      assert.ok(elements(tree).some((node) => node.props?.role === "alert"));
+      assert.equal(elements(tree).find((node) => node.type === "textarea").props.value, "Preserved broadcast intent");
+      assert.equal(elements(tree).find((node) => node.type === "Input" && node.props.placeholder === "All machines").props.value, "SYNTHETIC-*");
+      assert.equal(events.length, 0);
+      assert.equal(calls.length, 1);
+      assert.equal(calls[0].mode, "live");
+      assert.equal(calls[0].body.dryRun, dryRun);
+      assert.equal(elements(tree).some((node) => node.type === "table"), false);
+      assert.doesNotMatch(text(tree), /Admission results|Envelope preview/);
+      f.unmount();
+    }
+  }
 });
 
 test("viewer rejects foreign origins and rebinding hosts before private reads or owner RPC dispatch", async () => {

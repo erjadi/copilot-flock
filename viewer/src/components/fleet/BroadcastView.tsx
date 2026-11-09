@@ -18,18 +18,22 @@ export function BroadcastView({ ctx }: { ctx: Ctx }) {
   const [preview, setPreview] = useState<string | null>(null);
   const [rows, setRows] = useState<Row[] | null>(null);
   const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
   const set = <K extends keyof BroadcastFilter>(k: K, v: BroadcastFilter[K]) => setF((p) => ({ ...p, [k]: v }));
   const matched = matchMembers(ctx.data.members, ctx.data.sessions, f);
 
   const run = async (dryRun: boolean) => {
-    setBusy(true);
-    const body = { ...f, machines: f.machines || "*", toSession, newSession, title, repo, message, dryRun, waitForReply: wait };
-    const r = await post<{ results?: Row[]; envelopePreview?: string }>(ctx.base, ctx.mode, "/api/broadcast", body, () => dryRun
-      ? { envelopePreview: matched.map((m) => envelope("fleet-console", m.machineId, newSession ? "<new>" : toSession || "<coordinator>", message, "immediate")).join("\n\n") }
-      : { results: matched.map((m) => ({ machineId: m.machineId, ok: true, admissionStatus: newSession ? "rpc_accepted" : "delivered", latencyMs: 60 + Math.floor(Math.random() * 500), detail: newSession ? `created "${title || "Broadcast session"}"` : wait ? "reply: ack" : "delivered" })) });
-    if (dryRun) { setPreview(r.envelopePreview ?? JSON.stringify(r, null, 2)); setRows(null); }
-    else { setRows(r.results ?? []); setPreview(null); ctx.pushEvents([{ id: `evt-${Date.now()}`, timestamp: new Date().toISOString(), type: "outbox", target: "broadcast", fromMachine: ctx.data.hub.machineId, toMachine: matched.map((m) => m.machineId).join(","), action: "send_message", summary: `broadcast → ${matched.length} machines`, payload: body }]); }
-    setBusy(false);
+    setBusy(true); setError(null); setRows(null); setPreview(null);
+    try {
+      const body = { ...f, machines: f.machines || "*", toSession, newSession, title, repo, message, dryRun, waitForReply: wait };
+      const r = await post<{ results?: Row[]; envelopePreview?: string }>(ctx.base, ctx.mode, "/api/broadcast", body, () => dryRun
+        ? { envelopePreview: matched.map((m) => envelope("fleet-console", m.machineId, newSession ? "<new>" : toSession || "<coordinator>", message, "immediate")).join("\n\n") }
+        : { results: matched.map((m) => ({ machineId: m.machineId, ok: true, admissionStatus: newSession ? "rpc_accepted" : "delivered", latencyMs: 60 + Math.floor(Math.random() * 500), detail: newSession ? `created "${title || "Broadcast session"}"` : wait ? "reply: ack" : "delivered" })) });
+      if (dryRun) setPreview(r.envelopePreview ?? JSON.stringify(r, null, 2));
+      else { setRows(r.results ?? []); ctx.pushEvents([{ id: `evt-${Date.now()}`, timestamp: new Date().toISOString(), type: "outbox", target: "broadcast", fromMachine: ctx.data.hub.machineId, toMachine: matched.map((m) => m.machineId).join(","), action: "send_message", summary: `broadcast → ${matched.length} machines`, payload: body }]); }
+    } catch (failure) {
+      setError(`${dryRun ? "Preview failed" : "Broadcast admission UNKNOWN; do not blindly retry"}: ${failure instanceof Error ? failure.message : String(failure)}`);
+    } finally { setBusy(false); }
   };
 
   return <div>
@@ -46,6 +50,7 @@ export function BroadcastView({ ctx }: { ctx: Ctx }) {
       </Panel>
 
       <div className="space-y-5">
+        {error && <Panel className="border-destructive/30 p-5 text-xs text-destructive"><div role="alert">{error}</div></Panel>}
         <Panel className="p-4 sm:p-5 lg:p-6"><div className="mb-5 flex items-center justify-between"><h3 className="text-xs font-medium">Live match preview</h3><span className="font-mono text-[10px] text-muted-foreground">{matched.length} / {ctx.data.members.length} machines</span></div><div className="divide-y divide-border/50">{ctx.data.members.map((m) => { const on = matched.includes(m); const gpus = m.specs.gpus.map(gpuLabel).join(" · "); return <div key={m.machineId} className={`flex items-center gap-3 py-3 transition-opacity ${on ? "" : "opacity-30"}`}><Dot tone={on ? "online" : "muted"} /><span className="min-w-0 truncate font-mono text-[11px]">{m.machineId}</span><span className="ml-auto hidden text-right text-[10px] text-muted-foreground sm:block">{m.specs.memory.totalGb} GB{gpus ? ` · ${gpus}` : ""}</span><span className="w-12 shrink-0 text-right font-mono text-[9px] capitalize text-muted-foreground">{m.scope}</span></div>; })}</div></Panel>
         {preview && <Panel className="enter-up p-5 lg:p-6"><div className="mb-4 text-xs font-medium">Envelope preview</div><div className="max-h-96 min-w-0 space-y-5 overflow-auto">{(preview.match(/<cross_session_message\b[\s\S]*?<\/cross_session_message>/gi) ?? [preview]).map((text, i) => <SmartMessage key={i} text={text} compact />)}</div></Panel>}
         {rows && <Panel className="enter-up overflow-x-auto overscroll-contain"><div className="border-b border-border/60 px-5 py-4 text-xs font-medium">Admission results</div><table className="w-full min-w-[580px] text-xs"><thead className="text-left font-mono text-[9px] uppercase tracking-widest text-muted-foreground"><tr><th className="px-5 py-3 font-normal">Machine</th><th className="px-5 py-3 font-normal">Status</th><th className="px-5 py-3 text-right font-normal">Latency</th><th className="px-5 py-3 font-normal">Detail</th></tr></thead><tbody className="divide-y divide-border/50">{rows.map((r) => <tr key={r.machineId}><td className="px-5 py-3 font-mono text-[10px]">{r.machineId}</td><td className="px-5 py-3"><span className={`flex items-center gap-2 text-[11px] ${r.admissionStatus === "delivered" ? "text-online" : "text-muted-foreground"}`}><Dot tone={r.admissionStatus === "delivered" ? "online" : "muted"} />{r.admissionStatus === "delivered" ? "Delivered" : r.admissionStatus === "rpc_accepted" ? "RPC accepted" : r.admissionStatus === "failed" ? "Failed" : "Unknown"}</span></td><td className="px-5 py-3 text-right font-mono text-[10px] text-muted-foreground">{r.latencyMs}ms</td><td className="px-5 py-3 text-[11px] text-muted-foreground">{r.detail || "Admission unknown"}</td></tr>)}</tbody></table></Panel>}
