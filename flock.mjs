@@ -196,6 +196,7 @@ export async function installZeroBrokerIntegration(cfg, { configureStartup = con
     const target = path.join(home, filename);
     if (path.resolve(source) !== path.resolve(target)) fs.copyFileSync(source, target);
   }
+  const sourceProvenance = recordInstalledSourceProvenance(__dirname, home);
   const api = await getZeroBrokerApi();
   const copilotDirectory = getCopilotDir();
   const mcpFile = path.join(copilotDirectory, "mcp-config.json");
@@ -236,7 +237,7 @@ Public Pages propagation and accurate clocks bound freshness; no revocation SLA 
   const bootPersistence = configureStartup(path.join(home, "flock.mjs"), { strict: true });
   if (!bootPersistence) throw new Error("Platform startup persistence unavailable; local initialization retained for explicit integration repair");
   const daemon = await startDaemon(cfg);
-  return { architecture: cfg.architecture, groups: cfg.groups, bootPersistence, daemon, defaultGrants: "private-owner metadata discovery only; no execution, live transcript or external snapshot grants", nativeAdapter: "existing Desktop sessions only" };
+  return { architecture: cfg.architecture, groups: cfg.groups, bootPersistence, daemon, sourceProvenance, defaultGrants: "private-owner metadata discovery only; no execution, live transcript or external snapshot grants", nativeAdapter: "existing Desktop sessions only" };
 }
 
 function copyZeroBrokerModules(sourceDirectory, targetDirectory) {
@@ -5274,13 +5275,6 @@ export function resolveOrFindBridgeGitRepo() {
         fs.existsSync(path.join(dir, ".git")) &&
         (fs.existsSync(path.join(dir, "flock.mjs")) || fs.existsSync(path.join(dir, "bridge.mjs")))
       ) {
-        try {
-          execFileSync(
-            "git",
-            ["-C", dir, "remote", "set-url", "origin", "https://github.com/erjadi/copilot-flock.git"],
-            { stdio: "ignore", timeout: 3000, windowsHide: true }
-          );
-        } catch {}
         return dir;
       }
     } catch {}
@@ -5305,6 +5299,147 @@ export function resolveOrFindBridgeGitRepo() {
     }
   } catch {}
   return null;
+}
+
+export async function prepareBridgeReleaseSource(repoDir, { exec = execFileSync } = {}) {
+  const options = { stdio: ["ignore", "pipe", "pipe"], windowsHide: true, timeout: 20000 };
+  const releaseRef = "refs/copilot-flock/releases/main";
+  exec("git", ["-C", repoDir, "fetch", "--no-tags", "--no-write-fetch-head",
+    "https://github.com/erjadi/copilot-flock.git", `+refs/heads/main:${releaseRef}`], options);
+  const commit = exec("git", ["-C", repoDir, "rev-parse", "--verify", `${releaseRef}^{commit}`],
+    { ...options, encoding: "utf8" }).trim();
+  const { materializeReleaseCandidate } = await import("./zero-broker-release.mjs");
+  const release = materializeReleaseCandidate({ repoDir, commit, exec });
+  try {
+    const scriptPath = path.join(release.directory, "flock.mjs");
+    const compatibility = path.join(release.directory, "bridge.mjs");
+    if (!fs.existsSync(scriptPath) || !fs.existsSync(compatibility) ||
+        !fs.readFileSync(scriptPath).equals(fs.readFileSync(compatibility))) {
+      throw new Error("Release source lacks matching canonical and compatibility entry points");
+    }
+    for (const filename of release.files.filter((file) => path.dirname(file) === release.directory && file.endsWith(".mjs"))) {
+      exec(process.execPath, ["--check", filename], options);
+    }
+    const runtimeHashes = Object.fromEntries(release.files
+      .filter((file) => path.dirname(file) === release.directory && /^(?:flock|bridge|zero-broker-[a-z-]+)\.mjs$/.test(path.basename(file)))
+      .map((file) => [path.basename(file), crypto.createHash("sha256").update(fs.readFileSync(file)).digest("hex")]));
+    fs.writeFileSync(path.join(release.directory, "release-source.json"),
+      JSON.stringify({ schema: 1, sourceCommit: commit, scope: "runtime_modules_only", runtimeHashes }) + "\n");
+    return { ...release, scriptPath, commit };
+  } catch (error) {
+    fs.rmSync(release.directory, { recursive: true, force: true });
+    throw error;
+  }
+}
+
+function runtimeSourceHashes(directory) {
+  return Object.fromEntries(fs.readdirSync(directory)
+    .filter((name) => /^(?:flock|bridge|zero-broker-[a-z-]+)\.mjs$/.test(name))
+    .sort().map((name) => [name, crypto.createHash("sha256").update(fs.readFileSync(path.join(directory, name))).digest("hex")]));
+}
+
+export function getInstalledSourceProvenance(directory = getBridgeHome(), { exec = execFileSync } = {}) {
+  if (!fs.existsSync(directory)) return { status: "unrecorded", sourceCommit: null, scope: "runtime_modules_only", runtimeHashes: {} };
+  const runtimeHashes = runtimeSourceHashes(directory);
+  const marker = ["release-source.json", "installed-source.json"]
+    .map((name) => path.join(directory, name)).find((file) => fs.existsSync(file));
+  if (marker) {
+    const recorded = JSON.parse(fs.readFileSync(marker, "utf8"));
+    if (recorded.schema !== 1 || recorded.scope !== "runtime_modules_only" ||
+        recorded.sourceCommit !== null && !/^[0-9a-f]{40}$/.test(recorded.sourceCommit) ||
+        !recorded.runtimeHashes || typeof recorded.runtimeHashes !== "object") {
+      throw new Error("Invalid local runtime source provenance");
+    }
+    const matches = JSON.stringify(Object.entries(recorded.runtimeHashes).sort()) ===
+      JSON.stringify(Object.entries(runtimeHashes).sort());
+    return { status: matches ? recorded.status || "recorded_runtime_matches" : "modified_runtime",
+      sourceCommit: matches ? recorded.sourceCommit : null, scope: "runtime_modules_only", runtimeHashes };
+  }
+  if (fs.existsSync(path.join(directory, ".git"))) {
+    const options = { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: 5000, windowsHide: true };
+    const commit = exec("git", ["-C", directory, "rev-parse", "--verify", "HEAD^{commit}"], options).trim();
+    if (!/^[0-9a-f]{40}$/.test(commit)) throw new Error("Invalid source repository commit");
+    const names = Object.keys(runtimeHashes);
+    const tracked = exec("git", ["-C", directory, "ls-tree", "--name-only", commit], options)
+      .split(/\r?\n/).filter((name) => /^(?:flock|bridge|zero-broker-[a-z-]+)\.mjs$/.test(name)).sort();
+    const unchanged = JSON.stringify(names) === JSON.stringify(tracked) &&
+      exec("git", ["-C", directory, "diff", "--numstat", commit, "--", ...names], options).trim() === "";
+    return { status: unchanged ? "tracked_clean_runtime" : "modified_runtime",
+      sourceCommit: unchanged ? commit : null, scope: "runtime_modules_only", runtimeHashes };
+  }
+  return { status: "unrecorded", sourceCommit: null, scope: "runtime_modules_only", runtimeHashes };
+}
+
+export function recordInstalledSourceProvenance(sourceDirectory, destination = getBridgeHome(), options = {}) {
+  const source = getInstalledSourceProvenance(sourceDirectory, options);
+  const runtimeHashes = runtimeSourceHashes(destination);
+  const matches = JSON.stringify(Object.entries(source.runtimeHashes).sort()) ===
+    JSON.stringify(Object.entries(runtimeHashes).sort());
+  const result = { schema: 1, status: matches && source.sourceCommit ? "recorded_runtime_matches" :
+    matches ? source.status : "modified_runtime", sourceCommit: matches ? source.sourceCommit : null,
+    scope: "runtime_modules_only", runtimeHashes };
+  writeConfigFileSecure(result, path.join(destination, "installed-source.json"));
+  return result;
+}
+
+function bridgeReleaseInstallArguments(release, cfg) {
+  return [...zeroBrokerNodeFlags(), release.scriptPath, "install", "--architecture", "legacy",
+    "--scope", normalizeScope(cfg.scope || "work"),
+    ...(cfg.githubUser ? ["--github-user", cfg.githubUser] : [])];
+}
+
+export function installPreparedBridgeRelease(release, cfg, { exec = execFileSync } = {}) {
+  try {
+    const output = exec(process.execPath, bridgeReleaseInstallArguments(release, cfg), {
+      cwd: release.directory, env: { ...process.env, COPILOT_HOME: getCopilotDir() },
+      encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], windowsHide: true,
+      timeout: 120000, maxBuffer: 8 * 1024 * 1024,
+    });
+    return JSON.parse(output);
+  } finally {
+    fs.rmSync(release.directory, { recursive: true, force: true });
+  }
+}
+
+function schedulePreparedBridgeRelease(release, cfg) {
+  let log;
+  const logPath = path.join(getBridgeHome(), "update-install.log");
+  // The installer restarts its calling daemon, so a separate process owns snapshot cleanup.
+  const runner = `
+const fs = require("node:fs");
+const { spawnSync } = require("node:child_process");
+const [directory, ...args] = process.argv.slice(1);
+setTimeout(() => {
+  try {
+    const child = spawnSync(process.execPath, args, { stdio: "inherit", windowsHide: true, timeout: 120000 });
+    if (child.error) throw child.error;
+    process.exitCode = child.status ?? 1;
+    if (process.exitCode) console.error("Pinned Flock installation failed with exit status " + process.exitCode);
+  } catch (error) { console.error(error); process.exitCode = 1; }
+  finally { fs.rmSync(directory, { recursive: true, force: true }); }
+}, 300);
+`;
+  try {
+    ensureBridgeDir();
+    log = fs.openSync(logPath, "a");
+    const child = spawn(process.execPath, ["-e", runner, release.directory,
+      ...bridgeReleaseInstallArguments(release, cfg)], {
+      cwd: getBridgeHome(), env: { ...process.env, COPILOT_HOME: getCopilotDir() },
+      detached: true, stdio: ["ignore", log, log], windowsHide: true,
+    });
+    child.once("error", (error) => {
+      fs.appendFileSync(logPath, `Pinned Flock installer could not start: ${error.message}\n`);
+      fs.rmSync(release.directory, { recursive: true, force: true });
+    });
+    if (!child.pid) throw new Error(`Pinned Flock installer could not start; see ${logPath}`);
+    child.unref();
+    return { installerPid: child.pid, installationLog: logPath };
+  } catch (error) {
+    fs.rmSync(release.directory, { recursive: true, force: true });
+    throw error;
+  } finally {
+    if (log !== undefined) fs.closeSync(log);
+  }
 }
 
 let cachedBootstrapMembersMap = new Map();
@@ -6027,62 +6162,18 @@ export async function handleRpcAction(cfg, req, context = null) {
   if (action === "self_update") {
     const repoDir = resolveOrFindBridgeGitRepo();
     if (!repoDir) {
-      throw new Error(`Could not locate or clone copilot-signalr-bridge git repo on ${cfg.machineId}`);
+      throw new Error(`Could not locate or clone copilot-flock git repo on ${cfg.machineId}`);
     }
-    execFileSync("git", ["-C", repoDir, "fetch", "origin", "main"], {
-      stdio: ["ignore", "pipe", "pipe"],
-      timeout: 20000,
-      windowsHide: true,
-    });
-    execFileSync("git", ["-C", repoDir, "reset", "--hard", "origin/main"], {
-      stdio: ["ignore", "pipe", "pipe"],
-      timeout: 10000,
-      windowsHide: true,
-    });
-    const newCommit = execFileSync("git", ["-C", repoDir, "rev-parse", "--short", "HEAD"], {
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "ignore"],
-      timeout: 5000,
-      windowsHide: true,
-    }).trim();
-    const updatedRepoScript = fs.existsSync(path.join(repoDir, "flock.mjs"))
-      ? path.join(repoDir, "flock.mjs")
-      : path.join(repoDir, "bridge.mjs");
-    ensureBridgeDir();
-    const targetScript = path.join(getBridgeHome(), "flock.mjs");
-    const compatScript = path.join(getBridgeHome(), "bridge.mjs");
-    fs.copyFileSync(updatedRepoScript, targetScript);
-    fs.copyFileSync(updatedRepoScript, compatScript);
-    copyZeroBrokerModules(path.dirname(updatedRepoScript), getBridgeHome());
-
-    // Spawn `node flock.mjs install` detached after 300ms so the RPC reply returns first
-    setTimeout(() => {
-      try {
-        const child = spawn(
-          process.execPath,
-          [
-            targetScript,
-            "install",
-            "--scope",
-            cfg.scope || "work",
-            ...(cfg.githubUser ? ["--github-user", cfg.githubUser] : []),
-          ],
-          {
-            detached: true,
-            stdio: "ignore",
-            windowsHide: true,
-          }
-        );
-        child.unref();
-      } catch {}
-    }, 300);
+    const release = await prepareBridgeReleaseSource(repoDir);
+    const installation = schedulePreparedBridgeRelease(release, cfg);
 
     return {
       status: "updating",
       machineId: cfg.machineId,
       previousVersion: BRIDGE_VERSION,
       repoDir,
-      targetCommit: newCommit,
+      targetCommit: release.commit,
+      ...installation,
     };
   }
 
@@ -6201,9 +6292,10 @@ export async function handleRpcAction(cfg, req, context = null) {
     if (!repoDir) {
       throw new Error(`Could not locate copilot-signalr-bridge git repo on ${cfg.machineId}`);
     }
+    const installedSource = getInstalledSourceProvenance();
     execFileSync(
       "git",
-      ["-C", repoDir, "fetch", "--force", "--no-write-fetch-head", "origin", "+refs/heads/main:refs/remotes/origin/main"],
+      ["-C", repoDir, "fetch", "--force", "--no-write-fetch-head", "https://github.com/erjadi/copilot-flock.git", "+refs/heads/main:refs/remotes/origin/main"],
       {
         stdio: ["ignore", "pipe", "pipe"],
         timeout: 20000,
@@ -6212,7 +6304,7 @@ export async function handleRpcAction(cfg, req, context = null) {
     );
     execFileSync(
       "git",
-      ["-C", repoDir, "fetch", "--force", "origin", branch],
+      ["-C", repoDir, "fetch", "--force", "https://github.com/erjadi/copilot-flock.git", branch],
       {
         stdio: ["ignore", "pipe", "pipe"],
         timeout: 20000,
@@ -6226,7 +6318,8 @@ export async function handleRpcAction(cfg, req, context = null) {
       windowsHide: true,
     }).trim();
     const candidateSha = candidateCommit.slice(0, 7);
-    let diffStat = "";
+    let diffStat = null;
+    let publishedMainComparisonError = null;
     try {
       diffStat = execFileSync("git", ["-C", repoDir, "diff", "--stat", `origin/main..${candidateCommit}`], {
         encoding: "utf8",
@@ -6234,8 +6327,20 @@ export async function handleRpcAction(cfg, req, context = null) {
         timeout: 5000,
         windowsHide: true,
       }).trim();
-    } catch {
-      diffStat = candidateSha;
+    } catch (error) {
+      publishedMainComparisonError = `Published main comparison failed: ${error.message}`;
+    }
+    let installedDiffStat = null;
+    let installedComparisonError = installedSource.sourceCommit ? null :
+      `Installed runtime baseline is ${installedSource.status}; no source commit is inferred from version or refreshed origin/main`;
+    if (installedSource.sourceCommit) {
+      try {
+        installedDiffStat = execFileSync("git", ["-C", repoDir, "diff", "--stat", `${installedSource.sourceCommit}..${candidateCommit}`], {
+          encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: 5000, windowsHide: true,
+        }).trim();
+      } catch (error) {
+        installedComparisonError = `Installed source commit is unavailable for comparison: ${error.message}`;
+      }
     }
 
     // Extract candidate bridge.mjs, bootstrap-server.mjs, and test/bridge.test.mjs to temp files,
@@ -6359,6 +6464,11 @@ export async function handleRpcAction(cfg, req, context = null) {
       candidateCommit,
       candidateSha,
       diffStat,
+      publishedMainDiffStat: diffStat,
+      publishedMainComparisonError,
+      installedSource,
+      installedDiffStat,
+      installedComparisonError,
       checks,
       verificationLevel: "complete_candidate_syntax_root_tests_and_ed25519_signature",
       issues,
@@ -9489,25 +9599,9 @@ export async function updateFleetMachines(
   let localUpdate = null;
   if (includeSelf && matchesSelectorList(cfg.machineId, machines)) {
     const repoDir = resolveOrFindBridgeGitRepo();
-    if (repoDir) {
-      try {
-        execFileSync("git", ["-C", repoDir, "fetch", "origin", "main"], {
-          stdio: ["ignore", "pipe", "pipe"],
-          timeout: 20000,
-          windowsHide: true,
-        });
-        execFileSync("git", ["-C", repoDir, "reset", "--hard", "origin/main"], {
-          stdio: ["ignore", "pipe", "pipe"],
-          timeout: 10000,
-          windowsHide: true,
-        });
-        fs.copyFileSync(path.join(repoDir, "bridge.mjs"), path.join(getBridgeHome(), "bridge.mjs"));
-      } catch {}
-    }
-    localUpdate = await installBridge({
-      scopeArg: cfg.scope,
-      githubUserArg: cfg.githubUser,
-    });
+    if (!repoDir) throw new Error(`Could not locate or clone copilot-flock git repo on ${cfg.machineId}`);
+    const release = await prepareBridgeReleaseSource(repoDir);
+    localUpdate = installPreparedBridgeRelease(release, cfg);
   }
 
   if (batchItems.length > 0) {
@@ -9716,135 +9810,112 @@ export async function deleteOldBridgeSessions(wsInfo) {
 }
 
 export async function reprovisionLocalBridge(cfg, { syncInstall = false } = {}) {
-  ensureBridgeDir();
-  const wsInfo = getLocalWsConnectionInfo();
-  const reapedMcpPids = reapOrphanedMcpProcesses();
+  const repoDir = resolveOrFindBridgeGitRepo();
+  if (!repoDir) throw new Error(`Could not locate or clone copilot-flock git repo on ${cfg.machineId}`);
+  const release = await prepareBridgeReleaseSource(repoDir);
+  let installationScheduled = false;
+  try {
+    ensureBridgeDir();
+    const wsInfo = getLocalWsConnectionInfo();
+    const reapedMcpPids = reapOrphanedMcpProcesses();
 
-  // 1. Abort and delete all old bridge sessions (Coordinator, Thread Tracker, Upgrade bridge v1.7.0, etc.)
-  const removedSessions = await deleteOldBridgeSessions(wsInfo);
+    // 1. Abort and delete all old bridge sessions (Coordinator, Thread Tracker, Upgrade bridge v1.7.0, etc.)
+    const removedSessions = await deleteOldBridgeSessions(wsInfo);
 
-  // 2. Remove old bridge state, logs, caches, identity key, locks, transfers, and skill folders
-  const bridgeHome = getBridgeHome();
-  const filesToRemove = [
-    path.join(bridgeHome, "state.json"),
-    path.join(bridgeHome, "inbox.jsonl"),
-    path.join(bridgeHome, "outbox.jsonl"),
-    path.join(bridgeHome, "cli-sessions.json"),
-    path.join(bridgeHome, "identity.json"),
-    path.join(bridgeHome, "locks.json"),
-  ];
-  for (const f of filesToRemove) {
-    try {
-      if (fs.existsSync(f)) fs.unlinkSync(f);
-    } catch {}
-  }
-  const dirsToRemove = [
-    path.join(bridgeHome, "transfers"),
-    path.join(bridgeHome, "skill"),
-  ];
-  if (process.platform === "win32" && process.env.APPDATA) {
-    dirsToRemove.push(path.join(process.env.APPDATA, "com.github.githubapp", "app-skills", "signalr-bridge"));
-  }
-  for (const d of dirsToRemove) {
-    try {
-      if (fs.existsSync(d)) fs.rmSync(d, { recursive: true, force: true });
-    } catch {}
-  }
-  cachedIdentityKeypair = null;
-  cachedIdentityKeyPath = null;
-
-  // 3. Pull or clone a fresh repo checkout from origin/main
-  const managedRepoClone = path.join(bridgeHome, "repo");
-  const repoDir = resolveOrFindBridgeGitRepo() || managedRepoClone;
-  let targetCommit = null;
-  if (repoDir) {
-    try {
-      execFileSync("git", ["-C", repoDir, "fetch", "origin", "main"], {
-        stdio: ["ignore", "pipe", "pipe"],
-        timeout: 20000,
-        windowsHide: true,
-      });
-      execFileSync("git", ["-C", repoDir, "reset", "--hard", "origin/main"], {
-        stdio: ["ignore", "pipe", "pipe"],
-        timeout: 10000,
-        windowsHide: true,
-      });
-    } catch {
+    // 2. Remove old bridge state, logs, caches, identity key, locks, transfers, and skill folders
+    const bridgeHome = getBridgeHome();
+    const filesToRemove = [
+      path.join(bridgeHome, "state.json"),
+      path.join(bridgeHome, "inbox.jsonl"),
+      path.join(bridgeHome, "outbox.jsonl"),
+      path.join(bridgeHome, "cli-sessions.json"),
+      path.join(bridgeHome, "identity.json"),
+      path.join(bridgeHome, "locks.json"),
+    ];
+    for (const f of filesToRemove) {
       try {
-        if (fs.existsSync(managedRepoClone)) {
-          fs.rmSync(managedRepoClone, { recursive: true, force: true });
-        }
-        execFileSync(
-          "git",
-          ["clone", "https://github.com/erjadi/copilot-signalr-bridge.git", managedRepoClone],
-          { stdio: ["ignore", "pipe", "pipe"], timeout: 25000, windowsHide: true }
-        );
+        if (fs.existsSync(f)) fs.unlinkSync(f);
       } catch {}
     }
-    const activeRepoDir = fs.existsSync(path.join(repoDir, "bridge.mjs"))
-      ? repoDir
-      : managedRepoClone;
-    if (fs.existsSync(path.join(activeRepoDir, "bridge.mjs"))) {
-      targetCommit = execFileSync("git", ["-C", activeRepoDir, "rev-parse", "--short", "HEAD"], {
-        encoding: "utf8",
-        stdio: ["ignore", "pipe", "ignore"],
-        timeout: 5000,
-        windowsHide: true,
-      }).trim();
-      fs.copyFileSync(path.join(activeRepoDir, "bridge.mjs"), path.join(bridgeHome, "bridge.mjs"));
+    const dirsToRemove = [
+      path.join(bridgeHome, "transfers"),
+      path.join(bridgeHome, "skill"),
+    ];
+    if (process.platform === "win32" && process.env.APPDATA) {
+      dirsToRemove.push(path.join(process.env.APPDATA, "com.github.githubapp", "app-skills", "signalr-bridge"));
     }
-  }
+    for (const d of dirsToRemove) {
+      try {
+        if (fs.existsSync(d)) fs.rmSync(d, { recursive: true, force: true });
+      } catch {}
+    }
+    cachedIdentityKeypair = null;
+    cachedIdentityKeyPath = null;
 
-  // 4. Create brand-new, clean, idle Coordinator and Thread Tracker sessions (no initial LLM turn)
-  let newCoordinatorSessionId = null;
-  let newThreadTrackerSessionId = null;
-  if (wsInfo) {
-    const coordCreated = await createLocalSession({
-      cfg,
-      title: COORDINATOR_TITLE,
-      systemPrompt: COORDINATOR_CHARTER_PROMPT,
-      message: null,
-      mode: "immediate",
-    });
-    newCoordinatorSessionId = coordCreated.sessionId;
+    const targetCommit = release.commit;
 
-    const trackerCreated = await createLocalSession({
-      cfg,
-      title: THREAD_TRACKER_TITLE,
-      systemPrompt: THREAD_TRACKER_CHARTER_PROMPT,
-      message: null,
-      mode: "immediate",
-    });
-    newThreadTrackerSessionId = trackerCreated.sessionId;
-  } else {
-    const c1 = saveHeadlessCliSession({
-      session_id: crypto.randomUUID(),
-      title: COORDINATOR_TITLE,
-      session_type: "cli",
-      mode: "autopilot",
-      path: HOME_DIR,
-    });
-    const c2 = saveHeadlessCliSession({
-      session_id: crypto.randomUUID(),
-      title: THREAD_TRACKER_TITLE,
-      session_type: "cli",
-      mode: "autopilot",
-      path: HOME_DIR,
-    });
-    newCoordinatorSessionId = c1.session_id;
-    newThreadTrackerSessionId = c2.session_id;
-  }
+    // 3. Create brand-new, clean, idle Coordinator and Thread Tracker sessions (no initial LLM turn)
+    let newCoordinatorSessionId = null;
+    let newThreadTrackerSessionId = null;
+    if (wsInfo) {
+      const coordCreated = await createLocalSession({
+        cfg,
+        title: COORDINATOR_TITLE,
+        systemPrompt: COORDINATOR_CHARTER_PROMPT,
+        message: null,
+        mode: "immediate",
+      });
+      newCoordinatorSessionId = coordCreated.sessionId;
 
-  // 5. Generate fresh Ed25519 keypair and run install (synchronously when called from local CLI, or detached after 300ms when called via RPC)
-  const freshKey = ensureMachineIdentityKeypair();
-  const targetScript = path.join(bridgeHome, "bridge.mjs");
-  if (syncInstall) {
-    const installRes = await installBridge({
-      scopeArg: cfg.scope || "work",
-      githubUserArg: cfg.githubUser || null,
-    });
+      const trackerCreated = await createLocalSession({
+        cfg,
+        title: THREAD_TRACKER_TITLE,
+        systemPrompt: THREAD_TRACKER_CHARTER_PROMPT,
+        message: null,
+        mode: "immediate",
+      });
+      newThreadTrackerSessionId = trackerCreated.sessionId;
+    } else {
+      const c1 = saveHeadlessCliSession({
+        session_id: crypto.randomUUID(),
+        title: COORDINATOR_TITLE,
+        session_type: "cli",
+        mode: "autopilot",
+        path: HOME_DIR,
+      });
+      const c2 = saveHeadlessCliSession({
+        session_id: crypto.randomUUID(),
+        title: THREAD_TRACKER_TITLE,
+        session_type: "cli",
+        mode: "autopilot",
+        path: HOME_DIR,
+      });
+      newCoordinatorSessionId = c1.session_id;
+      newThreadTrackerSessionId = c2.session_id;
+    }
+
+    // 4. Generate fresh Ed25519 keypair and install the prepared immutable source.
+    const freshKey = ensureMachineIdentityKeypair();
+    if (syncInstall) {
+      const installRes = installPreparedBridgeRelease(release, cfg);
+      return {
+        status: "reprovisioned",
+        machineId: cfg.machineId,
+        targetCommit,
+        reapedMcpPids,
+        removedSessions,
+        newCoordinatorSessionId,
+        newThreadTrackerSessionId,
+        newKeyFingerprint: freshKey.fingerprint,
+        installResult: installRes,
+      };
+    }
+
+    const installation = schedulePreparedBridgeRelease(release, cfg);
+    installationScheduled = true;
+
     return {
-      status: "reprovisioned",
+      status: "reprovisioning",
       machineId: cfg.machineId,
       targetCommit,
       reapedMcpPids,
@@ -9852,41 +9923,11 @@ export async function reprovisionLocalBridge(cfg, { syncInstall = false } = {}) 
       newCoordinatorSessionId,
       newThreadTrackerSessionId,
       newKeyFingerprint: freshKey.fingerprint,
-      installResult: installRes,
+      ...installation,
     };
+  } finally {
+    if (!installationScheduled) fs.rmSync(release.directory, { recursive: true, force: true });
   }
-
-  setTimeout(() => {
-    try {
-      const child = spawn(
-        process.execPath,
-        [
-          targetScript,
-          "install",
-          "--scope",
-          cfg.scope || "work",
-          ...(cfg.githubUser ? ["--github-user", cfg.githubUser] : []),
-        ],
-        {
-          detached: true,
-          stdio: "ignore",
-          windowsHide: true,
-        }
-      );
-      child.unref();
-    } catch {}
-  }, 300);
-
-  return {
-    status: "reprovisioning",
-    machineId: cfg.machineId,
-    targetCommit,
-    reapedMcpPids,
-    removedSessions,
-    newCoordinatorSessionId,
-    newThreadTrackerSessionId,
-    newKeyFingerprint: freshKey.fingerprint,
-  };
 }
 
 export async function reprovisionFleetMachines(cfg, { machines = "*" } = {}) {
@@ -10867,6 +10908,7 @@ export async function installBridge({
     fs.copyFileSync(__filename, compatScript);
   }
   copyZeroBrokerModules(__dirname, getBridgeHome());
+  const sourceProvenance = recordInstalledSourceProvenance(__dirname, getBridgeHome());
   // Also update legacy ~/.copilot/signalr-bridge/bridge.mjs if that directory exists so running sessions stay in sync
   const legacyScript = path.join(getLegacyBridgeHome(), "bridge.mjs");
   if (fs.existsSync(getLegacyBridgeHome()) && path.resolve(__filename) !== path.resolve(legacyScript)) {
@@ -11099,6 +11141,7 @@ export async function installBridge({
 
   return {
     version: BRIDGE_VERSION,
+    sourceProvenance,
     sandbox: sandboxMode ? "v3" : null,
     installedScript: targetScript,
     configPath: activeConfigPath,

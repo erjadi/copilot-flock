@@ -175,6 +175,25 @@ ballots cannot approve a merge. Older ballots remain diagnostically verifiable,
 not full-scope approval. LAN and viewer checks remain separate release evidence;
 these changes neither upgrade live reviewers nor authorize deployment.
 
+**Legacy upgrades and source evidence:** ask Copilot to upgrade the approved
+legacy installation. It fetches the canonical release into a dedicated Git ref,
+pins the full commit and installs from an isolated Git-object snapshot. It does
+not reset a user checkout, move its branch, overwrite staged/unstaged work,
+rewrite `origin`, or replace `FETCH_HEAD`. Reprovisioning must prepare that
+source successfully before deleting its explicitly selected legacy state;
+reprovisioning and all live updates still require separate approval.
+Fetch or installer failures are errors, never permission to reinstall stale
+code. Deferred installers report a pending update with an installer PID and
+`update-install.log`; that is not proof the upgrade completed.
+
+Both install profiles record `installed-source.json` with the source commit
+when known and checksums of the installed runtime modules. Release reports
+separate the published-main diff from the recorded installed-runtime diff;
+the first may be empty even when an older installation differs. Missing,
+modified or unavailable installed baselines remain explicitly unknown.
+This local disk-runtime record is informational, not signed voter authority,
+proof of a running daemon's resident code, a release ballot, or live acceptance.
+
 ## Try it out hubless; deploy the components for the real potential
 
 **The Hubless LAN-Direct Trial is a "Try It Out" onboarding sandbox, not the

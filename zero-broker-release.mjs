@@ -37,11 +37,10 @@ export async function validateReleaseCandidateInWorker({ repoDir, commit }) {
   return result;
 }
 
-export function validateReleaseCandidate({ repoDir, commit, exec = execFileSync }) {
+export function materializeReleaseCandidate({ repoDir, commit, exec = execFileSync }) {
   if (!/^[0-9a-f]{40}$/.test(commit)) throw new Error("Release validation requires an immutable commit SHA");
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "flock-release-"));
   const options = { stdio: ["ignore", "pipe", "pipe"], windowsHide: true, maxBuffer: 8 * 1024 * 1024, timeout: 15000 };
-  const nodeFlags = sqliteFlags();
   try {
     const entries = exec("git", ["-C", repoDir, "ls-tree", "-r", "-z", commit], options).toString("utf8").split("\0").filter(Boolean);
     const files = [];
@@ -55,6 +54,18 @@ export function validateReleaseCandidate({ repoDir, commit, exec = execFileSync 
       fs.writeFileSync(target, exec("git", ["-C", repoDir, "show", `${commit}:${filename}`], options));
       files.push(target);
     }
+    return { directory, files };
+  } catch (error) {
+    fs.rmSync(directory, { recursive: true, force: true });
+    throw error;
+  }
+}
+
+export function validateReleaseCandidate({ repoDir, commit, exec = execFileSync }) {
+  const { directory, files } = materializeReleaseCandidate({ repoDir, commit, exec });
+  const options = { stdio: ["ignore", "pipe", "pipe"], windowsHide: true, maxBuffer: 8 * 1024 * 1024, timeout: 15000 };
+  const nodeFlags = sqliteFlags();
+  try {
     const modules = files.filter((filename) => filename.endsWith(".mjs"));
     for (const filename of modules) exec(process.execPath, ["--check", filename], options);
     const tests = files.filter((filename) => path.dirname(filename) === path.join(directory, "test") && filename.endsWith(".test.mjs"));
