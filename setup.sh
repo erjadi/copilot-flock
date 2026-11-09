@@ -51,7 +51,7 @@ if (( BASH_REMATCH[1] < 22 || (BASH_REMATCH[1] == 22 && BASH_REMATCH[2] < 5) ));
 fi
 [[ -z "$SCOPE" || "$SCOPE" == work || "$SCOPE" == personal ]] || fail "Scope must be work or personal."
 NODE_FLAGS=()
-if [[ "$LEGACY" == false ]] && (( (BASH_REMATCH[1] == 22 && BASH_REMATCH[2] < 13) || (BASH_REMATCH[1] == 23 && BASH_REMATCH[2] < 4) )); then
+if (( (BASH_REMATCH[1] == 22 && BASH_REMATCH[2] < 13) || (BASH_REMATCH[1] == 23 && BASH_REMATCH[2] < 4) )); then
   NODE_FLAGS+=("--experimental-sqlite")
 fi
 if [[ "$PROVISION_AZURE" == true ]]; then
@@ -102,14 +102,15 @@ if [[ "$PROVISION_AZURE" == true ]]; then
       catch { console.error("Azure deployment returned malformed JSON outputs."); process.exit(1); }
       const value = output?.[process.argv[1]]?.value;
       if (typeof value !== "string" || !value.trim()) {
-        console.error("Azure deployment did not return the required connection string."); process.exit(1);
+        console.error("Azure deployment did not return the required nonsecret resource metadata."); process.exit(1);
       }
       process.stdout.write(value);
     ' "$1"
   }
-  CONNECTION_STRING="$(output_value signalrConnectionString)"
-  SERVICEBUS_CONNECTION_STRING="$(output_value serviceBusConnectionString)"
-  echo "Managed Azure resources are ready; installing full Flock locally."
+  for field in subscriptionId signalrName signalrHostName serviceBusNamespaceName serviceBusEndpoint serviceBusTopicName; do
+    output_value "$field" >/dev/null
+  done
+  echo "Azure resources deployed; installation will retrieve authorized keys before initializing local state."
 fi
 
 ARGS=("${NODE_FLAGS[@]}" "$SCRIPT_DIR/flock.mjs" "install")
@@ -118,7 +119,7 @@ ARGS=("${NODE_FLAGS[@]}" "$SCRIPT_DIR/flock.mjs" "install")
 [[ "$PUBLISH_ROSTER" == false ]] || ARGS+=("--publish-roster")
 [[ -z "$VERIFIED_ROOT_FINGERPRINT" ]] || ARGS+=("--verified-root-fingerprint" "$VERIFIED_ROOT_FINGERPRINT")
 [[ -z "$GITHUB_USER" ]] || ARGS+=("--github-user" "$GITHUB_USER")
-if [[ "$PROVISION_AZURE" == true && "$LEGACY" == false ]]; then
+if [[ "$PROVISION_AZURE" == true ]]; then
   ARGS+=("--resource-group" "$RESOURCE_GROUP" "--azure-output-stdin")
   CONNECTION_STRING=""
   SERVICEBUS_CONNECTION_STRING=""
@@ -131,7 +132,7 @@ fi
 [[ -z "$CONNECTION_STRING" ]] || ARGS+=("--connection-string" "$CONNECTION_STRING")
 [[ -z "$SERVICEBUS_CONNECTION_STRING" ]] || ARGS+=("--servicebus-connection-string" "$SERVICEBUS_CONNECTION_STRING")
 echo "Installing and starting Copilot Flock..."
-if [[ "$PROVISION_AZURE" == true && "$LEGACY" == false ]]; then
+if [[ "$PROVISION_AZURE" == true ]]; then
   printf '%s' "$DEPLOYMENT_OUTPUT" | node "${ARGS[@]}"
 else
   node "${ARGS[@]}"

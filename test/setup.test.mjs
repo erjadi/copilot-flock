@@ -5,10 +5,18 @@ import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import vm from "node:vm";
+import { readManagedAzureCredentials } from "../zero-broker-transport.mjs";
 
 const root = fileURLToPath(new URL("../", import.meta.url));
 const fakeSignalr = "Endpoint=https://example.service.signalr.net;AccessKey=synthetic;";
-const fakeServiceBus = "Endpoint=sb://example.servicebus.windows.net/;SharedAccessKey=synthetic;";
+const fakeServiceBus = "Endpoint=sb://example.servicebus.windows.net/;SharedAccessKeyName=RootManageSharedAccessKey;SharedAccessKey=synthetic;";
+const metadata = Object.fromEntries(Object.entries({
+  subscriptionId: "11111111-2222-4333-8444-555555555555",
+  signalrName: "example-signalr", signalrHostName: "example.service.signalr.net",
+  serviceBusNamespaceName: "example", serviceBusEndpoint: "sb://example.servicebus.windows.net/",
+  serviceBusTopicName: "copilot-bridge-offline",
+}).map(([name, value]) => [name, { type: "String", value }]));
 const cleanEnv = {
   ...process.env,
   SIGNALR_CONNECTION_STRING: "",
@@ -21,6 +29,125 @@ const cleanEnv = {
 const readJournal = (file) => fs.existsSync(file)
   ? fs.readFileSync(file, "utf8").trim().split(/\r?\n/).filter(Boolean).map((line) => JSON.parse(line.replace(/^\uFEFF/, "")))
   : [];
+
+function azureKeyFixture({ legacy = false, failAt = 0, missingAt = 0 } = {}) {
+  const calls = [];
+  return {
+    calls,
+    async runAz(args) {
+      calls.push(args);
+      if (calls.length === failAt) throw new Error(`synthetic captured output: ${fakeSignalr} ${fakeServiceBus}`);
+      if (calls.length === missingAt) return {};
+      if (args[0] === "signalr") return { primaryConnectionString: fakeSignalr };
+      return legacy ? { primaryConnectionString: fakeServiceBus }
+        : { primaryKey: args.includes("FlockSendRule") ? "synthetic-send-material" : "synthetic-listen-material" };
+    },
+  };
+}
+
+test("managed Azure credentials use explicit pinned key-list actions and preserve least-privilege topic issuers", async () => {
+  for (const legacy of [false, true]) {
+    const f = azureKeyFixture({ legacy });
+    const result = await readManagedAzureCredentials({ outputs: metadata, resourceGroup: "rg-demo", legacy, runAz: f.runAz });
+    assert.equal(result.signalrConnectionString, fakeSignalr);
+    assert.equal(result.subscriptionId, metadata.subscriptionId.value);
+    assert.equal(f.calls.length, legacy ? 2 : 3);
+    for (const args of f.calls) {
+      assert.equal(args[args.indexOf("--subscription") + 1], metadata.subscriptionId.value);
+      assert.equal(args[args.indexOf("--resource-group") + 1], "rg-demo");
+      assert.equal(args.at(-1), "json");
+      assert.ok(!args.includes(fakeSignalr) && !args.includes(fakeServiceBus));
+    }
+    if (legacy) {
+      assert.equal(result.serviceBusConnectionString, fakeServiceBus);
+      assert.ok(f.calls[1].includes("RootManageSharedAccessKey"));
+    } else {
+      assert.equal(result.serviceBusConnectionString, undefined);
+      assert.equal(result.enrollmentKeys.sendRuleKey, "synthetic-send-material");
+      assert.equal(result.enrollmentKeys.listenRuleKey, "synthetic-listen-material");
+      assert.ok(!f.calls.flat().includes("RootManageSharedAccessKey"));
+      assert.deepEqual(f.calls.slice(1).map((args) => args[args.indexOf("--name") + 1]), ["FlockSendRule", "FlockListenRule"]);
+      assert.ok(f.calls.slice(1).every((args) => args.includes(metadata.serviceBusTopicName.value)));
+    }
+  }
+});
+
+test("managed key retrieval denies malformed/secret metadata and scrubs every key-list failure without fallback", async () => {
+  for (const outputs of [{}, { ...metadata, signalrConnectionString: { value: fakeSignalr } },
+    { ...metadata, subscriptionId: { value: "invalid" } }, { ...metadata, signalrName: { value: "name; command" } }]) {
+    const f = azureKeyFixture();
+    await assert.rejects(() => readManagedAzureCredentials({ outputs, resourceGroup: "rg-demo", runAz: f.runAz }));
+    assert.equal(f.calls.length, 0);
+  }
+  for (const legacy of [false, true]) for (const kind of ["failAt", "missingAt"]) {
+    for (let index = 1; index <= (legacy ? 2 : 3); index++) {
+      const f = azureKeyFixture({ legacy, [kind]: index });
+      await assert.rejects(() => readManagedAzureCredentials({ outputs: metadata, resourceGroup: "rg-demo", legacy, runAz: f.runAz }), (error) => {
+        assert.match(error.message, /key retrieval failed.*installation was not started/);
+        assert.ok(!String(error.stack).includes(fakeSignalr) && !String(error.stack).includes(fakeServiceBus));
+        assert.equal(error.cause, undefined);
+        return true;
+      });
+      assert.equal(f.calls.length, index);
+    }
+  }
+});
+
+test("both actual install entrypoints retrieve credentials before initialization and preserve state on retrieval failure", async () => {
+  for (const file of ["flock.mjs", "bridge.mjs"]) for (const legacy of [false, true]) {
+    const source = fs.readFileSync(path.join(root, file), "utf8");
+    const start = source.indexOf("async function main() {"), end = source.indexOf("\nconst isDirectEntrypoint =", start);
+    assert.ok(start > 0 && end > start);
+    async function run({ failAt = 0, saved = null, input = metadata, rawInput } = {}) {
+      const f = azureKeyFixture({ legacy, failAt });
+      const installed = [], initialized = [], logs = [], savedBytes = saved ? JSON.stringify(saved) : null;
+      const flags = { "azure-output-stdin": true, "resource-group": "rg-demo", "roster-repository": "example/rosters",
+        "publish-roster": true, ...(legacy ? { architecture: "legacy" } : {}) };
+      const context = vm.createContext({
+        process: { argv: [] }, parseCliArgs: () => ({ command: "install", positional: [], flags }),
+        fs: { existsSync: () => saved !== null, readFileSync: (file) => file === 0 ? rawInput ?? JSON.stringify(input) : savedBytes },
+        getConfigPath: () => "synthetic-config", getBridgeHome: () => "synthetic-home",
+        managedAzureAdapter: { readManagedAzureCredentials: (options) => readManagedAzureCredentials({ ...options, runAz: f.runAz }) },
+        getZeroBrokerApi: async () => ({ initializeZeroBrokerOwner: async (options) => initialized.push(options) }),
+        installBridge: async (options) => { installed.push(options); return { installed: true }; },
+        installZeroBrokerIntegration: async () => ({ installed: true }), loadConfig: () => ({ architecture: "zero-broker" }),
+        createZeroBrokerNativeHost: () => ({}), console: { log: (value) => logs.push(value) },
+      });
+      vm.runInContext(source.slice(start, end).replace('await import("./zero-broker-transport.mjs")', "managedAzureAdapter") + "\nthis.run = main;", context);
+      let error;
+      try { await context.run(); } catch (caught) { error = caught; }
+      assert.equal(saved ? JSON.stringify(saved) : null, savedBytes);
+      assert.ok(!logs.join("").includes(fakeSignalr) && !logs.join("").includes(fakeServiceBus));
+      return { f, installed, initialized, error };
+    }
+    const positive = await run();
+    assert.equal(positive.error, undefined);
+    assert.equal(legacy ? positive.installed.length : positive.initialized.length, 1);
+    const options = legacy ? positive.installed[0] : positive.initialized[0];
+    assert.equal(legacy ? options.connectionStringArg : options.signalr.accessKey, legacy ? fakeSignalr : "synthetic");
+    if (!legacy) assert.equal(options.enrollmentKeys.sendRuleKey, "synthetic-send-material");
+    for (let failAt = 1; failAt <= (legacy ? 2 : 3); failAt++) {
+      const failed = await run({ failAt });
+      assert.match(failed.error.message, /key retrieval failed/);
+      assert.equal(failed.installed.length + failed.initialized.length, 0);
+    }
+    const existing = await run({ saved: { architecture: "zero-broker", identity: "synthetic-retained-identity" } });
+    assert.ok(existing.error);
+    assert.equal(existing.f.calls.length + existing.installed.length + existing.initialized.length, 0);
+    const oldOutputs = await run({ input: { ...metadata, signalrConnectionString: { value: fakeSignalr } } });
+    assert.ok(oldOutputs.error);
+    assert.equal(oldOutputs.f.calls.length + oldOutputs.installed.length + oldOutputs.initialized.length, 0);
+    const malformed = await run({ rawInput: `{"credential":"${fakeSignalr}` });
+    assert.match(malformed.error.message, /valid nonsecret deployment metadata/);
+    assert.ok(!malformed.error.stack.includes(fakeSignalr));
+    assert.equal(malformed.f.calls.length + malformed.installed.length + malformed.initialized.length, 0);
+    if (legacy) {
+      const retained = await run({ failAt: 2, saved: { architecture: "legacy", identity: "synthetic-retained-identity" } });
+      assert.match(retained.error.message, /key retrieval failed/);
+      assert.equal(retained.installed.length + retained.initialized.length, 0);
+    }
+  }
+});
 
 function runPowerShell(options = {}) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "flock-setup-ps-"));
@@ -71,6 +198,10 @@ function node {
         return "v24.0.0"
     }
     Write-Journal "node" $args
+    if ($args -contains "--azure-output-stdin") {
+        $Metadata = ($input | Out-String) | ConvertFrom-Json
+        Write-Journal "metadata" @($Metadata.PSObject.Properties.Name)
+    }
     $global:LASTEXITCODE = 0
 }
 if ($env:MOCK_LEGACY -eq "1") {
@@ -99,10 +230,7 @@ if ($env:MOCK_LEGACY -eq "1") {
         MOCK_NODE_VERSION: options.nodeVersion || "",
         MOCK_SIGNALR: fakeSignalr,
         MOCK_SERVICEBUS: fakeServiceBus,
-        MOCK_OUTPUT: JSON.stringify({
-          signalrConnectionString: { value: fakeSignalr },
-          serviceBusConnectionString: { value: fakeServiceBus },
-        }),
+        MOCK_OUTPUT: JSON.stringify(metadata),
       },
     });
     return { ...result, events: readJournal(journal) };
@@ -111,7 +239,7 @@ if ($env:MOCK_LEGACY -eq "1") {
   }
 }
 
-test("managed PowerShell setup installs missing CLI, authenticates, deploys and passes keys without printing them", { skip: process.platform !== "win32" }, () => {
+test("managed PowerShell setup installs CLI, authenticates and forwards only resource metadata to native key retrieval", { skip: process.platform !== "win32" }, () => {
   const result = runPowerShell();
   assert.equal(result.status, 0, result.stderr);
   assert.equal(result.events.filter((event) => event.kind === "winget").length, 1);
@@ -120,14 +248,16 @@ test("managed PowerShell setup installs missing CLI, authenticates, deploys and 
   assert.ok(deployment.args.includes("properties.outputs"));
   assert.ok(deployment.args.some((arg) => String(arg).endsWith("azuredeploy.json")));
   const installed = result.events.find((event) => event.kind === "node");
-  assert.ok(installed.args.includes(fakeSignalr) && installed.args.includes(fakeServiceBus));
+  assert.ok(installed.args.includes("--azure-output-stdin"));
+  assert.ok(!installed.args.includes(fakeSignalr) && !installed.args.includes(fakeServiceBus));
+  assert.deepEqual(result.events.find((event) => event.kind === "metadata").args.sort(), Object.keys(metadata).sort());
   assert.ok(!result.stdout.includes(fakeSignalr) && !result.stdout.includes(fakeServiceBus));
   const older = runPowerShell({ zero: true, nodeVersion: "v22.5.0" });
   assert.equal(older.status, 0, older.stderr);
   assert.ok(older.events.find((event) => event.kind === "node").args.includes("--experimental-sqlite"));
 });
 
-test("managed Zero-Broker PowerShell setup forwards secret deployment outputs over stdin, not credential arguments", { skip: process.platform !== "win32" }, () => {
+test("managed Zero-Broker PowerShell setup forwards nonsecret metadata over stdin, never deployment credentials", { skip: process.platform !== "win32" }, () => {
   const result = runPowerShell({ zero: true });
   assert.equal(result.status, 0, result.stderr);
   const installed = result.events.find((event) => event.kind === "node");
@@ -203,6 +333,10 @@ if (args[0] === "deployment") process.stdout.write(process.env.MOCK_FAIL === "ou
     fs.writeFileSync(path.join(directory, "mock-node.mjs"), `
 import fs from "node:fs";
 fs.appendFileSync(process.env.SETUP_JOURNAL, JSON.stringify({ kind: "node", args: process.argv.slice(2) }) + "\\n");
+if (process.argv.includes("--azure-output-stdin")) {
+  const metadata = JSON.parse(fs.readFileSync(0, "utf8"));
+  fs.appendFileSync(process.env.SETUP_JOURNAL, JSON.stringify({ kind: "metadata", args: Object.keys(metadata) }) + "\\n");
+}
 `);
     const run = (args, settings = {}) => {
       if (fs.existsSync(journal)) fs.unlinkSync(journal);
@@ -212,10 +346,7 @@ fs.appendFileSync(process.env.SETUP_JOURNAL, JSON.stringify({ kind: "node", args
           ...cleanEnv, DISPLAY: "", REAL_NODE: process.execPath, SETUP_JOURNAL: journal,
           MOCK_FAIL: settings.fail || "", MOCK_AUTH: settings.authenticated ? "1" : "0",
           MOCK_NODE_VERSION: settings.nodeVersion || "",
-          MOCK_OUTPUT: JSON.stringify({
-            signalrConnectionString: { value: fakeSignalr },
-            serviceBusConnectionString: { value: fakeServiceBus },
-          }),
+          MOCK_OUTPUT: JSON.stringify(metadata),
         },
       });
       return { ...result, events: readJournal(journal) };
@@ -224,7 +355,9 @@ fs.appendFileSync(process.env.SETUP_JOURNAL, JSON.stringify({ kind: "node", args
     assert.equal(managed.status, 0, managed.stderr);
     assert.ok(managed.events.some((event) => event.kind === "az" && event.args[0] === "login" && event.args.includes("--use-device-code")));
     const installed = managed.events.find((event) => event.kind === "node");
-    assert.ok(installed.args.includes(fakeSignalr) && installed.args.includes(fakeServiceBus));
+    assert.ok(installed.args.includes("--azure-output-stdin"));
+    assert.ok(!installed.args.includes(fakeSignalr) && !installed.args.includes(fakeServiceBus));
+    assert.deepEqual(managed.events.find((event) => event.kind === "metadata").args.sort(), Object.keys(metadata).sort());
     assert.ok(!managed.stdout.includes(fakeSignalr) && !managed.stdout.includes(fakeServiceBus));
     const zero = run(["--provision-azure", "--roster-repository", "demo-owner/rosters", "--publish-roster"], { zero: true });
     assert.equal(zero.status, 0, zero.stderr);

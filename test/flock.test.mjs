@@ -122,7 +122,7 @@ test("public distribution has Apache licensing, loopback viewer defaults and syn
   }
 });
 
-test("managed ARM template deploys Serverless SignalR and Standard Service Bus with connection outputs", () => {
+test("managed ARM template deploys Serverless SignalR and Standard Service Bus with nonsecret metadata outputs", () => {
   if (process.env.BRIDGE_FAST_VOTE_TEST === "1" && !fs.existsSync(new URL("../package.json", import.meta.url))) return;
   const template = JSON.parse(fs.readFileSync(new URL("../infra/azuredeploy.json", import.meta.url), "utf8"));
   assert.equal(template.$schema, "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#");
@@ -149,15 +149,8 @@ test("managed ARM template deploys Serverless SignalR and Standard Service Bus w
     assert.deepEqual(rule?.properties.rights, [right]);
     assert.ok(rule.dependsOn.includes("[resourceId('Microsoft.ServiceBus/namespaces/topics', variables('serviceBusNamespaceName'), parameters('serviceBusTopicName'))]"));
   }
-  for (const name of ["serviceBusSendKey", "serviceBusListenKey", "serviceBusSendConnectionString", "serviceBusListenConnectionString"]) {
-    assert.equal(template.outputs[name].type, "string");
-    assert.match(template.outputs[name].value, /^\[listKeys\(/);
-  }
-  for (const name of ["signalrConnectionString", "serviceBusConnectionString"]) {
-    assert.equal(template.outputs[name].type, "string");
-    assert.match(template.outputs[name].value, /^\[listKeys\(/);
-    assert.match(template.outputs[name].value, /\.primaryConnectionString\]$/);
-  }
+  assert.deepEqual(Object.keys(template.outputs).sort(), ["subscriptionId", "signalrName", "signalrHostName", "serviceBusNamespaceName", "serviceBusEndpoint", "serviceBusTopicName"].sort());
+  assert.doesNotMatch(JSON.stringify(template.outputs), /listKeys|ConnectionString|primaryKey|SharedAccessKey/i);
 });
 
 test("bootstrap rejects public read access and requires authenticated owner, write access or explicit allowlisting", async () => {

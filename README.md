@@ -109,8 +109,17 @@ Optional resource-group and region settings are `-ResourceGroup` / `-Location`
 or `--resource-group` / `--location` (defaults: `rg-copilot-flock`, `eastus`).
 
 The wrappers install Azure CLI if missing, authenticate if needed, deploy
-[`infra/azuredeploy.json`](./infra/azuredeploy.json), and pass the resulting
-issuer outputs privately over stdin into owner initialization. Windows CLI
+[`infra/azuredeploy.json`](./infra/azuredeploy.json), and pass only nonsecret
+resource metadata over stdin. Before any local initialization, the native
+installer explicitly retrieves the required keys with authorized Azure CLI
+list-key actions pinned to that subscription/resource group. Zero-Broker reads
+only SignalR issuer and topic-scoped Send/Listen keys; the explicit legacy
+path reads SignalR and its namespace management connection string instead. Neither
+path falls back to deployment-secret outputs or existing credentials on denial.
+Keys stay in process memory until private installation storage, not deployment
+outputs, console logs or managed setup arguments. Earlier deployment histories
+may still contain credentials; this source fix does not clean those records
+or rotate keys, which require separate authorization. Windows CLI
 installation can require UAC; Debian/Ubuntu can require `sudo`; macOS requires
 existing Homebrew. Headless Linux uses device-code login. Node.js must already
 be available. GitHub CLI authentication and repository/Pages/workflow permissions

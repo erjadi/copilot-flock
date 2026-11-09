@@ -57,8 +57,12 @@ consent for unattended boots.
 3. Create the requested resource group and deploy
    [`infra/azuredeploy.json`](../infra/azuredeploy.json). Resource names are
    deterministic for that group, using a prefix plus a unique suffix.
-4. Capture issuer outputs without printing them and pass the deployment JSON
-   over stdin to `flock.mjs install`. Pin its subscription ID; stage the first
+4. Capture only nonsecret resource metadata and pass that JSON over stdin to
+   `flock.mjs install`. Before local identity creation, its shared native
+   provisioning adapter uses explicit authorized Azure CLI key-list actions
+   pinned to the returned subscription/resource names and approved resource
+   group. It captures keys in memory without printing them. Pin the
+   subscription ID; stage the first
    epoch topic, rules and subscriptions; publish signed genesis/history.
    Configure MCP, skills and startup without spawning privileged coordinator
    sessions. Report cloud readiness separately from process startup.
@@ -67,23 +71,43 @@ The ARM parameters are `location`, `namePrefix`, `uniqueSuffix`, `signalrSku`
 (`Free_F1` or `Standard_S1`), `serviceBusSku` (`Standard` only) and
 `serviceBusTopicName`. The wrappers use the template defaults; an operator can
 deploy the same template with reviewed parameter overrides for an advanced
-configuration. Outputs include resource names/endpoints, the topic name and
-both connection strings. **These string outputs are retained in Azure deployment
-history and contain resource-level keys.** Restrict deployment-history access;
-never paste outputs into an issue, transcript, screenshot or public artifact.
-The new managed path forwards these over stdin, not credential-bearing
-process arguments. Use a trusted owner machine and protect deployment records.
+configuration. Outputs contain only the subscription ID, SignalR name/hostname,
+Service Bus namespace/endpoint and topic name. **No keys, connection strings or
+`listKeys` expressions are deployment outputs.** Ordinary outputs remain readable
+in deployment history, so secrets must not be added there, even temporarily.
+Both setup wrappers forward metadata, not credentials, over stdin. The native
+adapter rejects old secret-bearing output JSON rather than silently accepting
+it. Managed provisioning never puts keys in process arguments or console logs.
 
 The template additionally defines exactly two topic-level authorization
 rules: `FlockSendRule` with `Send` and `FlockListenRule` with `Listen`. Its
-`serviceBusSendKey`, `serviceBusListenKey`, `serviceBusSendConnectionString`
-and `serviceBusListenConnectionString` outputs are **owner-only secrets**,
-also retained in deployment history. Managed initialization consumes them
-as private enrollment issuer material; never copy raw keys into guest invites.
+keys are **owner-only secrets**, retrieved after deployment with
+`az signalr key list` and `az servicebus topic authorization-rule keys list`
+for the two named rules, always with explicit subscription, resource group
+and resource identifiers. Copilot captures JSON responses privately, never as
+public output. Zero-Broker does not retrieve the namespace management key.
+The explicit legacy path instead uses
+`az servicebus namespace authorization-rule keys list` for
+`RootManageSharedAccessKey`, as required by its existing transport.
+For advanced/manual deployments, Copilot follows these same authorized
+post-deployment reads or passes the metadata to the native installer; it must
+not restore secret template outputs as a shortcut. Missing permissions,
+malformed responses or absent keys abort before installation/initialization,
+without falling back to another profile or generating replacement identity.
+No new Key Vault or paid resource is introduced. Managed initialization
+stores enrollment issuer material privately; never copy raw keys into guest invites.
 GitHub CLI authentication needs contents/Pages/workflow publication permissions.
 Azure CLI needs management rights on the pinned subscription/resources, even
 when existing signing keys are available. Granting `canMintTokens` does not
 create Azure RBAC or GitHub access on another PC.
+
+**Historical exposure is not automatically remediated.** Earlier versions of
+this template placed keys in ordinary deployment outputs, potentially exposing
+them to principals able to read deployment history even without `listKeys`
+permission. Removing outputs protects future deployments; it does not erase
+earlier records, revoke copied credentials or rotate keys. Reviewing/deleting
+historical deployments, restricting access and rotating affected credentials
+require separate owner authorization and have not been performed here.
 
 The Zero-Broker adapters stage a separate per-flock/epoch topic with those
 two rights and recipient-filtered `sub-<opaque-peer>-e<epoch>` subscriptions.

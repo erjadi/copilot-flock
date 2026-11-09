@@ -32,7 +32,7 @@ if ([int]$Matches[1] -lt 22 -or ([int]$Matches[1] -eq 22 -and [int]$Matches[2] -
     throw "Node.js >=22.5 is required before setup; no tools or resources were installed."
 }
 $NodeFlags = @()
-if (-not $Legacy -and (([int]$Matches[1] -eq 22 -and [int]$Matches[2] -lt 13) -or ([int]$Matches[1] -eq 23 -and [int]$Matches[2] -lt 4))) { $NodeFlags += "--experimental-sqlite" }
+if (([int]$Matches[1] -eq 22 -and [int]$Matches[2] -lt 13) -or ([int]$Matches[1] -eq 23 -and [int]$Matches[2] -lt 4)) { $NodeFlags += "--experimental-sqlite" }
 if ($ProvisionAzure) {
     $CopilotHome = if ($env:COPILOT_HOME) { $env:COPILOT_HOME } else { Join-Path $HOME ".copilot" }
     if (-not $Legacy -and (Test-Path (Join-Path $CopilotHome "flock\config.json"))) {
@@ -88,17 +88,14 @@ if ($ProvisionAzure) {
     try {
         $Deployment = ($DeploymentOutput -join "`n") | ConvertFrom-Json -ErrorAction Stop
     } catch {
-        throw "Azure deployment returned malformed JSON outputs; connection strings were not logged."
+        throw "Azure deployment returned malformed resource metadata."
     }
-    if ($Deployment.signalrConnectionString.value -isnot [string] -or
-        [string]::IsNullOrWhiteSpace($Deployment.signalrConnectionString.value) -or
-        $Deployment.serviceBusConnectionString.value -isnot [string] -or
-        [string]::IsNullOrWhiteSpace($Deployment.serviceBusConnectionString.value)) {
-        throw "Azure deployment did not return both required connection strings."
+    foreach ($Name in @("subscriptionId", "signalrName", "signalrHostName", "serviceBusNamespaceName", "serviceBusEndpoint", "serviceBusTopicName")) {
+        if ($Deployment.$Name.value -isnot [string] -or [string]::IsNullOrWhiteSpace($Deployment.$Name.value)) {
+            throw "Azure deployment did not return the required nonsecret resource metadata."
+        }
     }
-    $ConnectionString = $Deployment.signalrConnectionString.value
-    $ServiceBusConnectionString = $Deployment.serviceBusConnectionString.value
-    Write-Host "Managed Azure resources are ready; installing full Flock locally." -ForegroundColor Cyan
+    Write-Host "Azure resources deployed; installation will retrieve authorized keys before initializing local state." -ForegroundColor Cyan
 }
 
 $ArgsList = @($NodeFlags) + @($FlockScript, "install")
@@ -107,7 +104,7 @@ if ($RosterRepository) { $ArgsList += @("--roster-repository", $RosterRepository
 if ($PublishRoster) { $ArgsList += "--publish-roster" }
 if ($VerifiedRootFingerprint) { $ArgsList += @("--verified-root-fingerprint", $VerifiedRootFingerprint) }
 if ($GitHubUser) { $ArgsList += @("--github-user", $GitHubUser) }
-if ($ProvisionAzure -and -not $Legacy) {
+if ($ProvisionAzure) {
     $ArgsList += @("--resource-group", $ResourceGroup, "--azure-output-stdin")
 }
 if ($Scope) {
@@ -133,7 +130,7 @@ if ($ServiceBusConnectionString -and (-not $ProvisionAzure -or $Legacy)) {
 }
 
 Write-Host "Installing and starting Copilot Flock..." -ForegroundColor Cyan
-if ($ProvisionAzure -and -not $Legacy) {
+if ($ProvisionAzure) {
     $DeploymentOutput -join "`n" | & node @ArgsList
 } else { & node @ArgsList }
 exit $LASTEXITCODE

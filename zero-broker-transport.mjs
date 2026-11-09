@@ -83,6 +83,59 @@ export async function runAzureCli(args) {
   catch { throw new Error(`Azure CLI ${args.slice(0, 3).join(" ")} returned invalid JSON; captured output was not logged`); }
 }
 
+export async function readManagedAzureCredentials({ outputs, resourceGroup, legacy = false, runAz = runAzureCli }) {
+  const allowed = ["subscriptionId", "signalrName", "signalrHostName", "serviceBusNamespaceName", "serviceBusEndpoint", "serviceBusTopicName"];
+  check(outputs && typeof outputs === "object" && !Array.isArray(outputs) &&
+    Object.keys(outputs).every((name) => allowed.includes(name)), "Managed Azure input must contain nonsecret resource metadata only; secret deployment outputs are unsupported");
+  const value = (name) => {
+    const result = outputs[name]?.value;
+    check(typeof result === "string" && result.trim() === result && result.length > 0, "Azure deployment metadata is incomplete");
+    return result;
+  };
+  const subscriptionId = value("subscriptionId").toLowerCase(), signalrName = value("signalrName");
+  const namespaceName = value("serviceBusNamespaceName"), topicName = value("serviceBusTopicName");
+  const signalrHostName = value("signalrHostName");
+  check(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(subscriptionId) &&
+    typeof resourceGroup === "string" && /^[A-Za-z0-9._-]{1,90}$/.test(resourceGroup) && typeof legacy === "boolean" &&
+    /^[a-z0-9-]{3,63}$/i.test(signalrName) &&
+    /^[a-z0-9-]{6,50}$/i.test(namespaceName) && /^[A-Za-z0-9_-]{1,260}$/.test(topicName) &&
+    /^[a-z0-9.-]+\.service\.signalr\.net$/i.test(signalrHostName) &&
+    value("serviceBusEndpoint").toLowerCase() === `sb://${namespaceName.toLowerCase()}.servicebus.windows.net/`, "Invalid pinned Azure resource metadata");
+  const common = ["--subscription", subscriptionId, "--resource-group", resourceGroup];
+  try {
+    const signalrKeys = await runAz(["signalr", "key", "list", ...common, "--name", signalrName, "--output", "json"]);
+    const connection = signalrKeys?.primaryConnectionString;
+    const parts = Object.fromEntries(String(connection || "").split(";").filter(Boolean).map((part) => {
+      const index = part.indexOf("="); return [part.slice(0, index), part.slice(index + 1)];
+    }));
+    check(parts.Endpoint?.replace(/\/$/, "").toLowerCase() === `https://${signalrHostName.toLowerCase()}` &&
+      typeof parts.AccessKey === "string" && parts.AccessKey.trim().length > 0, "Azure omitted the expected SignalR issuer");
+    const result = { subscriptionId, namespaceName, signalrName, signalrConnectionString: connection };
+    if (legacy) {
+      const keys = await runAz(["servicebus", "namespace", "authorization-rule", "keys", "list", ...common,
+        "--namespace-name", namespaceName, "--name", "RootManageSharedAccessKey", "--output", "json"]);
+      check(typeof keys?.primaryConnectionString === "string" &&
+        keys.primaryConnectionString.startsWith(`Endpoint=sb://${namespaceName.toLowerCase()}.servicebus.windows.net/;`) &&
+        /(?:^|;)SharedAccessKeyName=RootManageSharedAccessKey(?:;|$)/.test(keys.primaryConnectionString) &&
+        /(?:^|;)SharedAccessKey=[^;]+/.test(keys.primaryConnectionString), "Azure omitted the legacy Service Bus credential");
+      result.serviceBusConnectionString = keys.primaryConnectionString;
+    } else {
+      const ruleKeys = {};
+      for (const name of ["FlockSendRule", "FlockListenRule"]) {
+        const keys = await runAz(["servicebus", "topic", "authorization-rule", "keys", "list", ...common,
+          "--namespace-name", namespaceName, "--topic-name", topicName, "--name", name, "--output", "json"]);
+        check(typeof keys?.primaryKey === "string" && keys.primaryKey.trim().length > 0, "Azure omitted a dedicated enrollment issuer key");
+        ruleKeys[name] = keys.primaryKey;
+      }
+      result.enrollmentKeys = { namespaceHost: `${namespaceName.toLowerCase()}.servicebus.windows.net`, topicName,
+        sendRuleKey: ruleKeys.FlockSendRule, listenRuleKey: ruleKeys.FlockListenRule };
+    }
+    return result;
+  } catch {
+    throw new Error("Authorized Azure post-deployment key retrieval failed. Verify list-key permissions on the pinned resources; installation was not started and captured credential output was not logged.");
+  }
+}
+
 export async function stageEpochResources({ flockUuid, rosterEpoch, opaquePeerIds, resourceGroup, namespaceName, signalr, subscriptionId, runAz = runAzureCli }) {
   check(/^[0-9a-f-]{36}$/.test(flockUuid) && Number.isSafeInteger(rosterEpoch) && rosterEpoch > 0, "Invalid staged epoch coordinates");
   check(/^[A-Za-z0-9._-]{1,90}$/.test(resourceGroup) && /^[a-z0-9-]{6,50}$/i.test(namespaceName), "Invalid Azure resource identifiers");

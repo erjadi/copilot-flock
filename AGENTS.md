@@ -15,7 +15,9 @@ group/costs, tool installation and a dedicated public roster repository first.
 Use `setup.ps1 -ProvisionAzure -RosterRepository <owner>/<repo> -PublishRoster`
 or the matching `setup.sh --provision-azure --roster-repository <owner>/<repo>
 --publish-roster` flags. The owner needs authenticated GitHub/Azure CLI access.
-Do not print issuer outputs; managed setup sends them over stdin.
+Never put issuer keys in ARM outputs or print them. Managed setup forwards only
+resource metadata over stdin; authorized pinned key-list actions run before
+local initialization and fail closed without credential-output fallbacks.
 For another owned PC, prepare a per-flock device card, independently verify its
 signing/encryption fingerprints and use a root-signed pre-bound owner invite.
 Guests use a distinct shared flock, provisional vouchers and explicit independent
@@ -34,7 +36,7 @@ claims before dispatch. Transport acceptance is not execution confirmation.
 Retain `UNKNOWN` outcomes; retry only through authenticated missing-receipt
 reconciliation with the original request identity, payload and deadline.
 
-ARM Send/Listen issuer outputs are secrets, not public roster fields or guest
+Azure Send/Listen issuer keys are secrets, not public roster fields or guest
 credentials. Owner signing alone does not authorize issuer keys: only root or
 explicit `canMintTokens` delegation does. Public roster leases last at most one
 hour; available issuers renew and rotate expiry epochs. Pages propagation,

@@ -11450,7 +11450,7 @@ Node.js >=22.5; Azure SignalR Serverless + Service Bus Standard + signed Pages.
 Copilot performs setup after scope, subscription, costs and public-publication consent.
 Fresh setup: install --roster-repository <owner/repo> --publish-roster
   --subscription-id <uuid> --namespace-name <name> --resource-group <group>
-  --azure-output-stdin (approved managed deployment outputs, including issuer keys)
+  --azure-output-stdin (nonsecret deployment metadata; authorized key reads precede initialization)
 Enrollment: prepare-enrollment --flock <uuid>; install --invite-file <path>
   --verified-root-fingerprint <fingerprint> --scope <personal|work>
 Local grants: grant-root --flock <uuid> --sessions <selected-existing-uuids>
@@ -11466,6 +11466,21 @@ Legacy configurations/v3 broker invites retain compatibility; do not migrate imp
   const invite = flags["invite-file"] ? JSON.parse(fs.readFileSync(String(flags["invite-file"]), "utf8")) : null;
   const zeroInstall = command === "install" && flags.architecture !== "legacy" && !flags.legacy && !flags.sandbox &&
     (savedConfig?.architecture === "zero-broker" || flags.architecture === "zero-broker" || (!savedConfig && !flags["bootstrap-url"] && invite?.type !== "copilot-flock-invite-v3"));
+  let managedAzure = null;
+  if (command === "install" && flags["azure-output-stdin"]) {
+    if (savedConfig?.architecture === "zero-broker" || invite || flags["connection-string"] ||
+        flags["servicebus-connection-string"] || flags["service-bus-connection-string"] ||
+        flags.reprovision || flags.clean || flags["from-scratch"] || flags.sandbox) {
+      throw new Error("Managed Azure metadata cannot replace existing Zero-Broker state or be combined with credentials, invites or reprovisioning");
+    }
+    let outputs;
+    try { outputs = JSON.parse(fs.readFileSync(0, "utf8").replace(/^\uFEFF/, "")); }
+    catch { throw new Error("Managed Azure stdin must contain valid nonsecret deployment metadata; captured input was not logged"); }
+    const { readManagedAzureCredentials } = await import("./zero-broker-transport.mjs");
+    managedAzure = await readManagedAzureCredentials({
+      outputs, resourceGroup: flags["resource-group"] || "rg-copilot-flock", legacy: !zeroInstall,
+    });
+  }
   if (command === "prepare-enrollment") {
     const api = await getZeroBrokerApi();
     console.log(JSON.stringify(api.prepareZeroBrokerEnrollment({ home: getBridgeHome(), flockUuid: flags.flock }), null, 2));
@@ -11489,20 +11504,16 @@ Legacy configurations/v3 broker invites retain compatibility; do not migrate imp
         await api.claimZeroBrokerVoucher({ home: getBridgeHome(), invitation: invite, verifiedRootFingerprint: flags["verified-root-fingerprint"], githubUser: flags["github-user"] });
       } else await api.enrollZeroBrokerDevice({ home: getBridgeHome(), invite, scope: flags.scope || "personal", verifiedRootFingerprint: flags["verified-root-fingerprint"] });
     } else {
-      const outputs = flags["azure-output-stdin"] ? JSON.parse(fs.readFileSync(0, "utf8").replace(/^\uFEFF/, "")) : {};
-      const connection = outputs.signalrConnectionString?.value || flags["connection-string"];
+      const connection = managedAzure?.signalrConnectionString || flags["connection-string"];
       const parts = Object.fromEntries(String(connection || "").split(";").filter(Boolean).map((part) => { const index = part.indexOf("="); return [part.slice(0, index), part.slice(index + 1)]; }));
       if (!parts.Endpoint || !parts.AccessKey) throw new Error("Zero-Broker owner initialization requires approved SignalR issuer credentials");
-      const namespaceName = outputs.serviceBusNamespaceName?.value || flags["namespace-name"];
-      const enrollmentKeys = outputs.serviceBusSendKey?.value && outputs.serviceBusListenKey?.value ? {
-        namespaceHost: `${namespaceName.toLowerCase()}.servicebus.windows.net`, topicName: outputs.serviceBusTopicName?.value,
-        sendRuleKey: outputs.serviceBusSendKey.value, listenRuleKey: outputs.serviceBusListenKey.value,
-      } : undefined;
+      const namespaceName = managedAzure?.namespaceName || flags["namespace-name"];
+      const enrollmentKeys = managedAzure?.enrollmentKeys;
       await api.initializeZeroBrokerOwner({
         home: getBridgeHome(), repository: flags["roster-repository"], resourceGroup: flags["resource-group"] || "rg-copilot-flock",
         namespaceName, signalr: { endpoint: parts.Endpoint.replace(/\/$/, ""), accessKey: parts.AccessKey },
         enrollmentKeys, scope: flags.scope || "personal", publishConsent: flags["publish-roster"] === true,
-        subscriptionId: outputs.subscriptionId?.value || flags["subscription-id"],
+        subscriptionId: managedAzure?.subscriptionId || flags["subscription-id"],
       });
     }
     console.log(JSON.stringify(await installZeroBrokerIntegration(loadConfig({ autoFetchAz: false })), null, 2));
@@ -11619,15 +11630,15 @@ Usage:
       ? fs.readFileSync(path.resolve(String(inviteFileArg)), "utf8")
       : flags["invite-json"] || flags["enrollment-json"] || flags.json || null;
     const res = await installBridge({
-      connectionStringArg: flags["connection-string"],
+      connectionStringArg: managedAzure?.signalrConnectionString || flags["connection-string"],
       serviceBusConnectionStringArg:
-        flags["servicebus-connection-string"] || flags["service-bus-connection-string"],
+        managedAzure?.serviceBusConnectionString || flags["servicebus-connection-string"] || flags["service-bus-connection-string"],
       bootstrapUrlArg: flags["bootstrap-url"],
       bootstrapOriginPinArg: flags["bootstrap-origin-pin"],
       enrollmentJsonArg: rawEnrollmentJson,
-      subscriptionArg: flags.subscription,
+      subscriptionArg: managedAzure?.subscriptionId || flags.subscription,
       resourceGroupArg: flags["resource-group"],
-      signalrNameArg: flags["signalr-name"],
+      signalrNameArg: managedAzure?.signalrName || flags["signalr-name"],
       machineIdArg: flags["machine-id"],
       scopeArg,
       githubUserArg: flags["github-user"] || flags.user,
