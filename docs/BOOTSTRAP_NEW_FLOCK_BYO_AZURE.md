@@ -163,7 +163,7 @@ The full serial 95-test integration took 364 seconds on the validation host.
 The signed policy therefore allows a bounded ten-minute test run and an
 eleven-minute worker, without dropping suites or enabling test selectors.
 Review RPCs allow a bounded twelve-and-a-half-minute response window, including
-the five-minute root-test budget. No live reviewer upgrade, Azure deployment
+the ten-minute root-test budget. No live reviewer upgrade, Azure deployment
 or platform acceptance is implied.
 
 State is private under `~/.copilot/flock/zero-broker/<uuid>`, including
@@ -206,7 +206,7 @@ and signed `copilot-flock-invite-v3` broker invites retain their original path.
 
 1. **Azure SignalR Service (`Serverless` mode)** — Provides real-time WebSocket routing (`wss://<your-signalr>.service.signalr.net/client/?hub=copilotbridge`) between online machines over outbound TCP 443 without a peer inbound application listener. Latency and VPN/proxy reachability depend on the deployed network and are not guaranteed.
    - *Cost*: Works on the **Free (`Free_F1`)** tier (up to 20 concurrent connections / 20,000 messages per day) or **Standard (`Standard_S1`)**.
-2. **Azure Service Bus Namespace (`Standard` SKU + topic `copilot-bridge-offline`)** — Provides durable, at-least-once **offline message queueing** using a Service Bus topic (`copilot-bridge-offline`) and per-machine subscriptions. *(Note: Use `Standard` SKU because Service Bus topics/subscriptions require `Standard`, not `Basic`.)* When your laptop is asleep or powered off, messages and release updates wait safely in Service Bus and drain automatically the moment it wakes up.
+2. **Azure Service Bus Namespace (`Standard` SKU + topic `copilot-bridge-offline`)** — Provides durable, at-least-once offline transport using a topic and per-machine subscriptions (`Standard`, not `Basic`, is required). Check actual receipts: confirmed Service Bus publication, legacy broker-file persistence and unknown runtime admission are distinct. Delivery requires valid authority/deadlines, retention, connectivity and reconciliation; waking a laptop does not guarantee immediate delivery or task execution, and queued release traffic does not authorize an update.
 3. **Optional: Bootstrap Token Broker (`bootstrap-server.mjs`)** — A tiny, zero-dependency Node.js HTTP service (runs on a Basic/Standard Azure App Service, Container App, or VM) that verifies Ed25519 signatures and GitHub identities to mint short-lived 60-minute hub JWTs for **1-step pasteable invites**, **collaborator flocks (`<owner>/<team>`)**, and **time-bound guest passes**.
 
 ---
