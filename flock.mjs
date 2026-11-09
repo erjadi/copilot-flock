@@ -6490,6 +6490,7 @@ export async function handleRpcAction(cfg, req, context = null) {
         SIGNALR_CONNECTION_STRING: "", SERVICEBUS_CONNECTION_STRING: "",
         COPILOT_FLOCK_BOOTSTRAP_URL: "", COPILOT_BRIDGE_BOOTSTRAP_URL: "" };
       for (const key of Object.keys(testEnv)) if (key.startsWith("NODE_TEST_")) delete testEnv[key];
+      assertLocalReleaseExecutionApproved(cfg, candidateCommit);
       execFileSync(process.execPath, ["--test", tmpTest], {
         stdio: ["ignore", "pipe", "pipe"],
         timeout: 15000,
@@ -6509,6 +6510,7 @@ export async function handleRpcAction(cfg, req, context = null) {
     checks.modulesSyntaxOk = false;
     try {
       const { validateReleaseCandidateInWorker } = await import("./zero-broker-release.mjs");
+      assertLocalReleaseExecutionApproved(cfg, candidateCommit);
       const complete = await validateReleaseCandidateInWorker({ repoDir, commit: candidateCommit });
       Object.assign(checks, complete);
     } catch (err) {

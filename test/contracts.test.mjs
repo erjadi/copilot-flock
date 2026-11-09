@@ -180,6 +180,66 @@ test("actual release handler denies smoke and worker execution before local exac
   }
 });
 
+test("release consent expiry before each launch prevents smoke or worker execution without retracting launched work", async (t) => {
+  const root = temporary(t);
+  const commit = "a".repeat(40);
+  for (const [index, api] of [flock, bridge].entries()) {
+    process.env.COPILOT_HOME = path.join(root, String(index));
+    const cfg = { machineId: "SYNTHETIC-PC", architecture: "legacy" };
+    const identity = api.ensureMachineIdentityKeypair();
+    const source = fs.readFileSync(new URL(`../${index ? "bridge" : "flock"}.mjs`, import.meta.url), "utf8");
+    const from = source.indexOf('  if (action === "review_release")');
+    const to = source.indexOf('  throw new Error(`Unsupported bridge RPC action:', from);
+    assert.ok(from > 0 && to > from);
+    const handler = source.slice(from, to);
+    const importExpression = 'await import("./zero-broker-release.mjs")';
+    assert.equal(handler.split(importExpression).length, 2);
+    const coverage = createReleaseCoverage([...RELEASE_VALIDATION_POLICY.requiredModules, ...RELEASE_VALIDATION_POLICY.requiredTests]);
+    for (const expireAt of ["never", "before-smoke", "before-worker", "during-worker"]) {
+      let now = Date.now();
+      const approval = api.approveLocalReleaseExecution(cfg, commit, { ackReviewedHostCode: true, now });
+      let smokeCalls = 0;
+      let workerCalls = 0;
+      const run = () => vm.runInNewContext(`(async () => { ${handler.replace(importExpression, "releaseWorkerFixture")} })()`, {
+        action: "review_release", params: { branch: "reviewed-branch", expectedCommit: commit }, cfg, fs, path, os, process, crypto, Buffer,
+        assertExpectedReleaseCommit: api.assertExpectedReleaseCommit,
+        resolveExpectedReleaseCommit: () => commit,
+        resolveOrFindBridgeGitRepo: () => root,
+        getInstalledSourceProvenance: () => ({ sourceCommit: null, status: "unrecorded" }),
+        assertLocalReleaseExecutionApproved: (config, sha) => api.assertLocalReleaseExecutionApproved(config, sha, now),
+        releaseVoteSigningPayload: api.releaseVoteSigningPayload,
+        releaseWorkerFixture: { validateReleaseCandidateInWorker: async () => {
+          workerCalls++;
+          if (expireAt === "during-worker") now = approval.expiresAt;
+          return { ...coverage, modulesSyntaxOk: true, unitTestsOk: true,
+            moduleCount: coverage.coverage.modules.length, testFileCount: coverage.coverage.testFiles.length,
+            candidateCommit: commit, verificationLevel: "complete_candidate_syntax_and_root_tests" };
+        } },
+        execFileSync: (program, args) => {
+          if (program === "git") {
+            if (expireAt === "before-smoke" && args.some((arg) => arg.endsWith(":test/local-rpc-fixture.mjs"))) now = approval.expiresAt;
+            return args.includes("show") ? "// Synthetic source; never executed\n" : "";
+          }
+          if (args.includes("--test")) {
+            smokeCalls++;
+            if (expireAt === "before-worker") now = approval.expiresAt;
+          }
+          return "";
+        },
+      });
+      if (expireAt === "never") {
+        const result = await run();
+        assert.equal(result.vote, "ACCEPT");
+        assert.equal(api.verifyVoteBallotSignature(result, identity.publicKey), true);
+      } else {
+        await assert.rejects(run, { code: "RELEASE_EXECUTION_NOT_APPROVED" });
+      }
+      assert.equal(smokeCalls, expireAt === "before-smoke" ? 0 : 1);
+      assert.equal(workerCalls, ["never", "during-worker"].includes(expireAt) ? 1 : 0);
+    }
+  }
+});
+
 test("release execution CLI refuses unacknowledged or missing identity without profile initialization", (t) => {
   const root = temporary(t);
   for (const script of ["flock.mjs", "bridge.mjs"]) {

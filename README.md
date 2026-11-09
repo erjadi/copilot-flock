@@ -180,7 +180,9 @@ Run this issuer only from independently reviewed installed or pinned code
 outside the unapproved candidate. **Never launch candidate `flock.mjs` to
 approve itself**: importing its top-level code already executes code.
 Approval is signed with the existing device identity, bound to its machine
-and SHA, expires after 30 minutes, and is rechecked before signing a ballot.
+and SHA, expires after 30 minutes, and is rechecked immediately before both
+smoke and full-worker launches and before signing a ballot. These are launch-time
+checks, not continuous cancellation or a guarantee to retract already-launched effects.
 Missing, expired, modified or mismatched approval denies execution; no identity
 is created or repaired. Branch/origin trust, an incoming request, or a peer's
 ballot is **not** local approval. No RPC or MCP tool grants this permission.

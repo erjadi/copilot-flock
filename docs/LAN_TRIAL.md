@@ -21,13 +21,13 @@ legacy journeys, not fresh defaults or hidden fallbacks from this trial.
 | Move between networks | No discovery or traversal; direct routes can fail after roaming, VPN changes, VLAN boundaries or client isolation. | Designed for home/office/hotspot/cloud networks with permitted outbound connectivity; corporate restrictions can still block it. |
 | Message a sleeping PC | No queue. Peer must be reachable and listening; never retry ambiguous delivery blindly. | Service Bus retains/drains offline messages under its configured retention, credentials and deduplication behavior. |
 | Onboard more PCs | Public offer exchange, independent fingerprint verification and reciprocal approvals for each pairing. | Fresh Zero-Broker uses independently pinned signed-roster invites and explicit claims/grants. Legacy broker invites require independent issuer-origin confirmation. Timing depends on environment. |
-| Ask who knows about a topic | Manually pick/share session UUIDs and permissions. | Pass-through coordinator targets a sub-two-second handoff; tracker searches permitted local sessions and synthesizes responses. |
-| Use headless GPU servers | Unsupported: existing Desktop control plane only. | Full runtime includes headless Ubuntu/Debian CLI hosts as well as Desktop x64/ARM64 hosts. |
+| Ask who knows about a topic | Manually pick/share session UUIDs and permissions. | Legacy pass-through coordinator targets a sub-two-second handoff; tracker searches permitted local sessions and synthesizes responses. |
+| Use headless GPU servers | Unsupported: existing Desktop control plane only. | Legacy runtime includes headless Ubuntu/Debian CLI hosts as well as Desktop x64/ARM64 hosts; fresh native Zero-Broker denies unsupported admission without spawning a fallback. |
 | Share across teams | Local per-peer/per-session grants only. | Owner/flock/machine hierarchy, personal/work scopes, collaborator boundaries and expiring guest memberships. External sessions remain opt-in. |
 | Start a worker remotely | Not provided. | Legacy remote session creation/orchestration under its authority rules; not a fresh Zero-Broker capability. |
 | Move files/branches | Not provided. | Legacy SHA-256 chunked file and Git-bundle transfer; not a fresh Zero-Broker capability. |
 | Coordinate resources | Not provided. | Legacy distributed locks, GPU telemetry and topology; fresh Zero-Broker roster membership is not live telemetry. |
-| Govern releases | No release votes. | Signed Ed25519 fleet release voting; the seven baseline tests are coverage, not seven votes or a governance guarantee. |
+| Govern releases | No release votes. | Legacy signed Ed25519 fleet release voting with exact-source consent and complete coverage/policy gates; the seven baseline tests are coverage, not seven votes or a governance guarantee. |
 | Permissions | No changes to selected existing-session mode/permissions, no privileged CLI fallback. | Broader coordinator/headless capabilities require separate trust/permission review. |
 
 ### What the live trial taught us

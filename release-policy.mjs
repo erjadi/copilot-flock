@@ -60,7 +60,7 @@ export const RELEASE_VALIDATION_POLICY = Object.freeze({
   environment: "clear_NODE_TEST_selectors_NODE_OPTIONS_coverage_fast_flags_and_cloud_overrides_isolate_COPILOT_HOME",
   testTimeoutMs: 600000,
   workerTimeoutMs: 660000,
-  localExecutionConsent: "exact_sha_existing_device_signature_30_minutes_before_tests_and_ballot",
+  localExecutionConsent: "exact_sha_existing_device_signature_30_minutes_each_launch_and_ballot",
 });
 
 export const RELEASE_VALIDATION_POLICY_HASH = crypto.createHash("sha256")

@@ -154,7 +154,10 @@ by the requester. Count-only/version-2 ballots remain diagnostic, not approvals.
 Any downstream merge/push must use that same `expectedCommit`, never infer
 intent from unanimity over a moved branch.
 The worker clears inherited Node test selectors and isolates `COPILOT_HOME`,
-so focused parent tests cannot silently skip candidate tests. Version-3
+with local execution consent rechecked immediately before smoke/full-worker
+launches and before a ballot. Launch-time validity does not cancel or retract
+effects of work already launched.
+Focused parent tests cannot silently skip candidate tests. Version-3
 registered-key ballots sign both the full SHA and complete validation scope;
 legacy smoke-only ballots and partial voter selections are not merge approval.
 All seven root suites are required, including the retained legacy RPC security
