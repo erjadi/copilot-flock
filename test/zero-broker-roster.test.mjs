@@ -553,6 +553,58 @@ test("grant changes after possible dispatch preserve UNKNOWN through reconciliat
   assert.equal(f.calls(), 1);
 });
 
+function addSharedMember(f) {
+  const guest = zb.createDeviceKeys({ directory: path.join(f.directory, "new-guest"), flockUuid: f.flockUuid });
+  const before = f.state.get(f.flockUuid);
+  const next = zb.createPreBoundInvite({ roster: before, actor: f.owner, recipient: guest, role: "guest",
+    ownerCredentials: f.credentials(before.rosterEpoch + 1), nowMs: f.nowMs });
+  f.trust(f.state, before, [next]);
+  f.trust(f.receiverState, before, [next]);
+}
+
+test("outgoing authority loss after possible admission preserves UNKNOWN and the original outbox", async (t) => {
+  const f = runtimeFixture(t, { captureResponses: true });
+  const request = { toOpaquePeerId: f.peer.opaquePeerId, action: "send_message", params: {},
+    requestId: crypto.randomUUID(), expiresAt: f.nowMs + 60000, timeoutMs: 100 };
+  assert.equal((await f.ownerRuntime.request(request)).status, "UNKNOWN");
+  assert.equal(f.calls(), 1);
+  addSharedMember(f);
+  const beforePackets = f.packets.length;
+  const readReceipt = f.state.getOutboxReceipt;
+  f.state.getOutboxReceipt = () => assert.fail("Local authority denial must not read cached result data");
+  let response;
+  try { response = await f.ownerRuntime.request(request); }
+  finally { f.state.getOutboxReceipt = readReceipt; }
+  assert.equal(response.status, "UNKNOWN");
+  assert.equal(response.result, null);
+  assert.equal(f.state.pendingOutbox(f.flockUuid).length, 1);
+  assert.equal(f.state.pendingOutbox(f.flockUuid)[0].request, request.requestId);
+  assert.equal(f.packets.length, beforePackets);
+  assert.equal(f.calls(), 1);
+  await assert.rejects(f.ownerRuntime.request({ ...request, params: { changed: true } }), /different payload or expiry/);
+  const fresh = await f.ownerRuntime.request({ ...request, requestId: crypto.randomUUID() });
+  assert.equal(fresh.status, "DENIED", "Definitely never-attempted work can still be denied");
+  assert.equal(f.state.pendingOutbox(f.flockUuid).length, 1);
+});
+
+test("outgoing authority loss between retry gates cannot terminally deny an earlier possible admission", async (t) => {
+  const f = runtimeFixture(t, { captureResponses: true });
+  const request = { toOpaquePeerId: f.peer.opaquePeerId, action: "send_message", params: {},
+    requestId: crypto.randomUUID(), expiresAt: f.nowMs + 60000, timeoutMs: 100 };
+  assert.equal((await f.ownerRuntime.request(request)).status, "UNKNOWN");
+  const mark = f.state.markOutboxAttempt;
+  f.state.markOutboxAttempt = (coordinates) => {
+    const first = mark(coordinates);
+    addSharedMember(f);
+    return first;
+  };
+  const response = await f.ownerRuntime.request(request);
+  assert.equal(response.status, "UNKNOWN");
+  assert.equal(response.result, null);
+  assert.equal(f.state.pendingOutbox(f.flockUuid).length, 1);
+  assert.equal(f.calls(), 1);
+});
+
 test("mock-adapter RPC confirms admission once, seals recipients and rejects delegate execution before transport", async (t) => {
   const f = runtimeFixture(t);
   assert.equal(isVerifiedZeroBrokerContext({ mode: "ROOT" }), false);

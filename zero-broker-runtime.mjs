@@ -308,13 +308,14 @@ export function createZeroBrokerRuntime({
     requireValue(Number.isInteger(timeoutMs) && timeoutMs > 0 && timeoutMs <= 300000, "Invalid request wait timeout");
     const payload = { requestId, action, params, expiresAt };
     validateRequest(payload);
+    const coordinates = { flockUuid: device.flockUuid, sender: device.opaquePeerId, recipient: toOpaquePeerId, requestId };
+    const prior = state.getOutboxAttemptState({ ...coordinates, payload, expiresAt });
     await refresh();
     try { authorizeOutgoing(payload); }
     catch (err) {
       if (err.code !== "DENIED") throw err;
-      return { requestId, status: "DENIED", result: null };
+      return { requestId, status: prior.status === "DENIED" || !prior.attempted ? "DENIED" : "UNKNOWN", result: null };
     }
-    const coordinates = { flockUuid: device.flockUuid, sender: device.opaquePeerId, recipient: toOpaquePeerId, requestId };
     const previous = state.getOutboxReceipt({ ...coordinates, payload, expiresAt });
     if (previous) return previous;
     state.queue({ ...coordinates, payload, expiresAt, nowMs: now() });
@@ -337,7 +338,7 @@ export function createZeroBrokerRuntime({
       const firstAttempt = state.markOutboxAttempt(coordinates);
       void transmit(entry, !firstAttempt).catch((err) => {
         if (closed) return;
-        const status = err.code === "DENIED" ? "DENIED" : "UNKNOWN";
+        const status = err.code === "DENIED" && firstAttempt && !prior.attempted ? "DENIED" : "UNKNOWN";
         if (status === "DENIED") {
           try { state.storeOutboxReceipt({ ...coordinates, status, result: null }); }
           catch {

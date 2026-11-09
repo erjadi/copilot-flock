@@ -246,6 +246,17 @@ export function createRosterState({ directory, capacity = 100000 }) {
       const row = db.prepare("SELECT * FROM outbox WHERE flock=? AND sender=? AND recipient=? AND request=?").get(flockUuid, sender, recipient, requestId);
       return row ? { ...row, payload: JSON.parse(row.document) } : null;
     },
+    getOutboxAttemptState: ({ flockUuid, sender, recipient, requestId, payload, expiresAt }) => {
+      const expected = digest(canonicalJson({ payload, expiresAt }));
+      const queued = db.prepare("SELECT digest,attempted FROM outbox WHERE flock=? AND sender=? AND recipient=? AND request=?")
+        .get(flockUuid, sender, recipient, requestId);
+      const receipt = db.prepare("SELECT digest,status FROM receipts WHERE flock=? AND sender=? AND recipient=? AND request=?")
+        .get(flockUuid, sender, recipient, requestId);
+      requireValue((!queued || queued.digest === expected) && (!receipt || receipt.digest === expected),
+        "Outgoing request ID reused with different payload or expiry");
+      return { attempted: queued?.attempted === 1 || Boolean(receipt && receipt.status !== "DENIED"),
+        status: receipt?.status || null };
+    },
     getOutboxReceipt: ({ flockUuid, sender, recipient, requestId, payload, expiresAt }) => {
       const row = db.prepare("SELECT * FROM receipts WHERE flock=? AND sender=? AND recipient=? AND request=?").get(flockUuid, sender, recipient, requestId);
       if (!row) return null;

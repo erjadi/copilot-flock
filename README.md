@@ -262,6 +262,11 @@ Incompatible ROOT receipts remain claimed but disclose no cached payload and
 never redispatch the original action. Older unbound receipt rows are extended
 in place and fail closed for ROOT disclosure; do not rebuild their ledger or
 reuse old device keys to recover them. This cannot retract data already delivered.
+After a possible transmission/admission with a lost reply, later outgoing
+authority loss preserves UNKNOWN and the original durable outbox. It does not
+become a terminal DENIED/no-admission claim or expose a cached result before
+current authority is checked. Definitely never-attempted work can still be
+denied; do not re-sign, rebind or blindly resend uncertain work.
 
 ## Try it out hubless; deploy the components for the real potential
 
