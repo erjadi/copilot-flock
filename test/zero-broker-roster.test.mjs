@@ -6,8 +6,9 @@ import os from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import * as zb from "../zero-broker-roster.mjs";
-import { createZeroBrokerRuntime, isVerifiedZeroBrokerContext } from "../zero-broker-runtime.mjs";
-import { cloudRequest, createGitHubRosterRepository, peekLockEncryptedPacket, stageEpochResources } from "../zero-broker-transport.mjs";
+import { createZeroBrokerRuntime, isVerifiedZeroBrokerContext, RPC_BODY_LIMIT_BYTES } from "../zero-broker-runtime.mjs";
+import { cloudRequest, createGitHubRosterRepository, ENCRYPTED_PACKET_HEADER_RESERVE_BYTES, peekLockEncryptedPacket,
+  prepareEncryptedPacket, sendEncryptedPacket, SERVICE_BUS_STANDARD_MESSAGE_BYTES, stageEpochResources } from "../zero-broker-transport.mjs";
 import { getZeroBrokerApi as flockApi } from "../flock.mjs";
 import { getZeroBrokerApi as bridgeApi } from "../bridge.mjs";
 
@@ -327,7 +328,7 @@ test("admission authorization schema upgrades in place without resetting existin
   } finally { inspected.close(); }
 });
 
-function runtimeFixture(t, { dispatch, readSnapshot, role = "owner", canMintTokens = false, captureResponses = false } = {}) {
+function runtimeFixture(t, { dispatch, readSnapshot, role = "owner", canMintTokens = false, captureResponses = false, cloudTransport = false } = {}) {
   const f = fixture(t);
   const roster = zb.createPreBoundInvite({
     roster: f.genesis, actor: f.owner, recipient: f.peer, role,
@@ -339,16 +340,22 @@ function runtimeFixture(t, { dispatch, readSnapshot, role = "owner", canMintToke
   const peers = new Map();
   const packets = [];
   const errors = [];
+  const cloudAttempts = [];
   let offline = false;
   let grants = false;
   let rootGrants = true;
   let grantRevision = 0;
   let summary = "Synthetic approved summary";
   let calls = 0;
-  const sendPacket = async ({ envelope }) => {
+  const sendPacket = async ({ transport, envelope }) => {
     packets.push(envelope);
     if (offline) throw Object.assign(new Error("Synthetic offline transport"), { ambiguous: true });
     if (captureResponses && envelope.fromOpaquePeerId === f.peer.opaquePeerId) return { admittedToTransport: true };
+    if (cloudTransport) return await sendEncryptedPacket({ transport, envelope, request: async (url, options) => {
+      cloudAttempts.push({ url, options });
+      if (url.includes(".servicebus.windows.net/")) await peers.get(envelope.toOpaquePeerId).receive(envelope);
+      return { status: 201 };
+    } });
     await peers.get(envelope.toOpaquePeerId).receive(envelope);
     return { admittedToTransport: true };
   };
@@ -373,7 +380,7 @@ function runtimeFixture(t, { dispatch, readSnapshot, role = "owner", canMintToke
   peers.set(f.owner.opaquePeerId, ownerRuntime);
   peers.set(f.peer.opaquePeerId, peerRuntime);
   f.trackCleanup(() => { ownerRuntime.close(); peerRuntime.close(); });
-  return { ...f, ownerRuntime, peerRuntime, packets, errors, calls: () => calls,
+  return { ...f, ownerRuntime, peerRuntime, packets, errors, cloudAttempts, calls: () => calls,
     setOffline: (value) => { offline = value; },
     setGrants: (value) => { grants = value; grantRevision++; },
     setRootGrants: (value) => { rootGrants = value; grantRevision++; },
@@ -736,6 +743,155 @@ test("snapshot revocation during an awaited read denies disclosure and never inv
   assert.equal(result.status, "DENIED");
   assert.equal(result.result, null);
   assert.equal(f.calls(), 0);
+});
+
+function encryptedRpcPacket(f, body) {
+  const roster = f.state.get(f.flockUuid);
+  const bundle = f.memberBundle(roster, f.owner);
+  const key = Buffer.from(bundle.flockKey, "base64");
+  try {
+    const sealedRpcBody = zb.sealBundle({ payload: body, recipientEncPubPem: f.peer.encPub,
+      flockUuid: f.flockUuid, rosterEpoch: roster.rosterEpoch,
+      recipientOpaquePeerId: f.peer.opaquePeerId, bundleType: "rpc-body" });
+    const envelope = zb.encryptFlockEnvelope({ roster, state: f.state, flockKey: key,
+      signingPriv: f.owner.signingPriv, fromOpaquePeerId: f.owner.opaquePeerId,
+      toOpaquePeerId: f.peer.opaquePeerId, action: body.kind === "response" ? "ping" : body.request.action,
+      body: { sealedRpcBody }, nowMs: f.nowMs });
+    return { envelope, transport: bundle.transport };
+  } finally { key.fill(0); }
+}
+
+test("Standard wire preflight rejects real double-sealed 180KiB RPC before either cloud attempt", async (t) => {
+  const f = runtimeFixture(t);
+  const packet = encryptedRpcPacket(f, { kind: "request",
+    request: { requestId: crypto.randomUUID(), action: "send_message", expiresAt: f.nowMs + 60000,
+      params: { message: "x".repeat(180 * 1024) } } });
+  assert.ok(Buffer.byteLength(JSON.stringify(packet.envelope), "utf8") > 256 * 1024);
+  t.diagnostic(`180 KiB application text produces ${Buffer.byteLength(JSON.stringify(packet.envelope), "utf8")} encrypted packet bytes before broker properties/reserve`);
+  const attempts = [];
+  await assert.rejects(sendEncryptedPacket({ ...packet, request: async (url, options) => {
+    attempts.push({ url, options });
+    return { status: url.includes("servicebus") ? 413 : 200 };
+  } }), { code: "PACKET_TOO_LARGE" });
+  assert.equal(attempts.length, 0);
+});
+
+function standardMessageBytes(envelope) {
+  const properties = { "Content-Type": "application/json", toOpaquePeerId: JSON.stringify(envelope.toOpaquePeerId),
+    BrokerProperties: JSON.stringify({ MessageId: envelope.messageId, TimeToLive: 3600 }) };
+  return Buffer.byteLength(JSON.stringify(envelope), "utf8") + Buffer.byteLength(JSON.stringify(properties), "utf8") + ENCRYPTED_PACKET_HEADER_RESERVE_BYTES;
+}
+
+test("Standard wire boundary measures actual encrypted request/receipt UTF-8 bytes and broker properties", async (t) => {
+  const f = runtimeFixture(t);
+  for (const kind of ["request", "response"]) {
+    const body = (count) => {
+      const nested = { escaped: "\u0000\"\\\n😀".repeat(64), pad: "x".repeat(count) };
+      return kind === "request" ? { kind, request: { requestId: "r".repeat(128), action: "send_message",
+        expiresAt: f.nowMs + 60000, params: nested } } :
+        { kind, requestId: "r".repeat(128), status: "DELIVERED", result: nested };
+    };
+    let low = 0, high = 180 * 1024;
+    while (low < high) {
+      const middle = Math.ceil((low + high) / 2);
+      const packet = encryptedRpcPacket(f, body(middle));
+      if (standardMessageBytes(packet.envelope) <= SERVICE_BUS_STANDARD_MESSAGE_BYTES) low = middle;
+      else high = middle - 1;
+    }
+    const accepted = encryptedRpcPacket(f, body(low));
+    const rejected = encryptedRpcPacket(f, body(low + 1));
+    const prepared = prepareEncryptedPacket(accepted.envelope);
+    assert.equal(prepared.messageBytes, standardMessageBytes(accepted.envelope));
+    assert.ok(prepared.messageBytes <= 256 * 1024);
+    assert.ok(prepared.messageBytes > 256 * 1024 - 16);
+    assert.ok(standardMessageBytes(rejected.envelope) > 256 * 1024);
+    t.diagnostic(`${kind}: accepted total ${prepared.messageBytes} bytes, next application byte totals ${standardMessageBytes(rejected.envelope)} bytes; 262144-byte budget includes 16384-byte reserve`);
+    const attempts = [];
+    assert.deepEqual(await sendEncryptedPacket({ ...accepted, request: async (url, options) => {
+      attempts.push({ url, options }); return { status: 201 };
+    } }), { admittedToTransport: true });
+    assert.equal(attempts.length, 2);
+    const signalr = attempts.find(({ url }) => url.includes(".service.signalr.net/")).options;
+    const serviceBus = attempts.find(({ url }) => url.includes(".servicebus.windows.net/")).options;
+    assert.deepEqual(JSON.parse(signalr.body).arguments, [JSON.parse(serviceBus.body)]);
+    const { Authorization: _token, ...properties } = serviceBus.headers;
+    assert.equal(Buffer.byteLength(serviceBus.body, "utf8") + Buffer.byteLength(JSON.stringify(properties), "utf8") +
+      ENCRYPTED_PACKET_HEADER_RESERVE_BYTES, prepared.messageBytes);
+    await assert.rejects(sendEncryptedPacket({ ...rejected, request: async () => assert.fail("Oversize must not reach either transport") }), { code: "PACKET_TOO_LARGE" });
+  }
+});
+
+test("Standard wire provider size rejection is explicit even after the other channel accepts", async (t) => {
+  const f = runtimeFixture(t);
+  const packet = encryptedRpcPacket(f, { kind: "response", requestId: crypto.randomUUID(), status: "UNKNOWN", result: null });
+  for (const rejectedChannel of ["servicebus", "signalr"]) {
+    const attempts = [];
+    await assert.rejects(sendEncryptedPacket({ ...packet, request: async (url) => {
+      attempts.push(url); return { status: url.includes(rejectedChannel) ? 413 : 201 };
+    } }), { code: "PACKET_SIZE_REJECTED", ambiguous: true });
+    assert.equal(attempts.length, 2);
+  }
+});
+
+function padCanonical(value, targetBytes, measure = (entry) => zb.canonicalJson(entry)) {
+  const remaining = targetBytes - Buffer.byteLength(measure(value), "utf8");
+  assert.ok(remaining >= 0);
+  value.pad = "x".repeat(remaining);
+  assert.equal(Buffer.byteLength(measure(value), "utf8"), targetBytes);
+  return value;
+}
+
+test("Standard runtime accepts exact typed UTF-8 boundaries on both cloud paths and rejects before new outbox admission", async (t) => {
+  const outcome = { status: "DELIVERED", result: { nested: "\u0000\"\\\n😀".repeat(1024), pad: "" } };
+  padCanonical(outcome.result, RPC_BODY_LIMIT_BYTES - 1024, (result) => zb.canonicalJson({ ...outcome, result }));
+  const f = runtimeFixture(t, { cloudTransport: true, dispatch: async () => outcome });
+  const request = { requestId: "r".repeat(128), action: "s".repeat(64),
+    params: { nested: { escaped: "\u0000\"\\\n😀".repeat(1024) }, pad: "" }, expiresAt: f.nowMs + 60000 };
+  padCanonical(request.params, RPC_BODY_LIMIT_BYTES, (params) => zb.canonicalJson({ kind: "reconcile", request: { ...request, params } }));
+  const result = await f.ownerRuntime.request({ ...request, toOpaquePeerId: f.peer.opaquePeerId });
+  assert.equal(result.status, "DELIVERED");
+  assert.deepEqual(result.result, outcome.result);
+  assert.equal(f.calls(), 1);
+  assert.equal(f.cloudAttempts.length, 4);
+  for (const { url, options } of f.cloudAttempts) {
+    const envelope = url.includes(".servicebus.windows.net/") ? JSON.parse(options.body) : JSON.parse(options.body).arguments[0];
+    assert.ok(standardMessageBytes(envelope) <= SERVICE_BUS_STANDARD_MESSAGE_BYTES);
+  }
+  const before = f.cloudAttempts.length;
+  await assert.rejects(f.ownerRuntime.request({ ...request, requestId: "n".repeat(128),
+    params: { ...request.params, pad: request.params.pad + "x" }, toOpaquePeerId: f.peer.opaquePeerId }), { code: "RPC_PAYLOAD_TOO_LARGE" });
+  assert.equal(f.cloudAttempts.length, before);
+  assert.equal(f.state.pendingOutbox(f.flockUuid).length, 0);
+  const params = {};
+  const changed = f.ownerRuntime.request({ toOpaquePeerId: f.peer.opaquePeerId, action: "send_message", params });
+  params.message = "x".repeat(180 * 1024);
+  await assert.rejects(changed, { code: "PACKET_TOO_LARGE" });
+  assert.equal(f.state.pendingOutbox(f.flockUuid).length, 0);
+  assert.equal(f.cloudAttempts.length, before);
+});
+
+test("Standard runtime retains durable UNKNOWN without redispatch when a post-action result exceeds its boundary", async (t) => {
+  const outcome = { status: "DELIVERED", result: { nested: "\u0000\"\\\n😀", pad: "" } };
+  padCanonical(outcome.result, RPC_BODY_LIMIT_BYTES - 1024 + 1, (result) => zb.canonicalJson({ ...outcome, result }));
+  const f = runtimeFixture(t, { cloudTransport: true, dispatch: async () => outcome });
+  const request = { toOpaquePeerId: f.peer.opaquePeerId, requestId: crypto.randomUUID(),
+    action: "send_message", params: {}, expiresAt: f.nowMs + 60000 };
+  const result = await f.ownerRuntime.request(request);
+  assert.equal(result.status, "UNKNOWN");
+  assert.equal(result.result, null);
+  assert.equal(f.calls(), 1);
+  assert.equal(f.state.pendingOutbox(f.flockUuid).length, 1);
+  const receipt = f.receiverState.readRequestReceipt({ roster: f.receiverState.get(f.flockUuid),
+    sender: f.owner.opaquePeerId, recipient: f.peer.opaquePeerId, requestId: request.requestId,
+    payload: { requestId: request.requestId, action: request.action, params: {}, expiresAt: request.expiresAt },
+    expiresAt: request.expiresAt, authorization: { mode: "ROOT", grantRevision: "0", rosterEpoch: 2 } });
+  assert.equal(receipt.status, "UNKNOWN");
+  assert.equal(receipt.result, null);
+  assert.ok(f.errors.some((entry) => entry.status === "UNKNOWN" && /result exceeds/.test(entry.message)));
+  await f.ownerRuntime.reconcilePending();
+  assert.equal((await f.ownerRuntime.request(request)).status, "UNKNOWN");
+  assert.equal(f.calls(), 1);
+  assert.equal(f.state.pendingOutbox(f.flockUuid).length, 1);
 });
 
 test("cloud HTTP is bounded, HTTPS-only and does not follow credential-bearing redirects", async () => {

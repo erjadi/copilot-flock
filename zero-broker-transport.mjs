@@ -318,12 +318,31 @@ export async function fetchPublicRosterChain({ rosterUrl, trustedRoster, request
   return { latest, transitions };
 }
 
-export async function sendEncryptedPacket({ transport, envelope, request = cloudRequest }) {
+export const SERVICE_BUS_STANDARD_MESSAGE_BYTES = 256 * 1024;
+export const ENCRYPTED_PACKET_HEADER_RESERVE_BYTES = 16 * 1024;
+
+export function prepareEncryptedPacket(envelope) {
   const body = JSON.stringify(envelope);
+  const properties = { "Content-Type": "application/json", toOpaquePeerId: JSON.stringify(envelope.toOpaquePeerId),
+    BrokerProperties: JSON.stringify({ MessageId: envelope.messageId, TimeToLive: 3600 }) };
+  const messageBytes = Buffer.byteLength(body, "utf8") + Buffer.byteLength(JSON.stringify(properties), "utf8") + ENCRYPTED_PACKET_HEADER_RESERVE_BYTES;
+  if (messageBytes > SERVICE_BUS_STANDARD_MESSAGE_BYTES) {
+    throw Object.assign(new Error("Encrypted packet exceeds the Service Bus Standard 256 KiB message budget including properties and 16 KiB header reserve; no cloud attempt was made"),
+      { code: "PACKET_TOO_LARGE" });
+  }
+  return { body, properties, messageBytes };
+}
+
+export async function sendEncryptedPacket({ transport, envelope, request = cloudRequest }) {
+  const { body, properties } = prepareEncryptedPacket(envelope);
   const results = await Promise.allSettled([
     request(`${transport.endpoint}/api/v1/hubs/${transport.hubName}`, { method: "POST", headers: { Authorization: `Bearer ${transport.hubPublishJwt}`, "Content-Type": "application/json" }, body: JSON.stringify({ target: "zeroBrokerEnvelope", arguments: [envelope] }) }),
-    request(`https://${transport.namespaceHost}/${transport.topicName}/messages`, { method: "POST", headers: { Authorization: transport.sbSendSas, "Content-Type": "application/json", toOpaquePeerId: JSON.stringify(envelope.toOpaquePeerId), BrokerProperties: JSON.stringify({ MessageId: envelope.messageId, TimeToLive: 3600 }) }, body }),
+    request(`https://${transport.namespaceHost}/${transport.topicName}/messages`, { method: "POST", headers: { Authorization: transport.sbSendSas, ...properties }, body }),
   ]);
+  if (results.some((result) => result.status === "fulfilled" && result.value.status === 413)) {
+    throw Object.assign(new Error("Encrypted packet size was rejected by a cloud transport; another channel may already have admitted it, so do not blindly retry"),
+      { code: "PACKET_SIZE_REJECTED", ambiguous: results.some((result) => result.status === "rejected" || [200, 201, 202].includes(result.value.status)) });
+  }
   if (results.some((result) => result.status === "fulfilled" && (result.value.status === 200 || result.value.status === 201 || result.value.status === 202))) return { admittedToTransport: true };
   const statuses = results.map((result) => result.status === "fulfilled" ? result.value.status : "UNKNOWN");
   throw Object.assign(new Error(`Both encrypted transport attempts failed (${statuses.join(", ")})`), { ambiguous: statuses.includes("UNKNOWN") });

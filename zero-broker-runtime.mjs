@@ -3,12 +3,12 @@ import {
   canonicalJson, decryptFlockEnvelope, encryptFlockEnvelope,
   openSealedBundle, sealBundle, verifyRosterChain,
 } from "./zero-broker-roster.mjs";
-import { sendEncryptedPacket } from "./zero-broker-transport.mjs";
+import { prepareEncryptedPacket, sendEncryptedPacket } from "./zero-broker-transport.mjs";
 
 const VERIFIED_CONTEXTS = new WeakSet();
 const SNAPSHOT_ACTIONS = new Set(["list_sessions", "list_shared_threads", "get_transcript"]);
 const TERMINAL_STATUSES = new Set(["DELIVERED", "DENIED", "OFFLINE", "BUSY", "UNKNOWN"]);
-const REQUEST_LIMIT = 430 * 1024;
+export const RPC_BODY_LIMIT_BYTES = 128 * 1024;
 
 function requireValue(condition, message) {
   if (!condition) throw new Error(message);
@@ -70,7 +70,10 @@ export function createZeroBrokerRuntime({
 
   function validateRequest(request) {
     requireValue(request && Object.keys(request).length === 4 && /^[A-Za-z0-9_-]{16,128}$/.test(request.requestId) && /^[a-z][a-z0-9_]{0,63}$/.test(request.action) && Number.isSafeInteger(request.expiresAt), "Invalid typed RPC request");
-    requireValue(request.params && Object.getPrototypeOf(request.params) === Object.prototype && Buffer.byteLength(canonicalJson(request)) <= REQUEST_LIMIT, "Invalid or oversized RPC parameters");
+    requireValue(request.params && Object.getPrototypeOf(request.params) === Object.prototype, "Invalid RPC parameters");
+    if (Buffer.byteLength(canonicalJson({ kind: "reconcile", request }), "utf8") > RPC_BODY_LIMIT_BYTES) {
+      throw Object.assign(new Error("RPC request exceeds the 128 KiB canonical UTF-8 body limit including reconciliation wrapper"), { code: "RPC_PAYLOAD_TOO_LARGE" });
+    }
   }
 
   async function authorize(request, senderId, envelopeExpiresAt = request.expiresAt) {
@@ -115,7 +118,9 @@ export function createZeroBrokerRuntime({
 
   function validateOutcome(outcome) {
     requireValue(outcome && TERMINAL_STATUSES.has(outcome.status) && Object.hasOwn(outcome, "result"), "Adapter must return an explicit admission status, not execution success");
-    requireValue(Buffer.byteLength(canonicalJson(outcome)) <= REQUEST_LIMIT - 1024, "RPC result exceeds recipient-sealed transport limit");
+    if (Buffer.byteLength(canonicalJson(outcome), "utf8") > RPC_BODY_LIMIT_BYTES - 1024) {
+      throw Object.assign(new Error("RPC outcome exceeds the 127 KiB canonical UTF-8 limit including status; 1 KiB is reserved for receipt metadata"), { code: "RPC_RESULT_TOO_LARGE" });
+    }
   }
 
   function deniedRequestStatus(request, sender, receipt) {
@@ -129,10 +134,12 @@ export function createZeroBrokerRuntime({
     return ["NOT_ADMITTED", "DENIED"].includes(receipt.status) ? "DENIED" : "UNKNOWN";
   }
 
-  async function emit(toOpaquePeerId, body, action = "ping") {
+  function prepareEmission(toOpaquePeerId, body, action = "ping") {
     const current = snapshot();
     try {
-      requireValue(Buffer.byteLength(canonicalJson(body)) <= REQUEST_LIMIT, "RPC body exceeds recipient-sealed transport limit");
+      if (Buffer.byteLength(canonicalJson(body), "utf8") > RPC_BODY_LIMIT_BYTES) {
+        throw Object.assign(new Error("RPC body exceeds the 128 KiB canonical UTF-8 transport limit; no cloud attempt was made"), { code: "PACKET_TOO_LARGE" });
+      }
       const recipient = current.roster.members.find((member) => member.opaquePeerId === toOpaquePeerId);
       requireValue(recipient, "Unknown encrypted RPC recipient");
       const sealedRpcBody = sealBundle({
@@ -145,10 +152,15 @@ export function createZeroBrokerRuntime({
         signingPriv: device.signingPriv, fromOpaquePeerId: device.opaquePeerId,
         toOpaquePeerId, action, body: { sealedRpcBody }, nowMs: now(),
       });
-      return await sendPacket({ transport: current.transport, envelope });
+      prepareEncryptedPacket(envelope);
+      return { transport: current.transport, envelope };
     } finally {
       current.flockKey.fill(0);
     }
+  }
+
+  async function emit(toOpaquePeerId, body, action = "ping") {
+    return await sendPacket(prepareEmission(toOpaquePeerId, body, action));
   }
 
   function authorizeOutgoing(payload) {
@@ -160,11 +172,13 @@ export function createZeroBrokerRuntime({
       } else if (!(rootSender && roster.members.every((member) => member.role === "owner")) && !SNAPSHOT_ACTIONS.has(payload.action)) {
         deny("Delegates and shared flocks cannot send arbitrary execution payloads");
       }
+      return roster;
   }
 
-  async function transmit(entry, reconcile = false) {
+  async function transmit(entry, reconcile = false, prepared = null) {
     if (entry.expiry <= now() && !reconcile) return;
-    authorizeOutgoing(entry.payload);
+    const roster = authorizeOutgoing(entry.payload);
+    if (!reconcile && prepared?.envelope.rosterEpoch === roster.rosterEpoch) return await sendPacket(prepared);
     await emit(entry.recipient, { kind: reconcile ? "reconcile" : "request", request: entry.payload }, reconcile ? "ping" : entry.payload.action);
   }
 
@@ -255,17 +269,19 @@ export function createZeroBrokerRuntime({
               outcome = await dispatch(request, context);
             }
             requireValue(!closed, "Runtime closed before admission confirmation");
-            validateOutcome(outcome);
             await refresh();
             const afterDispatch = await authorize(request, sender, Date.parse(authenticated.expiresAt));
             assertSameAuthorization(context, afterDispatch);
+            validateOutcome(outcome);
             state.finishRequest({ flockUuid: device.flockUuid, sender, recipient: device.opaquePeerId,
               requestId: request.requestId, authorization: claim.authorization, status: outcome.status, result: outcome.result });
             receipt = { status: outcome.status, result: outcome.result, authorization: claim.authorization };
           } catch (err) {
             if (closed) return { status: "UNKNOWN" };
             const status = err.code === "DENIED" && !(dispatchStarted && sideEffecting) ? "DENIED" : "UNKNOWN";
-            error(status, status === "DENIED" ? "Authorization changed before disclosure" : "Dispatch outcome unconfirmed; no automatic redispatch", request.requestId);
+            error(status, status === "DENIED" ? "Authorization changed before disclosure" :
+              err.code === "RPC_RESULT_TOO_LARGE" ? "RPC result exceeds the bounded transport limit; outcome UNKNOWN, no automatic redispatch" :
+                "Dispatch outcome unconfirmed; no automatic redispatch", request.requestId);
             state.finishRequest({ flockUuid: device.flockUuid, sender, recipient: device.opaquePeerId,
               requestId: request.requestId, authorization: claim.authorization, status, result: null });
             receipt = { status, result: null, authorization: claim.authorization };
@@ -287,10 +303,15 @@ export function createZeroBrokerRuntime({
         }
       }
       catch (err) {
-        if (err.code !== "DENIED") throw err;
-        const status = deniedRequestStatus(request, sender, receipt);
-        await emit(sender, { kind: "response", requestId: request.requestId, status, result: null });
-        return { status };
+        if (err.code === "RPC_RESULT_TOO_LARGE") {
+          error("UNKNOWN", "Snapshot result exceeds the bounded transport limit; no result disclosed", request.requestId);
+          receipt = { status: "UNKNOWN", result: null };
+        } else {
+          if (err.code !== "DENIED") throw err;
+          const status = deniedRequestStatus(request, sender, receipt);
+          await emit(sender, { kind: "response", requestId: request.requestId, status, result: null });
+          return { status };
+        }
       }
       await emit(sender, { kind: "response", requestId: request.requestId, status: receipt.status, result: receipt.result });
       return { status: receipt.status };
@@ -318,6 +339,7 @@ export function createZeroBrokerRuntime({
     }
     const previous = state.getOutboxReceipt({ ...coordinates, payload, expiresAt });
     if (previous) return previous;
+    const prepared = !prior.attempted ? prepareEmission(toOpaquePeerId, { kind: "request", request: payload }, action) : null;
     state.queue({ ...coordinates, payload, expiresAt, nowMs: now() });
     let timer;
     let resolve;
@@ -336,7 +358,7 @@ export function createZeroBrokerRuntime({
     try {
       const entry = state.getOutboxEntry(coordinates);
       const firstAttempt = state.markOutboxAttempt(coordinates);
-      void transmit(entry, !firstAttempt).catch((err) => {
+      void transmit(entry, !firstAttempt, firstAttempt ? prepared : null).catch((err) => {
         if (closed) return;
         const status = err.code === "DENIED" && firstAttempt && !prior.attempted ? "DENIED" : "UNKNOWN";
         if (status === "DENIED") {
@@ -347,7 +369,10 @@ export function createZeroBrokerRuntime({
             return;
           }
         }
-        error(status, status === "DENIED" ? "Outgoing request denied before transport" : "Encrypted transport admission unconfirmed; durable outbox retained", requestId);
+        error(status, status === "DENIED" ? "Outgoing request denied before transport" :
+          err.code === "PACKET_TOO_LARGE" ? "Encrypted packet exceeds the bounded Standard transport limit; no cloud attempt made; durable outbox retained" :
+            err.code === "PACKET_SIZE_REJECTED" ? "Cloud transport rejected packet size; another channel may have admitted it; durable outbox retained without blind retry" :
+              "Encrypted transport admission unconfirmed; durable outbox retained", requestId);
         resolve({ requestId, status, result: null });
       });
       return await response;

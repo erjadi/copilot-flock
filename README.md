@@ -197,6 +197,21 @@ GitHub Actions/Pages limits remain separate constraints. No paid SKU change
 or live load acceptance is implied. The administrative viewer and legacy
 topology/fleet/update tools remain legacy-only, not Zero-Broker native tools.
 
+Native RPC uses one conservative budget for both transport paths: each final
+UTF-8 serialized encrypted packet plus its serialized broker properties and
+a **16 KiB header reserve** must fit Service Bus Standard's **256 KiB** message
+limit (1 KiB = 1,024 bytes). This counts both recipient sealing and outer
+encryption/base64 expansion, not just application text. Typed request bodies
+including the longest reconciliation wrapper are limited to **128 KiB** of
+canonical UTF-8 JSON. Outcomes including their status are limited to **127 KiB**,
+reserving another 1 KiB for receipt metadata. Unsupported new requests fail
+before outbox admission; final wire-size preflight runs before either cloud
+attempt, including responses. A provider HTTP 413 is an explicit transport
+error even if the other channel accepts. Oversized post-action results remain
+durably **UNKNOWN**, with the original claims/outbox retained and no automatic
+redispatch. These bounds are verified with synthetic keys and cloud adapters,
+not live provider acceptance; no chunking or Premium SKU is implied.
+
 **Release validation:** before either smoke tests or full worker execution,
 each voter requires explicit **local approval of the exact reviewed SHA**.
 Ask that PC's Copilot to review the source without running it, then approve
