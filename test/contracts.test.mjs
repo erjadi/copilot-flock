@@ -10,6 +10,89 @@ import * as flock from "../flock.mjs";
 import * as bridge from "../bridge.mjs";
 import * as broker from "../bootstrap-server.mjs";
 import crypto from "node:crypto";
+import { RELEASE_VALIDATION_POLICY, RELEASE_VALIDATION_POLICY_HASH, createReleaseCoverage } from "../release-policy.mjs";
+
+test("expected release SHA rejects moved branches while preserving Git checkout and metadata", (t) => {
+  const root = temporary(t);
+  const f = releaseFixture(root);
+  fs.writeFileSync(path.join(f.checkout, ".git", "FETCH_HEAD"), "Synthetic preserved fetch marker\n");
+  const before = { head: git(f.checkout, "rev-parse", "HEAD"), origin: git(f.checkout, "remote", "get-url", "origin"),
+    index: fs.readFileSync(path.join(f.checkout, ".git", "index")),
+    fetch: fs.readFileSync(path.join(f.checkout, ".git", "FETCH_HEAD")),
+    status: git(f.checkout, "status", "--porcelain=v1", "--untracked-files=all") };
+  for (const api of [flock, bridge]) {
+    let executions = 0;
+    assert.throws(() => api.resolveExpectedReleaseCommit({ repoDir: f.checkout, branch: "main", exec: () => executions++ }), { code: "RELEASE_COMMIT_REQUIRED" });
+    assert.equal(executions, 0);
+    assert.throws(() => api.resolveExpectedReleaseCommit({ repoDir: f.checkout, branch: "main", expectedCommit: f.installed, exec: f.exec }), { code: "RELEASE_COMMIT_MISMATCH" });
+    assert.equal(api.resolveExpectedReleaseCommit({ repoDir: f.checkout, branch: "main", expectedCommit: f.candidate, exec: f.exec }), f.candidate);
+    assert.equal(git(f.checkout, "rev-parse", "HEAD"), before.head);
+    assert.equal(git(f.checkout, "remote", "get-url", "origin"), before.origin);
+    assert.equal(git(f.checkout, "status", "--porcelain=v1", "--untracked-files=all"), before.status);
+    assert.deepEqual(fs.readFileSync(path.join(f.checkout, ".git", "index")), before.index);
+    assert.deepEqual(fs.readFileSync(path.join(f.checkout, ".git", "FETCH_HEAD")), before.fetch);
+  }
+});
+
+test("actual release vote caller freezes intent, denies ungated peers and forwards exact SHA to every voter", async (t) => {
+  const root = temporary(t);
+  const expectedCommit = "a".repeat(40);
+  const keys = crypto.generateKeyPairSync("ed25519");
+  const targets = [{ machineId: "FIRST-PC" }, { machineId: "SECOND-PC" }];
+  const inventory = createReleaseCoverage([...RELEASE_VALIDATION_POLICY.requiredModules, ...RELEASE_VALIDATION_POLICY.requiredTests]);
+  for (const [index, api] of [flock, bridge].entries()) {
+    const source = fs.readFileSync(new URL(`../${index ? "bridge" : "flock"}.mjs`, import.meta.url), "utf8");
+    const method = namedFunction(source, "voteReleaseAcrossFlock").replace(
+      'const { RELEASE_REVIEW_TIMEOUT_MS } = await import("./zero-broker-release.mjs");', "const RELEASE_REVIEW_TIMEOUT_MS = 450000;");
+    assert.ok(!method.includes('await import("./zero-broker-release.mjs")'));
+    const calls = [];
+    let protocolSupported = false;
+    let ballotCommit = expectedCommit;
+    const context = vm.createContext({
+      fs, path, RELEASE_VALIDATION_POLICY_HASH,
+      assertExpectedReleaseCommit: api.assertExpectedReleaseCommit,
+      resolveOrFindBridgeGitRepo: () => root,
+      resolveExpectedReleaseCommit: ({ expectedCommit: value }) => { assert.equal(value, expectedCommit); calls.push("freeze"); return value; },
+      readExpectedReleaseCoverage: () => inventory,
+      discoverMachines: async () => { calls.push("discover"); return targets; },
+      getCachedBootstrapMembersMap: () => new Map(targets.map((target) => [target.machineId.toLowerCase(), { publicKey: keys.publicKey }])),
+      filterBroadcastTargets: () => targets,
+      verifyVoteBallotSignature: api.verifyVoteBallotSignature, summarizeReleaseVotes: api.summarizeReleaseVotes,
+      ensureBridgeDir() {}, getBridgeHome: () => root,
+      invokeRemoteRpcBatch: async (_cfg, items) => items.map((item) => {
+        calls.push(item.action);
+        if (item.action === "ping") return { item, ok: true, response: { result: protocolSupported ? {
+          releaseReviewProtocol: { version: 3, expectedCommitRequired: true, localExecutionApprovalRequired: true,
+            validationPolicyHash: RELEASE_VALIDATION_POLICY_HASH },
+        } : {} } };
+        assert.equal(item.params.expectedCommit, expectedCommit);
+        const ballot = { machineId: item.toMachine, branch: "main", candidateCommit: ballotCommit,
+          vote: "ACCEPT", voteSignatureVersion: 3,
+          verificationLevel: "complete_candidate_syntax_root_tests_and_ed25519_signature",
+          checks: { modulesSyntaxOk: true, bridgeSyntaxOk: true, bootstrapSyntaxOk: true,
+            unitTestsOk: true, localExecutionConsentVerified: true, ...inventory,
+            moduleCount: inventory.coverage.modules.length, testFileCount: inventory.coverage.testFiles.length,
+            verificationLevel: "complete_candidate_syntax_and_root_tests" } };
+        ballot.voteSignature = crypto.sign(null, Buffer.from(api.releaseVoteSigningPayload(ballot)), keys.privateKey).toString("base64");
+        return { item, ok: true, response: { result: ballot } };
+      }),
+    });
+    vm.runInContext(`${method}\nthis.vote = voteReleaseAcrossFlock;`, context);
+    await assert.rejects(() => context.vote({}, { branch: "main" }), { code: "RELEASE_COMMIT_REQUIRED" });
+    assert.deepEqual(calls, []);
+    await assert.rejects(() => context.vote({}, { branch: "main", expectedCommit }), /capability preflight/);
+    assert.deepEqual(calls, ["freeze", "discover", "ping", "ping"]);
+    protocolSupported = true;
+    calls.length = 0;
+    const report = await context.vote({}, { branch: "main", expectedCommit });
+    assert.equal(report.approvedForMerge, true);
+    assert.equal(report.expectedCommit, expectedCommit);
+    assert.deepEqual(calls, ["freeze", "discover", "ping", "ping", "review_release", "review_release"]);
+    ballotCommit = "b".repeat(40);
+    const moved = await context.vote({}, { branch: "main", expectedCommit });
+    assert.equal(moved.approvedForMerge, false);
+  }
+});
 
 test("local release execution approval binds reviewed host code to exact SHA, device, key and expiry", (t) => {
   const root = temporary(t);
@@ -60,14 +143,23 @@ test("actual release handler denies smoke and worker execution before local exac
     const commit = "a".repeat(40);
     const cfg = { machineId: "SYNTHETIC-PC", architecture: "legacy" };
     let executions = 0;
+    let expireDuringExecution = false;
     const run = () => vm.runInNewContext(`(async () => { ${source.slice(from, to)} })()`, {
-      action: "review_release", params: { branch: "untrusted-branch" }, cfg, fs, path, os, process, crypto, Buffer,
+      action: "review_release", params: { branch: "untrusted-branch", expectedCommit: commit }, cfg, fs, path, os, process, crypto, Buffer,
+      assertExpectedReleaseCommit: api.assertExpectedReleaseCommit,
+      resolveExpectedReleaseCommit: () => commit,
       resolveOrFindBridgeGitRepo: () => root,
       getInstalledSourceProvenance: () => ({ sourceCommit: null, status: "unrecorded" }),
       assertLocalReleaseExecutionApproved: api.assertLocalReleaseExecutionApproved,
       releaseVoteSigningPayload: api.releaseVoteSigningPayload,
       execFileSync: (program, args) => {
-        if (program !== "git") { executions++; return ""; }
+        if (program !== "git") {
+          executions++;
+          if (expireDuringExecution) api.approveLocalReleaseExecution(cfg, commit, {
+            ackReviewedHostCode: true, now: Date.now() - 30 * 60 * 1000,
+          });
+          return "";
+        }
         if (args.includes("rev-parse")) return commit;
         if (args.includes("show")) return "// Synthetic candidate; never executed\n";
         return "";
@@ -83,6 +175,8 @@ test("actual release handler denies smoke and worker execution before local exac
     assert.equal(result.candidateCommit, commit);
     // The synthetic VM does not load the real worker; incomplete evidence cannot ACCEPT.
     assert.equal(result.vote, "REJECT");
+    expireDuringExecution = true;
+    await assert.rejects(run, { code: "RELEASE_EXECUTION_NOT_APPROVED" });
   }
 });
 
@@ -92,6 +186,11 @@ test("release execution CLI refuses unacknowledged or missing identity without p
     const profile = path.join(root, script);
     const args = [fileURLToPath(new URL(`../${script}`, import.meta.url)), "approve-release-execution", "--commit", "a".repeat(40)];
     const env = { ...process.env, COPILOT_HOME: profile };
+    const invalidVote = spawnSync(process.execPath, [args[0], "vote-release", "--branch", "main"],
+      { env, encoding: "utf8", timeout: 5000 });
+    assert.notEqual(invalidVote.status, 0);
+    assert.match(invalidVote.stderr, /independently expected full release commit SHA/);
+    assert.equal(fs.existsSync(profile), false);
     for (const flags of [[], ["--ack-reviewed-host-code"]]) {
       const result = spawnSync(process.execPath, [...args, ...flags], { env, encoding: "utf8", timeout: 5000 });
       assert.notEqual(result.status, 0);
@@ -330,7 +429,8 @@ test("actual release comparison distinguishes empty published diff from changed 
     assert.ok(from > 0 && to > from);
     const compare = (failDiff = false) => vm.runInNewContext(`${source.slice(from, to)}
       ({ installedSource, candidateCommit, diffStat, publishedMainComparisonError, installedDiffStat, installedComparisonError });`, {
-      params: { branch: "main" }, branch: "main", repoDir: f.checkout,
+      params: { branch: "main", expectedCommit: f.candidate }, branch: "main", expectedCommit: f.candidate, repoDir: f.checkout,
+      resolveExpectedReleaseCommit: () => f.candidate,
       getInstalledSourceProvenance: () => api.getInstalledSourceProvenance(installedHome),
       execFileSync: (program, args, options) => {
         if (program === "git" && args.includes("fetch")) args = args.map((arg) =>

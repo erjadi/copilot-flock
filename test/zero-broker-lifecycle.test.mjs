@@ -9,6 +9,7 @@ import * as core from "../zero-broker-roster.mjs";
 import * as lifecycle from "../zero-broker-lifecycle.mjs";
 import { createZeroBrokerNativeHost, getMcpToolDefinitions, installZeroBrokerIntegration, zeroBrokerNodeFlags, releaseVoteSigningPayload, summarizeReleaseVotes, verifyVoteBallotSignature } from "../flock.mjs";
 import { RELEASE_REVIEW_TIMEOUT_MS, validateReleaseCandidateInWorker } from "../zero-broker-release.mjs";
+import { RELEASE_VALIDATION_POLICY, createReleaseCoverage, verifyReleaseCoverage, releaseCoveragePayload, readExpectedReleaseCoverage } from "../release-policy.mjs";
 
 const subscriptionId = "11111111-2222-4333-8444-555555555555";
 const sessionId = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
@@ -17,12 +18,14 @@ test("full-scope signed release ballots reject legacy smoke, tampering, missing 
   const keys = crypto.generateKeyPairSync("ed25519");
   const commit = "a".repeat(40);
   const branch = "synthetic-candidate";
+  const inventory = createReleaseCoverage([...RELEASE_VALIDATION_POLICY.requiredModules, ...RELEASE_VALIDATION_POLICY.requiredTests]);
   function ballot(machineId, changes = {}) {
     const result = {
-      machineId, branch, candidateCommit: commit, vote: "ACCEPT", voteSignatureVersion: 2,
+      machineId, branch, candidateCommit: commit, vote: "ACCEPT", voteSignatureVersion: 3,
       verificationLevel: "complete_candidate_syntax_root_tests_and_ed25519_signature",
       checks: { modulesSyntaxOk: true, bridgeSyntaxOk: true, bootstrapSyntaxOk: true,
-        unitTestsOk: true, moduleCount: 26, testFileCount: 7,
+        unitTestsOk: true, moduleCount: inventory.coverage.modules.length, testFileCount: 7,
+        localExecutionConsentVerified: true, ...inventory,
         verificationLevel: "complete_candidate_syntax_and_root_tests" }, ...changes,
     };
     result.voteSignature = crypto.sign(null, Buffer.from(releaseVoteSigningPayload(result)), keys.privateKey).toString("base64");
@@ -31,7 +34,7 @@ test("full-scope signed release ballots reject legacy smoke, tampering, missing 
   const first = ballot("FIRST-PC");
   const second = ballot("SECOND-PC");
   function summarize(items, onlineMachines = ["FIRST-PC", "SECOND-PC"]) {
-    return summarizeReleaseVotes({ branch, onlineMachines,
+    return summarizeReleaseVotes({ branch, expectedCommit: commit, expectedCoverageHash: inventory.coverageHash, onlineMachines,
       votes: items.map((item) => ({ ...item, signatureVerified: verifyVoteBallotSignature(item, keys.publicKey) })) });
   }
   assert.equal(summarize([first, second]).approvedForMerge, true);
@@ -44,6 +47,11 @@ test("full-scope signed release ballots reject legacy smoke, tampering, missing 
   const legacy = ballot("FIRST-PC", { voteSignatureVersion: 1 });
   assert.equal(verifyVoteBallotSignature(legacy, keys.publicKey), true);
   assert.equal(summarize([legacy, second]).approvedForMerge, false);
+  const v2 = ballot("FIRST-PC", { voteSignatureVersion: 2 });
+  assert.equal(verifyVoteBallotSignature(v2, keys.publicKey), true);
+  assert.equal(summarize([v2, second]).approvedForMerge, false);
+  assert.equal(summarize([ballot("FIRST-PC", { candidateCommit: "b".repeat(40) }),
+    ballot("SECOND-PC", { candidateCommit: "b".repeat(40) })]).approvedForMerge, false);
   for (const field of ["modulesSyntaxOk", "bridgeSyntaxOk", "bootstrapSyntaxOk", "unitTestsOk"]) {
     const changed = { ...first, checks: { ...first.checks, [field]: false } };
     assert.equal(verifyVoteBallotSignature(changed, keys.publicKey), false);
@@ -55,7 +63,23 @@ test("full-scope signed release ballots reject legacy smoke, tampering, missing 
   assert.equal(summarize([ballot("FIRST-PC", { checks: { ...first.checks, testFileCount: 1 } }), second]).approvedForMerge, false);
   assert.equal(summarize([ballot("FIRST-PC", { checks: { ...first.checks, testFileCount: 6 } }), second]).approvedForMerge, false);
   assert.equal(verifyVoteBallotSignature(first, crypto.generateKeyPairSync("ed25519").publicKey), false);
-  assert.equal(summarizeReleaseVotes({ branch, onlineMachines: ["FIRST-PC"], votes: [{ ...first, signatureVerified: false }] }).approvedForMerge, false);
+  assert.equal(summarizeReleaseVotes({ branch, expectedCommit: commit, expectedCoverageHash: inventory.coverageHash, onlineMachines: ["FIRST-PC"], votes: [{ ...first, signatureVerified: false }] }).approvedForMerge, false);
+  assert.throws(() => summarizeReleaseVotes({ branch, onlineMachines: [], votes: [] }), { code: "RELEASE_COMMIT_REQUIRED" });
+  assert.equal(summarize([ballot("FIRST-PC", { checks: { ...first.checks, localExecutionConsentVerified: false } }), second]).approvedForMerge, false);
+  const substituted = createReleaseCoverage([...RELEASE_VALIDATION_POLICY.requiredModules,
+    ...RELEASE_VALIDATION_POLICY.requiredTests.filter((name) => !name.includes("rpc-security")),
+    "test/unapproved-substitute.test.mjs"]);
+  assert.equal(verifyReleaseCoverage({ ...first.checks, ...substituted }), false);
+  assert.equal(verifyVoteBallotSignature({ ...first, checks: { ...first.checks, ...substituted } }, keys.publicKey), false);
+  assert.equal(summarize([ballot("FIRST-PC", { checks: { ...first.checks, ...substituted } }), second]).approvedForMerge, false);
+  const policyChange = { ...first.checks, coverage: { ...first.checks.coverage, policyHash: "b".repeat(64) } };
+  policyChange.coverageHash = crypto.createHash("sha256").update(releaseCoveragePayload(policyChange.coverage)).digest("hex");
+  assert.equal(summarize([ballot("FIRST-PC", { checks: policyChange }), second]).approvedForMerge, false);
+  const extra = createReleaseCoverage([...RELEASE_VALIDATION_POLICY.requiredModules,
+    ...RELEASE_VALIDATION_POLICY.requiredTests, "extra-surface.mjs"]);
+  const extraChecks = { ...first.checks, ...extra, moduleCount: extra.coverage.modules.length };
+  assert.equal(verifyReleaseCoverage(extraChecks), true);
+  assert.equal(summarize([ballot("FIRST-PC", { checks: extraChecks }), second]).approvedForMerge, false);
 });
 
 test("immutable release validation runs in a bounded worker without blocking the parent event loop", async (t) => {
@@ -64,7 +88,7 @@ test("immutable release validation runs in a bounded worker without blocking the
   fs.mkdirSync(path.join(directory, "test"));
   fs.mkdirSync(path.join(directory, "no-hooks"));
   for (const name of ["flock", "bridge", "bootstrap-server", "zero-broker-roster", "zero-broker-transport",
-    "zero-broker-runtime", "zero-broker-lifecycle", "zero-broker-enrollment", "zero-broker-release"]) {
+    "zero-broker-runtime", "zero-broker-lifecycle", "zero-broker-enrollment", "zero-broker-release", "release-policy"]) {
     fs.writeFileSync(path.join(directory, `${name}.mjs`), "export const syntheticFixture = true;");
   }
   for (const name of ["flock", "bridge", "setup", "contracts", "rpc-security", "zero-broker-lifecycle"]) {
@@ -87,9 +111,11 @@ test("immutable release validation runs in a bounded worker without blocking the
   try {
     const result = await validateReleaseCandidateInWorker({ repoDir: directory, commit: sha });
     assert.equal(result.candidateCommit, sha);
-    assert.equal(result.moduleCount, 16);
+    assert.equal(result.moduleCount, 17);
     assert.equal(result.testFileCount, 7);
     assert.equal(result.unitTestsOk, true);
+    assert.equal(verifyReleaseCoverage(result), true);
+    assert.equal(readExpectedReleaseCoverage({ repoDir: directory, expectedCommit: sha }).coverageHash, result.coverageHash);
     assert.ok(heartbeatTicks >= 2, "Parent event-loop heartbeat must continue during validation");
     assert.ok(RELEASE_REVIEW_TIMEOUT_MS > 360000, "RPC budget must cover the bounded worker and Git preflight");
   } finally { clearInterval(timer); }

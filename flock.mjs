@@ -18,6 +18,9 @@ import https from "node:https";
 import crypto from "node:crypto";
 import { spawn, execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { RELEASE_VALIDATION_POLICY_HASH, releaseCoveragePayload, verifyReleaseCoverage,
+  assertExpectedReleaseCommit, resolveExpectedReleaseCommit, readExpectedReleaseCoverage } from "./release-policy.mjs";
+export { assertExpectedReleaseCommit, resolveExpectedReleaseCommit };
 
 if (typeof dns.setDefaultResultOrder === "function") {
   try {
@@ -241,7 +244,7 @@ Public Pages propagation and accurate clocks bound freshness; no revocation SLA 
 }
 
 function copyZeroBrokerModules(sourceDirectory, targetDirectory) {
-  for (const filename of fs.readdirSync(sourceDirectory).filter((name) => /^zero-broker-[a-z-]+\.mjs$/.test(name))) {
+  for (const filename of fs.readdirSync(sourceDirectory).filter((name) => /^zero-broker-[a-z-]+\.mjs$/.test(name) || name === "release-policy.mjs")) {
     const source = path.join(sourceDirectory, filename);
     const target = path.join(targetDirectory, filename);
     if (path.resolve(source) !== path.resolve(target)) fs.copyFileSync(source, target);
@@ -5383,7 +5386,7 @@ export async function prepareBridgeReleaseSource(repoDir, { exec = execFileSync 
       exec(process.execPath, ["--check", filename], options);
     }
     const runtimeHashes = Object.fromEntries(release.files
-      .filter((file) => path.dirname(file) === release.directory && /^(?:flock|bridge|zero-broker-[a-z-]+)\.mjs$/.test(path.basename(file)))
+      .filter((file) => path.dirname(file) === release.directory && /^(?:flock|bridge|release-policy|zero-broker-[a-z-]+)\.mjs$/.test(path.basename(file)))
       .map((file) => [path.basename(file), crypto.createHash("sha256").update(fs.readFileSync(file)).digest("hex")]));
     fs.writeFileSync(path.join(release.directory, "release-source.json"),
       JSON.stringify({ schema: 1, sourceCommit: commit, scope: "runtime_modules_only", runtimeHashes }) + "\n");
@@ -5396,7 +5399,7 @@ export async function prepareBridgeReleaseSource(repoDir, { exec = execFileSync 
 
 function runtimeSourceHashes(directory) {
   return Object.fromEntries(fs.readdirSync(directory)
-    .filter((name) => /^(?:flock|bridge|zero-broker-[a-z-]+)\.mjs$/.test(name))
+    .filter((name) => /^(?:flock|bridge|release-policy|zero-broker-[a-z-]+)\.mjs$/.test(name))
     .sort().map((name) => [name, crypto.createHash("sha256").update(fs.readFileSync(path.join(directory, name))).digest("hex")]));
 }
 
@@ -5423,7 +5426,7 @@ export function getInstalledSourceProvenance(directory = getBridgeHome(), { exec
     if (!/^[0-9a-f]{40}$/.test(commit)) throw new Error("Invalid source repository commit");
     const names = Object.keys(runtimeHashes);
     const tracked = exec("git", ["-C", directory, "ls-tree", "--name-only", commit], options)
-      .split(/\r?\n/).filter((name) => /^(?:flock|bridge|zero-broker-[a-z-]+)\.mjs$/.test(name)).sort();
+      .split(/\r?\n/).filter((name) => /^(?:flock|bridge|release-policy|zero-broker-[a-z-]+)\.mjs$/.test(name)).sort();
     const unchanged = JSON.stringify(names) === JSON.stringify(tracked) &&
       exec("git", ["-C", directory, "diff", "--numstat", commit, "--", ...names], options).trim() === "";
     return { status: unchanged ? "tracked_clean_runtime" : "modified_runtime",
@@ -5852,6 +5855,8 @@ export async function handleRpcAction(cfg, req, context = null) {
       canonicalAddress: `${(githubUser || "unknown").toLowerCase()}/${normalizeScope(cfg.scope, "work")}/${cfg.machineId}`,
       version: BRIDGE_VERSION,
       scope: normalizeScope(cfg.scope, "work"),
+      releaseReviewProtocol: { version: 3, expectedCommitRequired: true,
+        localExecutionApprovalRequired: true, validationPolicyHash: RELEASE_VALIDATION_POLICY_HASH },
       githubUser,
       specs,
       hostname: os.hostname(),
@@ -6346,6 +6351,7 @@ export async function handleRpcAction(cfg, req, context = null) {
   }
 
   if (action === "review_release") {
+    const expectedCommit = assertExpectedReleaseCommit(params.expectedCommit);
     const branch = String(params.branch || "main").trim();
     if (!/^[A-Za-z0-9._/-]+$/.test(branch) || branch.includes("..")) {
       throw new Error(`Invalid branch name for review_release: ${branch}`);
@@ -6364,21 +6370,7 @@ export async function handleRpcAction(cfg, req, context = null) {
         windowsHide: true,
       }
     );
-    execFileSync(
-      "git",
-      ["-C", repoDir, "fetch", "--force", "https://github.com/erjadi/copilot-flock.git", branch],
-      {
-        stdio: ["ignore", "pipe", "pipe"],
-        timeout: 20000,
-        windowsHide: true,
-      }
-    );
-    const candidateCommit = execFileSync("git", ["-C", repoDir, "rev-parse", "FETCH_HEAD"], {
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "ignore"],
-      timeout: 5000,
-      windowsHide: true,
-    }).trim();
+    const candidateCommit = resolveExpectedReleaseCommit({ repoDir, branch, expectedCommit });
     const candidateSha = candidateCommit.slice(0, 7);
     let diffStat = null;
     let publishedMainComparisonError = null;
@@ -6421,6 +6413,9 @@ export async function handleRpcAction(cfg, req, context = null) {
       });
       const tmpBridge = path.join(tmpDir, "bridge.mjs");
       fs.writeFileSync(tmpBridge, candidateBridge, "utf8");
+      fs.writeFileSync(path.join(tmpDir, "release-policy.mjs"), execFileSync(
+        "git", ["-C", repoDir, "show", `${candidateCommit}:release-policy.mjs`],
+        { stdio: ["ignore", "pipe", "pipe"], timeout: 5000, windowsHide: true }));
       execFileSync(process.execPath, ["--check", tmpBridge], {
         stdio: ["ignore", "pipe", "pipe"],
         timeout: 5000,
@@ -6508,9 +6503,10 @@ export async function handleRpcAction(cfg, req, context = null) {
 
     const vote = issues.length === 0 ? "ACCEPT" : "REJECT";
     const idKey = assertLocalReleaseExecutionApproved(cfg, candidateCommit);
+    checks.localExecutionConsentVerified = true;
     const evidence = {
       machineId: cfg.machineId, branch, candidateCommit, vote, checks,
-      voteSignatureVersion: 2,
+      voteSignatureVersion: 3,
       verificationLevel: "complete_candidate_syntax_root_tests_and_ed25519_signature",
     };
     const votePayload = releaseVoteSigningPayload(evidence);
@@ -6524,6 +6520,7 @@ export async function handleRpcAction(cfg, req, context = null) {
       githubUser: cfg.githubUser || null,
       platform: `${process.platform}-${os.arch()}`,
       branch,
+      expectedCommit,
       candidateCommit,
       candidateSha,
       diffStat,
@@ -6536,7 +6533,7 @@ export async function handleRpcAction(cfg, req, context = null) {
       verificationLevel: "complete_candidate_syntax_root_tests_and_ed25519_signature",
       issues,
       vote,
-      voteSignatureVersion: 2,
+      voteSignatureVersion: 3,
       votePayload,
       publicKey: idKey.publicKey,
       keyFingerprint: idKey.fingerprint,
@@ -7574,7 +7571,7 @@ export const MCP_TOOLS = [
   {
     name: "vote_bridge_release",
     description:
-      "Pre-merge governance: each voter must first approve the exact reviewed SHA locally for host-privileged code execution; missing approval denies tests. Every online voter then validates all .mjs and root suites and returns a registered-key v2 ballot binding SHA and coverage. Temporary profiles are not an OS sandbox; smoke-only ballots cannot approve a merge.",
+      "Pre-merge governance: requires the independently expected full SHA and local host-code consent on every voter. Capability preflight excludes older ungated reviewers. Registered-key v3 ballots bind SHA, named coverage, policy hash and execution consent. Temporary profiles are not an OS sandbox; old ballots cannot approve a merge.",
     inputSchema: {
       type: "object",
       properties: {
@@ -7582,12 +7579,14 @@ export const MCP_TOOLS = [
           type: "string",
           description: "Candidate git branch on origin to review and vote on (e.g. 'v2.1.0-rc').",
         },
+        expected_commit: { type: "string", pattern: "^[0-9a-f]{40}$",
+          description: "Independently expected immutable SHA; moved branches and mismatched ballots are rejected." },
         machines: {
           type: "string",
           description: "Optional machine filter (default: '*' for all online flock members).",
         },
       },
-      required: ["branch"],
+      required: ["branch", "expected_commit"],
     },
   },
   {
@@ -8509,9 +8508,11 @@ async function executeMcpTool(cfg, name, args = {}) {
   }
 
   if (name === "vote_flock_release" || name === "vote_bridge_release") {
+    assertExpectedReleaseCommit(args.expected_commit);
     await ensureDaemonStarted(cfg);
     return await voteReleaseAcrossFlock(cfg, {
       branch: args.branch,
+      expectedCommit: args.expected_commit,
       machines: args.machines || "*",
     });
   }
@@ -9487,6 +9488,14 @@ export async function syncRemoteGitBranch(
 }
 
 export function releaseVoteSigningPayload(ballot) {
+  if (ballot.voteSignatureVersion === 3) {
+    const checks = ballot.checks || {};
+    return JSON.stringify(["flock-release-v3", ballot.machineId, ballot.branch, ballot.candidateCommit, ballot.vote,
+      ballot.verificationLevel, checks.verificationLevel, checks.modulesSyntaxOk,
+      checks.bridgeSyntaxOk, checks.bootstrapSyntaxOk, checks.unitTestsOk,
+      checks.moduleCount, checks.testFileCount, checks.localExecutionConsentVerified,
+      checks.coverageHash, releaseCoveragePayload(checks.coverage)]);
+  }
   if (ballot.voteSignatureVersion === 2) {
     const checks = ballot.checks || {};
     return JSON.stringify([
@@ -9499,7 +9508,9 @@ export function releaseVoteSigningPayload(ballot) {
   return `vote|${ballot.machineId}|${ballot.branch || "main"}|${ballot.candidateCommit || ballot.candidateSha}|${ballot.vote}`;
 }
 
-export function summarizeReleaseVotes({ branch, votes, onlineMachines }) {
+export function summarizeReleaseVotes({ branch, expectedCommit, expectedCoverageHash, votes, onlineMachines }) {
+  assertExpectedReleaseCommit(expectedCommit);
+  if (typeof expectedCoverageHash !== "string" || !/^[0-9a-f]{64}$/.test(expectedCoverageHash)) throw new Error("Independently expected release coverage hash is required");
   const expected = new Set(onlineMachines.map((id) => String(id).toLowerCase()));
   const actual = new Set(votes.map((vote) => String(vote.machineId).toLowerCase()));
   const votersComplete = expected.size > 0 && actual.size === votes.length &&
@@ -9507,21 +9518,22 @@ export function summarizeReleaseVotes({ branch, votes, onlineMachines }) {
   const assessed = votes.map((vote) => ({
     ...vote,
     completeValidationVerified: vote.signatureVerified === true &&
-      vote.voteSignatureVersion === 2 && vote.branch === branch &&
+      vote.voteSignatureVersion === 3 && vote.branch === branch && vote.candidateCommit === expectedCommit &&
       /^[0-9a-f]{40}$/.test(vote.candidateCommit || "") &&
       vote.verificationLevel === "complete_candidate_syntax_root_tests_and_ed25519_signature" &&
       vote.checks?.verificationLevel === "complete_candidate_syntax_and_root_tests" &&
       vote.checks?.modulesSyntaxOk === true && vote.checks?.bridgeSyntaxOk === true &&
       vote.checks?.bootstrapSyntaxOk === true && vote.checks?.unitTestsOk === true &&
-      Number.isInteger(vote.checks?.moduleCount) && vote.checks.moduleCount >= 9 &&
-      Number.isInteger(vote.checks?.testFileCount) && vote.checks.testFileCount >= 7,
+      vote.checks?.localExecutionConsentVerified === true && vote.checks.coverageHash === expectedCoverageHash && verifyReleaseCoverage(vote.checks),
   }));
   const acceptCount = assessed.filter((vote) => vote.vote === "ACCEPT" && vote.completeValidationVerified).length;
   const commitSet = new Set(assessed.map((vote) => vote.candidateCommit).filter(Boolean));
   const unanimousCommit = commitSet.size === 1 ? [...commitSet][0] : null;
-  const approvedForMerge = votersComplete && acceptCount === assessed.length && Boolean(unanimousCommit);
+  const approvedForMerge = votersComplete && acceptCount === assessed.length && unanimousCommit === expectedCommit;
   return {
-    votedAt: new Date().toISOString(), branch, unanimousCommit,
+    votedAt: new Date().toISOString(), branch, expectedCommit, unanimousCommit,
+    validationPolicyHash: RELEASE_VALIDATION_POLICY_HASH,
+    expectedCoverageHash,
     verificationScope: "complete_candidate_syntax_root_tests_and_ed25519_signature",
     onlineVoterCount: expected.size, votersComplete, acceptCount,
     rejectCount: assessed.length - acceptCount,
@@ -9536,7 +9548,7 @@ export function verifyVoteBallotSignature(ballot, registeredPublicKey = null) {
   }
   const pubKey = registeredPublicKey || ballot.publicKey || null;
   if (!pubKey) return false;
-  if (ballot.voteSignatureVersion !== undefined && ![1, 2].includes(ballot.voteSignatureVersion)) return false;
+  if (ballot.voteSignatureVersion !== undefined && ![1, 2, 3].includes(ballot.voteSignatureVersion)) return false;
   const payloadsToTry = ballot.candidateCommit || ballot.candidateSha ? [releaseVoteSigningPayload(ballot)] : [];
   for (const p of payloadsToTry) {
     try {
@@ -9552,7 +9564,12 @@ export function verifyVoteBallotSignature(ballot, registeredPublicKey = null) {
   return false;
 }
 
-export async function voteReleaseAcrossFlock(cfg, { branch = "main", machines = "*" } = {}) {
+export async function voteReleaseAcrossFlock(cfg, { branch = "main", expectedCommit, machines = "*" } = {}) {
+  assertExpectedReleaseCommit(expectedCommit);
+  const repoDir = resolveOrFindBridgeGitRepo();
+  if (!repoDir) throw new Error("Release voting requires a local Git object store");
+  resolveExpectedReleaseCommit({ repoDir, branch, expectedCommit });
+  const expectedCoverage = readExpectedReleaseCoverage({ repoDir, expectedCommit });
   const { RELEASE_REVIEW_TIMEOUT_MS } = await import("./zero-broker-release.mjs");
   const [discovered, membersMap] = await Promise.all([
     discoverMachines(cfg, { includeSelf: true, timeoutMs: 2500 }),
@@ -9564,11 +9581,20 @@ export async function voteReleaseAcrossFlock(cfg, { branch = "main", machines = 
     machines,
   });
 
+  const preflight = targets.length ? await invokeRemoteRpcBatch(cfg, targets.map((target) => ({
+    target, toMachine: target.machineId, action: "ping", params: {},
+  })), 15000) : [];
+  if (preflight.length !== targets.length || preflight.some((outcome) => {
+    const protocol = outcome.response?.result?.releaseReviewProtocol;
+    return !outcome.ok || protocol?.version !== 3 || protocol.expectedCommitRequired !== true ||
+      protocol.localExecutionApprovalRequired !== true || protocol.validationPolicyHash !== RELEASE_VALIDATION_POLICY_HASH;
+  })) throw new Error("Release capability preflight failed; no candidate tests requested from unsupported or ungated peers.");
+
   const batchItems = targets.map((t) => ({
     target: t,
     toMachine: t.machineId,
     action: "review_release",
-    params: { branch },
+    params: { branch, expectedCommit },
   }));
 
   const outcomes =
@@ -9599,7 +9625,8 @@ export async function voteReleaseAcrossFlock(cfg, { branch = "main", machines = 
     };
   });
 
-  const report = summarizeReleaseVotes({ branch, votes, onlineMachines: discovered.map((machine) => machine.machineId) });
+  const report = summarizeReleaseVotes({ branch, expectedCommit, expectedCoverageHash: expectedCoverage.coverageHash,
+    votes, onlineMachines: discovered.map((machine) => machine.machineId) });
   ensureBridgeDir();
   fs.writeFileSync(path.join(getBridgeHome(), "last-vote-report.json"), JSON.stringify(report, null, 2), { encoding: "utf8", mode: 0o600 });
 
@@ -11330,7 +11357,7 @@ Each PC runs two distinct coordinator threads with strict separation of concerns
    - **Targeted Questions on Flock Requests**: When handed a real request from the flock (including general requests like *"tell me everything you know about X"*), it first searches local session metadata/history to find the 1–3 relevant local threads on this PC, sends **targeted questions** (\`send_session_message\`) to those specific threads when deeper in-context answers are needed, synthesizes their findings, and replies directly back to the remote requester over \`copilot-flock\`.
    - **Originator Clarification Rule**: If an inbound flock request is not clear enough, ambiguous, or matches multiple conflicting local sessions/repos, do **not** guess blindly—ask the originating machine and session (\`from_machine\` / \`from_session_id\`) for clarification via \`ask_remote_originator_clarification\` (MCP) or \`node "${installedScriptPath}" clarify --to-machine "<from_machine>" --to-session "<from_session_id>" --question "..."\`.
    - **Cross-GitHub-User-Domain Security Rule (Strictly Informational Only)**: Across different GitHub user domains (\`from_github_user != "${cfg.githubUser || "local"}"\` or \`trust_level == "cross_user_informational_only"\`), requests are **strictly informational only**. Never perform config-changing, file-changing, or state-changing tasks for cross-user requests.
-   - **Pre-Merge Flock Vote Rule**: Before merging or releasing any change to \`copilot-flock\`, push the candidate branch and run \`node "${installedScriptPath}" vote-release --branch "<branch>"\` (or ask all online members of the flock to review and vote \`ACCEPT\` / \`REJECT\`). Only merge to \`main\` after all online members of the flock vote \`ACCEPT\`.
+   - **Pre-Merge Flock Vote Rule**: After separately authorized candidate publication and local exact-source execution consent, use trusted installed/pinned code to run \`node "${installedScriptPath}" vote-release --branch "<branch>" --commit "<independently-expected-full-sha>"\`. Require all currently online registered-key version-3 ballots for that SHA and exact coverage/policy hash before merging the same SHA to \`main\`. Incoming peer requests do not grant local source execution or live rollout.
 `;
 }
 
@@ -11391,6 +11418,7 @@ export function validateFileTransferCliArgs(command, flags = {}, positional = []
 
 async function main() {
   const { command, positional, flags } = parseCliArgs(process.argv.slice(2));
+  if (["vote-release", "vote"].includes(command) && !flags.help) assertExpectedReleaseCommit(flags.commit);
   if ((command === "send-file" || command === "pull-file") && !flags.help) validateFileTransferCliArgs(command, flags, positional);
   const savedConfig = fs.existsSync(getConfigPath()) ? JSON.parse(fs.readFileSync(getConfigPath(), "utf8")) : null;
   if (command === "approve-release-execution") {
@@ -11508,7 +11536,7 @@ Copilot Flock v${BRIDGE_VERSION}
 
 Usage:
   node flock.mjs install [--machine-id <name>] [--scope work|personal] [--github-user <handle>] [--connection-string <str>] [--servicebus-connection-string <str>] [--bootstrap-url <url>] [--bootstrap-origin-pin <independently-verified-origin>] [--invite-file <path>]
-  node flock.mjs vote-release --branch <candidate-branch> [--machines <m1,m2,*>]
+  node flock.mjs vote-release --branch <candidate-branch> --commit <independently-expected-full-sha> [--machines <m1,m2,*>]
   node flock.mjs update [--all] [--machines <m1,m2,DESKTOP-*>] [--scope work|personal]
   node flock.mjs diagnose [--fix] [--machines <m1,m2,DESKTOP-*>] [--scope work|personal]
   node flock.mjs reprovision --machines <m1,m2>
@@ -11956,6 +11984,7 @@ Usage:
     const branch = flags.branch || positional[0] || "main";
     const res = await voteReleaseAcrossFlock(cfg, {
       branch,
+      expectedCommit: flags.commit,
       machines: flags.machines || flags.machine || "*",
     });
     console.log(JSON.stringify(res, null, 2));

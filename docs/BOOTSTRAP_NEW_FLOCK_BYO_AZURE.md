@@ -144,8 +144,17 @@ reviewed code is not release ACCEPT or permission to upgrade live reviewers.
 Older ungated reviewers must not execute unreviewed source.
 
 Release review then uses exact-commit extraction and a bounded validation worker.
+Copilot supplies an independently expected full SHA (`--commit` in the CLI,
+`expected_commit` in MCP), freezes the branch before broadcast and rejects
+receiver-resolution or ballot mismatches. A capability-only preflight denies
+older ungated peers before requesting tests. Version-3 ballots sign named
+module/test coverage, local execution consent and the canonical policy hash;
+aggregation compares this with the exact Git-tree inventory computed separately
+by the requester. Count-only/version-2 ballots remain diagnostic, not approvals.
+Any downstream merge/push must use that same `expectedCommit`, never infer
+intent from unanimity over a moved branch.
 The worker clears inherited Node test selectors and isolates `COPILOT_HOME`,
-so focused parent tests cannot silently skip candidate tests. Version-2
+so focused parent tests cannot silently skip candidate tests. Version-3
 registered-key ballots sign both the full SHA and complete validation scope;
 legacy smoke-only ballots and partial voter selections are not merge approval.
 All seven root suites are required, including the retained legacy RPC security

@@ -192,9 +192,17 @@ entry points to match, and requires all seven root suites, including the
 actual legacy RPC security regressions and both Zero-Broker suites.
 The compatibility fast check includes its local fixture dependency and an
 isolated profile; it does not replace full-candidate validation.
-Version-2 Ed25519 ballots bind the full commit SHA and validation evidence.
+Release requests require the independently expected full SHA, not branch
+unanimity: Copilot freezes the branch once before broadcast, and each receiver
+rejects a moved branch before executing code. Capability-only preflight refuses
+older ungated reviewers without asking them to run candidate tests.
+Version-3 Ed25519 ballots bind the full commit SHA, local execution consent,
+canonical named module/test coverage and the versioned validation-policy hash.
+Aggregation compares coverage with the inventory independently read from that
+exact Git tree, not counts or the first ballot. The merge/push must retain
+`expectedCommit`; a different HEAD or unanimous replacement SHA is not approved.
 Missing voters, selected subsets, unregistered keys and legacy smoke-only
-ballots cannot approve a merge. Older ballots remain diagnostically verifiable,
+or version-2 ballots cannot approve a merge. Older ballots remain diagnostically verifiable,
 not full-scope approval. LAN and viewer checks remain separate release evidence;
 these changes neither upgrade live reviewers nor authorize deployment.
 Temporary `COPILOT_HOME`, environment filtering and timeouts are **not an OS

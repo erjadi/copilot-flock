@@ -4,6 +4,7 @@ import path from "node:path";
 import { execFile, execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
+import { RELEASE_VALIDATION_POLICY, createReleaseCoverage, verifyReleaseCoverage, releaseTreeFiles } from "./release-policy.mjs";
 
 export const RELEASE_REVIEW_TIMEOUT_MS = 450000;
 const execFileAsync = promisify(execFile);
@@ -29,9 +30,9 @@ export async function validateReleaseCandidateInWorker({ repoDir, commit }) {
   if (!/^[0-9a-f]{40}$/.test(commit)) throw new Error("Release validation requires an immutable commit SHA");
   const { stdout } = await execFileAsync(process.execPath, [
     ...sqliteFlags(), fileURLToPath(import.meta.url), "--validate-candidate", repoDir, commit,
-  ], { encoding: "utf8", windowsHide: true, timeout: 360000, maxBuffer: 8 * 1024 * 1024, env: releaseEnvironment() });
+  ], { encoding: "utf8", windowsHide: true, timeout: RELEASE_VALIDATION_POLICY.workerTimeoutMs, maxBuffer: 8 * 1024 * 1024, env: releaseEnvironment() });
   const result = JSON.parse(stdout);
-  if (result.candidateCommit !== commit || result.modulesSyntaxOk !== true || result.unitTestsOk !== true) {
+  if (result.candidateCommit !== commit || result.modulesSyntaxOk !== true || result.unitTestsOk !== true || !verifyReleaseCoverage(result)) {
     throw new Error("Release worker returned incomplete or mismatched candidate validation");
   }
   return result;
@@ -42,13 +43,9 @@ export function materializeReleaseCandidate({ repoDir, commit, exec = execFileSy
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "flock-release-"));
   const options = { stdio: ["ignore", "pipe", "pipe"], windowsHide: true, maxBuffer: 8 * 1024 * 1024, timeout: 15000 };
   try {
-    const entries = exec("git", ["-C", repoDir, "ls-tree", "-r", "-z", commit], options).toString("utf8").split("\0").filter(Boolean);
+    const entries = releaseTreeFiles(exec("git", ["-C", repoDir, "ls-tree", "-r", "-z", commit], options));
     const files = [];
-    for (const entry of entries) {
-      const match = /^100(?:644|755) blob [0-9a-f]{40}\t(.+)$/.exec(entry);
-      if (!match) throw new Error("Release tree contains an unsupported entry or symbolic link");
-      const filename = match[1];
-      if (filename.split("/").some((part) => !part || part === "." || part === "..") || filename.includes("\\") || filename.includes(":")) throw new Error("Unsafe release tree path");
+    for (const filename of entries) {
       const target = path.join(directory, ...filename.split("/"));
       fs.mkdirSync(path.dirname(target), { recursive: true });
       fs.writeFileSync(target, exec("git", ["-C", repoDir, "show", `${commit}:${filename}`], options));
@@ -69,19 +66,19 @@ export function validateReleaseCandidate({ repoDir, commit, exec = execFileSync 
     const modules = files.filter((filename) => filename.endsWith(".mjs"));
     for (const filename of modules) exec(process.execPath, ["--check", filename], options);
     const tests = files.filter((filename) => path.dirname(filename) === path.join(directory, "test") && filename.endsWith(".test.mjs"));
-    const requiredModules = ["flock.mjs", "bridge.mjs", "bootstrap-server.mjs",
-      "zero-broker-roster.mjs", "zero-broker-transport.mjs", "zero-broker-runtime.mjs",
-      "zero-broker-lifecycle.mjs", "zero-broker-enrollment.mjs", "zero-broker-release.mjs"];
-    const requiredTests = ["flock", "bridge", "setup", "contracts", "rpc-security", "zero-broker-roster", "zero-broker-lifecycle"];
+    const requiredModules = RELEASE_VALIDATION_POLICY.requiredModules;
+    const requiredTests = RELEASE_VALIDATION_POLICY.requiredTests;
     if (requiredModules.some((name) => !files.includes(path.join(directory, name))) ||
-        requiredTests.some((name) => !tests.includes(path.join(directory, "test", `${name}.test.mjs`)))) {
+        requiredTests.some((name) => !tests.includes(path.join(directory, ...name.split("/"))))) {
       throw new Error("Release candidate lacks required canonical, legacy or Zero-Broker validation surfaces");
     }
     if (!fs.readFileSync(path.join(directory, "flock.mjs")).equals(fs.readFileSync(path.join(directory, "bridge.mjs")))) {
       throw new Error("Release candidate canonical and compatibility entry points differ");
     }
-    exec(process.execPath, [...nodeFlags, "--test", "--test-concurrency=1", ...tests], { ...options, cwd: directory, timeout: 300000, env: releaseEnvironment(path.join(directory, "isolated-home")) });
-    return { modulesSyntaxOk: true, unitTestsOk: true, moduleCount: modules.length, testFileCount: tests.length, candidateCommit: commit, verificationLevel: "complete_candidate_syntax_and_root_tests" };
+    const inventory = createReleaseCoverage(files.map((filename) => path.relative(directory, filename).split(path.sep).join("/")));
+    exec(process.execPath, [...nodeFlags, "--test", "--test-concurrency=1", ...tests], { ...options, cwd: directory, timeout: RELEASE_VALIDATION_POLICY.testTimeoutMs, env: releaseEnvironment(path.join(directory, "isolated-home")) });
+    return { modulesSyntaxOk: true, unitTestsOk: true, moduleCount: modules.length, testFileCount: tests.length,
+      ...inventory, candidateCommit: commit, verificationLevel: "complete_candidate_syntax_and_root_tests" };
   } finally { fs.rmSync(directory, { recursive: true, force: true }); }
 }
 

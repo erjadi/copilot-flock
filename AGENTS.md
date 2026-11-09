@@ -249,6 +249,10 @@ Before merging or releasing **any** change to `copilot-flock`:
    do not authorize this command. Temporary profiles are not an OS sandbox;
    never run unreviewed source through an older ungated reviewer.
    ```powershell
-   node ~/.copilot/flock/flock.mjs vote-release --branch "<branch>"
+   node ~/.copilot/flock/flock.mjs vote-release --branch "<branch>" --commit "<independently-expected-full-sha>"
    ```
 3. Only merge/push to `main` and run `node ~/.copilot/flock/flock.mjs reprovision` after all online members of the flock vote **`ACCEPT`**.
+   Require version-3 registered-key ballots for that exact expected SHA and
+   Git-tree coverage/policy hash. Capability preflight must not send tests to
+   older ungated peers. Never merge a different HEAD or infer intent from a
+   unanimous moved branch; live reprovisioning still needs separate consent.
