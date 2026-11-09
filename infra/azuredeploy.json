@@ -32,11 +32,31 @@
     "serviceBusTopicName": {
       "type": "string",
       "defaultValue": "copilot-bridge-offline"
+    },
+    "deployTokenBroker": {
+      "type": "bool",
+      "defaultValue": true
+    },
+    "appServiceSku": {
+      "type": "string",
+      "defaultValue": "B1",
+      "allowedValues": ["B1", "F1"]
+    },
+    "allowedGithubRepo": {
+      "type": "string",
+      "defaultValue": "erjadi/copilot-flock"
+    },
+    "platformMaintainerUser": {
+      "type": "string",
+      "defaultValue": ""
     }
   },
   "variables": {
-    "signalrName": "[format('{0}-signalr-{1}', parameters('namePrefix'), parameters('uniqueSuffix'))]",
-    "serviceBusNamespaceName": "[format('{0}-sb-{1}', parameters('namePrefix'), parameters('uniqueSuffix'))]"
+    "signalrName": "[format('{0}-signalr-{1}', toLower(parameters('namePrefix')), parameters('uniqueSuffix'))]",
+    "serviceBusNamespaceName": "[format('{0}-sb-{1}', toLower(parameters('namePrefix')), parameters('uniqueSuffix'))]",
+    "webAppName": "[format('{0}-broker-{1}', toLower(parameters('namePrefix')), parameters('uniqueSuffix'))]",
+    "appServicePlanName": "[format('{0}-plan-{1}', toLower(parameters('namePrefix')), parameters('uniqueSuffix'))]",
+    "serviceBusDataOwnerRole": "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '090c5cfd-751d-490a-894a-3ce6f1109419')]"
   },
   "resources": [
     {
@@ -71,9 +91,79 @@
       "name": "[format('{0}/{1}', variables('serviceBusNamespaceName'), parameters('serviceBusTopicName'))]",
       "dependsOn": ["[resourceId('Microsoft.ServiceBus/namespaces', variables('serviceBusNamespaceName'))]"],
       "properties": {}
+    },
+    {
+      "condition": "[parameters('deployTokenBroker')]",
+      "type": "Microsoft.Web/serverfarms",
+      "apiVersion": "2023-12-01",
+      "name": "[variables('appServicePlanName')]",
+      "location": "[parameters('location')]",
+      "kind": "linux",
+      "sku": {
+        "name": "[parameters('appServiceSku')]",
+        "tier": "[if(equals(parameters('appServiceSku'), 'F1'), 'Free', 'Basic')]",
+        "capacity": 1
+      },
+      "properties": { "reserved": true }
+    },
+    {
+      "condition": "[parameters('deployTokenBroker')]",
+      "type": "Microsoft.Web/sites",
+      "apiVersion": "2023-12-01",
+      "name": "[variables('webAppName')]",
+      "location": "[parameters('location')]",
+      "kind": "app,linux",
+      "identity": { "type": "SystemAssigned" },
+      "dependsOn": [
+        "[resourceId('Microsoft.Web/serverfarms', variables('appServicePlanName'))]",
+        "[resourceId('Microsoft.SignalRService/signalR', variables('signalrName'))]",
+        "[resourceId('Microsoft.ServiceBus/namespaces', variables('serviceBusNamespaceName'))]"
+      ],
+      "properties": {
+        "serverFarmId": "[resourceId('Microsoft.Web/serverfarms', variables('appServicePlanName'))]",
+        "httpsOnly": true,
+        "siteConfig": {
+          "linuxFxVersion": "NODE|22-lts",
+          "appCommandLine": "node bootstrap-server.mjs",
+          "alwaysOn": "[not(equals(parameters('appServiceSku'), 'F1'))]",
+          "ftpsState": "Disabled",
+          "minTlsVersion": "1.2",
+          "appSettings": [
+            { "name": "SIGNALR_CONNECTION_STRING", "value": "[listKeys(resourceId('Microsoft.SignalRService/signalR', variables('signalrName')), '2023-02-01').primaryConnectionString]" },
+            { "name": "SERVICEBUS_CONNECTION_STRING", "value": "[listKeys(resourceId('Microsoft.ServiceBus/namespaces/AuthorizationRules', variables('serviceBusNamespaceName'), 'RootManageSharedAccessKey'), '2022-10-01-preview').primaryConnectionString]" },
+            { "name": "SERVICEBUS_NAMESPACE", "value": "[format('{0}.servicebus.windows.net', variables('serviceBusNamespaceName'))]" },
+            { "name": "SERVICEBUS_TOPIC", "value": "[parameters('serviceBusTopicName')]" },
+            { "name": "COPILOT_FLOCK_HUB", "value": "copilotbridge" },
+            { "name": "ALLOWED_GITHUB_REPO", "value": "[parameters('allowedGithubRepo')]" },
+            { "name": "PLATFORM_MAINTAINER_USER", "value": "[parameters('platformMaintainerUser')]" },
+            { "name": "PUBLIC_BOOTSTRAP_URL", "value": "[format('https://{0}.azurewebsites.net', variables('webAppName'))]" },
+            { "name": "SCM_DO_BUILD_DURING_DEPLOYMENT", "value": "false" },
+            { "name": "WEBSITES_ENABLE_APP_SERVICE_STORAGE", "value": "true" }
+          ]
+        }
+      }
+    },
+    {
+      "condition": "[parameters('deployTokenBroker')]",
+      "type": "Microsoft.ServiceBus/namespaces/providers/roleAssignments",
+      "apiVersion": "2022-04-01",
+      "name": "[format('{0}/Microsoft.Authorization/{1}', variables('serviceBusNamespaceName'), guid(resourceGroup().id, variables('webAppName'), 'servicebus-data-owner'))]",
+      "dependsOn": [
+        "[resourceId('Microsoft.ServiceBus/namespaces', variables('serviceBusNamespaceName'))]",
+        "[resourceId('Microsoft.Web/sites', variables('webAppName'))]"
+      ],
+      "properties": {
+        "roleDefinitionId": "[variables('serviceBusDataOwnerRole')]",
+        "principalId": "[if(parameters('deployTokenBroker'), reference(resourceId('Microsoft.Web/sites', variables('webAppName')), '2023-12-01', 'Full').identity.principalId, json('null'))]",
+        "principalType": "ServicePrincipal"
+      }
     }
   ],
   "outputs": {
+    "subscriptionId": {
+      "type": "string",
+      "value": "[subscription().subscriptionId]"
+    },
     "signalrName": {
       "type": "string",
       "value": "[variables('signalrName')]"
@@ -81,10 +171,6 @@
     "signalrHostName": {
       "type": "string",
       "value": "[reference(resourceId('Microsoft.SignalRService/signalR', variables('signalrName')), '2023-02-01').hostName]"
-    },
-    "signalrConnectionString": {
-      "type": "string",
-      "value": "[listKeys(resourceId('Microsoft.SignalRService/signalR', variables('signalrName')), '2023-02-01').primaryConnectionString]"
     },
     "serviceBusNamespaceName": {
       "type": "string",
@@ -94,13 +180,17 @@
       "type": "string",
       "value": "[format('sb://{0}.servicebus.windows.net/', variables('serviceBusNamespaceName'))]"
     },
-    "serviceBusConnectionString": {
-      "type": "string",
-      "value": "[listKeys(resourceId('Microsoft.ServiceBus/namespaces/AuthorizationRules', variables('serviceBusNamespaceName'), 'RootManageSharedAccessKey'), '2022-10-01-preview').primaryConnectionString]"
-    },
     "serviceBusTopicName": {
       "type": "string",
       "value": "[parameters('serviceBusTopicName')]"
+    },
+    "bootstrapUrl": {
+      "type": "string",
+      "value": "[if(parameters('deployTokenBroker'), format('https://{0}.azurewebsites.net', variables('webAppName')), '')]"
+    },
+    "webAppName": {
+      "type": "string",
+      "value": "[if(parameters('deployTokenBroker'), variables('webAppName'), '')]"
     }
   }
 }

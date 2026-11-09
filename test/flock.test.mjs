@@ -94,7 +94,7 @@ test("reply and clarification shell examples strip unsafe remote identifiers", (
 
 test("public distribution has Apache licensing, loopback viewer defaults and synthetic demo traffic", () => {
   if (process.env.BRIDGE_FAST_VOTE_TEST === "1" && !fs.existsSync(new URL("../package.json", import.meta.url))) return;
-  for (const file of ["../package.json", "../lan-trial/package.json", "../viewer/package.json"]) {
+  for (const file of ["../package.json", "../viewer/package.json"]) {
     const manifest = JSON.parse(fs.readFileSync(new URL(file, import.meta.url), "utf8"));
     assert.equal(manifest.license, "Apache-2.0");
   }
@@ -114,7 +114,7 @@ test("public distribution has Apache licensing, loopback viewer defaults and syn
   }
 });
 
-test("managed ARM template deploys Serverless SignalR and Standard Service Bus with connection outputs", () => {
+test("managed ARM template deploys Serverless SignalR and Standard Service Bus without secret outputs", () => {
   if (process.env.BRIDGE_FAST_VOTE_TEST === "1" && !fs.existsSync(new URL("../package.json", import.meta.url))) return;
   const template = JSON.parse(fs.readFileSync(new URL("../infra/azuredeploy.json", import.meta.url), "utf8"));
   assert.equal(template.$schema, "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#");
@@ -134,11 +134,8 @@ test("managed ARM template deploys Serverless SignalR and Standard Service Bus w
   assert.equal(serviceBus.sku.name, "[parameters('serviceBusSku')]");
   assert.ok(topic.dependsOn.includes("[resourceId('Microsoft.ServiceBus/namespaces', variables('serviceBusNamespaceName'))]"));
   assert.equal(template.parameters.serviceBusTopicName.defaultValue, "copilot-bridge-offline");
-  for (const name of ["signalrConnectionString", "serviceBusConnectionString"]) {
-    assert.equal(template.outputs[name].type, "string");
-    assert.match(template.outputs[name].value, /^\[listKeys\(/);
-    assert.match(template.outputs[name].value, /\.primaryConnectionString\]$/);
-  }
+  assert.ok(template.outputs.bootstrapUrl && template.outputs.webAppName);
+  assert.doesNotMatch(JSON.stringify(template.outputs), /listKeys|ConnectionString|AccessKey/i);
 });
 
 test("bootstrap rejects public read access and requires authenticated owner, write access or explicit allowlisting", async () => {

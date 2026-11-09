@@ -4,6 +4,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROVISION_AZURE=false
 RESOURCE_GROUP="rg-copilot-flock"
 LOCATION="eastus"
+SUBSCRIPTION=""
+NAME_PREFIX="flock"
+SKIP_BROKER=false
 SCOPE="${COPILOT_FLOCK_SCOPE:-${COPILOT_BRIDGE_SCOPE:-}}"
 MACHINE_ID="${COPILOT_FLOCK_MACHINE_ID:-${COPILOT_BRIDGE_MACHINE_ID:-}}"
 INVITE_FILE="${COPILOT_FLOCK_INVITE_FILE:-}"
@@ -21,6 +24,9 @@ while [[ $# -gt 0 ]]; do
     --provision-azure) PROVISION_AZURE=true; shift ;;
     --resource-group) require_value "$@"; RESOURCE_GROUP="$2"; shift 2 ;;
     --location) require_value "$@"; LOCATION="$2"; shift 2 ;;
+    --subscription) require_value "$@"; SUBSCRIPTION="$2"; shift 2 ;;
+    --name-prefix) require_value "$@"; NAME_PREFIX="$2"; shift 2 ;;
+    --skip-broker) SKIP_BROKER=true; shift ;;
     --scope) require_value "$@"; SCOPE="$2"; shift 2 ;;
     --machine-id) require_value "$@"; MACHINE_ID="$2"; shift 2 ;;
     --invite-file) require_value "$@"; INVITE_FILE="$2"; shift 2 ;;
@@ -34,8 +40,9 @@ done
 command -v node >/dev/null 2>&1 || fail "Node.js is required before running setup."
 [[ -z "$SCOPE" || "$SCOPE" == work || "$SCOPE" == personal ]] || fail "Scope must be work or personal."
 if [[ "$PROVISION_AZURE" == true ]]; then
-  [[ -z "$INVITE_FILE" && -z "$CONNECTION_STRING" && -z "$SERVICEBUS_CONNECTION_STRING" ]] ||
-    fail "--provision-azure cannot be combined with an invite or existing connection strings."
+  [[ -z "$INVITE_FILE" && -z "$CONNECTION_STRING" && -z "$SERVICEBUS_CONNECTION_STRING" && -z "$BOOTSTRAP_URL" ]] ||
+    fail "--provision-azure cannot be combined with an invite, bootstrap URL or existing connection strings."
+  [[ "$NAME_PREFIX" =~ ^[a-zA-Z0-9]{1,20}$ ]] || fail "Name prefix must be 1-20 alphanumeric characters."
   if ! command -v az >/dev/null 2>&1; then
     case "$(uname -s)" in
       Darwin)
@@ -66,25 +73,30 @@ if [[ "$PROVISION_AZURE" == true ]]; then
       az login --output none
     fi
   fi
-  az group create --name "$RESOURCE_GROUP" --location "$LOCATION" --output none
-  DEPLOYMENT_OUTPUT="$(az deployment group create --resource-group "$RESOURCE_GROUP" \
-    --template-file "$SCRIPT_DIR/infra/azuredeploy.json" --query "properties.outputs" --output json)"
-  output_value() {
-    printf '%s' "$DEPLOYMENT_OUTPUT" | node -e '
-      const fs = require("node:fs");
-      let output;
-      try { output = JSON.parse(fs.readFileSync(0, "utf8")); }
-      catch { console.error("Azure deployment returned malformed JSON outputs."); process.exit(1); }
-      const value = output?.[process.argv[1]]?.value;
-      if (typeof value !== "string" || !value.trim()) {
-        console.error("Azure deployment did not return the required connection string."); process.exit(1);
-      }
-      process.stdout.write(value);
-    ' "$1"
-  }
-  CONNECTION_STRING="$(output_value signalrConnectionString)"
-  SERVICEBUS_CONNECTION_STRING="$(output_value serviceBusConnectionString)"
-  echo "Managed Azure resources are ready; installing full Flock locally."
+  [[ -z "$SUBSCRIPTION" ]] || az account set --subscription "$SUBSCRIPTION"
+  SUBSCRIPTION="$(az account show --query id --output tsv)"
+  [[ "$SUBSCRIPTION" =~ ^[a-fA-F0-9-]{36}$ ]] || fail "Cannot resolve the selected Azure subscription."
+  GITHUB_USER="${GITHUB_USER:-}"
+  if [[ "$SKIP_BROKER" == false ]]; then
+    if [[ -z "$GITHUB_USER" ]]; then
+      command -v gh >/dev/null 2>&1 || fail "Sign in to GitHub CLI or provide GITHUB_USER before provisioning."
+      GITHUB_USER="$(gh api user --jq .login)"
+    fi
+    [[ "$GITHUB_USER" =~ ^[a-zA-Z0-9][a-zA-Z0-9-]{0,38}$ ]] || fail "Invalid GitHub maintainer."
+  fi
+  az group create --subscription "$SUBSCRIPTION" --name "$RESOURCE_GROUP" --location "$LOCATION" --output none
+  DEPLOYMENT_OUTPUT="$(az deployment group create --subscription "$SUBSCRIPTION" --resource-group "$RESOURCE_GROUP" \
+    --template-file "$SCRIPT_DIR/infra/azuredeploy.json" \
+    --parameters "location=$LOCATION" "namePrefix=$NAME_PREFIX" "deployTokenBroker=$([[ "$SKIP_BROKER" == false ]] && echo true || echo false)" \
+    "platformMaintainerUser=$GITHUB_USER" --query "properties.outputs" --output json 2>/dev/null)" ||
+    fail "Azure ARM deployment failed; captured output withheld."
+  MANAGED_ARGS=("$SCRIPT_DIR/managed-azure-setup.mjs" "--subscription" "$SUBSCRIPTION" "--resource-group" "$RESOURCE_GROUP")
+  [[ -z "$GITHUB_USER" ]] || MANAGED_ARGS+=("--github-user" "$GITHUB_USER")
+  [[ -z "$SCOPE" ]] || MANAGED_ARGS+=("--scope" "$SCOPE")
+  [[ -z "$MACHINE_ID" ]] || MANAGED_ARGS+=("--machine-id" "$MACHINE_ID")
+  [[ "$SKIP_BROKER" == false ]] || MANAGED_ARGS+=("--skip-broker")
+  printf '%s' "$DEPLOYMENT_OUTPUT" | node "${MANAGED_ARGS[@]}"
+  exit $?
 fi
 
 ARGS=("$SCRIPT_DIR/flock.mjs" "install")

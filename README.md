@@ -11,9 +11,9 @@ Ask your laptop's Copilot what your home desktop is building, dispatch a task to
 For example: *"Ask my Linux GPU server's Copilot to check whether its worker is
 ready for this build, and bring the answer back here."* Full deployed Flock
 routes that request to the remote coordinator, hands deeper discovery to its
-tracker, and returns permitted findings to the requesting session. The hubless
-trial demonstrates the simpler first step: delivering a benign message to an
-explicitly selected existing Desktop session on another LAN PC.
+tracker, and returns permitted findings to the requesting session. Deploy the
+stack once in your Azure subscription, then enroll additional PCs with signed
+invites.
 
 | Your Situation | Copy & Paste This Single Prompt into Your GitHub Copilot Chat |
 | :--- | :--- |
@@ -30,121 +30,33 @@ Tell Copilot: *"Set up a new full Flock using the managed ARM template. Confirm
 my Azure subscription, resource group, region, scope and costs first."*
 Copilot can run `.\setup.ps1 -ProvisionAzure -Scope personal` on Windows or
 `./setup.sh --provision-azure --scope personal` on Debian/Ubuntu or macOS.
-Optional resource-group and region settings are `-ResourceGroup` / `-Location`
-or `--resource-group` / `--location` (defaults: `rg-copilot-flock`, `eastus`).
+Selectors include subscription, resource group, location and resource-name
+prefix (`-SubscriptionId`, `-ResourceGroup`, `-Location`, `-NamePrefix`, or
+`--subscription`, `--resource-group`, `--location`, `--name-prefix`). Defaults
+are the current subscription, `rg-copilot-flock`, `eastus` and `flock`.
 
 The wrappers install Azure CLI if missing, authenticate if needed, deploy
-[`infra/azuredeploy.json`](./infra/azuredeploy.json), and pass the resulting
-connection strings directly into the full Flock installer. Windows CLI
+[`infra/azuredeploy.json`](./infra/azuredeploy.json), ZIP deploy the default
+Linux Node 22 Token Broker, and wait for its configured HTTPS health endpoint.
+Keys are retrieved through authorized subscription/resource-pinned Azure
+commands, then passed in memory to the installer with the broker origin.
+Neither ARM outputs nor managed installer arguments contain keys. Windows CLI
 installation can require UAC; Debian/Ubuntu can require `sudo`; macOS requires
 existing Homebrew. Headless Linux uses device-code login. Node.js must already
 be available. Without the provisioning flag, existing invite/direct-string
 installation remains unchanged and no Azure resources are provisioned.
 
-The template creates **SignalR Serverless (Free_F1 by default), Service Bus
-Standard and the offline topic**. Service Bus is billed; quotas, regional
-availability and subscription policy can reject deployment. It does **not**
-deploy the optional Token Broker; add that component separately for signed
-one-step invites and collaborator/guest onboarding. Connection-string outputs
-are sensitive Azure deployment records, not publishable setup logs. This is
-managed provisioning of your own components, not a vendor-hosted service.
+The template creates **SignalR Serverless (Free_F1), Service Bus Standard and
+the offline topic, plus a Token Broker Web App on a Linux B1 plan** by default.
+The broker has persistent storage and a managed identity with namespace-scoped
+Service Bus permissions; deployment requires permission to create that role
+assignment. Service Bus and B1 hosting are billed separately; quotas, regional
+availability and subscription policy can reject deployment. `-SkipBroker` /
+`--skip-broker` deliberately omits hosting and signed broker invites.
+Setup confirms registration and v3 enrollment before reporting success.
+This is your own deployment, not a vendor-hosted service. Local mock tests do
+not establish live Azure acceptance; resources remain deployed on failures.
 See the [managed setup guide](./docs/BOOTSTRAP_NEW_FLOCK_BYO_AZURE.md).
-
-## Try it out hubless; deploy the components for the real potential
-
-**The Hubless LAN-Direct Trial is a "Try It Out" onboarding sandbox, not the
-full deployed product.** It lets you see two Copilots exchange a message on
-the same reachable local network without first provisioning Azure components.
-Ask Copilot: *"Help me try the separate hubless LAN trial on these two PCs.
-Keep full Flock unchanged, and ask before pairing, granting sessions or changing
-firewall rules."* See the [trial guide](./docs/LAN_TRIAL.md).
-
-On prepared PCs the demonstration can take a few minutes; dependency setup,
-certificate verification, firewalls and permission prompts can take longer.
-"Sandbox" describes the limited onboarding scope, **not an OS sandbox** or
-permission to trust remote prompts. The trial has its own entry point, state,
-keys and `copilot-lan-trial` MCP name. It passed a bounded Windows two-PC live
-acceptance run and independent code reviews, not universal live-platform tests.
-
-**Deploy Azure SignalR Serverless and Azure Service Bus, plus the Token Broker
-for signed one-step enrollment, to unlock day-to-day fleet collaboration.**
-SignalR provides real-time cloud rendezvous; Service Bus supplies durable
-offline delivery; the broker makes the owner's deployment reusable by invited
-machines. Deploy once, then invite machines 2..N rather than pair every LAN
-endpoint manually. The broker is optional for direct connection-string setup,
-but is the component that enables the streamlined invite journey.
-
-### Capability comparison: "Try It Out" vs. full deployed Flock
-
-| Capability | Hubless LAN-Direct Trial (`lan-trial`) | Full deployed Copilot Flock (`flock.mjs`) |
-| --- | --- | --- |
-| Setup | Zero cloud/Azure provisioning; separate dependency preparation and temporary listener/state on each PC. | Owner provisions/connects SignalR Serverless + Service Bus; deploys a broker for signed invites. |
-| Network reach | Explicit private IPv4 and port on the same reachable LAN; both listeners must run. | Outbound cloud connections avoid peer inbound ports/NAT forwarding; intended across home, office, coffee shops and hotspots. |
-| Firewall friction | Per-host access must be checked; a narrowly scoped inbound rule and Windows UAC consent may be needed. No automatic firewall changes. | No inbound application listener required in the deployed design. SignalR uses WSS over TCP 443; Service Bus uses the deployed client's configured transport. Corporate proxy/egress policies still apply. |
-| Offline delivery | None. Sleeping, unreachable or non-listening peers cannot receive; results may be `OFFLINE` or `UNKNOWN`. | Service Bus store-and-forward drains on reconnect/wake with deduplication, subject to queue configuration, retention and credentials. |
-| Pairing/enrollment | Exchange public certificate offers, independently verify fingerprints and approve both peers locally. | Signed `copilot-flock-invite-v3` enrolls additional machines in one Copilot-led step through the deployed broker. "30 seconds" is an ideal onboarding target, not a guarantee. |
-| Finding useful sessions | Manually select session UUIDs and grant each peer/session/action; no automatic spawning. | Two coordinators route requests and search/synthesize permitted local knowledge; router aims to hand off in under two seconds, not finish research in that time. |
-| GUI/headless fleet | Existing Desktop loopback control plane only; no headless CLI fallback. | Desktop machines plus headless Ubuntu/Debian/GPU CLI hosts, subject to platform setup and runtime availability. |
-| Permissions | Selected existing sessions keep their modes/tool permissions; no CLI privilege substitution. | Broader orchestration includes privileged coordinator/headless flows. Review their trust and permissions separately; do not infer the trial's narrow guarantees. |
-| Namespaces/sharing | Local pinned peers with default-zero session grants; no cloud multi-flock hierarchy. | `<owner>/<flock>[/<machineId>]`, `personal`/`work`, collaborator teams and time-bound guests, with four anti-leakage boundaries. |
-| Remote sessions | Excluded. | Remote session creation and worker routing. |
-| Files/Git | Excluded; no arbitrary file/branch RPC. | SHA-256 chunked files and Git-bundle transfer. |
-| Coordination/resources | No distributed locks or fleet governance. | Resource locks, live machine/multi-GPU VRAM telemetry and signed Ed25519 release voting. |
-| Visualization | Minimal peer status and explicit session list. | Mermaid/overlap views and bipartite SVG flock topology maps. |
-| Revocation | Local peer/session revoke; cannot undo admitted work. | Per-flock membership revocation and time-bound guest expiry, with their documented isolation rules. |
-
-### Why the trial hits a wall in daily engineering
-
-Our live onboarding exposed the cost of a cloudless direct connection: choose
-the right interface/port, inspect per-PC Windows firewall policy, handle UAC
-consent where needed, exchange and verify certificate offers, and explicitly
-share a particular session UUID with message permission. Copilot performs the
-commands, but cannot eliminate those local security decisions. A listener,
-network or certificate change means revisiting that setup.
-
-Leave the LAN or lose reachability through VLANs, Wi-Fi client isolation or a
-VPN, and that direct endpoint stops being useful. VPNs are not universally
-incompatible, but the trial provides no traversal or route repair. A sleeping
-laptop has no queue waiting for it. A headless Linux CLI server cannot use this
-Desktop-only adapter. There is no fleet switchboard, guest invitation lifecycle,
-session spawning, file transfer or release ballot in the trial.
-
-For everyday work, ask: *"Deploy full Copilot Flock's components in my Azure
-subscription, then enroll these machines with signed invites."* That is a
-separate installation decision, not an automatic upgrade of trial state.
-The [new-deployment guide](./docs/BOOTSTRAP_NEW_FLOCK_BYO_AZURE.md) and
-[joining guide](./docs/JOINING_AND_SHARING_GUIDE.md) cover those paths. External
-collaborators still see **no sessions by default**: the full platform's
-switchboard does not bypass explicit sharing or flock boundaries.
-
-### Deployment costs, security and versioned evidence
-
-Azure SignalR offers a Free tier usable with Serverless mode, subject to its
-connection/message limits. Service Bus **Standard** supplies the required
-topics/subscriptions; broker hosting is a separate resource. Budget for their
-published capacity/usage charges and monitoring rather than assuming the
-whole deployment is free or promising a fixed price. Small deployments can
-use low-cost hosting, but actual cost depends on region, traffic and sizing.
-
-The four full-platform security boundaries are: isolated per-flock
-`v3_flock_<uuid>` cryptographic hubs; explicit `share_thread` opt-in with
-approved snapshots; `boundFlockId` partitioning; and membership expiry /
-`rosterEpoch` revocation. Same-owner autopilot/allow-all sessions may execute
-trusted owner instructions. External/guest callers are restricted to permitted
-informational access; sharing a machine does not authorize privileged execution
-or expose all of its sessions.
-
-| Version/platform evidence | What was established | What was not established |
-| --- | --- | --- |
-| Full Flock v3.3 baseline | Desktop Windows x64/ARM64 and Linux x64 GUI/headless CLI are full-runtime deployment paths; 7 baseline tests passed locally and in independent Linux review. | Seven tests are not exhaustive platform certification, a latency promise or seven release votes. |
-| LAN trial r5, Windows x64 | 46/46 isolated tests; real two-PC Windows11 Desktop admission both ways, denied unshared/post-unshare access and restored original state. | Not every Windows/Desktop build, network policy or future app version. |
-| LAN trial r5, Windows ARM64 | Independent 46/46 isolated tests and code-only review. | No physical ARM64 Desktop acceptance in this trial. |
-| LAN trial r5, Ubuntu x64 | Independent 46/46 isolated tests plus 7/7 full baseline. | No live Linux Desktop trial acceptance; trial cannot use headless CLI. |
-| macOS/other architectures | Full setup includes platform paths; no new live evidence from this trial. | No new certification or all-platform guarantee. |
-
-The LAN trial always needs Desktop's `ws.port`/`ws.token` control plane.
-The full platform's headless CLI path is deliberately separate; never use its
-privileged fallback to make a trial acceptance test appear to pass.
 
 ![Copilot Flock Bipartite Multi-Flock Topology (Warm Alabaster Light Theme)](./docs/assets/flock-topology-light.svg)
 *(Prefer dark mode? View the [Dark-Mode Bipartite SVG Topology Map](./docs/assets/flock-topology-dark.svg) or ask your Copilot: `"Show me a flock topology diagram"`.)*
@@ -193,7 +105,7 @@ Open GitHub Copilot on your first computer and say:
 
 Your Copilot will:
 1. Auto-detect whether your computer is a **`personal`** or **`work`** machine and ask you to confirm with 1 click.
-2. Provision (or connect to) your own **Azure SignalR Service** (`Serverless` mode — works on the Free tier!) and **Azure Service Bus Namespace** (for durable offline queues).
+2. Provision your own **Azure SignalR Service**, **Service Bus Standard** offline topic and default **Token Broker Web App** (or connect to approved existing resources).
 3. Enroll your first computer as `<your-github-handle>/<scope>/<HOSTNAME>` and generate a **Path 1 Invite JSON** that you can paste into all of your other computers!
 - Full guide: **[Setting Up a Brand-New Flock with BYO Azure (`docs/BOOTSTRAP_NEW_FLOCK_BYO_AZURE.md`)](./docs/BOOTSTRAP_NEW_FLOCK_BYO_AZURE.md)**
 

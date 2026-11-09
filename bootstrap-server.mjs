@@ -1552,7 +1552,7 @@ export function createBootstrapServer({
   return http.createServer(async (req, res) => {
   const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
 
-  if (url.pathname === "/" || url.pathname === "/healthz") {
+  if (url.pathname === "/" || url.pathname === "/healthz" || url.pathname === "/health") {
     const registry = loadMembersRegistry();
     const qStore = loadOfflineQueueStore();
     const v3Store = loadV3FlockStore();

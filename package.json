@@ -21,7 +21,7 @@
     "sessions": "node flock.mjs sessions",
     "viewer": "node viewer/viewer-server.mjs",
     "self-test": "node flock.mjs self-test",
-    "test": "node --test test/flock.test.mjs test/bridge.test.mjs test/setup.test.mjs"
+    "test": "node --test test/flock.test.mjs test/bridge.test.mjs test/setup.test.mjs test/managed-azure-setup.test.mjs"
   },
   "engines": {
     "node": ">=18.0.0"

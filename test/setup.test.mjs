@@ -4,209 +4,228 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const root = fileURLToPath(new URL("../", import.meta.url));
-const fakeSignalr = "Endpoint=https://example.service.signalr.net;AccessKey=synthetic;";
-const fakeServiceBus = "Endpoint=sb://example.servicebus.windows.net/;SharedAccessKey=synthetic;";
-const cleanEnv = {
-  ...process.env,
-  SIGNALR_CONNECTION_STRING: "",
-  SERVICEBUS_CONNECTION_STRING: "",
-  COPILOT_FLOCK_INVITE_FILE: "",
-  COPILOT_FLOCK_BOOTSTRAP_URL: "",
-  COPILOT_FLOCK_SCOPE: "",
-  COPILOT_BRIDGE_SCOPE: "",
-};
-const readJournal = (file) => fs.existsSync(file)
-  ? fs.readFileSync(file, "utf8").trim().split(/\r?\n/).filter(Boolean).map((line) => JSON.parse(line.replace(/^\uFEFF/, "")))
-  : [];
+const subscription = "11111111-2222-3333-4444-555555555555";
+const metadata = Object.fromEntries(Object.entries({
+  subscriptionId: subscription, signalrName: "demo-signalr",
+  signalrHostName: "demo-signalr.service.signalr.net",
+  serviceBusNamespaceName: "demo-sb", serviceBusEndpoint: "sb://demo-sb.servicebus.windows.net/",
+  serviceBusTopicName: "copilot-bridge-offline",
+  webAppName: "demo-broker", bootstrapUrl: "https://demo-broker.azurewebsites.net",
+}).map(([key, value]) => [key, { type: "string", value }]));
+const env = { ...process.env, SIGNALR_CONNECTION_STRING: "", SERVICEBUS_CONNECTION_STRING: "",
+  COPILOT_FLOCK_INVITE_FILE: "", COPILOT_FLOCK_BOOTSTRAP_URL: "",
+  COPILOT_FLOCK_SCOPE: "", COPILOT_BRIDGE_SCOPE: "", GITHUB_USER: "demo-owner",
+  COPILOT_FLOCK_ALLOWED_BOOTSTRAP_ORIGIN: "", COPILOT_BRIDGE_ALLOWED_BOOTSTRAP_ORIGIN: "" };
 
-function runPowerShell(options = {}) {
-  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "flock-setup-ps-"));
+function fixture() {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "flock-setup-entry-"));
   const journal = path.join(directory, "journal.jsonl");
+  fs.writeFileSync(path.join(directory, "driver.mjs"), `
+import fs from "node:fs";
+import { runManagedCli } from ${JSON.stringify(pathToFileURL(path.join(root, "managed-azure-setup.mjs")).href)};
+const args = process.argv.slice(2);
+const log = (kind, args) => fs.appendFileSync(process.env.JOURNAL, JSON.stringify({kind, args}) + "\\n");
+if (args[0].endsWith("flock.mjs")) { log("legacy", args); process.exit(0); }
+try {
+  await runManagedCli(args.slice(1), fs.readFileSync(0, "utf8"), {
+    runAz: async (args) => {
+      log("managed-az", args);
+      if (process.env.MOCK_FAIL === "keys") throw Error("synthetic-key-do-not-print");
+      if (args[0] === "webapp") return "";
+      return JSON.stringify({primaryConnectionString: args[0] === "signalr"
+        ? "Endpoint=https://demo-signalr.service.signalr.net;AccessKey=synthetic-key-do-not-print;"
+        : "Endpoint=sb://demo-sb.servicebus.windows.net/;SharedAccessKeyName=RootManageSharedAccessKey;SharedAccessKey=synthetic-key-do-not-print;"});
+    },
+    waitForBroker: async (url) => { log("health", [url]); },
+    install: async (options) => {
+      log("install", [options.bootstrapUrlArg, options.scopeArg, options.machineIdArg, options.githubUserArg]);
+      return {memberRegistered:true, enrolledFlockCount:2};
+    },
+  });
+} catch (error) { console.error(error.message); process.exitCode = 1; }
+`);
+  const outputs = (skip) => JSON.stringify(skip ? {
+    ...metadata, bootstrapUrl: { value: "" }, webAppName: { value: "" },
+  } : metadata);
+  return {
+    directory, journal, outputs,
+    result(result) {
+      const events = fs.existsSync(journal) ? fs.readFileSync(journal, "utf8")
+        .split(/\r?\n/).filter(Boolean).map((line) => JSON.parse(line.replace(/^\uFEFF/, ""))) : [];
+      return { ...result, events };
+    },
+    close() { fs.rmSync(directory, { recursive: true, force: true }); },
+  };
+}
+
+function runPowerShell({ fail = "", skip = false, legacy = false, githubUser = "demo-owner" } = {}) {
+  const f = fixture();
   try {
-    const wrapper = path.join(directory, "wrapper.ps1");
-    fs.writeFileSync(wrapper, `
-$global:FakeAzAvailable = $env:MOCK_AZ_AVAILABLE -eq "1"
+    fs.writeFileSync(path.join(f.directory, "wrapper.ps1"), `
+$global:Available = $false
 function Get-Command {
-    if ($args[0] -eq "az") {
-        if ($global:FakeAzAvailable) { return [PSCustomObject]@{ Name = "az" } }
-        return $null
-    }
-    Microsoft.PowerShell.Core\\Get-Command @args
+  if ($args[0] -eq "az") { if ($global:Available) { return @{Name="az"} }; return $null }
+  Microsoft.PowerShell.Core\\Get-Command @args
 }
-function Write-Journal($Kind, $Values) {
-    @{ kind = $Kind; args = @($Values) } | ConvertTo-Json -Compress | Add-Content -Encoding UTF8 $env:SETUP_JOURNAL
-}
-function winget {
-    Write-Journal "winget" $args
-    if ($env:MOCK_FAIL -eq "install") { $global:LASTEXITCODE = 9; return }
-    $global:FakeAzAvailable = $true
-    $global:LASTEXITCODE = 0
-}
+function Log($kind, $values) { @{kind=$kind; args=@($values)} | ConvertTo-Json -Compress | Add-Content -Encoding UTF8 $env:JOURNAL }
+function winget { Log "winget" $args; $global:Available=$true; $global:LASTEXITCODE=0; if ($env:MOCK_FAIL -eq "cli") {$global:LASTEXITCODE=9} }
+function gh { Log "gh" $args; $global:LASTEXITCODE=0; return "demo-owner" }
 function az {
-    Write-Journal "az" $args
-    $global:LASTEXITCODE = 0
-    if ($args[0] -eq "account") {
-        if ($env:MOCK_NATIVE_ACCOUNT_ERROR -eq "1") {
-            & $env:ComSpec /c "echo demo-auth-required 1>&2 & exit /b 1"
-        }
-        if ($env:MOCK_AUTH -ne "1") { $global:LASTEXITCODE = 1 }
-    } elseif ($args[0] -eq "login" -and $env:MOCK_FAIL -eq "login") {
-        $global:LASTEXITCODE = 9
-    } elseif ($args[0] -eq "group" -and $env:MOCK_FAIL -eq "group") {
-        $global:LASTEXITCODE = 9
-    } elseif ($args[0] -eq "deployment") {
-        if ($env:MOCK_FAIL -eq "deployment") { $global:LASTEXITCODE = 9; return }
-        if ($env:MOCK_FAIL -eq "malformed") { return '{invalid-json' }
-        if ($env:MOCK_FAIL -eq "output") { return '{"signalrConnectionString":{"value":42}}' }
-        return $env:MOCK_OUTPUT
-    }
+  Log "az" $args; $global:LASTEXITCODE=0
+  if ($args[0] -eq "account" -and $args[1] -eq "show") {
+    if ($args -contains "--query") { return $env:SUBSCRIPTION }
+    $global:LASTEXITCODE=1
+  }
+  if ($args[0] -eq $env:MOCK_FAIL) {
+    if ($args[0] -eq "deployment") { Write-Error "synthetic-key-do-not-print" }
+    $global:LASTEXITCODE=9; return
+  }
+  if ($args[0] -eq "deployment") { return $env:OUTPUTS }
 }
 function node {
-    Write-Journal "node" $args
-    $global:LASTEXITCODE = 0
+  $body = $input | Out-String
+  $body | & $env:REAL_NODE (Join-Path $env:FIXTURE "driver.mjs") @args
+  $global:LASTEXITCODE = $LASTEXITCODE
 }
-if ($env:MOCK_LEGACY -eq "1") {
-    & $env:MANAGED_SETUP_SCRIPT -Scope personal -MachineId DEMO-PC -ConnectionString $env:MOCK_SIGNALR -ServiceBusConnectionString $env:MOCK_SERVICEBUS
-} else {
-    & $env:MANAGED_SETUP_SCRIPT -ProvisionAzure -ResourceGroup rg-demo -Location eastus -Scope personal -MachineId DEMO-PC
+$a = @{Scope="personal"; MachineId="DEMO-PC"}
+if ($env:LEGACY -eq "1") {$a.ConnectionString="synthetic-direct"}
+else {
+  $a.ProvisionAzure=$true; $a.SubscriptionId=$env:SUBSCRIPTION
+  $a.ResourceGroup="rg-demo"; $a.Location="westus2"; $a.NamePrefix="example"
+  if ($env:SKIP -eq "1") {$a.SkipBroker=$true}
 }
+& $env:SETUP @a
 `);
-    const result = spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", wrapper], {
-      cwd: root,
-      encoding: "utf8",
-      timeout: 30000,
-      env: {
-        ...cleanEnv,
-        MANAGED_SETUP_SCRIPT: path.join(root, "setup.ps1"),
-        SETUP_JOURNAL: journal,
-        MOCK_AZ_AVAILABLE: options.available ? "1" : "0",
-        MOCK_AUTH: options.authenticated ? "1" : "0",
-        MOCK_FAIL: options.fail || "",
-        MOCK_LEGACY: options.legacy ? "1" : "0",
-        MOCK_NATIVE_ACCOUNT_ERROR: options.nativeAccountError ? "1" : "0",
-        MOCK_SIGNALR: fakeSignalr,
-        MOCK_SERVICEBUS: fakeServiceBus,
-        MOCK_OUTPUT: JSON.stringify({
-          signalrConnectionString: { value: fakeSignalr },
-          serviceBusConnectionString: { value: fakeServiceBus },
-        }),
-      },
-    });
-    return { ...result, events: readJournal(journal) };
-  } finally {
-    fs.rmSync(directory, { recursive: true, force: true });
-  }
+    return f.result(spawnSync("powershell.exe",
+      ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", path.join(f.directory, "wrapper.ps1")],
+      { cwd: root, encoding: "utf8", timeout: 30000, env: {
+        ...env, FIXTURE: f.directory, JOURNAL: f.journal, REAL_NODE: process.execPath,
+        SETUP: path.join(root, "setup.ps1"), SUBSCRIPTION: subscription,
+        OUTPUTS: fail === "malformed" ? "{invalid" : fail === "metadata" ? "{}" : f.outputs(skip),
+        MOCK_FAIL: fail, SKIP: skip ? "1" : "", LEGACY: legacy ? "1" : "", GITHUB_USER: githubUser,
+      } }));
+  } finally { f.close(); }
 }
 
-test("managed PowerShell setup installs missing CLI, authenticates, deploys and passes keys without printing them", { skip: process.platform !== "win32" }, () => {
-  const result = runPowerShell();
+function checkManaged(result, skip = false, githubUser = "demo-owner") {
   assert.equal(result.status, 0, result.stderr);
-  assert.equal(result.events.filter((event) => event.kind === "winget").length, 1);
-  assert.ok(result.events.some((event) => event.kind === "az" && event.args[0] === "login"));
   const deployment = result.events.find((event) => event.kind === "az" && event.args[0] === "deployment");
-  assert.ok(deployment.args.includes("properties.outputs"));
-  assert.ok(deployment.args.some((arg) => String(arg).endsWith("azuredeploy.json")));
-  const installed = result.events.find((event) => event.kind === "node");
-  assert.ok(installed.args.includes(fakeSignalr) && installed.args.includes(fakeServiceBus));
-  assert.ok(!result.stdout.includes(fakeSignalr) && !result.stdout.includes(fakeServiceBus));
+  assert.ok(deployment.args.includes("namePrefix=example"));
+  assert.ok(deployment.args.includes("location=westus2"));
+  assert.ok(deployment.args.includes(`deployTokenBroker=${!skip}`));
+  assert.ok(deployment.args.includes("--subscription"));
+  assert.ok(result.events.some((event) => event.kind === "az" && event.args[1] === "set"));
+  const install = result.events.find((event) => event.kind === "install");
+  assert.deepEqual(install.args, [skip ? null : "https://demo-broker.azurewebsites.net", "personal", "DEMO-PC", githubUser]);
+  const deploy = result.events.find((event) => event.kind === "managed-az" && event.args[0] === "webapp");
+  assert.equal(Boolean(deploy), !skip);
+  if (deploy) {
+    assert.ok(deploy.args.includes("--type") && deploy.args.includes("zip"));
+    assert.ok(!fs.existsSync(deploy.args[deploy.args.indexOf("--src-path") + 1]));
+  }
+  assert.doesNotMatch(result.stdout + result.stderr + JSON.stringify(result.events), /synthetic-key-do-not-print/);
+}
+
+test("PowerShell actual entrypoint installs CLI, authenticates, selects subscription and deploys default/omitted broker", { skip: process.platform !== "win32" }, () => {
+  for (const skip of [false, true]) {
+    const result = runPowerShell({ skip });
+    checkManaged(result, skip);
+    assert.ok(result.events.some((event) => event.kind === "winget"));
+    assert.ok(result.events.some((event) => event.kind === "az" && event.args[0] === "login"));
+  }
+  const github = runPowerShell({ githubUser: "" });
+  checkManaged(github);
+  assert.ok(github.events.some((event) => event.kind === "gh" && event.args.includes(".login")));
 });
 
-test("PowerShell setup preserves legacy installation and stops before installation on provisioning failures", { skip: process.platform !== "win32" }, () => {
-  const ready = runPowerShell({ available: true, authenticated: true });
-  assert.equal(ready.status, 0, ready.stderr);
-  assert.ok(!ready.events.some((event) => event.kind === "winget" || (event.kind === "az" && event.args[0] === "login")));
-  const nativeFailure = runPowerShell({ available: true, nativeAccountError: true });
-  assert.equal(nativeFailure.status, 0, nativeFailure.stderr);
-  assert.ok(nativeFailure.events.some((event) => event.kind === "az" && event.args[0] === "login"));
-  for (const fail of ["install", "login", "group", "deployment", "output", "malformed"]) {
-    const result = runPowerShell({ available: fail !== "install", fail });
-    assert.notEqual(result.status, 0);
-    assert.ok(!result.events.some((event) => event.kind === "node"));
+test("PowerShell actual entrypoint fails before local install and preserves direct setup", { skip: process.platform !== "win32" }, () => {
+  for (const fail of ["cli", "login", "group", "deployment", "malformed", "metadata", "keys"]) {
+    const result = runPowerShell({ fail });
+    assert.notEqual(result.status, 0, `${fail}: ${result.stdout}\n${result.stderr}`);
+    assert.ok(!result.events.some((event) => event.kind === "install"), fail);
+    assert.doesNotMatch(result.stdout + result.stderr, /synthetic-key-do-not-print/);
   }
   const legacy = runPowerShell({ legacy: true });
   assert.equal(legacy.status, 0, legacy.stderr);
-  assert.deepEqual(legacy.events.map((event) => event.kind), ["node"]);
+  assert.deepEqual(legacy.events.map((event) => event.kind), ["legacy"]);
 });
 
 const bashAvailable = spawnSync("bash", ["--version"], { encoding: "utf8", timeout: 5000 }).status === 0;
-test("Bash setup syntax is valid", { skip: !bashAvailable }, () => {
-  const result = spawnSync("bash", ["--noprofile", "--norc", "-n", "setup.sh"], { cwd: root, encoding: "utf8", timeout: 10000 });
-  assert.equal(result.status, 0, result.stderr);
-});
-
-test("Bash setup uses headless authentication, validates outputs, and preserves the non-provisioning path with local stubs", { skip: !bashAvailable }, () => {
-  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "flock-setup-bash-"));
+test("Bash syntax and actual managed/direct entrypoint flow with synthetic cloud adapters", { skip: !bashAvailable }, () => {
+  assert.equal(spawnSync("bash", ["-n", "setup.sh"], { cwd: root }).status, 0);
+  const f = fixture();
   try {
-    const bin = path.join(directory, "bin");
-    const journal = path.join(directory, "journal.jsonl");
-    fs.mkdirSync(bin);
-    fs.copyFileSync(path.join(root, "setup.sh"), path.join(directory, "setup.sh"));
-    fs.mkdirSync(path.join(directory, "infra"));
-    fs.copyFileSync(path.join(root, "infra", "azuredeploy.json"), path.join(directory, "infra", "azuredeploy.json"));
-    fs.writeFileSync(path.join(directory, "wrapper.sh"), `#!/usr/bin/env bash
-set -euo pipefail
+    fs.mkdirSync(path.join(f.directory, "bin"));
+    fs.mkdirSync(path.join(f.directory, "infra"));
+    fs.copyFileSync(path.join(root, "setup.sh"), path.join(f.directory, "setup.sh"));
+    fs.copyFileSync(path.join(root, "infra", "azuredeploy.json"), path.join(f.directory, "infra", "azuredeploy.json"));
+    fs.writeFileSync(path.join(f.directory, "wrapper.sh"), `
 export DEMO_DIR="$(cd "$(dirname "\${BASH_SOURCE[0]}")" && pwd)"
 export PATH="$DEMO_DIR/bin:$PATH"
 if command -v cygpath >/dev/null 2>&1; then export REAL_NODE="$(cygpath -u "$REAL_NODE")"; fi
 exec bash "$DEMO_DIR/setup.sh" "$@"
 `);
-    fs.writeFileSync(path.join(bin, "uname"), "#!/usr/bin/env bash\nprintf 'Linux\\n'\n", { mode: 0o755 });
-    fs.writeFileSync(path.join(bin, "az"), '#!/usr/bin/env bash\nexec "$REAL_NODE" "$DEMO_DIR/mock-az.mjs" "$@"\n', { mode: 0o755 });
-    fs.writeFileSync(path.join(bin, "node"), `#!/usr/bin/env bash
-if [[ "\${1:-}" == *flock.mjs ]]; then exec "$REAL_NODE" "$DEMO_DIR/mock-node.mjs" "$@"; fi
-exec "$REAL_NODE" "$@"
+    fs.writeFileSync(path.join(f.directory, "bin", "node"), `#!/usr/bin/env bash
+exec "$REAL_NODE" "$DEMO_DIR/driver.mjs" "$@"
 `, { mode: 0o755 });
-    fs.writeFileSync(path.join(directory, "mock-az.mjs"), `
+    fs.writeFileSync(path.join(f.directory, "bin", "uname"), "#!/usr/bin/env bash\nprintf 'Linux\\n'\n", { mode: 0o755 });
+    fs.writeFileSync(path.join(f.directory, "bin", "az"), `#!/usr/bin/env bash
+exec "$REAL_NODE" "$DEMO_DIR/az.mjs" "$@"
+`, { mode: 0o755 });
+    fs.writeFileSync(path.join(f.directory, "bin", "gh"), `#!/usr/bin/env bash
+exec "$REAL_NODE" "$DEMO_DIR/gh.mjs" "$@"
+`, { mode: 0o755 });
+    fs.writeFileSync(path.join(f.directory, "gh.mjs"), `
+import fs from "node:fs";
+fs.appendFileSync(process.env.JOURNAL, JSON.stringify({kind:"gh", args:process.argv.slice(2)}) + "\\n");
+process.stdout.write("demo-owner");
+`);
+    fs.writeFileSync(path.join(f.directory, "az.mjs"), `
 import fs from "node:fs";
 const args = process.argv.slice(2);
-fs.appendFileSync(process.env.SETUP_JOURNAL, JSON.stringify({ kind: "az", args }) + "\\n");
-if (args[0] === "account") process.exit(process.env.MOCK_AUTH === "1" ? 0 : 1);
-if (args[0] === "login" && process.env.MOCK_FAIL === "login") process.exit(9);
-if (args[0] === "group" && process.env.MOCK_FAIL === "group") process.exit(9);
-if (args[0] === "deployment" && process.env.MOCK_FAIL === "deployment") process.exit(9);
-if (args[0] === "deployment" && process.env.MOCK_FAIL === "malformed") { process.stdout.write("{invalid-json"); process.exit(0); }
-if (args[0] === "deployment") process.stdout.write(process.env.MOCK_FAIL === "output" ? "{}" : process.env.MOCK_OUTPUT);
+fs.appendFileSync(process.env.JOURNAL, JSON.stringify({kind:"az", args}) + "\\n");
+if (args[0] === process.env.MOCK_FAIL) {
+  if (args[0] === "deployment") console.error("synthetic-key-do-not-print");
+  process.exit(9);
+}
+if (args[0] === "account" && args[1] === "show") {
+  if (!args.includes("--query")) process.exit(1);
+  process.stdout.write(process.env.SUBSCRIPTION);
+}
+if (args[0] === "deployment") process.stdout.write(process.env.OUTPUTS);
 `);
-    fs.writeFileSync(path.join(directory, "mock-node.mjs"), `
-import fs from "node:fs";
-fs.appendFileSync(process.env.SETUP_JOURNAL, JSON.stringify({ kind: "node", args: process.argv.slice(2) }) + "\\n");
-`);
-    const run = (args, settings = {}) => {
-      if (fs.existsSync(journal)) fs.unlinkSync(journal);
-      const result = spawnSync("bash", ["--noprofile", "--norc", "wrapper.sh", ...args], {
-        cwd: directory, encoding: "utf8", timeout: 30000,
-        env: {
-          ...cleanEnv, DISPLAY: "", REAL_NODE: process.execPath, SETUP_JOURNAL: journal,
-          MOCK_FAIL: settings.fail || "", MOCK_AUTH: settings.authenticated ? "1" : "0",
-          MOCK_OUTPUT: JSON.stringify({
-            signalrConnectionString: { value: fakeSignalr },
-            serviceBusConnectionString: { value: fakeServiceBus },
-          }),
+    const run = (args, fail = "", skip = false) => {
+      if (fs.existsSync(f.journal)) fs.unlinkSync(f.journal);
+      return f.result(spawnSync("bash", ["--noprofile", "--norc", "wrapper.sh", ...args], {
+        cwd: f.directory, encoding: "utf8", timeout: 30000, env: {
+          ...env, GITHUB_USER: "", DISPLAY: "", REAL_NODE: process.execPath, JOURNAL: f.journal,
+          SUBSCRIPTION: subscription, MOCK_FAIL: fail,
+          OUTPUTS: fail === "malformed" ? "{invalid" : fail === "metadata" ? "{}" : f.outputs(skip),
         },
-      });
-      return { ...result, events: readJournal(journal) };
+      }));
     };
-    const managed = run(["--provision-azure", "--scope", "personal", "--resource-group", "rg-demo", "--location", "eastus"]);
-    assert.equal(managed.status, 0, managed.stderr);
-    assert.ok(managed.events.some((event) => event.kind === "az" && event.args[0] === "login" && event.args.includes("--use-device-code")));
-    const installed = managed.events.find((event) => event.kind === "node");
-    assert.ok(installed.args.includes(fakeSignalr) && installed.args.includes(fakeServiceBus));
-    assert.ok(!managed.stdout.includes(fakeSignalr) && !managed.stdout.includes(fakeServiceBus));
-    for (const fail of ["login", "group", "deployment", "output", "malformed"]) {
-      const failed = run(["--provision-azure"], { fail });
-      assert.notEqual(failed.status, 0);
-      assert.ok(!failed.events.some((event) => event.kind === "node"));
+    const args = ["--provision-azure", "--subscription", subscription, "--resource-group", "rg-demo",
+      "--location", "westus2", "--name-prefix", "example", "--scope", "personal", "--machine-id", "DEMO-PC"];
+    for (const skip of [false, true]) {
+      const result = run([...args, ...(skip ? ["--skip-broker"] : [])], "", skip);
+      checkManaged(result, skip, skip ? null : "demo-owner");
+      assert.ok(result.events.some((event) => event.kind === "az" && event.args.includes("--use-device-code")));
+      if (!skip) assert.ok(result.events.some((event) => event.kind === "gh"));
     }
-    const legacy = run(["--scope", "personal", "--connection-string", fakeSignalr, "--servicebus-connection-string", fakeServiceBus]);
-    assert.equal(legacy.status, 0, legacy.stderr);
-    assert.deepEqual(legacy.events.map((event) => event.kind), ["node"]);
-    const conflict = run(["--provision-azure", "--invite-file", "demo-invite.json"]);
+    for (const fail of ["login", "group", "deployment", "malformed", "metadata", "keys"]) {
+      const result = run(args, fail);
+      assert.notEqual(result.status, 0, fail);
+      assert.ok(!result.events.some((event) => event.kind === "install"), fail);
+      assert.doesNotMatch(result.stdout + result.stderr, /synthetic-key-do-not-print/);
+    }
+    const conflict = run(["--provision-azure", "--invite-file", "demo.json"]);
     assert.notEqual(conflict.status, 0);
     assert.equal(conflict.events.length, 0);
-  } finally {
-    fs.rmSync(directory, { recursive: true, force: true });
-  }
+    const direct = run(["--scope", "personal", "--connection-string", "synthetic-direct"]);
+    assert.equal(direct.status, 0, direct.stderr);
+    assert.deepEqual(direct.events.map((event) => event.kind), ["legacy"]);
+  } finally { f.close(); }
 });

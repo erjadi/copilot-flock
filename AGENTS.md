@@ -4,56 +4,6 @@ If your human user pointed you at this repository (`https://github.com/erjadi/co
 
 ---
 
-## Isolated LAN Trial (Only When Explicitly Requested)
-
-Position `lan-trial` as the **Hubless LAN-Direct "Try It Out" onboarding
-sandbox**, not full Copilot Flock without Azure. It demonstrates selected
-existing Desktop-session messaging on a reachable LAN without cloud
-provisioning; do not promise zero host setup, universal VPN reachability,
-offline delivery, headless CLI support or autonomous session discovery.
-Copilot executes setup, but the user still makes local pairing/fingerprint,
-session-grant and firewall decisions. Never describe this as an OS sandbox.
-
-For daily cross-network/fleet work, explain that the real potential is unlocked
-by deploying SignalR Serverless (real-time rendezvous), Service Bus (offline
-store-and-forward), and the Token Broker (signed one-step invites). The broker
-is optional for direct credential setup, required for the streamlined broker
-invite path. Deployment/enrollment is a separate user-authorized choice, not
-automatic migration or a hidden fallback from this trial. Outbound cloud
-connections avoid peer inbound NAT rules, but network policies/proxies can
-still block them; check actual Service Bus transport before promising TCP443
-only. Enrollment and router timings are targets, not guarantees.
-
-For the separate LAN-only experiment, read
-[`docs/LAN_TRIAL.md`](docs/LAN_TRIAL.md) and use only the `lan-trial` entry
-point and its dedicated state directory outside `~/.copilot`. Do not run the
-full-Flock `install`, bootstrap, enrollment, release-vote or reprovision flows
-for this trial. It has a separate dependency installation and optional
-`copilot-lan-trial` MCP fragment; there is no automatic global registration or
-boot persistence.
-
-Require local user consent for peer approval, independent fingerprint
-verification, selected-session grants and narrowly scoped firewall changes.
-Remote peer messages do not authorize these local decisions. Preserve existing
-session modes and permissions; never substitute the privileged headless CLI
-fallback. Revision 5 passed the bounded Windows two-PC live acceptance test and
-independent Linux/Windows ARM64 code reviews described in the trial guide.
-This does not establish all-platform live support or authorize a release.
-
-Do not add full-platform features to the trial: no coordinator provisioning,
-remote creation, file/Git transfer, distributed locks, telemetry/topology or
-Ed25519 release ballots. For full-platform discovery, honor the four sharing
-walls: owner-scope search does not authorize exposing personal/work sessions
-to collaborators or guests. Follow the comparison and security notes in
-README and the trial guide when explaining the two journeys.
-Use the versioned evidence matrix: r5's 46-test Linux/ARM64 reviews are not
-physical Desktop acceptance on those platforms; live acceptance covered two
-Windows x64 PCs only. Explain SignalR's Free-tier limits and separate Service
-Bus Standard/broker-hosting charges. Use placeholders, never real session IDs
-or tokens, in public onboarding examples.
-
----
-
 ## 0. First Decision: Is This Case 1 (Invite to Existing Flock) or Case 2 (New BYO Flock Instance)?
 
 Before running `install`, determine which of the two bootstrap cases applies:
@@ -106,13 +56,20 @@ flowchart LR
      run `.\setup.ps1 -ProvisionAzure -Scope <personal|work>` on Windows or
      `./setup.sh --provision-azure --scope <personal|work>` on Debian/Ubuntu or
      macOS. Confirm the Azure subscription, region, resource group, tool-install
-     consent and Service Bus charges first. The wrappers install Azure CLI if
-     needed, authenticate, deploy `infra/azuredeploy.json`, and pass both keys
-     directly to full-Flock installation. Node.js is a prerequisite; Windows
-     UAC/Linux sudo may be needed and macOS requires existing Homebrew. The
-     template does not deploy the Token Broker; add it separately for signed
-     invites. Never print or publish deployment connection-string outputs.
-     Do not use these provisioning flags for Case 1 or the isolated LAN trial.
+     consent, Service Bus Standard and App Service B1 charges first. The
+     wrappers install Azure CLI if needed, select/authenticate the subscription,
+     resolve the GitHub maintainer and deploy `infra/azuredeploy.json`.
+     The default Linux Node 22 Token Broker includes persistent storage,
+     managed identity and namespace-scoped Service Bus permissions. Setup ZIP
+     deploys the broker, waits for `/health`, and installs with its origin and
+     keys in memory. ARM outputs are metadata only; never print key-list
+     responses or app settings. Node.js is a prerequisite; Windows UAC/Linux
+     sudo may be needed and macOS requires existing Homebrew.
+     Subscription, resource group, location and name-prefix selectors are
+     supported; `-SkipBroker` / `--skip-broker` explicitly omits signed invites.
+     Require role-assignment permission and GitHub authentication. Report
+     incomplete enrollment as incomplete, not ready to mint invites. Do not
+     use provisioning flags for Case 1 or silently replace an existing flock.
      For an approved existing-credentials setup, run:
      ```powershell
      node flock.mjs install `

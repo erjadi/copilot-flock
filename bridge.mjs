@@ -10239,6 +10239,7 @@ export async function installBridge({
 
   // Register member metadata (machineId, githubUser, scope, version, specs) with bootstrap server
   let memberRegistration = null;
+  let enrolledFlockCount = 0;
   try {
     memberRegistration = await registerWithBootstrapServer(cfg);
     if (memberRegistration?.member?.githubUser && !cfg.githubUser) {
@@ -10273,6 +10274,7 @@ export async function installBridge({
         };
       }
       saveLocalFlocksConfig(fCfg);
+      enrolledFlockCount = enrolledV3.enrolledFlocks.length;
     }
   } catch {}
 
@@ -10528,6 +10530,7 @@ export async function installBridge({
     githubUser: cfg.githubUser || null,
     specs: cfg.specs || null,
     memberRegistered: Boolean(memberRegistration?.ok),
+    enrolledFlockCount,
     endpoint: cfg.endpoint,
     hub: cfg.hub,
     daemonPid: daemonInfo.pid,
