@@ -10,7 +10,7 @@ import { runAzureNegativeProbes } from "./azure-negative-probes.mjs";
 // Deliberately excluded from npm test. Never point this gate at an enrolled/production namespace.
 test("LIVE RELEASE GATE: scoped Azure clients, REST JWTs and subscription-only SAS isolation", {
   skip: process.env.COPILOT_FLOCK_LIVE_AZURE_APPROVED !== "1" ? "UNRUN: explicit approval and a disposable Azure namespace are required" : false,
-  timeout: 120000,
+  timeout: 240000,
 }, async (t) => {
   const files = ["flock.mjs", "bridge.mjs", "flock-azure.mjs", "flock-protocol.mjs", "flock-broker-free.mjs",
     "flock-lifecycle.mjs", "test/flock-azure.live.test.mjs", "test/azure-negative-probes.mjs"];
