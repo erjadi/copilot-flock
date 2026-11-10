@@ -4,6 +4,13 @@ Licensed under [Apache-2.0](./LICENSE). Copyright 2026 Eric Jadi.
 Viewer preview data, hostnames, network addresses and governance examples are
 synthetic, not captured conversations or real signed release evidence.
 
+**3.4.1 candidate, not yet released:** Linux uninstall now fails closed when
+service/cgroup child preservation is unproven and no longer uses systemd
+`disable --now`. Published 3.4.0 retains that known Linux safety limitation;
+do not remove an active shared Flock service using that release. See
+[removal safeguards and recovery](./docs/REMOVING_FLOCK.md). Existing release
+tags/assets are unchanged; this follow-up requires its own exact-candidate gates.
+
 **3.4.0 broker-free runtime:** broker-free onboarding, scoped Azure
 issuance/renewal, encrypted active RPC, owner-mediated leave/kick and guarded
 uninstall are wired. New setup defaults to two Azure services, not a hosted

@@ -6,6 +6,25 @@ the user does not need to type commands.
 
 ## Agent entrypoints
 
+**Published 3.4.0 Linux warning:** its systemd removal path uses
+`disable --now` before checking runtime clients. With `KillMode=control-group`,
+this can terminate persistent Copilot sessions sharing the Flock service cgroup.
+Do not run live Linux removal on that release without separately established
+child-preservation safeguards. The published tag/assets remain unchanged.
+
+The unreleased 3.4.1 candidate fails closed before local artifact removal if an exact
+canonical or legacy Flock user unit is active, has a MainPID or remaining
+cgroup, or cannot be inspected reliably. It preserves runtime, credentials,
+MCP settings, skills, startup artifacts and acknowledged-leave recovery on that
+initial block. It disables boot persistence without `--now` and rechecks unit
+quiescence before signalling a pinned daemon. A running daemon's unified cgroup
+must also be inspectable and outside service units other than its own OS user
+manager; unknown/custom service containment blocks cleanup even if the named
+Flock units are absent. The cgroup check is repeated at the exact PID stop.
+This conservative guard is not
+support for uninstalling an active shared Linux service; it does not stop that
+service or change its stop policy. Live uninstall validation remains separate.
+
 The agent can run `node flock.mjs uninstall`, `node flock.mjs unenroll --traceless`
 or `node flock.mjs flock unenroll --traceless`. The legacy `bridge.mjs` entrypoint
 supports the same forms. The MCP tool is `unenroll_flock` with `traceless: true`.

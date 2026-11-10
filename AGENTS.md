@@ -6,7 +6,7 @@ If your human user pointed you at this repository (`https://github.com/erjadi/co
 
 ## 0. Select the Protocol Before Setup
 
-This source implements 3.4.0; a version string is not proof of a released or
+This source is the 3.4.1 candidate; a version string is not proof of a released or
 validated deployment. Confirm the published tag and exact-commit evidence. For new setup,
 use [the broker-free guide](docs/BROKER_FREE_V34.md): the default provisions
 only SignalR Serverless and Service Bus Standard with narrow Send/Listen
@@ -211,6 +211,12 @@ unproven artifact/process ownership are explicit pending/retained outcomes.
 Never silently approve local-only cleanup or claim these are fully removed.
 Preserve conversations, session-state, chats, data.db, source checkouts and
 backups. Do not promise deletion of transcripts or OS audit logs.
+
+Published 3.4.0 Linux removal can terminate Copilot children through systemd
+`disable --now`; do not run it on a shared active service. The unreleased
+3.4.1 guard retains installation/recovery when unit or daemon-cgroup child
+preservation is unproven. It is not approval for live removal or a universal
+active-service cleanup guarantee. Preserve the immutable 3.4.0 tag/assets.
 
 The protocol is wired through active broker-free daemon/RPC/Azure transport,
 onboarding, renewal and removal. Source alone is not proof of a released

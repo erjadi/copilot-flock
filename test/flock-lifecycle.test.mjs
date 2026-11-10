@@ -7,7 +7,8 @@ import crypto from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { lifecyclePaths, atomicJson, recordInstalledArtifact, uninstallFlock as runUninstall, stopPinnedDaemon,
-  assertNoLinks, inspectProcess, findRuntimeClients } from "../flock-lifecycle.mjs";
+  assertNoLinks, inspectProcess, findRuntimeClients, assertLinuxUnitsQuiescent,
+  assertLinuxDaemonCgroupSafe, disablePersistence } from "../flock-lifecycle.mjs";
 import { matchesMember, signLeave, verifyLeave } from "../flock-membership.mjs";
 import { leaveV3Device, kickV3FlockMember, planV3DeviceLeave } from "../bootstrap-server.mjs";
 
@@ -36,6 +37,224 @@ function fixture(platform = "win32") {
     close: () => fs.rmSync(home, { recursive: true, force: true }) };
 }
 const confirm = async ({ request }) => ({ confirmed: true, flockId: request.flockId });
+
+function unitFixture(paths) {
+  const unit = path.basename(paths.persistence[0]);
+  const properties = { Id: unit, LoadState: "loaded", FragmentPath: paths.persistence[0],
+    ActiveState: "inactive", MainPID: "0", ControlGroup: "" };
+  const commands = [];
+  const query = (args) => {
+    commands.push(args);
+    if (args[0] === "list-units") {
+      assert.deepEqual(args, ["list-units", "--all", "--output=json", "--no-pager",
+        "--type=service", ...paths.persistence.map((filename) => path.basename(filename))]);
+      return JSON.stringify([{ unit }]);
+    }
+    if (args[0] === "show") {
+      assert.deepEqual(args, ["show", unit, "--property=Id,LoadState,FragmentPath,ActiveState,MainPID,ControlGroup"]);
+      return Object.entries(properties).map(([key, value]) => `${key}=${value}`).join("\n") + "\n";
+    }
+    assert.deepEqual(args, ["disable", unit]);
+    return "";
+  };
+  return { properties, commands, query };
+}
+
+test("Linux daemon stops reject service cgroups, unreadable boundaries and creation changes without a signal", async () => {
+  const f = fixture("linux");
+  try {
+    const script = path.join(f.root, "flock.mjs");
+    const pin = { pid: 123456, start: "boot:start", executable: process.execPath,
+      argv: [process.execPath, script, "daemon"] };
+    fs.writeFileSync(path.join(f.root, "daemon.pid"), String(pin.pid));
+    atomicJson(path.join(f.root, "daemon-identity.json"), { ...pin, script });
+    const check = (text) => assertLinuxDaemonCgroupSafe(pin.pid, { uid: 1000, read: () => text });
+    for (const text of [
+      "0::/user.slice/user-1000.slice/user@1000.service/app.slice/copilot-flock.service\n",
+      "0::/system.slice/custom-worker.service/nested\n", "0::/user.slice/user@1001.service/app.scope\n",
+      "1:name=systemd:/legacy\n", "0::/bad/../path\n", "0::/bad//path\n", "",
+    ]) {
+      let signals = 0;
+      await assert.rejects(stopPinnedDaemon(f.root, f.paths, {
+        inspect: () => pin, kill: () => { signals++; }, checkLinuxCgroup: () => check(text),
+      }), /unproven/);
+      assert.equal(signals, 0);
+      assert.throws(() => assertLinuxUnitsQuiescent(f.paths, {
+        query: () => "[]", inspect: () => pin, checkCgroup: () => check(text),
+      }), /unproven/, "Unknown service cgroups must block even when the named unit inventory is empty");
+    }
+    assert.throws(() => assertLinuxDaemonCgroupSafe(pin.pid, {
+      read: () => { throw Object.assign(new Error("cgroup inspection denied"), { code: "EACCES" }); },
+    }), /inspection denied/);
+    check("0::/user.slice/user-1000.slice/user@1000.service/app.slice/terminal.scope\n");
+    let reads = 0;
+    let signals = 0;
+    await assert.rejects(stopPinnedDaemon(f.root, f.paths, {
+      inspect: () => ++reads === 1 ? pin : { ...pin, start: "boot:replacement" },
+      kill: () => { signals++; },
+      checkLinuxCgroup: () => check("0::/user.slice/user-1000.slice/user@1000.service/app.slice/terminal.scope\n"),
+    }), /identity changed/);
+    assert.equal(signals, 0);
+    await stopPinnedDaemon(f.root, f.paths, {
+      inspect: () => signals ? null : pin, kill: () => { signals++; },
+      checkLinuxCgroup: () => check("0::/user.slice/user-1000.slice/user@1000.service/app.slice/terminal.scope\n"),
+    });
+    assert.equal(signals, 1);
+  } finally { f.close(); }
+});
+
+test("Linux cleanup requires inactive, empty exact units and rejects missing or malformed proof", () => {
+  const f = fixture("linux");
+  try {
+    const u = unitFixture(f.paths);
+    assertLinuxUnitsQuiescent(f.paths, { query: u.query });
+    assertLinuxUnitsQuiescent(f.paths, { query: () => "[]" });
+    for (const [key, value] of [
+      ["ActiveState", "active"], ["ActiveState", "deactivating"], ["MainPID", "123"],
+      ["MainPID", ""], ["ControlGroup", "/user.slice/user-1000.slice/user@1000.service/app.slice/copilot-flock.service"],
+      ["FragmentPath", "/other/copilot-flock.service"], ["Id", "unrelated.service"], ["LoadState", "not-found"],
+    ]) {
+      const before = u.properties[key];
+      u.properties[key] = value;
+      assert.throws(() => assertLinuxUnitsQuiescent(f.paths, { query: u.query }), /unproven/);
+      u.properties[key] = before;
+    }
+    delete u.properties.ControlGroup;
+    assert.throws(() => assertLinuxUnitsQuiescent(f.paths, { query: u.query }), /unproven/);
+    u.properties.ControlGroup = "";
+    for (const output of ["{}", "null", "[null]", '[{"unit":"unrelated.service"}]',
+      JSON.stringify([{ unit: u.properties.Id }, { unit: u.properties.Id }])]) {
+      assert.throws(() => assertLinuxUnitsQuiescent(f.paths, {
+        query: (args) => args[0] === "list-units" ? output : u.query(args),
+      }), /inventory/);
+    }
+    for (const output of ["MainPID=0\nMainPID=0\n", "missing-properties", ""]) {
+      assert.throws(() => assertLinuxUnitsQuiescent(f.paths, {
+        query: (args) => args[0] === "show" ? output : u.query(args),
+      }), /properties|unproven/);
+    }
+    assert.throws(() => assertLinuxUnitsQuiescent(f.paths, {
+      query: () => { throw Object.assign(new Error("user manager inaccessible"), { code: "EACCES" }); },
+    }), /inaccessible/);
+    assert.throws(() => assertLinuxUnitsQuiescent(f.paths, { query: () => "{broken" }), SyntaxError);
+    const legacy = path.basename(f.paths.persistence[1]);
+    assert.throws(() => assertLinuxUnitsQuiescent(f.paths, {
+      query: (args) => args[0] === "list-units" ? JSON.stringify([{ unit: legacy }])
+        : Object.entries({ ...u.properties, Id: legacy, FragmentPath: f.paths.persistence[1],
+          ActiveState: "active", MainPID: "456" }).map(([key, value]) => `${key}=${value}`).join("\n"),
+    }), /unproven/, "A loaded legacy unit must still block cleanup when its file is absent");
+  } finally { f.close(); }
+});
+
+test("Linux shared-cgroup or unavailable proof blocks all local cleanup and preserves acknowledged retry", async () => {
+  for (const mode of ["shared-cgroup", "unit-file-missing", "inspection-denied", "missing-cgroup"]) {
+    const f = fixture("linux");
+    try {
+      const targets = [f.paths.skills[0], f.paths.configs[0].path];
+      if (mode !== "unit-file-missing") targets.push(f.paths.persistence[0]);
+      for (const filename of targets) {
+        fs.mkdirSync(path.dirname(filename), { recursive: true });
+        fs.writeFileSync(filename, filename === f.paths.configs[0].path
+          ? JSON.stringify({ mcpServers: { "copilot-flock": {
+            command: process.execPath, args: [path.join(f.root, "flock.mjs"), "mcp"],
+          }, unrelated: { command: "keep" } } }) : "owned");
+        if (filename !== f.paths.configs[0].path) recordInstalledArtifact(f.root, filename, f.paths);
+      }
+      const retained = [...targets, ...["flock.mjs", "identity.json", "config.json", "flocks.json",
+        "installation.json"].map((name) => path.join(f.root, name))];
+      const before = retained.map((filename) => fs.readFileSync(filename));
+      const u = unitFixture(f.paths);
+      u.properties.ActiveState = "active";
+      u.properties.MainPID = "123";
+      u.properties.ControlGroup = "/user.slice/user-1000.slice/user@1000.service/app.slice/copilot-flock.service";
+      const leaves = [];
+      let mutations = 0;
+      const forbidden = async () => { mutations++; throw new Error("Local mutation forbidden before unit proof"); };
+      const options = { paths: f.paths,
+        leave: async (request) => { leaves.push(request.request.flockId); return confirm(request); },
+        checkPersistence: (paths) => {
+          if (mode === "inspection-denied") throw new Error("unit/cgroup inspection denied");
+          if (mode === "missing-cgroup") delete u.properties.ControlGroup;
+          assertLinuxUnitsQuiescent(paths, { query: u.query });
+        }, disable: forbidden, removeTasks: forbidden, stopDaemon: forbidden, findProcesses: forbidden };
+      for (let retry = 0; retry < 2; retry++) {
+        const result = await uninstallFlock(options);
+        assert.equal(result.fullyRemoved, false);
+        assert.equal(result.ok, false);
+        assert.deepEqual(result.removed, []);
+        assert.ok(result.retained.some((entry) => /unproven|inspection denied/.test(entry.reason)));
+        retained.forEach((filename, index) => assert.deepEqual(fs.readFileSync(filename), before[index]));
+        assert.ok(Object.values(JSON.parse(fs.readFileSync(path.join(f.root, "uninstall-progress.json"))).leaves)
+          .every((entry) => entry.confirmed === true));
+      }
+      assert.equal(mutations, 0);
+      assert.deepEqual(leaves, ["owner/personal", "owner/team"]);
+      Object.assign(u.properties, { ActiveState: "inactive", MainPID: "0", ControlGroup: "" });
+      const result = await uninstallFlock({ ...options,
+        checkPersistence: (paths) => assertLinuxUnitsQuiescent(paths, { query: u.query }),
+        disable: (filename, paths) => disablePersistence(filename, paths, { query: u.query }),
+        removeTasks: async () => [], stopDaemon: async () => {}, findProcesses: async () => [],
+      });
+      assert.equal(result.fullyRemoved, true, JSON.stringify(result));
+      assert.deepEqual(leaves, ["owner/personal", "owner/team"], "Retry must not repeat acknowledged leaves");
+      assert.equal(u.commands.some((args) => args.includes("--now") || args.includes("stop")), false);
+      assert.equal(fs.readFileSync(path.join(f.preserved, "events.jsonl"), "utf8"), "conversation");
+    } finally { f.close(); }
+  }
+});
+
+test("Linux disable rechecks quiescence and never stops a unit or removes skills after a service failure", async () => {
+  const f = fixture("linux");
+  try {
+    for (const filename of [f.paths.persistence[0], f.paths.skills[0]]) {
+      fs.mkdirSync(path.dirname(filename), { recursive: true });
+      fs.writeFileSync(filename, "owned");
+      recordInstalledArtifact(f.root, filename, f.paths);
+    }
+    const u = unitFixture(f.paths);
+    let stops = 0;
+    const result = await uninstallFlock({ paths: f.paths, leave: confirm,
+      checkPersistence: (paths) => assertLinuxUnitsQuiescent(paths, { query: u.query }),
+      removeTasks: async () => { u.properties.ActiveState = "active"; return []; },
+      disable: (filename, paths) => disablePersistence(filename, paths, { query: u.query }),
+      stopDaemon: async () => { stops++; },
+    });
+    assert.equal(result.fullyRemoved, false);
+    assert.deepEqual(result.removed, []);
+    assert.equal(stops, 0);
+    assert.equal(u.commands.some((args) => args[0] === "disable"), false);
+    for (const filename of [f.paths.persistence[0], f.paths.skills[0], path.join(f.root, "identity.json")]) {
+      assert.ok(fs.existsSync(filename));
+    }
+  } finally { f.close(); }
+});
+
+test("Linux rechecks unit activation before pinned-daemon stop even after persistence removal", async () => {
+  const f = fixture("linux");
+  try {
+    const filename = f.paths.persistence[0];
+    fs.mkdirSync(path.dirname(filename), { recursive: true });
+    fs.writeFileSync(filename, "owned");
+    recordInstalledArtifact(f.root, filename, f.paths);
+    const u = unitFixture(f.paths);
+    let stops = 0;
+    const result = await uninstallFlock({ paths: f.paths, leave: confirm,
+      checkPersistence: (paths) => assertLinuxUnitsQuiescent(paths, { query: u.query }),
+      removeTasks: async () => [],
+      disable: async (target, paths) => {
+        await disablePersistence(target, paths, { query: u.query });
+        Object.assign(u.properties, { ActiveState: "active", MainPID: "456" });
+      },
+      stopDaemon: async () => { stops++; },
+    });
+    assert.equal(result.fullyRemoved, false);
+    assert.equal(stops, 0);
+    assert.deepEqual(u.commands.filter((args) => args[0] === "disable"), [["disable", path.basename(filename)]]);
+    assert.ok(fs.existsSync(path.join(f.root, "identity.json")));
+    assert.ok(fs.existsSync(path.join(f.root, "flock.mjs")));
+    assert.ok(fs.existsSync(path.join(f.root, "uninstall-progress.json")));
+  } finally { f.close(); }
+});
 
 test("member selectors are conjunctive, require a selector and never match a sibling device", () => {
   const member = { githubUser: "owner", githubUserId: 1, deviceId: "a", machineId: "PC-A" };
@@ -118,6 +337,7 @@ for (const platform of ["win32", "linux", "darwin"]) {
       }
       const disabled = [];
       const result = await uninstallFlock({ paths: f.paths, leave: confirm,
+        checkPersistence: async () => {},
         disable: async (filename) => disabled.push(filename), removeTasks: async () => [] });
       assert.equal(result.fullyRemoved, true, JSON.stringify(result));
       assert.deepEqual(disabled, [f.paths.persistence[0]]);
@@ -266,11 +486,13 @@ test("Linux enumeration skips proven other-user processes but retains denied sam
     assert.deepEqual(clients.map((client) => client.pid), [42, 43, 47, 48]);
     assert.equal(inspected.includes(1), false, "Root-owned /proc/1/exe must not be inspected by another user's cleanup");
     const retained = await uninstallFlock({ paths: f.paths, leave: confirm, removeTasks: async () => [],
+      checkPersistence: async () => {},
       findProcesses: () => findRuntimeClients(f.paths, options) });
     assert.equal(retained.fullyRemoved, false);
     assert.ok(retained.retained.some((entry) => entry.path === "Process:42"));
     assert.ok(fs.existsSync(path.join(f.root, "identity.json")));
     const removed = await uninstallFlock({ paths: f.paths, leave: confirm, removeTasks: async () => [],
+      checkPersistence: async () => {},
       findProcesses: () => findRuntimeClients(f.paths, { ...options, readdir: () => ["1"] }) });
     assert.equal(removed.fullyRemoved, true, JSON.stringify(removed));
   } finally { f.close(); }
@@ -541,7 +763,8 @@ const readdir = fs.readdirSync;
 fs.readdirSync = (filename, ...args) => filename === "/proc" ? [] : readdir(filename, ...args);
 cp.execFileSync = (command, args) => {
   if (command === "powershell.exe" && /FLOCK_TASK_NAMES|FLOCK_RUNTIME_SCRIPTS/.test(args.at(-1))) return "[]";
-  if (command === "systemctl" && JSON.stringify(args) === JSON.stringify(["--user", "disable", "--now", path.basename(process.env.FIXTURE_PERSISTENCE)])) return "";
+  if (command === "systemctl" && JSON.stringify(args) === JSON.stringify(["--user", "list-units", "--all", "--output=json", "--no-pager", "--type=service", "copilot-flock.service", "copilot-signalr-bridge.service"])) return "[]";
+  if (command === "systemctl" && JSON.stringify(args) === JSON.stringify(["--user", "disable", path.basename(process.env.FIXTURE_PERSISTENCE)])) return "";
   if (command === "launchctl" && JSON.stringify(args) === JSON.stringify(["bootout", "gui/" + process.getuid(), process.env.FIXTURE_PERSISTENCE])) return "";
   if (command === "ps" && JSON.stringify(args) === JSON.stringify(["-axo", "uid=,pid="])) return "";
   throw new Error("Unexpected native command in isolated uninstall fixture: " + command);

@@ -89,7 +89,7 @@ function copyRuntimeModules(sourceDirectory, destinationDirectory, installedEntr
   }
 }
 
-export const BRIDGE_VERSION = "3.4.0";
+export const BRIDGE_VERSION = "3.4.1";
 
 const DEFAULT_AZURE_SUBSCRIPTION = process.env.COPILOT_FLOCK_SUBSCRIPTION || "";
 const DEFAULT_AZURE_RESOURCE_GROUP = process.env.COPILOT_FLOCK_RESOURCE_GROUP || "";

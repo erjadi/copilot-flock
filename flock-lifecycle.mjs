@@ -162,9 +162,23 @@ function commandIsDaemon(identity, scripts) {
   ].includes(identity.command));
 }
 
+export function assertLinuxDaemonCgroupSafe(pid, {
+  read = (filename) => fs.readFileSync(filename, "utf8"), uid = process.getuid?.(),
+} = {}) {
+  const rows = read(`/proc/${pid}/cgroup`).trim().split("\n").filter((line) => line.startsWith("0::"));
+  const group = rows.length === 1 ? rows[0].slice(3) : "";
+  const parts = group.split("/").slice(1);
+  if (pid === 1 || !Number.isSafeInteger(uid) || !group.startsWith("/") || group.includes("\0") ||
+      (group !== "/" && parts.some((part) => !part || part === "." || part === "..")) ||
+      parts.some((part) => part.endsWith(".service") && part !== `user@${uid}.service`)) {
+    throw new Error("Linux daemon service-cgroup child preservation is unproven; installation retained");
+  }
+}
+
 export async function stopPinnedDaemon(root, paths, {
   inspect = inspectProcess, kill = (pid) => process.kill(pid),
   delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+  checkLinuxCgroup = assertLinuxDaemonCgroupSafe,
 } = {}) {
   const pidPath = path.join(root, "daemon.pid");
   if (!fs.existsSync(pidPath)) return;
@@ -185,6 +199,7 @@ export async function stopPinnedDaemon(root, paths, {
     return;
   }
   if (pid === process.pid) throw new Error("Uninstaller cannot terminate its own process");
+  if (paths.platform === "linux") checkLinuxCgroup(pid);
   // Re-inspect immediately before signalling to reject stale/reused PIDs.
   if (JSON.stringify(inspect(pid)) !== JSON.stringify(live)) throw new Error("Daemon process identity changed");
   kill(pid);
@@ -275,10 +290,55 @@ function removeEmptyParents(filename, stop) {
   }
 }
 
-async function disablePersistence(filename, paths) {
+function queryUserSystemd(args) {
+  return execFileSync("systemctl", ["--user", ...args], {
+    encoding: "utf8", timeout: 6000, stdio: ["ignore", "pipe", "pipe"],
+  });
+}
+
+export function assertLinuxUnitsQuiescent(paths, {
+  query = queryUserSystemd, inspect = inspectProcess, checkCgroup = assertLinuxDaemonCgroupSafe,
+} = {}) {
+  if (paths.platform !== "linux") return;
+  const expected = new Map(paths.persistence.map((filename) => [path.basename(filename), filename]));
+  const units = JSON.parse(query(["list-units", "--all", "--output=json", "--no-pager",
+    "--type=service", ...expected.keys()]));
+  if (!Array.isArray(units)) throw new Error("Linux unit inventory unavailable; installation retained");
+  const seen = new Set();
+  for (const unit of units) {
+    if (!expected.has(unit?.unit) || seen.has(unit.unit)) {
+      throw new Error("Unexpected Linux unit inventory; installation retained");
+    }
+    seen.add(unit.unit);
+    const properties = new Map();
+    for (const line of query(["show", unit.unit,
+      "--property=Id,LoadState,FragmentPath,ActiveState,MainPID,ControlGroup"]).trim().split("\n")) {
+      const separator = line.indexOf("=");
+      const key = line.slice(0, separator);
+      if (separator < 1 || properties.has(key)) throw new Error("Invalid Linux unit properties; installation retained");
+      properties.set(key, line.slice(separator + 1));
+    }
+    if (properties.get("Id") !== unit.unit || properties.get("LoadState") !== "loaded" ||
+        properties.get("FragmentPath") !== expected.get(unit.unit) ||
+        properties.get("ActiveState") !== "inactive" || properties.get("MainPID") !== "0" ||
+        properties.get("ControlGroup") !== "") {
+      throw new Error(`Linux unit ${unit.unit} is active or child preservation is unproven; installation retained`);
+    }
+  }
+  for (const root of paths.roots) {
+    const filename = assertNoLinks(path.join(root, "daemon.pid"));
+    if (!fs.existsSync(filename)) continue;
+    const pid = Number(fs.readFileSync(filename, "utf8").trim());
+    if (!Number.isSafeInteger(pid) || pid <= 0) throw new Error("Malformed daemon PID; installation retained");
+    const live = inspect(pid, "linux");
+    if (live && commandIsDaemon(live, paths.scripts)) checkCgroup(pid);
+  }
+}
+
+export async function disablePersistence(filename, paths, { query = queryUserSystemd } = {}) {
   if (paths.platform === "linux") {
-    execFileSync("systemctl", ["--user", "disable", "--now", path.basename(filename)],
-      { timeout: 6000, stdio: ["ignore", "pipe", "pipe"] });
+    assertLinuxUnitsQuiescent(paths, { query });
+    query(["disable", path.basename(filename)]);
   } else if (paths.platform === "darwin") {
     execFileSync("launchctl", ["bootout", `gui/${process.getuid()}`, filename],
       { timeout: 6000, stdio: ["ignore", "pipe", "pipe"] });
@@ -377,7 +437,7 @@ ConvertTo-Json -InputObject @($found) -Compress`], {
 export async function uninstallFlock({
   paths = lifecyclePaths(), leave, inventory, brokerFreeLeave, localOnly = false, approveLocalOnly = false,
   stopDaemon = stopPinnedDaemon, disable = disablePersistence, removeTasks = removeOwnedScheduledTasks,
-  findProcesses = findRuntimeClients,
+  findProcesses = findRuntimeClients, checkPersistence = assertLinuxUnitsQuiescent,
 } = {}) {
   if (localOnly && !approveLocalOnly) throw new Error("Local-only removal requires explicit approval; remote membership will remain");
   const report = { ok: false, fullyRemoved: false, localOnly, removed: [], retained: [], pending: [], preserved:
@@ -498,6 +558,13 @@ export async function uninstallFlock({
   }
   if (report.retained.some(({ path: filename }) => paths.roots.some((root) => filename === root || filename.startsWith(root + path.sep)))) return report;
   if (installations.length) {
+    try { await checkPersistence(paths); }
+    catch (error) {
+      report.retained.push(...installations.map(({ root }) => ({ path: root, reason: error.message })));
+      return report;
+    }
+  }
+  if (installations.length) {
     try {
       for (const result of await removeTasks(paths)) {
         if (result.removed) report.removed.push(result.path);
@@ -525,11 +592,17 @@ export async function uninstallFlock({
           path.dirname(path.dirname(filename));
         removeEmptyParents(filename, stop);
       }
-    } catch (error) { report.retained.push({ path: filename, reason: error.message }); }
+    } catch (error) {
+      report.retained.push({ path: filename, reason: error.message });
+      if (paths.persistence.includes(filename)) return report;
+    }
   }
   if (report.retained.some(({ path: filename }) => paths.persistence.includes(filename))) return report;
   for (const { root } of installations) {
-    try { await stopDaemon(root, paths); }
+    try {
+      await checkPersistence(paths);
+      await stopDaemon(root, paths);
+    }
     catch (error) { report.retained.push({ path: root, reason: error.message }); return report; }
   }
   if (installations.length) {
