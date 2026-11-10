@@ -9,7 +9,7 @@ import * as legacy from "../bridge.mjs";
 
 const implementations = [canonical, legacy];
 const cfg = { protocol: "broker-free-v34", endpoint: "https://fixture.service.signalr.net",
-  host: "fixture.service.signalr.net", hub: "fixture-forbidden", clientToken: "fixture-private-token",
+  host: "fixture.service.signalr.net", hub: "fixture_forbidden", clientToken: "fixture-private-token",
   credentialExpiresAt: Number.MAX_SAFE_INTEGER };
 
 function mockTlsSocket(t, respond, { timeout = false } = {}) {

@@ -1,5 +1,12 @@
-import { HUB, TOPIC } from "../flock-azure.mjs";
+import { HUB, TOPIC, jwt } from "../flock-azure.mjs";
 import { peerSubscription } from "../flock-protocol.mjs";
+
+export const OTHER_HUB = "fixture_forbidden";
+
+export function createOtherHubClientControl(cfg, { key, peerId, now = Date.now() }) {
+  return { ...cfg, hub: OTHER_HUB,
+    clientToken: jwt(`${cfg.endpoint}/client/?hub=${OTHER_HUB}`, key, cfg.credentialExpiresAt, { peerId, now }) };
+}
 
 export function classifySignalRClientDenial(error) {
   const status = Number.isInteger(error?.statusCode) && error.statusCode >= 100 && error.statusCode <= 599 ? error.statusCode : null;
@@ -16,7 +23,7 @@ export async function runAzureNegativeProbes({ request, signalrEndpoint, service
   const body = { target: "fixture-negative", arguments: [] };
   const probes = [
     ["client-jwt-cannot-rest-send", hub, transport.signalrClientToken, "POST", body],
-    ["rest-jwt-cannot-send-other-hub", `${signalrEndpoint}/api/v1/hubs/fixture-forbidden`, transport.signalrRestToken, "POST", body],
+    ["rest-jwt-cannot-send-other-hub", `${signalrEndpoint}/api/v1/hubs/${OTHER_HUB}`, transport.signalrRestToken, "POST", body],
     ["rest-jwt-cannot-send-other-user", `${hub}/users/${ownerPeerId}`, transport.signalrRestToken, "POST", body],
     ["servicebus-sas-cannot-rest-send", hub, transport.serviceBusSendSas, "POST", body],
     ["expired-rest-jwt", hub, expiredRestToken, "POST", body],

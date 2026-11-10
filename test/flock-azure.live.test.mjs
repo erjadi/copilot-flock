@@ -5,7 +5,7 @@ import crypto from "node:crypto";
 import { AzureTransport, azureEndpoints, parseAzureConnection, HUB, TOPIC, jwt, sas } from "../flock-azure.mjs";
 import { createDeviceIdentity, createOwnerState, createJoinCode, approveJoin, acceptWelcome, ownerFingerprint, peerSubscription } from "../flock-protocol.mjs";
 import { connectSignalRClient } from "../flock.mjs";
-import { runAzureNegativeProbes, classifySignalRClientDenial } from "./azure-negative-probes.mjs";
+import { OTHER_HUB, createOtherHubClientControl, runAzureNegativeProbes, classifySignalRClientDenial } from "./azure-negative-probes.mjs";
 
 // Deliberately excluded from npm test. Never point this gate at an enrolled/production namespace.
 test("LIVE RELEASE GATE: scoped Azure clients, REST JWTs and subscription-only SAS isolation", {
@@ -72,8 +72,27 @@ test("LIVE RELEASE GATE: scoped Azure clients, REST JWTs and subscription-only S
       t.diagnostic(JSON.stringify({ kind: "live-gate-positive-probe",
         operation: peerId === state.localPeerId ? "owner-client-connect" : "peer-client-connect", outcome: "passed" }));
       if (peerId === code.body.peerId) {
+        let controlReceived = false;
+        const controlCfg = createOtherHubClientControl(cfg, { key: signalr.key, peerId });
+        clients.push(await connectSignalRClient(controlCfg, { userId: peerId, onInvocation: (target, args) => {
+          if (target === "flock34Control" && args[0]?.probe === probe) controlReceived = true;
+        } }));
+        t.diagnostic(JSON.stringify({ kind: "live-gate-positive-probe",
+          operation: "other-hub-valid-client-connect", outcome: "passed" }));
+        const controlUrl = `${signalr.endpoint}/api/v1/hubs/${OTHER_HUB}`;
+        const controlToken = jwt(controlUrl, signalr.key, transport.expiresAt);
+        const controlResponse = await request(controlUrl, controlToken, "POST", {
+          target: "flock34Control", arguments: [{ probe }],
+        });
+        await controlResponse.body?.cancel();
+        assert.equal(controlResponse.status, 202, "The distinct valid hub must accept its correctly scoped REST token");
+        const controlDeadline = Date.now() + 10000;
+        while (!controlReceived && Date.now() < controlDeadline) await new Promise((resolve) => setTimeout(resolve, 50));
+        assert.ok(controlReceived, "The distinct valid hub must deliver to its correctly scoped client");
+        t.diagnostic(JSON.stringify({ kind: "live-gate-positive-probe",
+          operation: "other-hub-valid-rest-send-and-client-receive", outcome: "passed" }));
         try {
-          const invalid = await connectSignalRClient({ ...cfg, hub: "fixture-forbidden" }, { userId: peerId, onInvocation() {} });
+          const invalid = await connectSignalRClient({ ...cfg, hub: OTHER_HUB }, { userId: peerId, onInvocation() {} });
           invalid.close();
           clientIsolation = classifySignalRClientDenial({ statusCode: 101 });
         } catch (error) { clientIsolation = classifySignalRClientDenial(error); }

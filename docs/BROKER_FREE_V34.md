@@ -159,6 +159,15 @@ both exact fixture subscriptions and reports failures. Never point it at
 enrolled/production resources, infer permission from environment flags, or
 mark an unexecuted gate passed.
 
+The distinct wrong-hub fixture is `fixture_forbidden`, shared by the REST and
+WebSocket probes. [Azure's documented hub-name syntax](https://learn.microsoft.com/en-us/azure/azure-signalr/swagger/signalr-data-plane-rest-v1)
+requires an alphabetic first character and only alphanumeric characters or
+underscores; a hyphenated fixture can fail input validation instead of proving
+authorization isolation. The harness additionally connects to the distinct
+hub using a token minted for that exact hub and confirms REST delivery using
+its matching REST token. Both positive controls must pass; they do not replace
+any original positive or negative probe, or permit HTTP 400 as a denial.
+
 SignalR startup observes both the HTTP upgrade and JSON handshake from the
 start. Rejected upgrades, early closes and handshake timeouts reject the
 caller explicitly, close the socket and clear the handshake timer; they do not

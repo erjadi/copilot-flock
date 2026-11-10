@@ -1,6 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { runAzureNegativeProbes, classifySignalRClientDenial } from "./azure-negative-probes.mjs";
+import crypto from "node:crypto";
+import { OTHER_HUB, createOtherHubClientControl, runAzureNegativeProbes, classifySignalRClientDenial } from "./azure-negative-probes.mjs";
+import { HUB } from "../flock-azure.mjs";
 import { peerSubscription } from "../flock-protocol.mjs";
 
 const fixture = {
@@ -11,6 +13,25 @@ const fixture = {
     serviceBusSendSas: "fixture-send", serviceBusListenSas: "fixture-listen" },
   expiredRestToken: "fixture-expired-rest", expiredListenSas: "fixture-expired-listen",
 };
+
+test("Azure wrong-hub fixture is syntactically valid and its positive control has matching scoped credentials", () => {
+  assert.match(OTHER_HUB, /^[A-Za-z][A-Za-z0-9_]*$/);
+  assert.notEqual(OTHER_HUB.toLowerCase(), HUB.toLowerCase());
+  const now = 1800000000000;
+  const cfg = { protocol: "broker-free-v34", endpoint: fixture.signalrEndpoint, hub: HUB,
+    clientToken: fixture.transport.signalrClientToken, credentialExpiresAt: now + 60000 };
+  const control = createOtherHubClientControl(cfg, { key: "fixture-key", peerId: fixture.peerId, now });
+  assert.equal(cfg.hub, HUB);
+  assert.equal(cfg.clientToken, fixture.transport.signalrClientToken);
+  assert.equal(control.hub, OTHER_HUB);
+  assert.equal(control.credentialExpiresAt, cfg.credentialExpiresAt);
+  const [header, body, signature] = control.clientToken.split(".");
+  const claims = JSON.parse(Buffer.from(body, "base64url").toString("utf8"));
+  assert.equal(claims.aud, `${fixture.signalrEndpoint}/client/?hub=${OTHER_HUB}`);
+  assert.equal(claims.nameid, fixture.peerId);
+  assert.equal(claims.exp, cfg.credentialExpiresAt / 1000);
+  assert.equal(signature, crypto.createHmac("sha256", "fixture-key").update(`${header}.${body}`).digest("base64url"));
+});
 
 test("Azure gate probes all original isolation operations with exact tokens, targets and methods", async () => {
   const calls = [];
@@ -23,7 +44,7 @@ test("Azure gate probes all original isolation operations with exact tokens, tar
   assert.ok(results.every((result) => result.outcome === "denied" && result.status === 403));
   assert.deepEqual(calls.map(([url, token, method]) => [url, token, method]), [
     [`${fixture.signalrEndpoint}/api/v1/hubs/copilotbridge`, "fixture-client", "POST"],
-    [`${fixture.signalrEndpoint}/api/v1/hubs/fixture-forbidden`, "fixture-rest", "POST"],
+    [`${fixture.signalrEndpoint}/api/v1/hubs/${OTHER_HUB}`, "fixture-rest", "POST"],
     [`${fixture.signalrEndpoint}/api/v1/hubs/copilotbridge/users/${fixture.ownerPeerId}`, "fixture-rest", "POST"],
     [`${fixture.signalrEndpoint}/api/v1/hubs/copilotbridge`, "fixture-send", "POST"],
     [`${fixture.signalrEndpoint}/api/v1/hubs/copilotbridge`, "fixture-expired-rest", "POST"],
