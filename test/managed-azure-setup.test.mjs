@@ -244,7 +244,7 @@ test("broker /health is an actual HTTP alias without credential disclosure", asy
   } finally { await new Promise((resolve) => server.close(resolve)); }
 });
 
-test("ZIP contains exactly the current broker sources and opens with the Windows archive reader", () => {
+test("ZIP contains exactly the current broker sources and opens without Windows PowerShell module autoload", () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "flock-zip-test-"));
   try {
     const zip = path.join(directory, "broker.zip");
@@ -264,8 +264,9 @@ test("ZIP contains exactly the current broker sources and opens with the Windows
     assert.deepEqual(names, ["bootstrap-server.mjs", "flock-membership.mjs", "package.json"]);
     if (process.platform === "win32") {
       const result = spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command",
-        "Expand-Archive -LiteralPath $env:TEST_ZIP -DestinationPath $env:TEST_DEST -ErrorAction Stop"],
-      { encoding: "utf8", timeout: 30000, env: { ...process.env, TEST_ZIP: zip, TEST_DEST: path.join(directory, "expanded") } });
+        "Add-Type -AssemblyName System.IO.Compression.FileSystem; [System.IO.Compression.ZipFile]::ExtractToDirectory($env:TEST_ZIP, $env:TEST_DEST)"],
+      { encoding: "utf8", timeout: 30000, env: { ...process.env, PSModulePath: path.join(directory, "no-powershell-modules"),
+        TEST_ZIP: zip, TEST_DEST: path.join(directory, "expanded") } });
       assert.equal(result.status, 0, result.stderr);
       for (const name of names) assert.deepEqual(fs.readFileSync(path.join(directory, "expanded", name)), fs.readFileSync(path.join(root, name)));
     }
