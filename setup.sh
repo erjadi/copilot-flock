@@ -6,13 +6,16 @@ RESOURCE_GROUP="rg-copilot-flock"
 LOCATION="eastus"
 SUBSCRIPTION=""
 NAME_PREFIX="flock"
-SKIP_BROKER=false
+SKIP_BROKER=true
 SCOPE="${COPILOT_FLOCK_SCOPE:-${COPILOT_BRIDGE_SCOPE:-}}"
 MACHINE_ID="${COPILOT_FLOCK_MACHINE_ID:-${COPILOT_BRIDGE_MACHINE_ID:-}}"
 INVITE_FILE="${COPILOT_FLOCK_INVITE_FILE:-}"
 BOOTSTRAP_URL="${COPILOT_FLOCK_BOOTSTRAP_URL:-}"
 CONNECTION_STRING="${SIGNALR_CONNECTION_STRING:-}"
 SERVICEBUS_CONNECTION_STRING="${SERVICEBUS_CONNECTION_STRING:-}"
+SERVICEBUS_SEND_CONNECTION_STRING="${SERVICEBUS_SEND_CONNECTION_STRING:-}"
+SERVICEBUS_LISTEN_CONNECTION_STRING="${SERVICEBUS_LISTEN_CONNECTION_STRING:-}"
+FLOCK=""
 
 fail() { printf '%s\n' "$1" >&2; exit 1; }
 require_value() {
@@ -27,12 +30,16 @@ while [[ $# -gt 0 ]]; do
     --subscription) require_value "$@"; SUBSCRIPTION="$2"; shift 2 ;;
     --name-prefix) require_value "$@"; NAME_PREFIX="$2"; shift 2 ;;
     --skip-broker) SKIP_BROKER=true; shift ;;
+    --legacy-broker) SKIP_BROKER=false; shift ;;
     --scope) require_value "$@"; SCOPE="$2"; shift 2 ;;
     --machine-id) require_value "$@"; MACHINE_ID="$2"; shift 2 ;;
     --invite-file) require_value "$@"; INVITE_FILE="$2"; shift 2 ;;
     --bootstrap-url) require_value "$@"; BOOTSTRAP_URL="$2"; shift 2 ;;
     --connection-string) require_value "$@"; CONNECTION_STRING="$2"; shift 2 ;;
     --servicebus-connection-string) require_value "$@"; SERVICEBUS_CONNECTION_STRING="$2"; shift 2 ;;
+    --servicebus-send-connection-string) require_value "$@"; SERVICEBUS_SEND_CONNECTION_STRING="$2"; shift 2 ;;
+    --servicebus-listen-connection-string) require_value "$@"; SERVICEBUS_LISTEN_CONNECTION_STRING="$2"; shift 2 ;;
+    --flock) require_value "$@"; FLOCK="$2"; shift 2 ;;
     *) fail "Unknown setup option: $1" ;;
   esac
 done
@@ -40,7 +47,8 @@ done
 command -v node >/dev/null 2>&1 || fail "Node.js is required before running setup."
 [[ -z "$SCOPE" || "$SCOPE" == work || "$SCOPE" == personal ]] || fail "Scope must be work or personal."
 if [[ "$PROVISION_AZURE" == true ]]; then
-  [[ -z "$INVITE_FILE" && -z "$CONNECTION_STRING" && -z "$SERVICEBUS_CONNECTION_STRING" && -z "$BOOTSTRAP_URL" ]] ||
+  [[ -z "$INVITE_FILE" && -z "$CONNECTION_STRING" && -z "$SERVICEBUS_CONNECTION_STRING" &&
+     -z "$SERVICEBUS_SEND_CONNECTION_STRING" && -z "$SERVICEBUS_LISTEN_CONNECTION_STRING" && -z "$BOOTSTRAP_URL" ]] ||
     fail "--provision-azure cannot be combined with an invite, bootstrap URL or existing connection strings."
   [[ "$NAME_PREFIX" =~ ^[a-zA-Z0-9]{1,20}$ ]] || fail "Name prefix must be 1-20 alphanumeric characters."
   if ! command -v az >/dev/null 2>&1; then
@@ -77,13 +85,12 @@ if [[ "$PROVISION_AZURE" == true ]]; then
   SUBSCRIPTION="$(az account show --query id --output tsv)"
   [[ "$SUBSCRIPTION" =~ ^[a-fA-F0-9-]{36}$ ]] || fail "Cannot resolve the selected Azure subscription."
   GITHUB_USER="${GITHUB_USER:-}"
-  if [[ "$SKIP_BROKER" == false ]]; then
-    if [[ -z "$GITHUB_USER" ]]; then
-      command -v gh >/dev/null 2>&1 || fail "Sign in to GitHub CLI or provide GITHUB_USER before provisioning."
-      GITHUB_USER="$(gh api user --jq .login)"
-    fi
-    [[ "$GITHUB_USER" =~ ^[a-zA-Z0-9][a-zA-Z0-9-]{0,38}$ ]] || fail "Invalid GitHub maintainer."
+  if [[ -z "$GITHUB_USER" ]]; then
+    command -v gh >/dev/null 2>&1 || fail "Sign in to GitHub CLI or provide GITHUB_USER before provisioning."
+    GITHUB_USER="$(gh api user --jq .login)"
   fi
+  [[ "$GITHUB_USER" =~ ^[a-zA-Z0-9][a-zA-Z0-9-]{0,38}$ ]] || fail "Invalid GitHub owner label."
+  [[ -n "$SCOPE" ]] || fail "Confirm an explicit personal or work scope before provisioning."
   az group create --subscription "$SUBSCRIPTION" --name "$RESOURCE_GROUP" --location "$LOCATION" --output none
   DEPLOYMENT_OUTPUT="$(az deployment group create --subscription "$SUBSCRIPTION" --resource-group "$RESOURCE_GROUP" \
     --template-file "$SCRIPT_DIR/infra/azuredeploy.json" \
@@ -94,7 +101,7 @@ if [[ "$PROVISION_AZURE" == true ]]; then
   [[ -z "$GITHUB_USER" ]] || MANAGED_ARGS+=("--github-user" "$GITHUB_USER")
   [[ -z "$SCOPE" ]] || MANAGED_ARGS+=("--scope" "$SCOPE")
   [[ -z "$MACHINE_ID" ]] || MANAGED_ARGS+=("--machine-id" "$MACHINE_ID")
-  [[ "$SKIP_BROKER" == false ]] || MANAGED_ARGS+=("--skip-broker")
+  [[ "$SKIP_BROKER" == true ]] || MANAGED_ARGS+=("--legacy-broker")
   printf '%s' "$DEPLOYMENT_OUTPUT" | node "${MANAGED_ARGS[@]}"
   exit $?
 fi
@@ -106,5 +113,8 @@ ARGS=("$SCRIPT_DIR/flock.mjs" "install")
 [[ -z "$BOOTSTRAP_URL" ]] || ARGS+=("--bootstrap-url" "$BOOTSTRAP_URL")
 [[ -z "$CONNECTION_STRING" ]] || ARGS+=("--connection-string" "$CONNECTION_STRING")
 [[ -z "$SERVICEBUS_CONNECTION_STRING" ]] || ARGS+=("--servicebus-connection-string" "$SERVICEBUS_CONNECTION_STRING")
+[[ -z "$SERVICEBUS_SEND_CONNECTION_STRING" ]] || ARGS+=("--servicebus-send-connection-string" "$SERVICEBUS_SEND_CONNECTION_STRING")
+[[ -z "$SERVICEBUS_LISTEN_CONNECTION_STRING" ]] || ARGS+=("--servicebus-listen-connection-string" "$SERVICEBUS_LISTEN_CONNECTION_STRING")
+[[ -z "$FLOCK" ]] || ARGS+=("--flock" "$FLOCK")
 echo "Installing and starting Copilot Flock..."
 node "${ARGS[@]}"

@@ -1,5 +1,11 @@
 # Joining an Existing Flock, Inviting Teammates & Sharing Threads (Case 1 Guide)
 
+**Legacy broker-backed reference.** One-step v3 invitations below are preserved
+for explicitly configured legacy installations. New 3.4.0 broker-free joining
+uses device-bound Join Codes, owner approval and independently pinned sealed
+Welcome Tickets. Use [the current source-candidate guide](./BROKER_FREE_V34.md);
+do not apply legacy hub, session-creation or immediate-revocation claims to it.
+
 ![Two Ways to Bootstrap Copilot Flock](./assets/flock-onboarding-paths.svg)
 
 This guide covers **Case 1**: joining an **existing Copilot Flock** via a pasteable invite, adding your own additional computers, creating shared collaborator flocks (`<owner>/<team>`), issuing time-bound guest passes (`<owner>/<flock>/<machineId>`), and sharing specific threads safely.

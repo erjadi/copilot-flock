@@ -6,15 +6,21 @@ param(
     [string]$BootstrapUrl = $env:COPILOT_FLOCK_BOOTSTRAP_URL,
     [string]$ConnectionString = $env:SIGNALR_CONNECTION_STRING,
     [string]$ServiceBusConnectionString = $env:SERVICEBUS_CONNECTION_STRING,
+    [string]$ServiceBusSendConnectionString = $env:SERVICEBUS_SEND_CONNECTION_STRING,
+    [string]$ServiceBusListenConnectionString = $env:SERVICEBUS_LISTEN_CONNECTION_STRING,
+    [string]$Flock,
     [switch]$ProvisionAzure,
     [string]$SubscriptionId,
     [string]$ResourceGroup = "rg-copilot-flock",
     [string]$Location = "eastus",
     [string]$NamePrefix = "flock",
-    [switch]$SkipBroker
+    [switch]$SkipBroker,
+    [switch]$LegacyBroker
 )
 
 $ErrorActionPreference = "Stop"
+if ($LegacyBroker -and $SkipBroker) { throw "-LegacyBroker and -SkipBroker cannot be combined." }
+$SkipBroker = -not $LegacyBroker
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $FlockScript = Join-Path $ScriptDir "flock.mjs"
 
@@ -22,7 +28,7 @@ if (-not (Get-Command node -ErrorAction SilentlyContinue)) {
     throw "Node.js is required before running setup."
 }
 if ($ProvisionAzure) {
-    if ($InviteFile -or $ConnectionString -or $ServiceBusConnectionString -or $BootstrapUrl) {
+    if ($InviteFile -or $ConnectionString -or $ServiceBusConnectionString -or $ServiceBusSendConnectionString -or $ServiceBusListenConnectionString -or $BootstrapUrl) {
         throw "-ProvisionAzure cannot be combined with an invite, bootstrap URL or existing connection strings."
     }
     if ([string]::IsNullOrWhiteSpace($ResourceGroup) -or [string]::IsNullOrWhiteSpace($Location)) {
@@ -64,12 +70,13 @@ if ($ProvisionAzure) {
     $SubscriptionId = & az account show --query id --output tsv
     if ($LASTEXITCODE -ne 0 -or $SubscriptionId -notmatch '^[a-fA-F0-9-]{36}$') { throw "Cannot resolve the selected Azure subscription." }
     $GitHubUser = $env:GITHUB_USER
-    if (-not $SkipBroker -and -not $GitHubUser) {
+    if (-not $GitHubUser) {
         if (-not (Get-Command gh -ErrorAction SilentlyContinue)) { throw "Sign in to GitHub CLI or provide GITHUB_USER before provisioning." }
         $GitHubUser = & gh api user --jq .login
         if ($LASTEXITCODE -ne 0) { throw "Cannot resolve the authenticated GitHub maintainer." }
     }
-    if (-not $SkipBroker -and $GitHubUser -notmatch '^[a-zA-Z0-9][a-zA-Z0-9-]{0,38}$') { throw "Invalid GitHub maintainer." }
+    if ($GitHubUser -notmatch '^[a-zA-Z0-9][a-zA-Z0-9-]{0,38}$') { throw "Invalid GitHub owner label." }
+    if (-not $Scope) { throw "Confirm an explicit personal or work scope before provisioning." }
     & az group create --subscription $SubscriptionId --name $ResourceGroup --location $Location --output none
     if ($LASTEXITCODE -ne 0) {
         throw "Azure resource group creation failed."
@@ -96,7 +103,7 @@ if ($ProvisionAzure) {
     if ($GitHubUser) { $ManagedArgs += @("--github-user", $GitHubUser) }
     if ($Scope) { $ManagedArgs += @("--scope", $Scope) }
     if ($MachineId) { $ManagedArgs += @("--machine-id", $MachineId) }
-    if ($SkipBroker) { $ManagedArgs += "--skip-broker" }
+    if ($LegacyBroker) { $ManagedArgs += "--legacy-broker" }
     try {
         $ErrorActionPreference = "Continue"
         ($DeploymentOutput -join "`n") | & node @ManagedArgs
@@ -127,6 +134,13 @@ if ($ConnectionString) {
 if ($ServiceBusConnectionString) {
     $ArgsList += @("--servicebus-connection-string", $ServiceBusConnectionString)
 }
+if ($ServiceBusSendConnectionString) {
+    $ArgsList += @("--servicebus-send-connection-string", $ServiceBusSendConnectionString)
+}
+if ($ServiceBusListenConnectionString) {
+    $ArgsList += @("--servicebus-listen-connection-string", $ServiceBusListenConnectionString)
+}
+if ($Flock) { $ArgsList += @("--flock", $Flock) }
 
 Write-Host "Installing and starting Copilot Flock..." -ForegroundColor Cyan
 & node @ArgsList

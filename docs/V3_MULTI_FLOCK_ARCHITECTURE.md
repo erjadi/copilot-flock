@@ -1,5 +1,10 @@
 # Copilot SignalR Bridge `v3.0` — Multi-Flock P2P Platform Architecture & RFC
 
+**Legacy reference:** this document describes broker-backed compatibility,
+not the broker-free 3.4.0 default. Its hub, maintainer visibility and revocation
+model must not be used to infer 3.4 behavior.
+See [the current protocol](./BROKER_FREE_V34.md).
+
 - **Status**: Draft RFC for Flock Peer Review (`branch: v3-multi-flock-design`)
 - **Baseline**: `v2.2.0` (`5fc4b3e`)
 - **Platform Maintainer**: `@erjadi` (`your-signalr.service.signalr.net` / `your-flock-bootstrap.azurewebsites.net`)

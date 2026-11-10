@@ -1,5 +1,8 @@
 # Copilot SignalR Bridge `v3.0` — Implementation & Test Plan (DevDoc)
 
+**Historical legacy plan:** this is not the broker-free 3.4.0 implementation or
+release evidence. See [the current protocol and required gates](./BROKER_FREE_V34.md).
+
 - **Branch**: `origin/v3-multi-flock-design`
 - **Companion Spec**: [`docs/V3_MULTI_FLOCK_ARCHITECTURE.md`](./V3_MULTI_FLOCK_ARCHITECTURE.md)
 - **Live Production Baseline (Untouched During Preview)**: `v2.2.0` (`5fc4b3e`)

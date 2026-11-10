@@ -63,7 +63,7 @@ test("HKDF per-message random salt, canonical AAD and mandatory signature reject
 });
 test("guest and collaborator cannot derive owner privileges or access unshared sessions", async () => {
   const f = await group("guest");
-  for (const action of ["self_update", "create_session", "list_sessions", "reprovision"]) {
+  for (const action of ["self_update", "create_session", "list_projects", "reprovision"]) {
     assert.throws(() => encryptEnvelope({ state: f.peerState, identity: f.peer, cert: f.peerState.cert,
       action, payload: { params: { fromGitHubUser: "demo" } }, targetPeerId: f.state.localPeerId }), /forbids/);
   }

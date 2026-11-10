@@ -11,13 +11,26 @@ or `node flock.mjs flock unenroll --traceless`. The legacy `bridge.mjs` entrypoi
 supports the same forms. The MCP tool is `unenroll_flock` with `traceless: true`.
 It returns the result before its own MCP process exits on successful cleanup.
 
-The current authenticated leave transport is the explicitly configured legacy
-broker, using the new signed `/api/v3/flocks/leave-plan` and `/flocks/leave`
-routes. An older deployed broker without those routes will return an explicit
-pending/failure result. This source change does not deploy or restart brokers.
-No automatic Azure management privilege acquisition is attempted.
+Broker-free installations use signed device leave requests to the designated
+owner, targeted subscription deletion, retained-recipient key rotation and
+owner-signed completion receipts. An offline or unauthorized owner means
+pending leave, not success. The explicitly configured legacy broker remains a
+separate compatibility route using signed `/api/v3/flocks/leave-plan` and
+`/flocks/leave` endpoints. Older brokers without them return pending/failure.
+No silent broker fallback or automatic management privilege acquisition occurs.
 
 ## Membership acknowledgment and recovery
+
+In broker-free mode, each membership is independently acknowledged and retries
+keep a stable operation ID, including an interrupted rotation after subscription
+deletion. Pending owner approval intents are cleaned only for the departing
+device. Unaccepted local Join Codes may correspond to unconfirmed owner-side
+approvals, so they block full removal until reconciled. Owner self-removal
+does not delegate signing/renewal authority or delete retained peers.
+Partitioned receivers unaware of removal can accept until short certificate
+expiry; this is not immediate global revocation.
+
+The following broker-specific behavior applies only to explicit legacy mode:
 
 The device signs its flock, device and machine selectors, request ID and
 timestamp with its enrolled Ed25519 key. The broker discovers remote
@@ -93,7 +106,7 @@ and external backups cannot be erased by runtime uninstall. Returned `removed`,
 the current cleanup does not establish that every historical or live MCP
 process trace is gone.
 
-## 3.4 protocol preparation, not a release claim
+## 3.4.0 source candidate, not a release claim
 
 `flock-protocol.mjs` exercises device-bound signed Join Codes, X25519 sealed
 Welcome Tickets, independently pinned owner fingerprints, short MemberCerts,
@@ -110,10 +123,10 @@ Partitioned receivers unaware of a kick may accept until certificate expiry;
 there is no distributed sequencer or immediate-global-revocation guarantee.
 Renewal remains owner-mediated.
 
-These are isolated library fixtures, **not wired active runtime behavior**.
-Azure token issuance/audience scoping, subscription-only SAS isolation,
-broker-free owner-mediated leave/kick, default two-service deployment and
-owner-mediated renewal still need integration. Positive and negative live
-Azure tests, immutable candidate review and the required release vote remain
-unrun gates. Existing installations are untouched and version metadata remains
-3.3.1 until a complete release candidate is prepared.
+These mechanisms are wired through the broker-free runtime, Azure adapter,
+daemon, RPC/CLI/MCP, renewal and uninstall. New setup defaults to two services;
+existing installations remain untouched. Full retained recovery, strict JSON
+edits, unproven legacy ownership and live-process retention are intentional
+limitations, not "traceless success." Positive and negative live Azure tests,
+immutable candidate review and the required release vote remain unrun gates.
+See [the active protocol and gate reference](./BROKER_FREE_V34.md).

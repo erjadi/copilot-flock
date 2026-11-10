@@ -35,7 +35,8 @@
     },
     "deployTokenBroker": {
       "type": "bool",
-      "defaultValue": true
+      "defaultValue": false,
+      "metadata": { "description": "Explicit legacy compatibility only. Broker-free is the default." }
     },
     "appServiceSku": {
       "type": "string",
@@ -91,6 +92,20 @@
       "name": "[format('{0}/{1}', variables('serviceBusNamespaceName'), parameters('serviceBusTopicName'))]",
       "dependsOn": ["[resourceId('Microsoft.ServiceBus/namespaces', variables('serviceBusNamespaceName'))]"],
       "properties": {}
+    },
+    {
+      "type": "Microsoft.ServiceBus/namespaces/AuthorizationRules",
+      "apiVersion": "2022-10-01-preview",
+      "name": "[format('{0}/FlockSendRule', variables('serviceBusNamespaceName'))]",
+      "dependsOn": ["[resourceId('Microsoft.ServiceBus/namespaces', variables('serviceBusNamespaceName'))]"],
+      "properties": { "rights": ["Send"] }
+    },
+    {
+      "type": "Microsoft.ServiceBus/namespaces/AuthorizationRules",
+      "apiVersion": "2022-10-01-preview",
+      "name": "[format('{0}/FlockListenRule', variables('serviceBusNamespaceName'))]",
+      "dependsOn": ["[resourceId('Microsoft.ServiceBus/namespaces', variables('serviceBusNamespaceName'))]"],
+      "properties": { "rights": ["Listen"] }
     },
     {
       "condition": "[parameters('deployTokenBroker')]",

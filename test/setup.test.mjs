@@ -37,7 +37,7 @@ try {
       if (args[0] === "webapp") return "";
       return JSON.stringify({primaryConnectionString: args[0] === "signalr"
         ? "Endpoint=https://demo-signalr.service.signalr.net;AccessKey=synthetic-key-do-not-print;"
-        : "Endpoint=sb://demo-sb.servicebus.windows.net/;SharedAccessKeyName=RootManageSharedAccessKey;SharedAccessKey=synthetic-key-do-not-print;"});
+        : "Endpoint=sb://demo-sb.servicebus.windows.net/;SharedAccessKeyName=" + args[args.indexOf("--name")+1] + ";SharedAccessKey=synthetic-key-do-not-print;"});
     },
     waitForBroker: async (url) => { log("health", [url]); },
     install: async (options) => {
@@ -95,7 +95,7 @@ if ($env:LEGACY -eq "1") {$a.ConnectionString="synthetic-direct"}
 else {
   $a.ProvisionAzure=$true; $a.SubscriptionId=$env:SUBSCRIPTION
   $a.ResourceGroup="rg-demo"; $a.Location="westus2"; $a.NamePrefix="example"
-  if ($env:SKIP -eq "1") {$a.SkipBroker=$true}
+  if ($env:SKIP -ne "1") {$a.LegacyBroker=$true}
 }
 & $env:SETUP @a
 `);
@@ -210,13 +210,13 @@ if (args[0] === "deployment") process.stdout.write(process.env.OUTPUTS);
     const args = ["--provision-azure", "--subscription", subscription, "--resource-group", "rg-demo",
       "--location", "westus2", "--name-prefix", "example", "--scope", "personal", "--machine-id", "DEMO-PC"];
     for (const skip of [false, true]) {
-      const result = run([...args, ...(skip ? ["--skip-broker"] : [])], "", skip);
-      checkManaged(result, skip, skip ? null : "demo-owner");
+      const result = run([...args, ...(skip ? [] : ["--legacy-broker"])], "", skip);
+      checkManaged(result, skip, "demo-owner");
       assert.ok(result.events.some((event) => event.kind === "az" && event.args.includes("--use-device-code")));
       if (!skip) assert.ok(result.events.some((event) => event.kind === "gh"));
     }
     for (const fail of ["login", "group", "deployment", "malformed", "metadata", "keys"]) {
-      const result = run(args, fail);
+      const result = run([...args, "--legacy-broker"], fail);
       assert.notEqual(result.status, 0, fail);
       assert.ok(!result.events.some((event) => event.kind === "install"), fail);
       assert.doesNotMatch(result.stdout + result.stderr, /synthetic-key-do-not-print/);

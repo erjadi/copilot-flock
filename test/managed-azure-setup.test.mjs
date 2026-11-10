@@ -10,7 +10,7 @@ import { createBootstrapServer } from "../bootstrap-server.mjs";
 
 const root = fileURLToPath(new URL("../", import.meta.url));
 const subscription = "11111111-2222-3333-4444-555555555555";
-const options = { subscription, resourceGroup: "rg-demo", githubUser: "demo-owner", scope: "personal" };
+const options = { subscription, resourceGroup: "rg-demo", githubUser: "demo-owner", scope: "personal", legacyBroker: true };
 const values = {
   subscriptionId: subscription, signalrName: "demo-signalr", signalrHostName: "demo-signalr.service.signalr.net",
   serviceBusNamespaceName: "demo-sb", serviceBusEndpoint: "sb://demo-sb.servicebus.windows.net/",
@@ -27,7 +27,8 @@ function adapters(overrides = {}) {
   return { events,
     runAz: async (args) => {
       events.push(["az", args]);
-      return JSON.stringify({ primaryConnectionString: args[0] === "signalr" ? signalr : serviceBus });
+      return JSON.stringify({ primaryConnectionString: args[0] === "signalr" ? signalr
+        : serviceBus.replace("RootManageSharedAccessKey", args[args.indexOf("--name") + 1]) });
     },
     createBrokerZip: (zip) => { createBrokerZip(zip); events.push(["zip", zip]); },
     waitForBroker: async (url) => { events.push(["health", url]); },
@@ -40,7 +41,11 @@ function adapters(overrides = {}) {
 
 test("complete conditional ARM stack wires runtime, credentials, persistent storage, identity and namespace role", () => {
   const template = JSON.parse(fs.readFileSync(path.join(root, "infra", "azuredeploy.json"), "utf8"));
-  assert.equal(template.parameters.deployTokenBroker.defaultValue, true);
+  assert.equal(template.parameters.deployTokenBroker.defaultValue, false);
+  assert.deepEqual(template.resources.filter((r) => !r.condition && r.type.split("/").length === 2).map((r) => r.type),
+    ["Microsoft.SignalRService/signalR", "Microsoft.ServiceBus/namespaces"]);
+  const policies = template.resources.filter((r) => r.type.endsWith("/AuthorizationRules"));
+  assert.deepEqual(policies.map((r) => r.properties.rights), [["Send"], ["Listen"]]);
   assert.equal(template.parameters.appServiceSku.defaultValue, "B1");
   assert.equal(template.parameters.allowedGithubRepo.defaultValue, "erjadi/copilot-flock");
   for (const name of ["signalrName", "serviceBusNamespaceName", "webAppName", "appServicePlanName"]) {
@@ -97,11 +102,15 @@ test("managed installation pins key reads and broker origin, deploys temporary Z
   assert.ok(!fs.existsSync(a.events.find((e) => e[0] === "zip")[1]));
 });
 
-test("skip broker has no ZIP, webapp deployment, health or bootstrap origin", async () => {
+test("default broker-free has separate scoped policy reads and no ZIP, webapp, health or bootstrap origin", async () => {
   const a = adapters();
-  await runManagedSetup(outputs({ webAppName: "", bootstrapUrl: "" }), { ...options, skipBroker: true }, a);
-  assert.deepEqual(a.events.map((e) => e[0]), ["az", "az", "install"]);
+  await runManagedSetup(outputs({ webAppName: "", bootstrapUrl: "" }), { ...options, legacyBroker: undefined }, a);
+  assert.deepEqual(a.events.map((e) => e[0]), ["az", "az", "az", "az", "install"]);
   assert.equal(a.events.at(-1)[1].bootstrapUrlArg, null);
+  assert.equal(a.events.at(-1)[1].protocolArg, "broker-free-v34");
+  assert.equal(a.events.at(-1)[1].flockIdArg, "demo-owner/personal");
+  assert.match(a.events.at(-1)[1].serviceBusSendConnectionStringArg, /SharedAccessKeyName=FlockSendRule;/);
+  assert.match(a.events.at(-1)[1].serviceBusListenConnectionStringArg, /SharedAccessKeyName=FlockListenRule;/);
 });
 
 test("invalid metadata and legacy secret outputs reject before key reads or initialization", async () => {
@@ -280,7 +289,7 @@ process.exitCode = 9;
         ? `@echo off\r\n"${process.execPath}" "${stub}" %*\r\n`
         : `#!/bin/sh\nexec "${process.execPath}" "${stub}" "$@"\n`, { mode: 0o755 });
     const result = spawnSync(process.execPath, [path.join(root, "managed-azure-setup.mjs"),
-      "--subscription", subscription, "--resource-group", "rg-demo", "--github-user", "demo-owner"], {
+      "--subscription", subscription, "--resource-group", "rg-demo", "--github-user", "demo-owner", "--legacy-broker"], {
       input: JSON.stringify(outputs()), encoding: "utf8", timeout: 30000,
       env: { ...process.env, PATH: `${directory}${path.delimiter}${process.env.PATH}`,
         AZ_DENIAL_JOURNAL: journal },

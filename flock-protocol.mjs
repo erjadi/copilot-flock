@@ -3,7 +3,7 @@ import fs from "node:fs";
 import { atomicJson, assertNoLinks } from "./flock-lifecycle.mjs";
 
 const DAY = 86400000;
-const MAX_BYTES = 192 * 1024;
+const MAX_BYTES = 128 * 1024;
 const domain = "copilot-flock/3.4/";
 const digest = (value) => crypto.createHash("sha256").update(value).digest("hex");
 const encode = (value) => Buffer.from(value).toString("base64url");
@@ -45,28 +45,34 @@ export function ownerFingerprint(publicKey) {
   return digest(key.export({ type: "spki", format: "der" }));
 }
 function publicDevice(join) {
+  if (!["personal", "work"].includes(join.scope) || typeof join.machineId !== "string" ||
+      !/^[A-Za-z0-9._-]{1,128}$/.test(join.machineId)) throw new Error("Invalid device machine/scope");
   if (crypto.createPublicKey(join.deviceEd25519Pub).asymmetricKeyType !== "ed25519" ||
       crypto.createPublicKey(join.deviceX25519Pub).asymmetricKeyType !== "x25519") throw new Error("Wrong device key algorithm");
   if (join.peerId !== ownerFingerprint(join.deviceEd25519Pub)) throw new Error("Peer ID is not device-key bound");
 }
-export function createJoinCode(identity, { machineId, scope }, now = Date.now()) {
+export function createJoinCode(identity, { machineId, scope, flockId }, now = Date.now()) {
   if (!["personal", "work"].includes(scope) || typeof machineId !== "string" ||
       !/^[A-Za-z0-9._-]{1,128}$/.test(machineId)) throw new Error("Invalid machine or scope");
   const body = { type: "copilot-flock-join-v1", peerId: ownerFingerprint(identity.ed25519.publicKey),
     deviceEd25519Pub: identity.ed25519.publicKey, deviceX25519Pub: identity.x25519.publicKey,
-    machineId, scope, issuedAt: now, expiresAt: now + 600000, nonce: encode(crypto.randomBytes(32)) };
+    machineId, scope, ...(flockId ? { flockId } : {}), issuedAt: now, expiresAt: now + 600000, nonce: encode(crypto.randomBytes(32)) };
   return { body, signature: sign("join", body, identity.ed25519.privateKey) };
 }
 export function verifyJoinCode(code, now = Date.now()) {
+  if (Buffer.byteLength(canonical(code)) > 16384) throw new Error("Join Code size limit exceeded");
   const join = code.body;
-  if (join.type !== "copilot-flock-join-v1" || join.issuedAt > now + 30000 ||
+  if (join.type !== "copilot-flock-join-v1" || !Number.isSafeInteger(join.issuedAt) ||
+      !Number.isSafeInteger(join.expiresAt) || join.expiresAt <= join.issuedAt || join.issuedAt > now + 30000 ||
       join.expiresAt <= now || join.expiresAt - join.issuedAt > 600000) throw new Error("Expired Join Code");
   publicDevice(join);
+  if (join.flockId !== undefined && (typeof join.flockId !== "string" ||
+      !/^[a-z0-9-]+\/[a-z0-9-]+$/.test(join.flockId) || join.flockId.length > 128)) throw new Error("Invalid intended flock");
   bytes(join.nonce, 32);
   verify("join", join, code.signature, join.deviceEd25519Pub);
   return join;
 }
-function validateCert(cert, ownerPublicKey, now) {
+export function validateCert(cert, ownerPublicKey, now = Date.now()) {
   verify("member-cert", cert.body, cert.signature, ownerPublicKey);
   const body = cert.body;
   publicDevice(body);
@@ -76,8 +82,8 @@ function validateCert(cert, ownerPublicKey, now) {
       !Number.isSafeInteger(body.issuedAt) || !Number.isSafeInteger(body.expiresAt) ||
       body.issuedAt > now + 30000 || body.expiresAt <= now ||
       body.expiresAt - body.issuedAt > DAY || body.expiresAt <= body.issuedAt ||
-      typeof body.flockId !== "string" || !/^[a-z0-9-]+\/[a-z0-9-]+$/.test(body.flockId) ||
-      !Array.isArray(body.sessionIds) || body.sessionIds.some((id) => typeof id !== "string") ||
+      typeof body.flockId !== "string" || !/^[a-z0-9-]+\/[a-z0-9-]+$/.test(body.flockId) || body.flockId.length > 128 ||
+      !Array.isArray(body.sessionIds) || body.sessionIds.some((id) => typeof id !== "string" || !id || id.length > 128) ||
       body.sessionIds.length > 100) throw new Error("Invalid or expired MemberCert");
   return body;
 }
@@ -86,7 +92,7 @@ function sharedKey(privateKey, publicKey, salt, info) {
   const secret = crypto.diffieHellman({ privateKey: crypto.createPrivateKey(privateKey), publicKey: crypto.createPublicKey(publicKey) });
   return Buffer.from(crypto.hkdfSync("sha256", secret, salt, Buffer.from(domain + info), 32));
 }
-function seal(value, recipientPublicKey) {
+export function seal(value, recipientPublicKey) {
   const ephemeral = keypair("x25519");
   const salt = crypto.randomBytes(32);
   const aad = Buffer.from(canonical({ publicKey: ephemeral.publicKey, salt: encode(salt) }));
@@ -95,7 +101,7 @@ function seal(value, recipientPublicKey) {
   const ciphertext = Buffer.concat([cipher.update(canonical(value)), cipher.final()]);
   return { publicKey: ephemeral.publicKey, salt: encode(salt), ciphertext: encode(ciphertext), tag: encode(cipher.getAuthTag()) };
 }
-function unseal(box, privateKey) {
+export function unseal(box, privateKey) {
   const salt = bytes(box.salt, 32);
   const aad = Buffer.from(canonical({ publicKey: box.publicKey, salt: box.salt }));
   const decipher = crypto.createDecipheriv("aes-256-gcm", sharedKey(privateKey, box.publicKey, salt, "welcome"), Buffer.alloc(12));
@@ -106,7 +112,7 @@ function unseal(box, privateKey) {
 
 export async function approveJoin({ code, ownerIdentity, ownerPublicKey, rotationOwnerPeerId, flockId, role,
   sessionIds = [], membershipExpiresAt, epoch, keyId, groupKey, verifyIdentityPolicy,
-  provisionTransport, authorizeOwner, now = Date.now() }) {
+  provisionTransport, authorizeOwner, metadata = {}, now = Date.now() }) {
   const join = verifyJoinCode(code, now);
   if (role === "owner") throw new Error("Join approval cannot delegate rotation-owner authority");
   if (!Number.isSafeInteger(membershipExpiresAt) || membershipExpiresAt <= now) throw new Error("Membership expiry required");
@@ -120,7 +126,7 @@ export async function approveJoin({ code, ownerIdentity, ownerPublicKey, rotatio
     deviceX25519Pub: join.deviceX25519Pub, issuedAt: now, expiresAt, sessionIds };
   const cert = { body, signature: sign("member-cert", body, ownerIdentity.ed25519.privateKey) };
   validateCert(cert, ownerPublicKey, now);
-  const transport = await provisionTransport({ peerId: join.peerId, subscription: `sub-${join.peerId}`, expiresAt });
+  const transport = await provisionTransport({ peerId: join.peerId, subscription: `sub-${join.peerId}`, expiresAt, cert });
   await authorizeOwner();
   const allowedTransportFields = ["expiresAt", "subscription", "signalrClientToken", "signalrRestToken",
     "serviceBusSendSas", "serviceBusListenSas"];
@@ -130,7 +136,7 @@ export async function approveJoin({ code, ownerIdentity, ownerPublicKey, rotatio
   for (const token of [transport.signalrClientToken, transport.signalrRestToken, transport.serviceBusSendSas, transport.serviceBusListenSas]) {
     if (typeof token !== "string" || !token || /(?:AccessKey|SharedAccessKey)=/.test(token)) throw new Error("Scoped transport tokens required; never export transport master keys");
   }
-  const payload = { cert, ownerPublicKey, rotationOwnerPeerId, epoch, keyId, groupKey: encode(groupKey), transport };
+  const payload = { cert, ownerPublicKey, rotationOwnerPeerId, epoch, keyId, groupKey: encode(groupKey), transport, metadata };
   const bodyTicket = { type: "copilot-flock-welcome-v1", peerId: join.peerId, flockId,
     joinHash: digest(canonical(code)), expiresAt, box: seal(payload, join.deviceX25519Pub) };
   return { body: bodyTicket, ownerPublicKey, signature: sign("welcome", bodyTicket, ownerIdentity.ed25519.privateKey) };
@@ -144,8 +150,12 @@ export function acceptWelcome(ticket, { identity, code, pinnedOwnerFingerprint, 
   const result = unseal(ticket.body.box, identity.x25519.privateKey);
   const member = validateCert(result.cert, ticket.ownerPublicKey, now);
   if (member.peerId !== ticket.body.peerId || member.flockId !== ticket.body.flockId ||
+      member.machineId !== code.body.machineId || member.scope !== code.body.scope ||
       member.deviceX25519Pub !== identity.x25519.publicKey || result.ownerPublicKey !== ticket.ownerPublicKey ||
       member.expiresAt !== ticket.body.expiresAt || result.transport.expiresAt > member.expiresAt) throw new Error("Welcome key/certificate binding mismatch");
+  if (!Number.isSafeInteger(result.epoch) || result.epoch < 1 ||
+      typeof result.keyId !== "string" || !result.keyId ||
+      result.rotationOwnerPeerId !== ownerFingerprint(ticket.ownerPublicKey)) throw new Error("Welcome epoch/owner binding mismatch");
   bytes(result.groupKey, 32);
   return result;
 }
@@ -174,16 +184,16 @@ function authorize(header, cert, state, now) {
 export function authorizeAction(member, action, payload) {
   if (typeof action !== "string" || action.length > 64) throw new Error("Invalid action");
   if (member.role === "owner") return;
-  if (action === "ping" || action === "list_shared_threads") return;
+  if (["ping", "list_shared_threads", "list_sessions", "rpc_response", "leave", "renew"].includes(action)) return;
   if ((action === "send_message" || action === "get_transcript") &&
-      member.sessionIds.includes(payload?.params?.targetSession) &&
+      member.sessionIds.includes(payload?.params?.targetSession || payload?.params?.session) &&
       !payload.params.delegate && !payload.params.newSession) return;
   throw new Error("Member role/session scope forbids this action");
 }
-export function encryptEnvelope({ state, identity, cert, action, payload, targetPeerId, now = Date.now() }) {
+export function encryptEnvelope({ state, identity, cert, action, payload, targetPeerId, now = Date.now(), messageId = crypto.randomUUID() }) {
   const header = { v: 34, flockId: state.flockId, peerId: ownerFingerprint(identity.ed25519.publicKey),
     scope: cert.body.scope, epoch: state.epoch, keyId: state.keyId, salt: encode(crypto.randomBytes(32)),
-    messageId: crypto.randomUUID(), sentAt: now, expiresAt: Math.min(now + 300000, cert.body.expiresAt),
+    messageId, sentAt: now, expiresAt: Math.min(now + 300000, cert.body.expiresAt),
     targetPeerId, action };
   authorize(header, cert, state, now);
   authorizeAction(cert.body, action, payload);
@@ -224,13 +234,29 @@ export function createOwnerState({ identity, flockId, scope, machineId, now = Da
     epoch: 1, minAcceptedEpoch: 1, keyId: crypto.randomUUID(), groupKey: encode(crypto.randomBytes(32)), cert };
 }
 
+export function signedControl(type, body, identity) {
+  return { type, body, signature: sign(`control/${type}`, body, identity.ed25519.privateKey) };
+}
+export function verifyControl(control, ownerPublicKey, type) {
+  if (control.type !== type) throw new Error("Unexpected control type");
+  verify(`control/${type}`, control.body, control.signature, ownerPublicKey);
+  return control.body;
+}
+export function renewOwnerCert(state, identity, now = Date.now()) {
+  if (ownerFingerprint(identity.ed25519.publicKey) !== state.rotationOwnerPeerId) throw new Error("Not the rotation owner");
+  const body = { ...state.cert.body, issuedAt: now, expiresAt: now + DAY };
+  const cert = { body, signature: sign("member-cert", body, identity.ed25519.privateKey) };
+  validateCert(cert, state.ownerPublicKey, now);
+  return cert;
+}
+
 export class DurableReceiver {
   constructor(filename, loadState, clock = Date.now) {
     this.filename = filename;
     this.loadState = loadState;
     this.clock = clock;
   }
-  async dispatch(envelope, handler) {
+  async dispatch(envelope, handler, authorizeCompletion = null) {
     assertNoLinks(this.filename);
     const lock = `${this.filename}.lock`;
     const fd = fs.openSync(lock, "wx", 0o600);
@@ -249,7 +275,8 @@ export class DurableReceiver {
       atomicJson(this.filename, ledger);
       assertAuthorized();
       const result = await handler({ member, payload, header: envelope.header, assertAuthorized });
-      assertAuthorized();
+      if (authorizeCompletion) authorizeCompletion();
+      else assertAuthorized();
       ledger[key].status = "complete";
       atomicJson(this.filename, ledger);
       return result;

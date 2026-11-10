@@ -13,6 +13,7 @@ const runtimeFiles = [
   "daemon-identity.json", "daemon.log", "inbox.jsonl", "outbox.jsonl", "locks.json",
   "cli-sessions.json", "processed-offline-ids.json", "last-vote-report.json",
   "installation.json", "uninstall-progress.json",
+  "flock-protocol.mjs", "flock-azure.mjs", "flock-broker-free.mjs", "broker-free.json",
 ];
 
 export function lifecyclePaths({ home = os.homedir(), copilotHome = process.env.COPILOT_HOME || path.join(home, ".copilot"),
@@ -339,7 +340,7 @@ ConvertTo-Json -InputObject @($found) -Compress`], {
 }
 
 export async function uninstallFlock({
-  paths = lifecyclePaths(), leave, inventory, localOnly = false, approveLocalOnly = false,
+  paths = lifecyclePaths(), leave, inventory, brokerFreeLeave, localOnly = false, approveLocalOnly = false,
   stopDaemon = stopPinnedDaemon, disable = disablePersistence, removeTasks = removeOwnedScheduledTasks,
   findProcesses = findRuntimeClients,
 } = {}) {
@@ -366,7 +367,41 @@ export async function uninstallFlock({
     const config = read("config.json", {});
     const identity = read("identity.json", null);
     const flocks = read("flocks.json", { flocks: {} }).flocks;
-    if (inventory && !localOnly && identity?.privateKey && config.machineId) {
+    const brokerFree = read("broker-free.json", null);
+    const ownedRuntimeFiles = [...runtimeFiles];
+    if (brokerFree) {
+      if (brokerFree.schema !== 34 || !brokerFree.flocks || config.protocol !== "broker-free-v34") {
+        report.pending.push({ path: root, reason: "Broker-free state/config must be reconciled before removal" });
+      } else {
+        for (const id of Object.keys(brokerFree.flocks)) {
+          for (const prefix of ["epoch", "replay", "responses"]) ownedRuntimeFiles.push(`${prefix}-${hash(id)}.json`);
+        }
+        try {
+          if (localOnly) {
+            for (const record of Object.values(brokerFree.flocks).filter((record) => !record.departed)) {
+              report.pending.push({ flockId: record.flockId, reason: "Explicit local-only removal; remote leave unconfirmed" });
+            }
+          } else {
+            if (!brokerFreeLeave) throw new Error("Authorized owner-mediated leave unavailable");
+            const results = await brokerFreeLeave({ root, config });
+            if (!Array.isArray(results)) throw new Error("Broker-free leave results unconfirmed");
+            for (const record of Object.values(brokerFree.flocks).filter((record) => !record.departed)) {
+              if (!results.some((result) => result.flockId === record.flockId && result.confirmed === true)) {
+                report.pending.push({ flockId: record.flockId,
+                  reason: results.find((result) => result.flockId === record.flockId)?.error || "Owner acknowledgment pending" });
+              }
+            }
+            const latest = read("broker-free.json", null);
+            if (Object.keys(latest?.pendingJoins || {}).length) {
+              report.pending.push({ path: root, reason: "Unaccepted Join Codes may have owner-side approvals/subscriptions; retain identities until owner cleanup is confirmed" });
+            }
+          }
+        } catch (error) { report.pending.push({ path: root, reason: error.message }); }
+      }
+    } else if (config.protocol === "broker-free-v34") {
+      report.pending.push({ path: root, reason: "Missing broker-free membership state; cannot prove all flocks left" });
+    }
+    if (config.protocol !== "broker-free-v34" && inventory && !localOnly && identity?.privateKey && config.machineId) {
       try {
         const request = signLeave({ flockId: "*", deviceId: identity.fingerprint,
           machineId: config.machineId }, identity.privateKey);
@@ -381,7 +416,7 @@ export async function uninstallFlock({
     }
     const journal = read("uninstall-progress.json", { type: "copilot-flock-uninstall-v1", leaves: {} });
     if (journal.type !== "copilot-flock-uninstall-v1") throw new Error("Invalid uninstall journal");
-    for (const [flockId, flock] of Object.entries(flocks)) {
+    for (const [flockId, flock] of Object.entries(config.protocol === "broker-free-v34" ? {} : flocks)) {
       if (localOnly) { report.pending.push({ flockId, reason: "Explicit local-only removal; remote leave unconfirmed" }); continue; }
       const previous = journal.leaves[flockId];
       if (previous?.confirmed) continue;
@@ -404,10 +439,10 @@ export async function uninstallFlock({
       }
       atomicJson(path.join(root, "uninstall-progress.json"), journal);
     }
-    if (!Object.keys(flocks).length && (config.bootstrapUrl || config.connectionString) && !localOnly) {
+    if (config.protocol !== "broker-free-v34" && !Object.keys(flocks).length && (config.bootstrapUrl || config.connectionString) && !localOnly) {
       report.pending.push({ path: root, reason: "Legacy membership inventory is unavailable; cannot prove all flocks left" });
     }
-    installations.push({ root, manifest: read("installation.json", { artifacts: {} }) });
+    installations.push({ root, ownedRuntimeFiles, manifest: read("installation.json", { artifacts: {} }) });
   }
   if (report.pending.length && !localOnly) {
     report.retained.push(...installations.map(({ root }) => ({ path: root, reason: "Retained credentials and leave journal for retry" })));
@@ -415,8 +450,8 @@ export async function uninstallFlock({
   }
   // Preflight links before stopping processes or changing any shared configuration.
   for (const filename of [...paths.skills, ...paths.persistence, ...paths.configs.map((config) => config.path)]) assertNoLinks(filename);
-  for (const { root } of installations) {
-    for (const filename of runtimeFiles) assertNoLinks(path.join(root, filename));
+  for (const { root, ownedRuntimeFiles } of installations) {
+    for (const filename of ownedRuntimeFiles) assertNoLinks(path.join(root, filename));
   }
   if (installations.length) {
     try {
@@ -470,9 +505,9 @@ export async function uninstallFlock({
     catch (error) { report.retained.push({ path: config.path, reason: error.message }); }
   }
   if (report.retained.some(({ path: filename }) => paths.configs.some((config) => config.path === filename))) return report;
-  for (const { root } of installations) {
+  for (const { root, ownedRuntimeFiles } of installations) {
     // Unknown files are never erased, even inside a dedicated runtime directory.
-    for (const filename of runtimeFiles.filter((name) => name !== "flock.mjs" && name !== "bridge.mjs" && name !== "installation.json")
+    for (const filename of ownedRuntimeFiles.filter((name) => name !== "flock.mjs" && name !== "bridge.mjs" && name !== "installation.json")
       .concat(["installation.json", "bridge.mjs", "flock.mjs"])) {
       const target = path.join(root, filename);
       assertNoLinks(target);

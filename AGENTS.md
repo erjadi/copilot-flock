@@ -4,7 +4,28 @@ If your human user pointed you at this repository (`https://github.com/erjadi/co
 
 ---
 
-## 0. First Decision: Is This Case 1 (Invite to Existing Flock) or Case 2 (New BYO Flock Instance)?
+## 0. Select the Protocol Before Setup
+
+This is a 3.4.0 source candidate, not a released deployment. For new setup,
+use [the broker-free guide](docs/BROKER_FREE_V34.md): the default provisions
+only SignalR Serverless and Service Bus Standard with narrow Send/Listen
+policies. No default broker, Web App, hosting plan or managed identity.
+Existing installations remain unchanged; never silently migrate them or fall
+back to hosted credentials.
+
+Broker-free joining uses `join_request` -> `approve_join` -> `accept_welcome`,
+with independent device/owner fingerprint verification and explicit finite
+membership/session approval. Use `renew_membership` for owner-mediated renewal.
+Multiple memberships require explicit flock selection, including replies.
+No existing threads are automatically visible; only approved snapshots and
+guarded messaging are supported. Remote creation, file/admin operations and
+privileged coordinator provisioning remain legacy-only.
+
+The following invite/bootstrap flow is the **explicit legacy reference**.
+A signed v3 invite or an existing legacy config selects it; a new install
+without either uses broker-free setup.
+
+### Legacy Case 1 or New Case 2
 
 Before running `install`, determine which of the two bootstrap cases applies:
 
@@ -56,27 +77,32 @@ flowchart LR
      run `.\setup.ps1 -ProvisionAzure -Scope <personal|work>` on Windows or
      `./setup.sh --provision-azure --scope <personal|work>` on Debian/Ubuntu or
      macOS. Confirm the Azure subscription, region, resource group, tool-install
-     consent, Service Bus Standard and App Service B1 charges first. The
+     consent and Service Bus Standard charges first. The
      wrappers install Azure CLI if needed, select/authenticate the subscription,
      resolve the GitHub maintainer and deploy `infra/azuredeploy.json`.
-     The default Linux Node 22 Token Broker includes persistent storage,
-     managed identity and namespace-scoped Service Bus permissions. Setup ZIP
-     deploys the broker, waits for `/health`, and installs with its origin and
-     keys in memory. ARM outputs are metadata only; never print key-list
+     The default creates only SignalR/Service Bus and required child resources.
+     Separate Manage/Send/Listen credentials are passed in memory to the
+     designated owner's broker-free installer. `-LegacyBroker` /
+     `--legacy-broker` explicitly adds the B1-hosted broker, managed identity,
+     role assignment, ZIP deployment and health checks. ARM outputs are metadata
+     only; never print key-list
      responses or app settings. Node.js is a prerequisite; Windows UAC/Linux
      sudo may be needed and macOS requires existing Homebrew.
      Subscription, resource group, location and name-prefix selectors are
-     supported; `-SkipBroker` / `--skip-broker` explicitly omits signed invites.
-     Require role-assignment permission and GitHub authentication. Report
+     supported; `-SkipBroker` / `--skip-broker` is a compatibility no-op.
+     Require role-assignment permission only for legacy hosting, and GitHub
+     authentication to resolve the owner label. Report
      incomplete enrollment as incomplete, not ready to mint invites. Do not
      use provisioning flags for Case 1 or silently replace an existing flock.
-     For an approved existing-credentials setup, run:
+     For an approved fresh broker-free existing-credentials setup, run:
      ```powershell
      node flock.mjs install `
        --scope <personal|work> `
        --connection-string "<SIGNALR_CONNECTION_STRING>" `
-       --servicebus-connection-string "<SERVICEBUS_CONNECTION_STRING>" `
-       [--bootstrap-url "https://<your-bootstrap-app>.azurewebsites.net/api/bootstrap"]
+       --servicebus-connection-string "<SERVICEBUS_MANAGE_CONNECTION_STRING>" `
+       --servicebus-send-connection-string "<SERVICEBUS_SEND_CONNECTION_STRING>" `
+       --servicebus-listen-connection-string "<SERVICEBUS_LISTEN_CONNECTION_STRING>" `
+       --flock "<owner>/<flock>"
      ```
 
 ---
@@ -107,7 +133,11 @@ flowchart LR
 
 ---
 
-## 3. What `node flock.mjs install` Installs Automatically
+## 3. Legacy Installation Reference
+
+The following automatic coordinator/topology installation is legacy behavior.
+Broker-free installation instead follows the narrower runtime/MCP/skill and
+strict-persistence behavior documented in `docs/BROKER_FREE_V34.md`.
 
 Running `node flock.mjs install` (zero external npm dependencies; works on Windows 11 x64/ARM64, macOS, and Linux x64/ARM64):
 1. Installs `~/.copilot/flock/flock.mjs` (and legacy compatibility shim `bridge.mjs`).
@@ -136,7 +166,13 @@ Each enrolled machine runs two distinct coordinator threads:
 
 ---
 
-## 5. The 4 Anti-Leakage Hard Walls (`Shared Machines ≠ Shared Threads`)
+## 5. Legacy Anti-Leakage Reference (`Shared Machines ≠ Shared Threads`)
+
+These v3 hub/eviction descriptions do not apply to the broker-free protocol:
+3.4 uses encrypted group envelopes on `copilotbridge`, signed MemberCerts,
+durable epoch/hash floors and owner-mediated renewal/rotation. A partitioned
+receiver unaware of a kick may accept until certificate expiry. No immediate
+global revocation is promised. See the current guide for the full boundaries.
 
 1. **Per-Flock Cryptographic Hub Isolation**: Each v3 flock routes over its own isolated hub (`v3_flock_<flockUuid>`) with short-lived 60-minute JWTs and Ed25519 envelope signatures.
 2. **Default Thread Visibility = Zero for External Flocks**: Collaborator flocks (`<owner>/<team>`) and guest passes see **zero** existing personal/work threads unless a thread is explicitly opted in via `share_thread` (which exports an `approved-snapshot` redacting tool secrets).
@@ -170,6 +206,7 @@ Never silently approve local-only cleanup or claim these are fully removed.
 Preserve conversations, session-state, chats, data.db, source checkouts and
 backups. Do not promise deletion of transcripts or OS audit logs.
 
-The 3.4 crypto primitives in `flock-protocol.mjs` are isolated source work,
-not the active runtime transport. Do not represent this branch as a completed
-broker-free deployment or as passing live Azure release gates.
+The protocol is wired through active broker-free daemon/RPC/Azure transport,
+onboarding, renewal and removal. Do not represent prepared source as a released
+product or as passing live Azure gates. Positive/negative audience/SAS tests,
+immutable candidate review and the required release vote remain unrun gates.

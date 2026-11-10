@@ -18,7 +18,9 @@ import https from "node:https";
 import crypto from "node:crypto";
 import { spawn, execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { uninstallFlock, lifecyclePaths, recordInstalledArtifact, pinDaemonIdentity } from "./flock-lifecycle.mjs";
+import { uninstallFlock, lifecyclePaths, recordInstalledArtifact, pinDaemonIdentity, atomicJson, assertNoLinks, stopPinnedDaemon, inspectProcess } from "./flock-lifecycle.mjs";
+import { BrokerFreeRuntime } from "./flock-broker-free.mjs";
+import { authorizeAction, ownerFingerprint } from "./flock-protocol.mjs";
 
 if (typeof dns.setDefaultResultOrder === "function") {
   try {
@@ -76,14 +78,14 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 function copyRuntimeModules(sourceDirectory, destinationDirectory) {
-  for (const module of ["flock-lifecycle.mjs", "flock-membership.mjs"]) {
+  for (const module of ["flock-lifecycle.mjs", "flock-membership.mjs", "flock-protocol.mjs", "flock-azure.mjs", "flock-broker-free.mjs"]) {
     const source = path.join(sourceDirectory, module);
-    const destination = path.join(destinationDirectory, module);
+    const destination = assertNoLinks(path.join(destinationDirectory, module));
     if (path.resolve(source) !== path.resolve(destination)) fs.copyFileSync(source, destination);
   }
 }
 
-export const BRIDGE_VERSION = "3.3.1";
+export const BRIDGE_VERSION = "3.4.0";
 
 const DEFAULT_AZURE_SUBSCRIPTION = process.env.COPILOT_FLOCK_SUBSCRIPTION || "";
 const DEFAULT_AZURE_RESOURCE_GROUP = process.env.COPILOT_FLOCK_RESOURCE_GROUP || "";
@@ -1046,6 +1048,16 @@ export function loadConfig({ autoFetchAz = true, refreshSpecs = false } = {}) {
     } catch {}
   }
 
+  if (cfg.protocol === "broker-free-v34") {
+    const activeFlocks = Object.values(brokerFreeRuntime(cfg).read().flocks).filter((record) => !record.departed);
+    return { ...cfg, flockId: activeFlocks.length === 1 ? activeFlocks[0].flockId : undefined,
+      hub: DEFAULT_HUB, bootstrapUrl: null, connectionString: null,
+      installedScriptPath: path.join(getBridgeHome(), "flock.mjs") };
+  }
+  if (fs.existsSync(path.join(getBridgeHome(), "broker-free.json"))) {
+    throw new Error("Broker-free state requires its explicit protocol config; refusing legacy credential fallback");
+  }
+
   // Automatic v2 -> v3 backup when migrating legacy "private" scope to "personal"
   if (cfg.scope === "private" && fs.existsSync(activeConfigPath)) {
     const bakPath = `${activeConfigPath}.v2.bak.json`;
@@ -1196,7 +1208,9 @@ export function loadLocalFlocksConfig(cfg = null, customPath = getFlocksConfigPa
   if (fs.existsSync(customPath)) {
     try {
       stored = JSON.parse(fs.readFileSync(customPath, "utf8")) || { flocks: {} };
-    } catch {}
+    } catch (error) {
+      if (cfg?.protocol === "broker-free-v34") throw new Error("Cannot read broker-free sharing policy", { cause: error });
+    }
   }
   const flocks = { ...(stored.flocks || {}) };
 
@@ -1236,6 +1250,7 @@ export function loadLocalFlocksConfig(cfg = null, customPath = getFlocksConfigPa
     ownerGitHubUser: owner,
     scope,
     flocks,
+    threadBindings: stored.threadBindings || {},
   };
 }
 
@@ -1320,6 +1335,13 @@ export function shareThreadWithFlock(
   },
   customPath = getFlocksConfigPath()
 ) {
+  if (cfg?.protocol === "broker-free-v34") {
+    brokerFreeRuntime(cfg).record(flockId);
+    if (typeof summarySnapshot !== "string" || !summarySnapshot.trim()) throw new Error("Broker-free sharing requires an explicitly approved summary snapshot, not an automatic live transcript");
+    const resolved = resolveLocalSession(sessionId);
+    if (resolved.session_id !== sessionId) throw new Error("Share the exact local session ID");
+    summarySnapshot = redactFlockSnapshot(summarySnapshot);
+  }
   const parsed = parseFlockAddress(flockId, cfg?.githubUser);
   const fCfg = loadLocalFlocksConfig(cfg, customPath);
   if (!fCfg.flocks[parsed.flockId]) {
@@ -1339,6 +1361,11 @@ export function shareThreadWithFlock(
     };
   }
   const flockEntry = fCfg.flocks[parsed.flockId];
+  if (cfg?.protocol === "broker-free-v34") {
+    if (fCfg.threadBindings?.[sessionId] && fCfg.threadBindings[sessionId] !== parsed.flockId) throw new Error("Thread is bound to another flock");
+    flockEntry.trustTier = "collaborator";
+    flockEntry.sessionVisibility = "explicit_opt_in_only";
+  }
   flockEntry.sharedSnapshots = flockEntry.sharedSnapshots || {};
   flockEntry.sharedSessionIds = Array.isArray(flockEntry.sharedSessionIds)
     ? flockEntry.sharedSessionIds
@@ -2387,7 +2414,10 @@ export class RawWebSocketClient {
 
 export async function connectSignalRClient(cfg, { userId, onInvocation, onClose }) {
   const clientAudience = `${cfg.endpoint}/client/?hub=${cfg.hub}`;
-  const accessToken = createSignalRJwt({
+  if (cfg.protocol === "broker-free-v34" && (!cfg.clientToken || cfg.credentialExpiresAt <= Date.now())) {
+    throw new Error("Owner-issued scoped SignalR client credentials expired or unavailable");
+  }
+  const accessToken = cfg.protocol === "broker-free-v34" ? cfg.clientToken : createSignalRJwt({
     endpoint: cfg.endpoint,
     accessKey: cfg.accessKey,
     audience: clientAudience,
@@ -2458,7 +2488,15 @@ export async function connectSignalRClient(cfg, { userId, onInvocation, onClose 
     if (onClose) onClose(closeInfo || { code: ws.closeCode, reason: ws.closeReason });
   };
 
-  await ws.connect();
+  try { await ws.connect(); }
+  catch (error) {
+    ws.close();
+    if (cfg.protocol === "broker-free-v34") {
+      const status = error.message.match(/HTTP\/1\.[01] (\d{3})/)?.[1];
+      throw new Error(`Scoped SignalR WebSocket failed${status ? ` (HTTP ${status})` : ""}; credential-bearing details withheld`);
+    }
+    throw error;
+  }
   ws.sendText(JSON.stringify({ protocol: "json", version: 1 }) + RECORD_SEP);
   let hsTimer = null;
   try {
@@ -3406,14 +3444,17 @@ export function buildCrossSessionEnvelope({
   const cliMachine = String(senderMachine).replace(/[^A-Za-z0-9._:-]/g, "");
   const cliSession = String(senderSession).replace(/[^A-Za-z0-9._:-]/g, "");
   const cliFromSession = String(targetSessionId || "").replace(/[^A-Za-z0-9._:-]/g, "");
-  const cliReplyCmd = `node "${escapedScript}" send --to-machine "${cliMachine}" --to-session "${cliSession}" --from-session "${cliFromSession}" --message "<your reply>"`;
-  const cliClarifyCmd = `node "${escapedScript}" clarify --to-machine "${cliMachine}" --to-session "${cliSession}" --from-session "${cliFromSession}" --question "<clarifying question>"`;
+  const flockFlag = cfg.protocol === "broker-free-v34" ? ` --flock "${String(cfg.flockId).replace(/[^a-z0-9/-]/g, "")}"` : "";
+  const cliReplyCmd = `node "${escapedScript}" send${flockFlag} --to-machine "${cliMachine}" --to-session "${cliSession}" --from-session "${cliFromSession}" --message "<your reply>"`;
+  const cliClarifyCmd = cfg.protocol === "broker-free-v34"
+    ? cliReplyCmd.replace("<your reply>", "<clarifying question>")
+    : `node "${escapedScript}" clarify --to-machine "${cliMachine}" --to-session "${cliSession}" --from-session "${cliFromSession}" --question "<clarifying question>"`;
 
   const replyGuidance = waitForReply
     ? `REPLY_INSTRUCTION: The remote caller on "${senderMachine}" is waiting synchronously for your turn to finish (--wait). Reply directly in your normal assistant response; you do NOT need to invoke send_remote_session_message unless sending additional async follow-ups later.`
     : `REPLY_INSTRUCTION: This message came from a remote Copilot on another computer ("${senderMachine}", scope "${senderScope}"${senderGitHubUser ? `, github_user "@${senderGitHubUser}"` : ""}, session "${senderSession}"). Do NOT call local send_session_message to reply (local send_session_message only works on the same computer). If a reply is needed, either call the MCP tool \`send_remote_session_message\` (with to_machine="${senderMachine}", to_session="${senderSession}", from_session="${targetSessionId}") OR run this command via powershell/bash:\n${cliReplyCmd}`;
 
-  const clarifyGuidance = `CLARIFICATION_INSTRUCTION: If this inbound request is not clear enough, ambiguous, or missing key details needed to route or execute safely, do NOT guess blindly—ask the originator ("${senderMachine}", session "${senderSession}") for clarification using the MCP tool \`ask_remote_originator_clarification\` (with to_machine="${senderMachine}", to_session="${senderSession}", from_session="${targetSessionId}", question="...") OR run:\n${cliClarifyCmd}`;
+  const clarifyGuidance = `CLARIFICATION_INSTRUCTION: If this inbound request is not clear enough, ambiguous, or missing key details needed to route or execute safely, do NOT guess blindly—ask the originator ("${senderMachine}", session "${senderSession}") for clarification using the MCP tool \`${cfg.protocol === "broker-free-v34" ? "send_remote_session_message" : "ask_remote_originator_clarification"}\` OR run:\n${cliClarifyCmd}`;
 
   const lines = [
     `<cross_session_message>`,
@@ -3423,6 +3464,10 @@ export function buildCrossSessionEnvelope({
   ];
   if (senderGitHubUser) {
     lines.push(`from_github_user: "${senderGitHubUser}"`);
+  }
+  if (cfg.protocol === "broker-free-v34") {
+    lines.push(`from_flock: "${cfg.flockId}"`, `from_peer_id: "${cfg.remotePeerId}"`,
+      `FLOCK_REPLY_SCOPE: Include flock="${cfg.flockId}" in any remote MCP reply or clarification. The sender's certificate does not establish a GitHub identity.`);
   }
   lines.push(
     `sender_verified: ${Boolean(senderVerified)}`,
@@ -3482,7 +3527,9 @@ async function injectHeadlessCliSessionMessage({
   waitForReply = false,
   notifyOnIdle = false,
   waitTimeoutMs = 90000,
+  assertAuthorized = () => {},
 }) {
+  assertAuthorized();
   const copilotBin = resolveCopilotCliBin();
   if (!copilotBin) {
     throw new Error(
@@ -3509,7 +3556,7 @@ async function injectHeadlessCliSessionMessage({
     "-p",
     promptEnvelope,
     `--session-id=${resolved.session_id}`,
-    "--allow-all",
+    ...(cfg.protocol === "broker-free-v34" ? [] : ["--allow-all"]),
     "--no-ask-user",
     "-s",
   ];
@@ -3517,6 +3564,7 @@ async function injectHeadlessCliSessionMessage({
 
   if (waitForReply) {
     const replyText = await new Promise((resolve, reject) => {
+      assertAuthorized();
       const child = spawn(copilotBin, cliArgs, {
         cwd: sessionCwd,
         stdio: ["ignore", "pipe", "pipe"],
@@ -3543,11 +3591,12 @@ async function injectHeadlessCliSessionMessage({
       });
       child.on("close", (code) => {
         clearTimeout(timer);
+        try { assertAuthorized(); } catch (error) { reject(error); return; }
         const text = stdout.trim();
         if (text) {
           // Only write fallback valid-envelope events if a mock CLI binary did not create events.jsonl
           try {
-            if (!fs.existsSync(eventsPath) || fs.statSync(eventsPath).size === 0) {
+            if (cfg.protocol !== "broker-free-v34" && (!fs.existsSync(eventsPath) || fs.statSync(eventsPath).size === 0)) {
               const userEvId = crypto.randomUUID();
               const asstEvId = crypto.randomUUID();
               fs.appendFileSync(
@@ -3605,6 +3654,8 @@ async function injectHeadlessCliSessionMessage({
 
   // Non-blocking background execution via headless copilot CLI
   if (notifyOnIdle && fromMachine) {
+    assertAuthorized();
+    assertAuthorized();
     const bgChild = spawn(copilotBin, cliArgs, {
       cwd: sessionCwd,
       detached: true,
@@ -3638,6 +3689,10 @@ async function injectHeadlessCliSessionMessage({
         });
       } catch {}
     });
+    if (cfg.protocol === "broker-free-v34") {
+      await new Promise((resolve, reject) => { bgChild.once("spawn", resolve); bgChild.once("error", reject); });
+      assertAuthorized();
+    }
     bgChild.unref();
 
     return {
@@ -3695,7 +3750,9 @@ export async function injectLocalSessionMessage({
   waitTimeoutMs = 90000,
   dispatchTimeoutMs = 8000,
   dispatchPollIntervalMs = 50,
+  assertAuthorized = () => {},
 }) {
+  assertAuthorized();
   const wsInfo = getLocalWsConnectionInfo();
   const hasDesktopDb = fs.existsSync(path.join(getCopilotDir(), "data.db"));
 
@@ -3732,7 +3789,7 @@ export async function injectLocalSessionMessage({
   }]: ${message}`;
 
   if (!wsInfo) {
-    return await injectHeadlessCliSessionMessage({
+    const result = await injectHeadlessCliSessionMessage({
       cfg,
       resolved,
       promptEnvelope,
@@ -3743,7 +3800,23 @@ export async function injectLocalSessionMessage({
       waitForReply,
       notifyOnIdle,
       waitTimeoutMs,
+      assertAuthorized,
     });
+    assertAuthorized();
+    if (cfg.protocol === "broker-free-v34") {
+      const deadline = Date.now() + Math.max(100, Number(dispatchTimeoutMs) || 8000);
+      let observed = false;
+      while (Date.now() < deadline) {
+        assertAuthorized();
+        if (eventReader.readNewEvents().some((event) => isMatchingDispatchedUserEvent(event, {
+          requestId: result.requestId, promptEnvelope, displayPrompt, message,
+        }))) { observed = true; break; }
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      assertAuthorized();
+      if (!observed) throw new Error("Headless dispatch unconfirmed; admitted operation quarantined, not automatically retried");
+    }
+    return result;
   }
 
   const requestId = crypto.randomUUID();
@@ -3765,6 +3838,7 @@ export async function injectLocalSessionMessage({
 
   await ws.connect();
   try {
+    assertAuthorized();
     const frame = {
       type: "send_message",
       session_id: resolved.session_id,
@@ -3791,6 +3865,7 @@ export async function injectLocalSessionMessage({
     let trailingEventsAfterDispatch = [];
 
     while (Date.now() < dispatchDeadline) {
+      assertAuthorized();
       if (wsError) throw wsError;
       const newEvents = eventReader.readNewEvents();
       if (newEvents.length > 0) {
@@ -3818,7 +3893,7 @@ export async function injectLocalSessionMessage({
       // the target session may be busy running an active turn or warming up MCP servers.
     // Hold the WebSocket open in the background for up to 60s until events.jsonl records
       // the turn so github.exe does not cancel the queued message on disconnect.
-      if (!waitForReply && effectiveDispatchTimeoutMs >= 3000) {
+      if (cfg.protocol !== "broker-free-v34" && !waitForReply && effectiveDispatchTimeoutMs >= 3000) {
         keepWsOpenInBackground = true;
         (async () => {
           const bgDeadline = Date.now() + 60000;
@@ -4429,8 +4504,12 @@ export async function invokeRemoteRpc(
     params = {},
     timeoutMs = 8000,
     collectAll = false,
+    flockId = cfg.flockId,
   }
 ) {
+  if (cfg.protocol === "broker-free-v34") {
+    return brokerFreeRuntime(cfg).invoke({ flockId, toMachine, action, params, timeoutMs, collectAll });
+  }
   const requestId = crypto.randomUUID();
   const replyUserId = `rpc-${requestId}`;
   const responses = [];
@@ -4513,6 +4592,12 @@ export async function invokeRemoteRpc(
 
 export async function invokeRemoteRpcBatch(cfg, items, timeoutMs = 18000) {
   if (!items || items.length === 0) return [];
+  if (cfg.protocol === "broker-free-v34") {
+    return Promise.all(items.map(async (item) => {
+      try { return { item, ok: true, response: await invokeRemoteRpc(cfg, { ...item, timeoutMs }) }; }
+      catch (error) { return { item, ok: false, error: error.message }; }
+    }));
+  }
   const replyUserId = `rpc-batch-${crypto.randomUUID()}`;
   const pending = new Map();
 
@@ -5847,7 +5932,7 @@ export async function handleRpcAction(cfg, req) {
     }
 
     try {
-      for (const module of ["flock-lifecycle.mjs", "flock-membership.mjs"]) {
+      for (const module of ["flock-lifecycle.mjs", "flock-membership.mjs", "flock-protocol.mjs", "flock-azure.mjs", "flock-broker-free.mjs"]) {
         const content = execFileSync("git", ["-C", repoDir, "show", `${candidateCommit}:${module}`], {
           encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: 5000,
         });
@@ -6265,6 +6350,17 @@ export async function runDaemon(cfg) {
   const pidPath = getDaemonPidPath();
   const statePath = getStatePath();
   fs.writeFileSync(pidPath, String(process.pid), "utf8");
+  if (cfg.protocol === "broker-free-v34") {
+    const daemon = await brokerFreeRuntime(cfg).start();
+    atomicJson(statePath, { status: "connected", protocol: cfg.protocol, machineId: cfg.machineId,
+      pid: process.pid, updatedAt: new Date().toISOString() });
+    await new Promise((resolve) => {
+      const shutdown = () => { daemon.close().then(resolve, (error) => { logDaemon(error.message); process.exitCode = 1; resolve(); }); };
+      process.once("SIGTERM", shutdown);
+      process.once("SIGINT", shutdown);
+    });
+    return;
+  }
 
   const knownPeers = new Map();
   const updateStateFile = (status, extra = {}) => {
@@ -6460,7 +6556,21 @@ export function isLocalDaemonRunning() {
 }
 
 export async function ensureDaemonStarted(cfg) {
-  const status = isLocalDaemonRunning();
+  let status = isLocalDaemonRunning();
+  if (cfg.protocol === "broker-free-v34" && status.running) {
+    const pinPath = assertNoLinks(path.join(getBridgeHome(), "daemon-identity.json"));
+    const pin = fs.existsSync(pinPath) ? JSON.parse(fs.readFileSync(pinPath, "utf8")) : null;
+    const live = inspectProcess(status.pid);
+    if (!live) status = { running: false };
+    else if (!pin || pin.pid !== status.pid || pin.start !== live.start || pin.executable !== live.executable ||
+        pin.command !== live.command || JSON.stringify(pin.argv) !== JSON.stringify(live.argv) ||
+        !lifecyclePaths().scripts.includes(pin.script)) {
+      if (lifecyclePaths().scripts.some((script) => live.argv?.includes(script) || live.command?.includes(script))) {
+        throw new Error("Unverified Flock daemon retained; no duplicate is started and no unrelated process is stopped");
+      }
+      status = { running: false };
+    }
+  }
   if (status.running) {
     return status;
   }
@@ -6507,6 +6617,7 @@ export async function ensureDaemonStarted(cfg) {
       } catch {}
     }
   }
+  if (cfg.protocol === "broker-free-v34") throw new Error("Broker-free daemon connection readiness not confirmed; inspect retained daemon log and enrollment");
   return { running: true, pid: spawnedPid };
 }
 
@@ -6515,6 +6626,18 @@ export async function ensureDaemonStarted(cfg) {
 // ---------------------------------------------------------------------------
 
 const MCP_TOOLS = [
+  { name: "join_request", description: "Generate a device-bound Join Code locally; no bearer invitation or enrollment occurs.",
+    inputSchema: { type: "object", properties: {} } },
+  { name: "approve_join", description: "Designated owner approves independently verified device keys and seals a scoped Welcome Ticket.",
+    inputSchema: { type: "object", properties: { flock: { type: "string" }, join_code: { type: "object" },
+      device_fingerprint: { type: "string" }, role: { type: "string", enum: ["collaborator", "guest"] },
+      session_ids: { type: "array", items: { type: "string" } }, membership_expires_at: { type: "integer" },
+      renew: { type: "boolean" } }, required: ["flock", "join_code", "device_fingerprint"] } },
+  { name: "accept_welcome", description: "Accept this device's sealed Welcome Ticket after independently pinning the owner's fingerprint.",
+    inputSchema: { type: "object", properties: { welcome_ticket: { type: "object" }, owner_fingerprint: { type: "string" } },
+      required: ["welcome_ticket", "owner_fingerprint"] } },
+  { name: "renew_membership", description: "Request owner-mediated renewal before credential expiry; expired devices need a new Join Code.",
+    inputSchema: { type: "object", properties: { flock: { type: "string" } } } },
   {
     name: "flock_status",
     description:
@@ -7279,10 +7402,47 @@ const MCP_TOOLS = [
   },
 ];
 
+for (const tool of MCP_TOOLS) {
+  tool.inputSchema.properties.flock ||= { type: "string", description: "Explicit <owner>/<flock> membership. Required when more than one broker-free flock is enrolled." };
+}
+Object.assign(MCP_TOOLS.find((tool) => tool.name === "kick_flock_member").inputSchema.properties, {
+  peer_id: { type: "string", description: "Exact signed device fingerprint; conjunctive with machine_id when both are supplied." },
+  operation_id: { type: "string", description: "Stable operation ID for retrying an interrupted owner rotation." },
+});
+
 async function executeMcpTool(cfg, name, args = {}) {
   if (name === "unenroll_flock") {
     if (args.traceless !== true) throw new Error("Specify traceless=true to remove this installation");
     return uninstallBridge();
+  }
+  if (name === "join_request") {
+    if (cfg.protocol !== "broker-free-v34") throw new Error("Legacy enrollment is unchanged; generate broker-free Join Codes in a separately configured installation");
+    return brokerFreeRuntime(cfg).joinRequest({ machineId: cfg.machineId, scope: cfg.scope, flockId: args.flock });
+  }
+  if (cfg.protocol === "broker-free-v34") {
+    cfg = { ...cfg, flockId: args.flock || cfg.flockId };
+    const runtime = brokerFreeRuntime(cfg);
+    if (name === "approve_join") return runtime.approve({
+      flockId: args.flock, code: args.join_code, role: args.role || "collaborator",
+      sessionIds: args.session_ids || [], membershipExpiresAt: args.membership_expires_at,
+      expectedEd25519Fingerprint: args.device_fingerprint, renew: args.renew === true,
+    });
+    if (name === "accept_welcome") return installBridge({ welcomeTicketArg: args.welcome_ticket,
+      ownerFingerprintArg: args.owner_fingerprint, protocolArg: "broker-free-v34" });
+    if (name === "renew_membership") return runtime.renewMembership(runtime.select(args.flock).flockId);
+    if (name === "list_flocks") return brokerFreeFlockSummaries(runtime);
+    if (name === "kick_flock_member") {
+      const record = runtime.assertOwner(runtime.select(args.flock));
+      if (args.github_user) throw new Error("Broker-free identities are device-key bound; a GitHub label is not a member selector");
+      const candidates = Object.entries(record.members).filter(([id, entry]) => !entry.removed &&
+        (!args.peer_id || id === args.peer_id) && (!args.machine_id || entry.cert.body.machineId === args.machine_id));
+      if ((!args.peer_id && !args.machine_id) || candidates.length !== 1) throw new Error("Select exactly one cryptographic peer; all supplied selectors must match");
+      return runtime.removePeer({ flockId: record.flockId, peerId: candidates[0][0], operationId: args.operation_id });
+    }
+    const supported = new Set(["flock_status", "bridge_status", "list_remote_machines", "list_remote_sessions",
+      "get_remote_session_transcript", "send_remote_session_message", "broadcast_remote_session_message",
+      "share_thread", "unshare_thread", "list_shared_threads"]);
+    if (!supported.has(name)) throw new Error(`Tool ${name} is not a broker-free operation; legacy broker fallback is forbidden`);
   }
   if (name === "flock_status" || name === "bridge_status") {
     const daemonStatus = await ensureDaemonStarted(cfg);
@@ -7427,7 +7587,7 @@ async function executeMcpTool(cfg, name, args = {}) {
       });
     } catch (err) {
       const allowOfflineQueue = args.offline_queue !== false && !waitForReply;
-      if (allowOfflineQueue && /Timed out after .* waiting for response from machine/i.test(err.message)) {
+        if (cfg.protocol !== "broker-free-v34" && allowOfflineQueue && /Timed out after .* waiting for response from machine/i.test(err.message)) {
         const reqId = crypto.randomUUID();
         const sentAt = new Date().toISOString();
         const auth = signRpcRequest({
@@ -9048,7 +9208,7 @@ export async function updateFleetMachines(
   };
 }
 
-export function configureBootPersistence(targetScript) {
+export function configureBootPersistence(targetScript, { strict = false } = {}) {
   try {
     if (process.platform === "linux") {
       const systemdDir = path.join(HOME_DIR, ".config", "systemd", "user");
@@ -9064,7 +9224,7 @@ Wants=network-online.target
 Type=simple
 WorkingDirectory=${HOME_DIR}
 Environment=PATH=${path.join(HOME_DIR, ".local", "bin")}:/usr/local/bin:/usr/bin:/bin
-ExecStart=${process.execPath} ${targetScript} daemon
+ExecStart=${JSON.stringify(process.execPath).replace(/%/g, "%%")} ${JSON.stringify(targetScript).replace(/%/g, "%%")} daemon
 Restart=always
 RestartSec=3
 
@@ -9080,7 +9240,7 @@ WantedBy=default.target
             timeout: 4000,
           });
           fs.unlinkSync(legacyUnitPath);
-        } catch {}
+        } catch (error) { if (strict) throw error; }
       }
       try {
         execFileSync("systemctl", ["--user", "daemon-reload"], { stdio: "ignore", timeout: 4000 });
@@ -9088,14 +9248,14 @@ WantedBy=default.target
           stdio: "ignore",
           timeout: 4000,
         });
-      } catch {}
+      } catch (error) { if (strict) throw error; }
       try {
         const user = os.userInfo().username;
-        execFileSync("sudo", ["-n", "loginctl", "enable-linger", user], {
-          stdio: "ignore",
-          timeout: 4000,
-        });
-      } catch {}
+        if (strict) {
+          const linger = execFileSync("loginctl", ["show-user", user, "-p", "Linger", "--value"], { encoding: "utf8", timeout: 4000 });
+          if (linger.trim() !== "yes") throw new Error("User lingering is not enabled; obtain explicit approval before enabling it");
+        } else execFileSync("sudo", ["-n", "loginctl", "enable-linger", user], { stdio: "ignore", timeout: 4000 });
+      } catch (error) { if (strict) throw error; }
       return { platform: "linux", type: "systemd-user", path: unitPath };
     }
 
@@ -9154,7 +9314,7 @@ WantedBy=default.target
       fs.writeFileSync(plistPath, plist, "utf8");
       return { platform: "darwin", type: "launch-agent", path: plistPath };
     }
-  } catch {}
+  } catch (error) { if (strict) throw new Error(`Boot persistence failed: ${error.message}`); }
   return null;
 }
 
@@ -10313,6 +10473,8 @@ export async function installBridge({
   scopeArg,
   githubUserArg,
   hubArg,
+  protocolArg, welcomeTicketArg, ownerFingerprintArg, flockIdArg,
+  serviceBusSendConnectionStringArg, serviceBusListenConnectionStringArg,
 } = {}) {
   ensureBridgeDir();
   const activeConfigPath = getConfigPath();
@@ -10328,6 +10490,28 @@ export async function installBridge({
     try {
       existing = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf8"));
     } catch {}
+  }
+  if (protocolArg === "broker-free-v34" || welcomeTicketArg ||
+      (!Object.keys(existing).length && !bootstrapUrlArg && !enrollmentJsonArg)) {
+    if (bootstrapUrlArg || enrollmentJsonArg) throw new Error("Broker-free mode cannot silently enroll through a legacy broker invite");
+    if (Object.keys(existing).length && existing.protocol !== "broker-free-v34") {
+      throw new Error("Existing legacy installation remains unchanged; broker-free migration requires explicit separate enrollment");
+    }
+    const runtime = brokerFreeRuntime(existing);
+    let enrollment;
+    if (welcomeTicketArg) {
+      enrollment = await runtime.accept(welcomeTicketArg, ownerFingerprintArg);
+    } else if (!Object.keys(runtime.read().flocks).length || (flockIdArg && !runtime.read().flocks[flockIdArg])) {
+      enrollment = await runtime.initializeOwner({ flockId: flockIdArg || `${githubUserArg || resolveLocalGitHubUser()}/${scopeArg}`, machineId: machineIdArg || os.hostname(),
+        scope: scopeArg, connectionString: connectionStringArg, manageConnectionString: serviceBusConnectionStringArg,
+        sendConnectionString: serviceBusSendConnectionStringArg, listenConnectionString: serviceBusListenConnectionStringArg });
+    } else {
+      const record = runtime.select(flockIdArg);
+      if (!record.transport && record.ownerSecrets) await runtime.renewOwn(record.flockId);
+      enrollment = { enrolled: true, flockId: record.flockId };
+    }
+    return installBrokerFreeLocal({ ...existing, protocol: "broker-free-v34", machineId: runtime.select(enrollment.flockId).cert.body.machineId,
+      scope: scopeArg || runtime.select(enrollment.flockId).cert.body.scope, flockId: enrollment.flockId }, enrollment);
   }
 
   let parsedEnrollmentJson = null;
@@ -10683,6 +10867,141 @@ export async function installBridge({
   };
 }
 
+export function brokerFreeRuntime(cfg = {}, options = {}) {
+  return new BrokerFreeRuntime(options.root || getBridgeHome(), {
+    connect: connectSignalRClient,
+    dispatch: (request) => dispatchBrokerFreeRpc(cfg, request),
+    log: (message) => logDaemon(message),
+    ...options,
+  });
+}
+
+function brokerFreeFlockSummaries(runtime) {
+  return Object.values(runtime.read().flocks).map((record) => ({ flockId: record.flockId,
+    peerId: record.localPeerId, role: record.cert.body.role, epoch: record.epoch,
+    ownerFingerprint: ownerFingerprint(record.ownerPublicKey), expiresAt: record.cert.body.expiresAt,
+    departed: record.departed === true, protocol: "broker-free-v34" }));
+}
+
+export function redactFlockSnapshot(text) {
+  return String(text).replace(/-----BEGIN [^-]*PRIVATE KEY-----[\s\S]*?-----END [^-]*PRIVATE KEY-----/g, "[redacted private key]")
+    .replace(/\b(?:Bearer|SharedAccessSignature)\s+[^\s"'<>]+/gi, "[redacted token]")
+    .replace(/\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g, "[redacted JWT]")
+    .replace(/\b(?:gh[pousr]_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]+)\b/g, "[redacted GitHub token]")
+    .replace(/((?:AccessKey|SharedAccessKey|api[_-]?key|password|client[_-]?secret|token)\s*["']?\s*[:=]\s*["']?)[^\s;"',}]+/gi, "$1[redacted]");
+}
+
+export async function dispatchBrokerFreeRpc(cfg, { member, payload, action, assertAuthorized, flockId }) {
+  const params = payload.params || {};
+  const shared = () => {
+    assertAuthorized();
+    authorizeAction(member, action, payload);
+    const config = loadLocalFlocksConfig(cfg);
+    const policy = config.flocks[flockId];
+    return Object.entries(policy?.sharedSnapshots || {}).filter(([id]) =>
+      (!config.threadBindings?.[id] || config.threadBindings[id] === flockId) &&
+      (policy.sharedSessionIds || []).includes(id) && (member.role === "owner" || member.sessionIds.includes(id)));
+  };
+  const snapshot = () => {
+    const id = action === "get_transcript" ? params.session : params.targetSession;
+    const entry = shared().find(([sessionId]) => sessionId === id);
+    if (!entry || !entry[1].summarySnapshot) throw new Error("Thread is not explicitly shared to this flock with an approved snapshot");
+    const bindings = loadLocalFlocksConfig(cfg).threadBindings || {};
+    if (bindings[id] && bindings[id] !== flockId) throw new Error("Thread is bound to another flock");
+    return { id, ...entry[1] };
+  };
+  if (action === "ping") return { machineId: cfg.machineId, scope: cfg.scope, version: BRIDGE_VERSION,
+    platform: process.platform, activeSessionCount: shared().length };
+  if (action === "list_sessions" || action === "list_shared_threads") {
+    const sessions = shared().slice(0, Math.min(100, Math.max(1, Number(params.limit) || 30)))
+      .map(([id, entry]) => ({ session_id: id, title: entry.title, session_type: "approved-snapshot",
+        is_running: false, updated_at: entry.sharedAt }));
+    return { machineId: cfg.machineId, scope: cfg.scope, count: sessions.length, sessions };
+  }
+  if (action === "get_transcript") {
+    const entry = snapshot();
+    return { session: { session_id: entry.id, title: entry.title, mode: "approved-snapshot" },
+      messages: [{ role: "assistant", content: redactFlockSnapshot(entry.summarySnapshot), timestamp: entry.sharedAt }] };
+  }
+  if (action === "send_message") {
+    snapshot();
+    if (params.dryRun === true) return { dryRun: true, targetSession: params.targetSession, dispatchedToRuntime: false };
+    if (params.delegate || params.newSession || params.notifyOnIdle) throw new Error("Broker-free shared-thread dispatch cannot create delegated sessions or unguarded background notifications");
+    const result = await injectLocalSessionMessage({ cfg: { ...cfg, flockId, remotePeerId: member.peerId }, targetSession: params.targetSession,
+      message: params.message, fromMachine: member.machineId, fromScope: member.scope,
+      senderVerified: true, trustLevel: "cross_user_informational_only",
+      fromSessionId: params.fromSessionId, mode: params.mode, waitForReply: Boolean(params.waitForReply),
+      waitTimeoutMs: Math.min(90000, Number(params.waitTimeoutMs) || 90000),
+      assertAuthorized: () => { snapshot(); } });
+    snapshot();
+    if (result.reply?.content) result.reply.content = redactFlockSnapshot(result.reply.content);
+    return result;
+  }
+  throw new Error(`Unsupported broker-free RPC action: ${action}; no legacy dispatch fallback`);
+}
+
+async function installBrokerFreeLocal(config, enrollment) {
+  const root = assertNoLinks(getBridgeHome());
+  if (fs.existsSync(path.join(root, ".git"))) throw new Error("Refusing to overwrite a source checkout");
+  fs.mkdirSync(root, { recursive: true });
+  const paths = lifecyclePaths();
+  const manifestPath = path.join(root, "installation.json");
+  const manifest = fs.existsSync(manifestPath) ? JSON.parse(fs.readFileSync(assertNoLinks(manifestPath), "utf8")) : { artifacts: {} };
+  for (const artifact of [...paths.persistence, ...paths.skills]) {
+    assertNoLinks(artifact);
+    if (fs.existsSync(artifact) && manifest.artifacts[artifact] !== crypto.createHash("sha256").update(fs.readFileSync(artifact)).digest("hex")) {
+      throw new Error(`Unowned/modified installation artifact retained: ${artifact}`);
+    }
+  }
+  await stopPinnedDaemon(root, paths);
+  for (const name of ["flock.mjs", "bridge.mjs"]) {
+    const target = assertNoLinks(path.join(root, name));
+    if (path.resolve(__filename) !== target) fs.copyFileSync(__filename, target);
+  }
+  copyRuntimeModules(__dirname, root);
+  atomicJson(getConfigPath(), config);
+  const mcpPath = path.join(getCopilotDir(), "mcp-config.json");
+  assertNoLinks(mcpPath);
+  const mcp = fs.existsSync(mcpPath) ? JSON.parse(fs.readFileSync(mcpPath, "utf8")) : {};
+  mcp.mcpServers ||= {};
+  const targetScript = path.join(root, "flock.mjs");
+  const previous = mcp.mcpServers["copilot-flock"];
+  if (previous && !(previous.command === process.execPath && previous.args?.length === 2 &&
+      previous.args[0] === targetScript && previous.args[1] === "mcp")) throw new Error("MCP name is owned by another command; retained");
+  mcp.mcpServers["copilot-flock"] = { type: "stdio", command: process.execPath, args: [targetScript, "mcp"], tools: ["*"] };
+  atomicJson(mcpPath, mcp);
+  const skill = `---
+name: copilot-flock
+description: Device-bound broker-free cross-machine Copilot Flock messaging and safe removal.
+---
+Copilot is the interface. Use native tools on this PC and Flock only across PCs.
+This installation uses broker-free-v34, never a hosted broker fallback.
+To join, generate join_request, ask the owner to approve_join after independently verifying
+the device fingerprint, then accept_welcome with an independently obtained owner fingerprint.
+Owner approval requires explicit session IDs and a finite membership expiry.
+Use share_thread only with the user's approved, secret-free summary snapshot. No existing
+threads are visible by default. Remote transcript access returns that snapshot only.
+Use renew_membership before certificate expiry; expired/missed-rotation recovery needs a
+fresh Join Code and owner approval with renew=true. Guests never receive master keys.
+When the user says "Remove Copilot Flock", call unenroll_flock with traceless=true.
+Pending owner acknowledgment retains recovery. Never erase Copilot conversations,
+session-state, data.db, source checkouts or backups. Traceless excludes audit logs and backups.
+Owner removal ends that owner's renewal service; it does not delegate authority or erase peers.
+`;
+  for (const filename of paths.skills.filter((filename) => path.basename(path.dirname(filename)) === "copilot-flock")) {
+    fs.mkdirSync(path.dirname(filename), { recursive: true });
+    fs.writeFileSync(filename, skill, "utf8");
+    recordInstalledArtifact(root, filename, paths);
+  }
+  const persistence = configureBootPersistence(targetScript, { strict: true });
+  if (!persistence?.path) throw new Error("Boot persistence was not confirmed; enrollment remains recoverable");
+  recordInstalledArtifact(root, persistence.path, paths);
+  const daemon = await ensureDaemonStarted(config);
+  if (!daemon.state || daemon.state.status !== "connected") throw new Error("Broker-free daemon readiness unconfirmed; enrollment retained for retry");
+  return { protocol: config.protocol, enrollment, installedScript: targetScript, daemonPid: daemon.pid,
+    liveAzureScopeGates: "NOT RUN: disposable-namespace positive/negative JWT and SAS isolation tests required before merge/release" };
+}
+
 export async function uninstallBridge(options = {}) {
   const callLeave = async ({ config, request }, route) => {
       if (!config.bootstrapUrl) throw new Error("No explicit legacy broker; authorized owner leave transport is required");
@@ -10699,6 +11018,7 @@ export async function uninstallBridge(options = {}) {
     ...options,
     inventory: options.inventory || ((context) => callLeave(context, "leave-plan")),
     leave: options.leave || ((context) => callLeave(context, "leave")),
+    brokerFreeLeave: options.brokerFreeLeave || (({ root, config }) => brokerFreeRuntime(config, { root }).leaveAll()),
   });
 }
 
@@ -10868,6 +11188,34 @@ export function resolveCliMessage(flags = {}, positional = []) {
 
 async function main() {
   const { command, positional, flags } = parseCliArgs(process.argv.slice(2));
+  if (command === "join-request") {
+    if (fs.existsSync(getConfigPath()) && JSON.parse(fs.readFileSync(getConfigPath(), "utf8")).protocol !== "broker-free-v34") {
+      throw new Error("Existing legacy installation remains unchanged; broker-free enrollment requires a separately configured home");
+    }
+    const code = await brokerFreeRuntime().joinRequest({ machineId: flags["machine-id"] || os.hostname(),
+      scope: flags.scope, flockId: flags.flock || flags["renew-flock"], renewFlock: flags["renew-flock"] || null });
+    console.log(JSON.stringify(code, null, 2));
+    return;
+  }
+  if (command === "approve-join" || command === "accept-welcome" || command === "renew-membership") {
+    const runtime = brokerFreeRuntime();
+    let result;
+    if (command === "approve-join") {
+      if (!flags["join-code-file"]) throw new Error("A locally reviewed --join-code-file is required");
+      result = await runtime.approve({ flockId: flags.flock, code: JSON.parse(fs.readFileSync(path.resolve(flags["join-code-file"]), "utf8")),
+        expectedEd25519Fingerprint: flags["device-fingerprint"], role: flags.role || "collaborator",
+        sessionIds: String(flags["session-ids"] || "").split(",").filter(Boolean),
+        membershipExpiresAt: flags["membership-expires-at"] ? Number(flags["membership-expires-at"]) : undefined,
+        renew: flags.renew === true });
+    } else if (command === "accept-welcome") {
+      if (!flags["welcome-file"]) throw new Error("--welcome-file is required");
+      const ticket = JSON.parse(fs.readFileSync(path.resolve(flags["welcome-file"]), "utf8"));
+      result = await installBridge({ welcomeTicketArg: ticket, ownerFingerprintArg: flags["owner-fingerprint"],
+        protocolArg: "broker-free-v34", machineIdArg: flags["machine-id"], scopeArg: flags.scope });
+    } else result = await runtime.renewMembership(runtime.select(flags.flock).flockId);
+    console.log(JSON.stringify(result, null, 2));
+    return;
+  }
 
   if (command === "uninstall" || command === "unenroll" ||
       (command === "flock" && positional[0] === "unenroll")) {
@@ -10969,6 +11317,10 @@ Usage:
       scopeArg,
       githubUserArg: flags["github-user"] || flags.user,
       hubArg: flags.hub,
+      protocolArg: flags.protocol,
+      flockIdArg: flags.flock,
+      serviceBusSendConnectionStringArg: flags["servicebus-send-connection-string"],
+      serviceBusListenConnectionStringArg: flags["servicebus-listen-connection-string"],
     });
     console.log(JSON.stringify(res, null, 2));
     return;
@@ -11004,6 +11356,19 @@ Usage:
   }
 
   const cfg = loadConfig({ autoFetchAz: true, refreshSpecs: Boolean(flags.refresh) });
+  if (flags.flock) cfg.flockId = flags.flock;
+  if (cfg.protocol === "broker-free-v34") {
+    if (["members", "enrolled", "flock"].includes(command)) {
+      const record = brokerFreeRuntime(cfg).select(cfg.flockId);
+      console.log(JSON.stringify({ flockId: record.flockId, members: Object.entries(record.members)
+        .map(([peerId, entry]) => ({ peerId, machineId: entry.cert.body.machineId, role: entry.cert.body.role,
+          expiresAt: entry.cert.body.expiresAt, removed: entry.removed === true })) }, null, 2));
+      return;
+    }
+    const supported = new Set(["daemon", "mcp", "machines", "sessions", "send", "transcript", "broadcast",
+      "status", "flocks", "my-flocks", "version", "versions", "specs", "share-thread", "unshare-thread", "shared-threads", "kick"]);
+    if (!supported.has(command)) throw new Error(`Command ${command} is not available in broker-free mode; legacy fallback is forbidden`);
+  }
 
   if (command === "daemon") {
     await runDaemon(cfg);

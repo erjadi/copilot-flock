@@ -4,11 +4,13 @@ Licensed under [Apache-2.0](./LICENSE). Copyright 2026 Eric Jadi.
 Viewer preview data, hostnames, network addresses and governance examples are
 synthetic, not captured conversations or real signed release evidence.
 
-**3.4 preparation status:** this branch adds guarded local removal and isolated
-broker-free protocol primitives; it is **not a completed 3.4 release**.
-The current Azure deployment and active runtime remain the 3.3.1 broker-backed
-implementation. Scoped Azure transport integration, broker-free lifecycle
-wiring and positive/negative live Azure tests are still required.
+**3.4.0 source candidate, not released:** broker-free onboarding, scoped Azure
+issuance/renewal, encrypted active RPC, owner-mediated leave/kick and guarded
+uninstall are wired. New setup defaults to two Azure services, not a hosted
+broker. Existing installations are untouched. Positive/negative live Azure
+isolation, immutable candidate review and the all-online ACCEPT release vote
+remain unrun merge/release gates. See the
+[current broker-free behavior and limitations](./docs/BROKER_FREE_V34.md).
 
 **Connect all of your GitHub Copilot computers—Windows desktops, ARM64 laptops, headless Linux GPU servers, and cloud VMs—into one real-time, peer-to-peer flock.**
 
@@ -23,7 +25,7 @@ invites.
 
 | Your Situation | Copy & Paste This Single Prompt into Your GitHub Copilot Chat |
 | :--- | :--- |
-| **🟢 Path 1 — Joining an Existing Flock**<br/>*(You have an Invite JSON from your other PC or a teammate)* | `"Clone https://github.com/erjadi/copilot-flock, read AGENTS.md, and enroll me using this invite JSON: <paste JSON>"` |
+| **🟢 Path 1 — Joining an Existing Flock** | `"Read AGENTS.md and create a device-bound Join Code for owner/team. Help me verify the owner's fingerprint before accepting their Welcome Ticket."` Legacy broker invites remain explicitly supported. |
 | **🟣 Path 2 — Starting a Brand-New Flock**<br/>*(Setting up your own BYO Azure SignalR + Service Bus instance)* | `"Clone https://github.com/erjadi/copilot-flock, read AGENTS.md, and set up a brand-new Copilot Flock instance in my Azure subscription."` |
 
 The viewer's local server binds to `127.0.0.1` by default. `VIEWER_HOST` is an
@@ -48,24 +50,24 @@ prefix (`-SubscriptionId`, `-ResourceGroup`, `-Location`, `-NamePrefix`, or
 are the current subscription, `rg-copilot-flock`, `eastus` and `flock`.
 
 The wrappers install Azure CLI if missing, authenticate if needed, deploy
-[`infra/azuredeploy.json`](./infra/azuredeploy.json), ZIP deploy the default
-Linux Node 22 Token Broker, and wait for its configured HTTPS health endpoint.
+[`infra/azuredeploy.json`](./infra/azuredeploy.json).
 Keys are retrieved through authorized subscription/resource-pinned Azure
-commands, then passed in memory to the installer with the broker origin.
+commands, then passed in memory to the broker-free owner installer.
 Neither ARM outputs nor managed installer arguments contain keys. Windows CLI
 installation can require UAC; Debian/Ubuntu can require `sudo`; macOS requires
 existing Homebrew. Headless Linux uses device-code login. Node.js must already
 be available. Without the provisioning flag, existing invite/direct-string
 installation remains unchanged and no Azure resources are provisioned.
 
-The template creates **SignalR Serverless (Free_F1), Service Bus Standard and
-the offline topic, plus a Token Broker Web App on a Linux B1 plan** by default.
-The broker has persistent storage and a managed identity with namespace-scoped
-Service Bus permissions; deployment requires permission to create that role
-assignment. Service Bus and B1 hosting are billed separately; quotas, regional
-availability and subscription policy can reject deployment. `-SkipBroker` /
-`--skip-broker` deliberately omits hosting and signed broker invites.
-Setup confirms registration and v3 enrollment before reporting success.
+The template defaults to **SignalR Serverless (Free_F1) and Service Bus
+Standard**, with topic `copilot-bridge-offline`, Send-only `FlockSendRule` and
+Listen-only `FlockListenRule`. Service Bus is billed separately. There is no
+default Web App, hosting plan, managed identity or broker deployment.
+`-LegacyBroker` / `--legacy-broker` explicitly restores the legacy hosted path,
+including separately billed B1 hosting and role-assignment requirements.
+`-SkipBroker` / `--skip-broker` is a compatibility no-op for the new default.
+Setup confirms persisted enrollment and daemon readiness before success;
+this is not evidence that the required live scope-isolation gate passed.
 This is your own deployment, not a vendor-hosted service. Local mock tests do
 not establish live Azure acceptance; resources remain deployed on failures.
 See the [managed setup guide](./docs/BOOTSTRAP_NEW_FLOCK_BYO_AZURE.md).
@@ -75,7 +77,17 @@ See the [managed setup guide](./docs/BOOTSTRAP_NEW_FLOCK_BYO_AZURE.md).
 
 ---
 
-## Why Copilot Flock Exists
+## Legacy compatibility feature guide
+
+The following existing feature, onboarding and architecture reference describes
+the **explicit legacy/broker-backed mode**, including one-step v3 invites,
+privileged coordinators and its broader RPC surface. It is not the new
+broker-free default or a promise of unconditional offline delivery, latency
+or immediate global revocation. For new 3.4.0 setup, two-step joining and the
+narrower active surface, use [the current guide](./docs/BROKER_FREE_V34.md)
+and [managed setup](./docs/BOOTSTRAP_NEW_FLOCK_BYO_AZURE.md).
+
+### Why Copilot Flock Exists
 
 Most developers and engineers work across more than one machine: a **work laptop**, a **personal desktop**, a **headless Linux GPU server or robot brain**, and a **cloud VM**. Normally, each computer's GitHub Copilot is trapped on an island—it has no idea what your other computers are working on.
 

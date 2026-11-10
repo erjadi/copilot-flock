@@ -657,7 +657,7 @@ test(
 
   let wsServer = null;
   try {
-    assert.equal(BRIDGE_VERSION, "3.3.1");
+    assert.equal(BRIDGE_VERSION, "3.4.0");
 
     const hugeSessionId = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
     const eventsPath = env.insertSession({

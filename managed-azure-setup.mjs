@@ -9,6 +9,7 @@ import { setTimeout as sleep } from "node:timers/promises";
 const root = fileURLToPath(new URL(".", import.meta.url));
 
 export function validateDeployment(outputs, options) {
+  options = { ...options, skipBroker: options.legacyBroker !== true };
   const names = ["subscriptionId", "signalrName", "signalrHostName", "serviceBusNamespaceName",
     "serviceBusEndpoint", "serviceBusTopicName", "bootstrapUrl", "webAppName"];
   if (!outputs || typeof outputs !== "object" || Object.keys(outputs).some((name) => !names.includes(name))) {
@@ -32,6 +33,8 @@ export function validateDeployment(outputs, options) {
   }
   if (options.skipBroker) {
     if (result.webAppName || result.bootstrapUrl) throw new Error("Unexpected broker in broker-free deployment.");
+    if (!/^[a-z0-9][a-z0-9-]{0,38}$/i.test(options.githubUser || "") ||
+        !["personal", "work"].includes(options.scope)) throw new Error("Explicit owner label and scope required for new broker-free enrollment");
   } else if (!/^[a-z0-9-]{2,60}$/i.test(result.webAppName) ||
       result.bootstrapUrl !== `https://${result.webAppName}.azurewebsites.net` ||
       !/^[a-z0-9][a-z0-9-]{0,38}$/i.test(options.githubUser || "")) {
@@ -124,10 +127,11 @@ export async function waitForBroker(origin, { fetchImpl = fetch, delay = sleep, 
 }
 
 export async function runManagedSetup(outputs, options, adapters = {}) {
+  options = { ...options, skipBroker: options.legacyBroker !== true };
   const metadata = validateDeployment(outputs, options);
   const azure = adapters.runAz || runAz;
   const coordinates = ["--subscription", options.subscription, "--resource-group", options.resourceGroup];
-  const getKey = async (args, endpoint) => {
+  const getKey = async (args, endpoint, policy = "RootManageSharedAccessKey") => {
     let value;
     try {
       value = JSON.parse(await azure([...args, ...coordinates, "--output", "json"])).primaryConnectionString;
@@ -139,7 +143,7 @@ export async function runManagedSetup(outputs, options, adapters = {}) {
         !(endpoint.startsWith("https:")
           ? /;AccessKey=[^;]+(?:;|$)/.test(value)
           : /;SharedAccessKey=[^;]+(?:;|$)/.test(value) &&
-            value.includes(";SharedAccessKeyName=RootManageSharedAccessKey;"))) {
+            value.includes(`;SharedAccessKeyName=${policy};`))) {
       throw new Error("Azure returned invalid credentials; local installation was not started.");
     }
     return value;
@@ -149,6 +153,16 @@ export async function runManagedSetup(outputs, options, adapters = {}) {
   const serviceBus = await getKey(["servicebus", "namespace", "authorization-rule", "keys", "list",
     "--namespace-name", metadata.serviceBusNamespaceName, "--name", "RootManageSharedAccessKey"],
   metadata.serviceBusEndpoint);
+  let send;
+  let listen;
+  if (options.skipBroker) {
+    for (const rule of ["FlockSendRule", "FlockListenRule"]) {
+      const credential = await getKey(["servicebus", "namespace", "authorization-rule", "keys", "list",
+        "--namespace-name", metadata.serviceBusNamespaceName, "--name", rule], metadata.serviceBusEndpoint, rule);
+      if (rule === "FlockSendRule") send = credential;
+      else listen = credential;
+    }
+  }
 
   if (!options.skipBroker) {
     const pinned = process.env.COPILOT_FLOCK_ALLOWED_BOOTSTRAP_ORIGIN ||
@@ -183,6 +197,9 @@ export async function runManagedSetup(outputs, options, adapters = {}) {
         subscriptionArg: options.subscription, resourceGroupArg: options.resourceGroup,
         signalrNameArg: metadata.signalrName, githubUserArg: options.githubUser,
         scopeArg: options.scope || null, machineIdArg: options.machineId || null,
+        ...(options.skipBroker ? { protocolArg: "broker-free-v34",
+          flockIdArg: `${options.githubUser}/${options.scope}`,
+          serviceBusSendConnectionStringArg: send, serviceBusListenConnectionStringArg: listen } : {}),
       });
     } catch {
       throw new Error("Local Flock installation failed; credentials and captured details withheld. Azure resources remain deployed.");
@@ -201,15 +218,16 @@ export async function runManagedCli(args, input, adapters) {
   const { values } = parseArgs({ args, options: {
     subscription: { type: "string" }, "resource-group": { type: "string" },
     "github-user": { type: "string" }, scope: { type: "string" },
-    "machine-id": { type: "string" }, "skip-broker": { type: "boolean" },
+    "machine-id": { type: "string" }, "skip-broker": { type: "boolean" }, "legacy-broker": { type: "boolean" },
   } });
+  if (values["legacy-broker"] && values["skip-broker"]) throw new Error("Legacy broker and skip broker are mutually exclusive");
   let outputs;
   try { outputs = JSON.parse(input); }
   catch { throw new Error("Azure deployment returned malformed JSON metadata."); }
   return runManagedSetup(outputs, {
     subscription: values.subscription, resourceGroup: values["resource-group"],
     githubUser: values["github-user"], scope: values.scope,
-    machineId: values["machine-id"], skipBroker: values["skip-broker"],
+    machineId: values["machine-id"], legacyBroker: values["legacy-broker"],
   }, adapters);
 }
 
