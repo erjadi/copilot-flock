@@ -430,6 +430,65 @@ test("junction/symlink escape rejected without touching destination", async () =
   } finally { f.close(); }
 });
 
+test("Windows daemon ownership accepts independent executable and script quoting with exact process pins", async () => {
+  const f = fixture();
+  try {
+    const pid = 123456;
+    fs.writeFileSync(path.join(f.root, "daemon.pid"), String(pid));
+    const plainScript = path.join(f.root, "flock.mjs");
+    const spacedScript = path.join(f.root, "with spaces", "flock.mjs");
+    const spacedExe = "C:\\Program Files\\nodejs\\node.exe";
+    const plainExe = "C:\\Node\\node.exe";
+    for (const [executable, script, command] of [
+      [spacedExe, spacedScript, `"${spacedExe}" "${spacedScript}" daemon`],
+      [spacedExe, plainScript, `"${spacedExe}" ${plainScript} daemon`],
+      [plainExe, spacedScript, `${plainExe} "${spacedScript}" daemon`],
+      [plainExe, plainScript, `${plainExe} ${plainScript} daemon`],
+    ]) {
+      const live = { pid, start: "created", executable, command };
+      atomicJson(path.join(f.root, "daemon-identity.json"), { ...live, script });
+      let killed = 0;
+      await stopPinnedDaemon(f.root, { ...f.paths, scripts: [script] }, {
+        inspect: () => killed ? null : live,
+        kill: (target) => { assert.equal(target, pid); killed++; },
+      });
+      assert.equal(killed, 1, `Exact pinned daemon was not recognized: ${command}`);
+    }
+  } finally { f.close(); }
+});
+
+test("Windows daemon quoting never admits extra arguments, different scripts or a changed creation identity", async () => {
+  const f = fixture();
+  try {
+    const pid = 123456;
+    const executable = "C:\\Program Files\\nodejs\\node.exe";
+    const script = path.join(f.root, "flock.mjs");
+    const command = `"${executable}" ${script} daemon`;
+    fs.writeFileSync(path.join(f.root, "daemon.pid"), String(pid));
+    let killed = 0;
+    for (const invalid of [
+      `${command} --other`, `${command} && other`, `"${executable}" ${script}.other daemon`,
+      `"${executable}" ${script} not-daemon`,
+    ]) {
+      const live = { pid, start: "created", executable, command: invalid };
+      atomicJson(path.join(f.root, "daemon-identity.json"), { ...live, script });
+      await stopPinnedDaemon(f.root, f.paths, { inspect: () => live, kill: () => killed++ });
+      assert.equal(killed, 0);
+    }
+    const live = { pid, start: "created", executable, command };
+    atomicJson(path.join(f.root, "daemon-identity.json"), { ...live, start: "reused", script });
+    await assert.rejects(stopPinnedDaemon(f.root, f.paths, { inspect: () => live, kill: () => killed++ }),
+      /stored creation identity/);
+    atomicJson(path.join(f.root, "daemon-identity.json"), { ...live, script });
+    let reads = 0;
+    await assert.rejects(stopPinnedDaemon(f.root, f.paths, {
+      inspect: () => ++reads === 1 ? live : { ...live, start: "replaced" },
+      kill: () => killed++,
+    }), /identity changed/);
+    assert.equal(killed, 0);
+  } finally { f.close(); }
+});
+
 test("stale PID never kills unrelated process; pinned identity must match immediately before signalling", async () => {
   const f = fixture();
   try {

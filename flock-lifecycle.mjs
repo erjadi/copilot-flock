@@ -154,8 +154,12 @@ export function pinDaemonIdentity(root, script, inspect = inspectProcess) {
 function commandIsDaemon(identity, scripts) {
   if (identity.argv) return identity.argv.length === 3 &&
     scripts.includes(path.resolve(identity.argv[1])) && identity.argv[2] === "daemon";
-  return scripts.some((script) => identity.command === `"${identity.executable}" "${script}" daemon` ||
-    identity.command === `${identity.executable} ${script} daemon`);
+  return scripts.some((script) => [
+    `"${identity.executable}" "${script}" daemon`,
+    `"${identity.executable}" ${script} daemon`,
+    `${identity.executable} "${script}" daemon`,
+    `${identity.executable} ${script} daemon`,
+  ].includes(identity.command));
 }
 
 export async function stopPinnedDaemon(root, paths, {

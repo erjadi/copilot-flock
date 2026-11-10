@@ -98,6 +98,10 @@ New daemons persist PID, executable/command and process creation identity.
 Cleanup rechecks the live identity before signalling the specific PID. A stale
 PID never authorizes terminating an unrelated process. Legacy running daemons
 without a creation-identity pin require coordination and are retained.
+Windows executable and script quoting are recognized independently; the full
+command must still match the exact runtime script in bare `daemon` mode.
+Extra arguments, script substrings and changed creation identities do not
+authorize signalling.
 Other runtime-referencing Node processes are discovered but not terminated
 without a creation-identity proof. They retain the installation and require
 their host to close them before retrying cleanup.
