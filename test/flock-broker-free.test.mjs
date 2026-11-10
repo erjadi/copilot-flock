@@ -238,7 +238,8 @@ test("broker-free uninstall retains offline recovery, then leaves every flock an
   fs.writeFileSync(path.join(preserved, "events.jsonl"), "conversation evidence");
   const runtime = new BrokerFreeRuntime(root, f.options);
   const options = { paths, brokerFreeLeave: () => runtime.leaveAll(), findProcesses: async () => [],
-    stopDaemon: async () => {}, removeTasks: async () => [], disable: async () => {} };
+    stopDaemon: async () => {}, removeTasks: async () => [], disable: async () => {},
+    checkPersistence: async () => {} };
   f.deny(true);
   const pending = await uninstallFlock(options);
   assert.equal(pending.fullyRemoved, false);
