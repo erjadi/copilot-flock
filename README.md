@@ -38,6 +38,12 @@ Copilot reports pending remote cleanup or retained artifacts rather than
 claiming success when an owner/broker is offline or authorization is missing.
 See [removal scope and limitations](./docs/REMOVING_FLOCK.md).
 
+Upgrading an existing legacy client preserves its protocol, registered identity
+and memberships; it does not migrate cloud resources or credentials to
+broker-free mode. Release, canary rollout and resident-daemon versus caller-MCP
+verification are distinct gates. See
+[upgrade boundaries](./docs/BROKER_FREE_V34.md#release-and-existing-client-upgrades).
+
 ## Managed Azure setup: one approved Copilot-led flow
 
 Tell Copilot: *"Set up a new full Flock using the managed ARM template. Confirm

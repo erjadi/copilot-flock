@@ -7,6 +7,10 @@ const MAX_BYTES = 128 * 1024;
 const domain = "copilot-flock/3.4/";
 const digest = (value) => crypto.createHash("sha256").update(value).digest("hex");
 const encode = (value) => Buffer.from(value).toString("base64url");
+export function peerSubscription(peerId) {
+  if (typeof peerId !== "string" || !/^[a-f0-9]{64}$/.test(peerId)) throw new Error("Invalid subscription peer identity");
+  return `sub-${digest(domain + "subscription\n" + peerId).slice(0, 46)}`;
+}
 function bytes(value, length) {
   if (typeof value !== "string" || !/^[A-Za-z0-9_-]+$/.test(value)) throw new Error("Noncanonical binary encoding");
   const result = Buffer.from(value, "base64url");
@@ -126,13 +130,13 @@ export async function approveJoin({ code, ownerIdentity, ownerPublicKey, rotatio
     deviceX25519Pub: join.deviceX25519Pub, issuedAt: now, expiresAt, sessionIds };
   const cert = { body, signature: sign("member-cert", body, ownerIdentity.ed25519.privateKey) };
   validateCert(cert, ownerPublicKey, now);
-  const transport = await provisionTransport({ peerId: join.peerId, subscription: `sub-${join.peerId}`, expiresAt, cert });
+  const transport = await provisionTransport({ peerId: join.peerId, subscription: peerSubscription(join.peerId), expiresAt, cert });
   await authorizeOwner();
   const allowedTransportFields = ["expiresAt", "subscription", "signalrClientToken", "signalrRestToken",
     "serviceBusSendSas", "serviceBusListenSas"];
   if (Object.keys(transport).some((field) => !allowedTransportFields.includes(field))) throw new Error("Unexpected transport material");
   if (transport.expiresAt > expiresAt || transport.expiresAt <= now ||
-      transport.subscription !== `sub-${join.peerId}`) throw new Error("Transport scope or expiry mismatch");
+      transport.subscription !== peerSubscription(join.peerId)) throw new Error("Transport scope or expiry mismatch");
   for (const token of [transport.signalrClientToken, transport.signalrRestToken, transport.serviceBusSendSas, transport.serviceBusListenSas]) {
     if (typeof token !== "string" || !token || /(?:AccessKey|SharedAccessKey)=/.test(token)) throw new Error("Scoped transport tokens required; never export transport master keys");
   }

@@ -19,7 +19,7 @@ signs a ten-minute Join Code binding both public keys, machine, scope and
 intended flock. Private keys remain local. The owner independently verifies
 the device fingerprint and intended identity/access policy before approval.
 The owner approves explicit session IDs, role and finite membership expiry,
-creates only `sub-<peerId>`, and returns an owner-signed, X25519-sealed Welcome
+creates only the intended peer's subscription, and returns an owner-signed, X25519-sealed Welcome
 Ticket. The recipient independently obtains and pins the owner fingerprint
 before accepting. A self-box is not remote proof of X25519 private-key possession.
 There is no transferable bearer invitation or first-redemption race ledger.
@@ -57,8 +57,26 @@ never outlive membership. SignalR client and REST-send JWT audiences are
 distinct. Send-only topic SAS and Listen-only own-subscription SAS do not
 grant Manage. Guests receive no transport master keys, owner signing keys
 or management credentials. The owner retains management authority locally.
-Provider enforcement of these exact scopes is an **unrun live gate**, not
-established by token parsing or mocks.
+Provider enforcement of these exact scopes is an **unestablished live gate**,
+not established by token parsing or mocks. A diagnostic run with required
+negative probes removed does not satisfy this gate. In particular, denial of
+REST sends to another hub and another user remains required until an explicit
+architecture/contract decision changes that boundary; a wrong-credential-type
+probe is additional coverage, not a substitute. The disposable live harness
+records every negative operation's method, HTTP status and outcome, along with
+raw source-file SHA-256 hashes, without logging credentials or response bodies.
+Non-401/403 statuses, including 404, and network failures never prove denial.
+SignalR REST uses an explicit `Bearer` authorization scheme; Service Bus
+retains its separate SAS scheme with a lowercase signed resource URI.
+Subscription creation uses the provider-default description; each published
+message independently bounds its queue TTL by the message and transport expiry.
+The full peer fingerprint remains in the signed certificate/envelope, not
+truncated to the transport subscription name. Subscription names are `sub-`
+plus 46 hex characters of a domain-separated SHA-256 over the **entire**
+canonical peer fingerprint (50 characters, Azure's subscription-name limit).
+This uses a 184-bit hash output rather than aliasing peers by
+a shared fingerprint prefix. Known mapped-name collisions
+with local retained or pending memberships are rejected before provisioning.
 
 The active broker-free RPC surface supports ping, certificate-filtered
 session listings, approved-snapshot transcript access, guarded messaging to
@@ -140,3 +158,25 @@ network failures do not count as isolation. Cleanup attempts deletion of
 both exact fixture subscriptions and reports failures. Never point it at
 enrolled/production resources, infer permission from environment flags, or
 mark an unexecuted gate passed.
+
+## Release and existing-client upgrades
+
+Live provider experiments on an edited checkout are diagnostic evidence, not
+approval of its original commit. A source or harness fix creates a new full
+commit/tree and new review target. Release requires pinned exact-source test
+receipts, positive and negative provider results, disposable-resource teardown,
+renewed implementation review and fresh registered-identity ballots from the
+complete online flock. Historical votes, self-advertised keys, a mutable
+`FETCH_HEAD`, an exit code without executed-test counts, or an approval Boolean
+cannot substitute for those gates.
+
+An existing legacy client's software upgrade is **not** a broker-free
+infrastructure or credential migration. Preserve its machine ID, existing
+Ed25519 identity, flock memberships, credential configuration and conversations.
+Roll out a verified published source candidate canary-first with an independent
+recovery path, and verify the resident daemon separately from the caller's
+already-running MCP process. Do not silently run clean/re-enroll, replace keys,
+restart the entire Copilot app, deploy a broker or delete production hosting.
+Changing an existing flock's protocol/authority requires a separate explicit
+migration decision. A source release alone does not demonstrate that every
+host has upgraded or that an old loaded MCP process has reloaded.

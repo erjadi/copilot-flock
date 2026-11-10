@@ -3,14 +3,19 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import crypto from "node:crypto";
 import { AzureTransport, azureEndpoints, parseAzureConnection, HUB, TOPIC, jwt, sas } from "../flock-azure.mjs";
-import { createDeviceIdentity, createOwnerState, createJoinCode, approveJoin, acceptWelcome, ownerFingerprint } from "../flock-protocol.mjs";
+import { createDeviceIdentity, createOwnerState, createJoinCode, approveJoin, acceptWelcome, ownerFingerprint, peerSubscription } from "../flock-protocol.mjs";
 import { connectSignalRClient } from "../flock.mjs";
+import { runAzureNegativeProbes } from "./azure-negative-probes.mjs";
 
 // Deliberately excluded from npm test. Never point this gate at an enrolled/production namespace.
 test("LIVE RELEASE GATE: scoped Azure clients, REST JWTs and subscription-only SAS isolation", {
   skip: process.env.COPILOT_FLOCK_LIVE_AZURE_APPROVED !== "1" ? "UNRUN: explicit approval and a disposable Azure namespace are required" : false,
   timeout: 120000,
-}, async () => {
+}, async (t) => {
+  const files = ["flock.mjs", "bridge.mjs", "flock-azure.mjs", "flock-protocol.mjs", "flock-broker-free.mjs",
+    "flock-lifecycle.mjs", "test/flock-azure.live.test.mjs", "test/azure-negative-probes.mjs"];
+  t.diagnostic(JSON.stringify({ kind: "live-gate-source-hashes", sha256: Object.fromEntries(files.map((file) =>
+    [file, crypto.createHash("sha256").update(fs.readFileSync(new URL(`../${file}`, import.meta.url))).digest("hex")])) }));
   const config = JSON.parse(fs.readFileSync(process.env.COPILOT_FLOCK_LIVE_AZURE_CONFIG, "utf8"));
   assert.equal(config.disposable, true, "Only an explicitly disposable deployment is eligible");
   const signalr = parseAzureConnection(config.connectionString, "signalr");
@@ -34,13 +39,10 @@ test("LIVE RELEASE GATE: scoped Azure clients, REST JWTs and subscription-only S
   const peerIds = [state.localPeerId, code.body.peerId];
   const clients = [];
   const request = (url, token, method = "POST", body) => fetch(url, { method, redirect: "error",
-    signal: AbortSignal.timeout(10000), headers: { Authorization: token, "Content-Type": "application/json" },
+    signal: AbortSignal.timeout(10000), headers: {
+      Authorization: new URL(url).origin === signalr.endpoint ? `Bearer ${token}` : token,
+      "Content-Type": "application/json" },
     ...(body === undefined ? {} : { body: JSON.stringify(body) }) });
-  const denied = async (url, token, method = "POST", body) => {
-    const response = await request(url, token, method, body);
-    assert.ok([401, 403].includes(response.status), `Isolation gate required HTTP 401/403; observed ${response.status}`);
-    await response.body?.cancel();
-  };
   try {
     const ownerTransport = await azure.issue(state.cert, state.ownerPublicKey);
     const ticket = await approveJoin({ code, ownerIdentity: owner, ownerPublicKey: state.ownerPublicKey,
@@ -49,6 +51,14 @@ test("LIVE RELEASE GATE: scoped Azure clients, REST JWTs and subscription-only S
       membershipExpiresAt: Date.now() + 3600000, verifyIdentityPolicy: async () => {},
       authorizeOwner: async () => {}, provisionTransport: ({ cert }) => azure.issue(cert, state.ownerPublicKey) });
     const welcome = acceptWelcome(ticket, { identity: peer, code, pinnedOwnerFingerprint: ownerFingerprint(state.ownerPublicKey) });
+    const ownSub = `${manage.endpoint}/${TOPIC}/subscriptions/${peerSubscription(code.body.peerId)}`;
+    const results = await runAzureNegativeProbes({ request, signalrEndpoint: signalr.endpoint,
+      serviceBusEndpoint: manage.endpoint, ownerPeerId: state.localPeerId, peerId: code.body.peerId,
+      transport: welcome.transport,
+      expiredRestToken: jwt(`${signalr.endpoint}/api/v1/hubs/${HUB}`, signalr.key,
+        Date.now() - 300000, { now: Date.now() - 600000 }),
+      expiredListenSas: sas(ownSub, "FlockListenRule", listen.key, Date.now() - 300000, Date.now() - 600000) });
+    for (const result of results) t.diagnostic(JSON.stringify({ kind: "live-gate-negative-probe", ...result }));
     const probe = crypto.randomUUID();
     const received = new Set();
     for (const [peerId, transport] of [[state.localPeerId, ownerTransport], [code.body.peerId, welcome.transport]]) {
@@ -74,21 +84,8 @@ test("LIVE RELEASE GATE: scoped Azure clients, REST JWTs and subscription-only S
     let queued = false;
     await azure.drain(welcome.transport, async (message) => { if (message.probe === probe) queued = true; return true; });
     assert.ok(queued, "Own-subscription Listen SAS must receive the Send-only topic message");
-    const hubUrl = `${signalr.endpoint}/api/v1/hubs/${HUB}`;
-    const probeBody = { target: "fixture-negative", arguments: [] };
-    await denied(hubUrl, welcome.transport.signalrClientToken, "POST", probeBody);
-    await denied(`${signalr.endpoint}/api/v1/hubs/fixture-forbidden`, welcome.transport.signalrRestToken, "POST", probeBody);
-    await denied(`${hubUrl}/users/${state.localPeerId}`, welcome.transport.signalrRestToken, "POST", probeBody);
-    await denied(hubUrl, jwt(hubUrl, signalr.key, Date.now() - 300000, { now: Date.now() - 600000 }), "POST", probeBody);
-    const ownSub = `${manage.endpoint}/${TOPIC}/Subscriptions/sub-${code.body.peerId}`;
-    const otherSub = `${manage.endpoint}/${TOPIC}/Subscriptions/sub-${state.localPeerId}`;
-    await denied(`${otherSub}/messages/head?timeout=0`, welcome.transport.serviceBusListenSas);
-    await denied(`${ownSub}/messages/head?timeout=0`, welcome.transport.serviceBusSendSas);
-    await denied(`${manage.endpoint}/${TOPIC}/messages`, welcome.transport.serviceBusListenSas, "POST", { probe });
-    await denied(`${ownSub}?api-version=2017-04`, welcome.transport.serviceBusListenSas, "DELETE");
-    await denied(`${ownSub}?api-version=2017-04`, welcome.transport.serviceBusSendSas, "DELETE");
-    await denied(`${ownSub}/messages/head?timeout=0`, sas(ownSub, "FlockListenRule", listen.key,
-      Date.now() - 300000, Date.now() - 600000));
+    assert.deepEqual(results.filter((result) => result.outcome !== "denied"), [],
+      "All original isolation probes require HTTP 401/403; acceptance, missing entities and request failures fail the gate");
   } finally {
     clients.forEach((client) => client.close());
     // Exactly the two freshly generated fixture peers, never a namespace/topic or preexisting subscription.

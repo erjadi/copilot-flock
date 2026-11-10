@@ -6,7 +6,7 @@ import path from "node:path";
 import crypto from "node:crypto";
 import { AzureTransport, azureEndpoints, validateTransport, sas } from "../flock-azure.mjs";
 import { BrokerFreeRuntime } from "../flock-broker-free.mjs";
-import { encryptEnvelope, ownerFingerprint } from "../flock-protocol.mjs";
+import { encryptEnvelope, ownerFingerprint, peerSubscription } from "../flock-protocol.mjs";
 import { lifecyclePaths, atomicJson, uninstallFlock, recordInstalledArtifact } from "../flock-lifecycle.mjs";
 import { pathToFileURL } from "node:url";
 
@@ -29,8 +29,9 @@ async function fixture(t) {
     requests.push({ url, ...options });
     if (deny) return new Response("denied", { status: 403 });
     const parsed = new URL(url);
-    const peer = parsed.pathname.match(/\/Subscriptions\/(sub-[a-f0-9]{64})/)?.[1];
+    const peer = parsed.pathname.match(/\/subscriptions\/(sub-[a-f0-9]{46})/)?.[1];
     if (options.method === "PUT" && peer && !parsed.pathname.includes("/messages/")) {
+      assert.equal(options.body, '<entry xmlns="http://www.w3.org/2005/Atom"><content type="application/xml"><SubscriptionDescription xmlns="http://schemas.microsoft.com/netservices/2010/10/servicebus/connect" xmlns:i="http://www.w3.org/2001/XMLSchema-instance"/></content></entry>');
       if (!subscribers.has(peer)) subscribers.set(peer, []);
       return new Response("", { status: 201 });
     }
@@ -39,6 +40,7 @@ async function fixture(t) {
       return new Response(null, { status: 204 });
     }
     if (parsed.hostname.endsWith(".signalr.net")) {
+      assert.match(options.headers.Authorization, /^Bearer [A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/);
       const { target, arguments: args } = JSON.parse(options.body);
       if (args[0].type === deniedRealtimeType) { deniedRealtimeType = null; return new Response("denied", { status: 403 }); }
       for (const socket of sockets) if (!socket.ws.closed) socket.callback(target, structuredClone(args));
@@ -52,7 +54,7 @@ async function fixture(t) {
       const queue = subscribers.get(peer);
       if (!queue?.length) return new Response(null, { status: 204 });
       return new Response(JSON.stringify(queue[0]), { status: 201,
-        headers: { Location: `${endpoints.serviceBusEndpoint}/copilot-bridge-offline/Subscriptions/${peer}/messages/lock` } });
+        headers: { Location: `${endpoints.serviceBusEndpoint}/copilot-bridge-offline/subscriptions/${peer}/messages/lock` } });
     }
     if (options.method === "DELETE" && parsed.pathname.endsWith("/messages/lock")) {
       subscribers.get(peer)?.shift();
@@ -92,19 +94,44 @@ test("scoped Azure issuance has exact audiences, expiry, policy and target-only 
   const record = f.peer.record("demo/team");
   validateTransport(record.transport, endpoints, record.localPeerId, record.cert.body.expiresAt);
   assert.equal(record.ownerSecrets, undefined);
-  assert.ok(f.subscribers.has(`sub-${record.localPeerId}`));
+  assert.ok(f.subscribers.has(peerSubscription(record.localPeerId)));
+  assert.equal(record.transport.subscription.length, 50);
+  assert.throws(() => peerSubscription("not-a-fingerprint"), /identity/);
   for (const field of ["signalrClientToken", "signalrRestToken"]) {
     const parts = record.transport[field].split(".");
     assert.equal(parts[2], crypto.createHmac("sha256", "signalr-fixture").update(parts.slice(0, 2).join(".")).digest("base64url"));
   }
   const token = new URLSearchParams(record.transport.serviceBusListenSas.slice(22));
+  assert.equal(token.get("sr"), `${endpoints.serviceBusEndpoint}/copilot-bridge-offline/subscriptions/${peerSubscription(record.localPeerId)}`);
   const encoded = encodeURIComponent(token.get("sr"));
   assert.equal(token.get("sig"), crypto.createHmac("sha256", "listen-fixture").update(`${encoded}\n${token.get("se")}`).digest("base64"));
+  const mixed = new URLSearchParams(sas("https://FIXTURE.servicebus.windows.net/TOPIC/Subscriptions/sub-test",
+    "FlockListenRule", "listen-fixture", record.transport.expiresAt).slice(22));
+  assert.equal(mixed.get("sr"), "https://fixture.servicebus.windows.net/topic/subscriptions/sub-test");
+  assert.equal(mixed.get("sig"), crypto.createHmac("sha256", "listen-fixture")
+    .update(`${encodeURIComponent(mixed.get("sr"))}\n${mixed.get("se")}`).digest("base64"));
   const tampered = { ...record.transport, serviceBusListenSas: sas(`${endpoints.serviceBusEndpoint}/copilot-bridge-offline`,
     "FlockListenRule", "listen-fixture", record.transport.expiresAt) };
   assert.throws(() => validateTransport(tampered, endpoints, record.localPeerId, record.cert.body.expiresAt), /audience/);
   await assert.rejects(new AzureTransport(endpoints, { secrets: { listenKey: "listen-fixture" } }).subscription(record.localPeerId, "DELETE"), /Manage/);
   assert.throws(() => azureEndpoints("https://evil.example", endpoints.serviceBusEndpoint), /endpoints/);
+});
+test("subscription names bind the full peer identity and known namespace collisions reject before cloud effects", async (t) => {
+  const f = await fixture(t);
+  const code = await f.peer.joinRequest({ machineId: "ANOTHER-PEER", scope: "personal", flockId: "demo/team" });
+  const colliding = code.body.peerId.slice(0, 44) + (code.body.peerId[44] === "a" ? "b" : "a") + code.body.peerId.slice(45);
+  assert.notEqual(colliding, code.body.peerId);
+  assert.notEqual(peerSubscription(colliding), peerSubscription(code.body.peerId), "Different full identities must not alias by fingerprint prefix");
+  assert.equal(peerSubscription(code.body.peerId),
+    `sub-${crypto.createHash("sha256").update("copilot-flock/3.4/subscription\n" + code.body.peerId).digest("hex").slice(0, 46)}`);
+  const data = f.owner.read();
+  data.flocks["demo/other"] = { ...structuredClone(data.flocks["demo/team"]), flockId: "demo/other", localPeerId: code.body.peerId };
+  f.owner.save(data);
+  const before = f.requests.length;
+  await assert.rejects(f.owner.approve({ flockId: "demo/team", code, expectedEd25519Fingerprint: code.body.peerId,
+    role: "guest", membershipExpiresAt: Date.now() + 3600000 }), /subscription collides/);
+  assert.equal(f.requests.length, before);
+  assert.ok(f.subscribers.has(peerSubscription(f.code.body.peerId)));
 });
 test("active two-device encrypted RPC, durable admission and guest role negatives", async (t) => {
   const f = await fixture(t);
@@ -137,8 +164,8 @@ test("owner-mediated signed leave rotates only retained peers and safely retries
   assert.equal(results[0].confirmed, true);
   assert.equal(results[0].receipt.body.operationId, operationId);
   assert.equal(f.owner.record("demo/team").epoch, 2);
-  assert.equal(f.subscribers.has(`sub-${f.code.body.peerId}`), false);
-  assert.equal(f.subscribers.has(`sub-${f.owner.record("demo/team").localPeerId}`), true);
+  assert.equal(f.subscribers.has(peerSubscription(f.code.body.peerId)), false);
+  assert.equal(f.subscribers.has(peerSubscription(f.owner.record("demo/team").localPeerId)), true);
   assert.deepEqual(await f.peer.leaveAll(), []);
 });
 test("owner renewal preserves device and role; wrong pins, target changes and stale epochs fail", async (t) => {
@@ -158,7 +185,7 @@ test("owner renewal preserves device and role; wrong pins, target changes and st
   await assert.rejects(other.accept(ticket, "wrong"), /pin/);
   await other.accept(ticket, ownerFingerprint(before.ownerPublicKey));
   await f.owner.removePeer({ flockId: "demo/team", peerId: f.code.body.peerId, operationId: "target-only" });
-  assert.equal(f.subscribers.has(`sub-${code.body.peerId}`), true);
+  assert.equal(f.subscribers.has(peerSubscription(code.body.peerId)), true);
   const old = encryptEnvelope({ state: before, identity: before.identity, cert: before.cert,
     action: "ping", targetPeerId: "*", payload: {} });
   await assert.rejects(f.owner.consume(f.owner.record("demo/team"), { type: "envelope", flockId: "demo/team", envelope: old }), /epoch/);
@@ -191,7 +218,7 @@ test("multiple memberships use distinct peer subscriptions, explicit dispatch an
   await assert.rejects(f.owner.approve({ flockId: "demo/team", code, expectedEd25519Fingerprint: code.body.peerId,
     role: "guest", membershipExpiresAt: Date.now() + 3600000 }), /another flock/);
   await f.owner.removePeer({ flockId: "demo/team", peerId: f.code.body.peerId });
-  assert.equal(f.subscribers.has(`sub-${code.body.peerId}`), true);
+  assert.equal(f.subscribers.has(peerSubscription(code.body.peerId)), true);
   const duplicate = await f.peer.joinRequest({ machineId: "PEER", scope: "work", flockId: "demo/second" });
   await assert.rejects(f.owner.approve({ flockId: "demo/second", code: duplicate, expectedEd25519Fingerprint: duplicate.body.peerId,
     role: "guest", membershipExpiresAt: Date.now() + 3600000 }), /ambiguous/);
@@ -292,8 +319,8 @@ test("owner removal cleans targeted interrupted approvals without deleting retai
   assert.ok(f.owner.record("demo/team").pendingApprovals[code.body.peerId]);
   f.deny(false);
   assert.equal((await f.owner.leaveAll())[0].confirmed, true);
-  assert.equal(f.subscribers.has(`sub-${f.code.body.peerId}`), true);
-  assert.ok(f.requests.some((request) => request.method === "DELETE" && request.url.includes(`sub-${code.body.peerId}?`)));
+  assert.equal(f.subscribers.has(peerSubscription(f.code.body.peerId)), true);
+  assert.ok(f.requests.some((request) => request.method === "DELETE" && request.url.includes(`${peerSubscription(code.body.peerId)}?`)));
 });
 test("a provably stale mutation lock is recoverable while a live lock is never stolen", async (t) => {
   const f = await fixture(t);

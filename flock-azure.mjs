@@ -1,5 +1,5 @@
 import crypto from "node:crypto";
-import { validateCert } from "./flock-protocol.mjs";
+import { validateCert, peerSubscription } from "./flock-protocol.mjs";
 
 export const HUB = "copilotbridge";
 export const TOPIC = "copilot-bridge-offline";
@@ -38,14 +38,14 @@ export function jwt(audience, key, expiresAt, { peerId, now = Date.now() } = {})
 }
 export function sas(resource, rule, key, expiresAt, now = Date.now()) {
   if (!Number.isSafeInteger(expiresAt) || expiresAt <= now || expiresAt - now > DAY) throw new Error("Invalid SAS lifetime");
-  const sr = encodeURIComponent(resource);
+  const sr = encodeURIComponent(resource.toLowerCase());
   const expiry = Math.floor(expiresAt / 1000);
   const signature = crypto.createHmac("sha256", key).update(`${sr}\n${expiry}`).digest("base64");
   return `SharedAccessSignature sr=${sr}&sig=${encodeURIComponent(signature)}&se=${expiry}&skn=${encodeURIComponent(rule)}`;
 }
 export function validateTransport(transport, endpoints, peerId, certificateExpiresAt, now = Date.now()) {
   azureEndpoints(endpoints.signalrEndpoint, endpoints.serviceBusEndpoint);
-  if (!Number.isSafeInteger(transport.expiresAt) || transport.subscription !== `sub-${peerId}` || transport.expiresAt > certificateExpiresAt ||
+  if (!Number.isSafeInteger(transport.expiresAt) || transport.subscription !== peerSubscription(peerId) || transport.expiresAt > certificateExpiresAt ||
       transport.expiresAt <= now || transport.expiresAt - now > DAY) throw new Error("Transport lifetime or subscription mismatch");
   for (const [field, audience] of [
     ["signalrClientToken", `${endpoints.signalrEndpoint}/client/?hub=${HUB}`],
@@ -61,7 +61,7 @@ export function validateTransport(transport, endpoints, peerId, certificateExpir
   }
   for (const [field, resource, rule] of [
     ["serviceBusSendSas", `${endpoints.serviceBusEndpoint}/${TOPIC}`, "FlockSendRule"],
-    ["serviceBusListenSas", `${endpoints.serviceBusEndpoint}/${TOPIC}/Subscriptions/sub-${peerId}`, "FlockListenRule"],
+    ["serviceBusListenSas", `${endpoints.serviceBusEndpoint}/${TOPIC}/subscriptions/${peerSubscription(peerId)}`, "FlockListenRule"],
   ]) {
     if (!transport[field]?.startsWith("SharedAccessSignature ")) throw new Error("Expected scoped SAS, not a connection string");
     const token = new URLSearchParams(transport[field].slice(22));
@@ -85,13 +85,13 @@ export class AzureTransport {
   async subscription(peerId, method) {
     if (!/^[a-f0-9]{64}$/.test(peerId) || !["PUT", "DELETE"].includes(method)) throw new Error("Invalid targeted subscription operation");
     if (!this.secrets?.manageKey || this.secrets.manageRule !== "RootManageSharedAccessKey") throw new Error("Explicit owner Manage credentials required for subscription changes");
-    const resource = `${this.endpoints.serviceBusEndpoint}/${TOPIC}/Subscriptions/sub-${peerId}`;
+    const resource = `${this.endpoints.serviceBusEndpoint}/${TOPIC}/subscriptions/${peerSubscription(peerId)}`;
     const token = sas(this.endpoints.serviceBusEndpoint, this.secrets.manageRule, this.secrets.manageKey, this.clock() + 300000, this.clock());
-    const body = method === "PUT" ? '<entry xmlns="http://www.w3.org/2005/Atom"><content type="application/xml"><SubscriptionDescription xmlns="http://schemas.microsoft.com/netservices/2010/10/servicebus/connect"><DefaultMessageTimeToLive>P1D</DefaultMessageTimeToLive><LockDuration>PT1M</LockDuration><MaxDeliveryCount>10</MaxDeliveryCount></SubscriptionDescription></content></entry>' : undefined;
+    const body = method === "PUT" ? '<entry xmlns="http://www.w3.org/2005/Atom"><content type="application/xml"><SubscriptionDescription xmlns="http://schemas.microsoft.com/netservices/2010/10/servicebus/connect" xmlns:i="http://www.w3.org/2001/XMLSchema-instance"/></content></entry>' : undefined;
     await this.request(`${resource}?api-version=2017-04`, { method, headers: {
       Authorization: token, "Content-Type": "application/atom+xml;type=entry;charset=utf-8",
     }, ...(body ? { body } : {}) }, method === "DELETE" ? [404] : []);
-    return { confirmed: true, subscription: `sub-${peerId}` };
+    return { confirmed: true, subscription: peerSubscription(peerId) };
   }
   async issue(cert, ownerPublicKey) {
     const member = validateCert(cert, ownerPublicKey, this.clock());
@@ -102,11 +102,11 @@ export class AzureTransport {
     const member = validateCert(cert, ownerPublicKey, this.clock());
     if (!this.secrets?.signalrKey || !this.secrets.sendKey || !this.secrets.listenKey) throw new Error("Owner signing credentials unavailable");
     const expiresAt = Math.min(member.expiresAt, this.clock() + DAY);
-    const result = { subscription: `sub-${member.peerId}`, expiresAt,
+    const result = { subscription: peerSubscription(member.peerId), expiresAt,
       signalrClientToken: jwt(`${this.endpoints.signalrEndpoint}/client/?hub=${HUB}`, this.secrets.signalrKey, expiresAt, { peerId: member.peerId, now: this.clock() }),
       signalrRestToken: jwt(`${this.endpoints.signalrEndpoint}/api/v1/hubs/${HUB}`, this.secrets.signalrKey, expiresAt, { now: this.clock() }),
       serviceBusSendSas: sas(`${this.endpoints.serviceBusEndpoint}/${TOPIC}`, "FlockSendRule", this.secrets.sendKey, expiresAt, this.clock()),
-      serviceBusListenSas: sas(`${this.endpoints.serviceBusEndpoint}/${TOPIC}/Subscriptions/sub-${member.peerId}`, "FlockListenRule", this.secrets.listenKey, expiresAt, this.clock()),
+      serviceBusListenSas: sas(`${this.endpoints.serviceBusEndpoint}/${TOPIC}/subscriptions/${peerSubscription(member.peerId)}`, "FlockListenRule", this.secrets.listenKey, expiresAt, this.clock()),
     };
     validateTransport(result, this.endpoints, member.peerId, member.expiresAt, this.clock());
     return result;
@@ -122,11 +122,11 @@ export class AzureTransport {
       headers: { Authorization: transport.serviceBusSendSas, "Content-Type": "application/json",
         BrokerProperties: JSON.stringify({ TimeToLive: Math.max(1, Math.floor((expiresAt - this.clock()) / 1000)) }) }, body });
     await this.request(`${this.endpoints.signalrEndpoint}/api/v1/hubs/${HUB}`, { method: "POST",
-      headers: { Authorization: transport.signalrRestToken, "Content-Type": "application/json" },
+      headers: { Authorization: `Bearer ${transport.signalrRestToken}`, "Content-Type": "application/json" },
       body: JSON.stringify({ target: "flock34", arguments: [message] }) });
   }
   async drain(transport, consume, limit = 20) {
-    const resource = `${this.endpoints.serviceBusEndpoint}/${TOPIC}/Subscriptions/${transport.subscription}`;
+    const resource = `${this.endpoints.serviceBusEndpoint}/${TOPIC}/subscriptions/${transport.subscription}`;
     for (let index = 0; index < limit; index++) {
       const response = await this.request(`${resource}/messages/head?timeout=0`, {
         method: "POST", headers: { Authorization: transport.serviceBusListenSas },

@@ -6,7 +6,7 @@ import { AzureTransport, azureEndpoints, parseAzureConnection, validateTransport
 import { createDeviceIdentity, createOwnerState, createJoinCode, approveJoin, acceptWelcome,
   ownerFingerprint, canonical, encryptEnvelope, decryptEnvelope, DurableReceiver,
   createRotation, applyRotation, signedControl, verifyControl, renewOwnerCert, validateCert,
-  verifyJoinCode } from "./flock-protocol.mjs";
+  verifyJoinCode, peerSubscription } from "./flock-protocol.mjs";
 
 const hash = (value) => crypto.createHash("sha256").update(typeof value === "string" ? value : canonical(value)).digest("hex");
 let processIdentity;
@@ -162,8 +162,10 @@ export class BrokerFreeRuntime {
       if (join.peerId !== expectedEd25519Fingerprint) throw new Error("Join identity policy requires the independently supplied Ed25519 fingerprint");
       const previous = record.members[join.peerId];
       for (const other of Object.values(data.flocks)) {
-        if (other.flockId !== flockId && other.endpoints.serviceBusEndpoint === record.endpoints.serviceBusEndpoint &&
-            (other.localPeerId === join.peerId || other.members?.[join.peerId])) throw new Error("Peer subscription collides with another flock");
+        if (other.endpoints.serviceBusEndpoint !== record.endpoints.serviceBusEndpoint) continue;
+        const ids = new Set([other.localPeerId, ...Object.keys(other.members || {}), ...Object.keys(other.pendingApprovals || {})]);
+        if ([...ids].some((id) => peerSubscription(id) === peerSubscription(join.peerId) &&
+            (other.flockId !== flockId || id !== join.peerId))) throw new Error("Peer subscription collides with an existing membership");
       }
       if (Object.entries(record.members).some(([id, entry]) => id !== join.peerId && !entry.removed &&
           entry.cert.body.machineId.toLowerCase() === join.machineId.toLowerCase())) throw new Error("Duplicate machine name would make RPC dispatch ambiguous");
@@ -299,7 +301,7 @@ export class BrokerFreeRuntime {
           minAcceptedEpoch: next.minAcceptedEpoch, rotationHash: next.rotationHash };
       }
       const receipt = signedControl("leave-receipt", { flockId, peerId, operationId,
-        epoch: transition.rotation.body.epoch, confirmed: true, subscriptionDeleted: `sub-${peerId}` }, record.identity);
+        epoch: transition.rotation.body.epoch, confirmed: true, subscriptionDeleted: peerSubscription(peerId) }, record.identity);
       record.transitions[operationId] = { ...transition, confirmed: true, receipt };
       if (selfLeave) record.departed = true;
       data.flocks[flockId] = record;
@@ -312,7 +314,7 @@ export class BrokerFreeRuntime {
     if (message.flockId !== record.flockId) return true;
     if (message.type === "leave-receipt") {
       const body = verifyControl(message.receipt, record.ownerPublicKey, "leave-receipt");
-      if (body.flockId !== record.flockId || !body.confirmed || body.subscriptionDeleted !== `sub-${body.peerId}`) {
+      if (body.flockId !== record.flockId || !body.confirmed || body.subscriptionDeleted !== peerSubscription(body.peerId)) {
         throw new Error("Invalid leave receipt");
       }
       return true;
@@ -431,7 +433,7 @@ export class BrokerFreeRuntime {
             const receipt = verifyControl(message.receipt, record.ownerPublicKey, "leave-receipt");
             if (receipt.flockId !== record.flockId || receipt.peerId !== record.localPeerId ||
                 receipt.operationId !== params.operationId || !receipt.confirmed ||
-                receipt.subscriptionDeleted !== `sub-${record.localPeerId}`) throw new Error("Leave receipt target mismatch");
+                receipt.subscriptionDeleted !== peerSubscription(record.localPeerId)) throw new Error("Leave receipt target mismatch");
             settle({ result: message.receipt, fromMachine: toMachine, requestId });
             return;
           }

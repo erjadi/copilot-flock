@@ -20,6 +20,11 @@ Multiple memberships require explicit flock selection, including replies.
 No existing threads are automatically visible; only approved snapshots and
 guarded messaging are supported. Remote creation, file/admin operations and
 privileged coordinator provisioning remain legacy-only.
+An existing legacy client upgrade must preserve its registered identity and
+protocol/credentials; it is not authorization for broker-free migration.
+Verify resident daemon and caller MCP separately, canary-first with independent
+recovery. Never infer permission for clean/re-enroll, broad app restarts or
+production broker/resource deletion from a software upgrade request.
 
 The following invite/bootstrap flow is the **explicit legacy reference**.
 A signed v3 invite or an existing legacy config selects it; a new install
