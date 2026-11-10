@@ -18,6 +18,7 @@ import https from "node:https";
 import crypto from "node:crypto";
 import { spawn, execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { uninstallFlock, lifecyclePaths, recordInstalledArtifact, pinDaemonIdentity } from "./flock-lifecycle.mjs";
 
 if (typeof dns.setDefaultResultOrder === "function") {
   try {
@@ -73,6 +74,14 @@ function ipv4Lookup(hostname, options, callback) {
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+
+function copyRuntimeModules(sourceDirectory, destinationDirectory) {
+  for (const module of ["flock-lifecycle.mjs", "flock-membership.mjs"]) {
+    const source = path.join(sourceDirectory, module);
+    const destination = path.join(destinationDirectory, module);
+    if (path.resolve(source) !== path.resolve(destination)) fs.copyFileSync(source, destination);
+  }
+}
 
 export const BRIDGE_VERSION = "3.3.1";
 
@@ -5603,6 +5612,7 @@ export async function handleRpcAction(cfg, req) {
     const compatScript = path.join(getBridgeHome(), "bridge.mjs");
     fs.copyFileSync(updatedRepoScript, targetScript);
     fs.copyFileSync(updatedRepoScript, compatScript);
+    copyRuntimeModules(path.dirname(updatedRepoScript), getBridgeHome());
 
     // Spawn `node flock.mjs install` detached after 300ms so the RPC reply returns first
     setTimeout(() => {
@@ -5837,6 +5847,12 @@ export async function handleRpcAction(cfg, req) {
     }
 
     try {
+      for (const module of ["flock-lifecycle.mjs", "flock-membership.mjs"]) {
+        const content = execFileSync("git", ["-C", repoDir, "show", `${candidateCommit}:${module}`], {
+          encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: 5000,
+        });
+        fs.writeFileSync(path.join(tmpDir, module), content, "utf8");
+      }
       const candidateTest = execFileSync(
         "git",
         ["-C", repoDir, "show", "FETCH_HEAD:test/bridge.test.mjs"],
@@ -6245,6 +6261,7 @@ export async function drainAndProcessOfflineQueue(
 
 export async function runDaemon(cfg) {
   ensureBridgeDir();
+  pinDaemonIdentity(getBridgeHome(), __filename);
   const pidPath = getDaemonPidPath();
   const statePath = getStatePath();
   fs.writeFileSync(pidPath, String(process.pid), "utf8");
@@ -7235,6 +7252,18 @@ const MCP_TOOLS = [
     },
   },
   {
+    name: "unenroll_flock",
+    description: "Remove Copilot Flock from this PC: leave every enrolled flock with signed device authorization, then remove owned installation artifacts. Offline/denied leaves retain recovery and are reported pending. Conversations and source checkouts are preserved.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        traceless: { type: "boolean", description: "Remove owned installation artifacts after acknowledged leave." },
+      },
+      required: ["traceless"],
+      additionalProperties: false,
+    },
+  },
+  {
     name: "flock_topology",
     description:
       "Generate a live multi-flock topology diagram (both a Mermaid diagram for inline chat rendering and a dark-mode SVG artifact) showing all enrolled flocks (<owner>/<flock>[/<machineId>]), online/offline machines, hardware specs, and shared threads.",
@@ -7251,6 +7280,10 @@ const MCP_TOOLS = [
 ];
 
 async function executeMcpTool(cfg, name, args = {}) {
+  if (name === "unenroll_flock") {
+    if (args.traceless !== true) throw new Error("Specify traceless=true to remove this installation");
+    return uninstallBridge();
+  }
   if (name === "flock_status" || name === "bridge_status") {
     const daemonStatus = await ensureDaemonStarted(cfg);
     const machines = await discoverMachines(cfg, { includeSelf: true, timeoutMs: 2200 });
@@ -8498,14 +8531,14 @@ export async function runMcpServer(cfg) {
   let framingMode = null; // "newline" | "content-length"
   let rawBuffer = Buffer.alloc(0);
 
-  const sendRpcMessage = (obj) => {
+  const sendRpcMessage = (obj, onFlushed) => {
     const json = JSON.stringify(obj);
     if (framingMode === "content-length") {
       const body = Buffer.from(json, "utf8");
       process.stdout.write(`Content-Length: ${body.length}\r\n\r\n`);
-      process.stdout.write(body);
+      process.stdout.write(body, onFlushed);
     } else {
-      process.stdout.write(json + "\n");
+      process.stdout.write(json + "\n", onFlushed);
     }
   };
 
@@ -8560,6 +8593,7 @@ export async function runMcpServer(cfg) {
           jsonrpc: "2.0",
           id,
           result: {
+            ...(toolName === "unenroll_flock" && !output.ok ? { isError: true } : {}),
             content: [
               {
                 type: "text",
@@ -8567,7 +8601,7 @@ export async function runMcpServer(cfg) {
               },
             ],
           },
-        });
+        }, toolName === "unenroll_flock" && output.ok ? () => process.exit(0) : undefined);
       } catch (err) {
         sendRpcMessage({
           jsonrpc: "2.0",
@@ -8979,6 +9013,7 @@ export async function updateFleetMachines(
           windowsHide: true,
         });
         fs.copyFileSync(path.join(repoDir, "bridge.mjs"), path.join(getBridgeHome(), "bridge.mjs"));
+        copyRuntimeModules(repoDir, getBridgeHome());
       } catch {}
     }
     localUpdate = await installBridge({
@@ -9262,6 +9297,7 @@ export async function reprovisionLocalBridge(cfg, { syncInstall = false } = {}) 
         windowsHide: true,
       }).trim();
       fs.copyFileSync(path.join(activeRepoDir, "bridge.mjs"), path.join(bridgeHome, "bridge.mjs"));
+      copyRuntimeModules(activeRepoDir, bridgeHome);
     }
   }
 
@@ -10386,11 +10422,13 @@ export async function installBridge({
   if (path.resolve(__filename) !== path.resolve(compatScript)) {
     fs.copyFileSync(__filename, compatScript);
   }
+  copyRuntimeModules(__dirname, getBridgeHome());
   // Also update legacy ~/.copilot/signalr-bridge/bridge.mjs if that directory exists so running sessions stay in sync
   const legacyScript = path.join(getLegacyBridgeHome(), "bridge.mjs");
   if (fs.existsSync(getLegacyBridgeHome()) && path.resolve(__filename) !== path.resolve(legacyScript)) {
     try {
       fs.copyFileSync(__filename, legacyScript);
+      copyRuntimeModules(__dirname, getLegacyBridgeHome());
     } catch {}
   }
 
@@ -10476,9 +10514,9 @@ export async function installBridge({
         path.join(HOME_DIR, ".config", "com.github.githubapp", "app-skills", "signalr-bridge")
       );
     }
-    skillLocations.push(path.join(HOME_DIR, ".copilot", "skills", "copilot-flock"));
+    skillLocations.push(path.join(getCopilotDir(), "skills", "copilot-flock"));
     skillLocations.push(path.join(getBridgeHome(), "skill", "copilot-flock"));
-    topologySkillLocations.push(path.join(HOME_DIR, ".copilot", "skills", "flock-topology"));
+    topologySkillLocations.push(path.join(getCopilotDir(), "skills", "flock-topology"));
     topologySkillLocations.push(path.join(getBridgeHome(), "skill", "flock-topology"));
 
     for (const oldDir of legacySkillLocations) {
@@ -10490,16 +10528,23 @@ export async function installBridge({
       try {
         fs.mkdirSync(dir, { recursive: true });
         fs.writeFileSync(path.join(dir, "SKILL.md"), skillMarkdown, "utf8");
-      } catch {}
+        recordInstalledArtifact(getBridgeHome(), path.join(dir, "SKILL.md"));
+      } catch (error) {
+        throw new Error(`Flock skill installation or ownership recording failed: ${formatErrorDetail(error)}`);
+      }
     }
     for (const dir of topologySkillLocations) {
       try {
         fs.mkdirSync(dir, { recursive: true });
         fs.writeFileSync(path.join(dir, "SKILL.md"), topologySkillMarkdown, "utf8");
-      } catch {}
+        recordInstalledArtifact(getBridgeHome(), path.join(dir, "SKILL.md"));
+      } catch (error) {
+        throw new Error(`Topology skill installation or ownership recording failed: ${formatErrorDetail(error)}`);
+      }
     }
 
     bootPersistence = configureBootPersistence(targetScript);
+    if (bootPersistence?.path) recordInstalledArtifact(getBridgeHome(), bootPersistence.path);
 
     // 4. Ensure "Copilot Flock Thread Tracker" and "Copilot Flock Coordinator" exist and are renamed from legacy titles
     threadTracker = await ensureThreadTrackerSession(cfg);
@@ -10638,6 +10683,25 @@ export async function installBridge({
   };
 }
 
+export async function uninstallBridge(options = {}) {
+  const callLeave = async ({ config, request }, route) => {
+      if (!config.bootstrapUrl) throw new Error("No explicit legacy broker; authorized owner leave transport is required");
+      const origin = validatePinnedBootstrapOrigin(config.bootstrapUrl, config.bootstrapUrl);
+      const response = await fetch(`${origin}/api/v3/flocks/${route}`, {
+        method: "POST", redirect: "error", signal: AbortSignal.timeout(10000),
+        headers: { "Content-Type": "application/json" }, body: JSON.stringify(request),
+      });
+      const result = await response.json();
+      if (!response.ok || result.ok !== true) throw new Error(result.error || result.pending || "Remote leave cleanup pending");
+      return result;
+  };
+  return uninstallFlock({
+    ...options,
+    inventory: options.inventory || ((context) => callLeave(context, "leave-plan")),
+    leave: options.leave || ((context) => callLeave(context, "leave")),
+  });
+}
+
 function generateTopologySkillMarkdown(installedScriptPath, cfg) {
   return `---
 name: flock-topology
@@ -10692,6 +10756,19 @@ This machine is connected to **the flock** on the **copilot-flock** Azure Signal
      - The user asks to list, inspect, or message a Copilot thread on **another computer / remote machine**,
      - A target thread is not on this machine and needs to be reached on your other PC, or
      - You receive a \`<cross_session_message>\` with \`from_machine\` set to a remote computer (\`from_machine != "${cfg.machineId}"\`).
+
+## Removing Flock from This PC
+
+When the user says "Remove Copilot Flock from this PC", run
+\`node "${installedScriptPath}" uninstall\` or \`unenroll_flock\` with \`traceless: true\`.
+This is a local installation lifecycle operation, not a cross-machine message.
+Do not delete conversations, session-state, data.db, repositories or backups.
+Report pending leaves, retained artifacts and failed cleanup honestly. An offline
+or denied owner/broker must not trigger an automatic local-only fallback.
+Only after explicit user approval may you use \`--local-only --approve-local-only\`;
+that does not confirm remote leave. Traceless excludes transcripts, OS audit logs
+and external backups. Legacy running daemons without a creation-identity pin
+are retained rather than killed by a possibly stale PID.
 
 ## How to Use (Cross-Machine)
 
@@ -10791,6 +10868,18 @@ export function resolveCliMessage(flags = {}, positional = []) {
 
 async function main() {
   const { command, positional, flags } = parseCliArgs(process.argv.slice(2));
+
+  if (command === "uninstall" || command === "unenroll" ||
+      (command === "flock" && positional[0] === "unenroll")) {
+    if (command !== "uninstall" && flags.traceless !== true) throw new Error("Use unenroll --traceless to remove this PC's Flock installation");
+    const result = await uninstallBridge({
+      paths: lifecyclePaths(), localOnly: flags["local-only"] === true,
+      approveLocalOnly: flags["approve-local-only"] === true,
+    });
+    console.log(JSON.stringify(result, null, 2));
+    if (!result.ok) process.exitCode = 1;
+    return;
+  }
 
   if (command === "help" || flags.help) {
     console.log(`

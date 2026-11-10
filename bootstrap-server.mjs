@@ -14,6 +14,7 @@ import path from "node:path";
 import http from "node:http";
 import https from "node:https";
 import crypto from "node:crypto";
+import { matchesMember, verifyLeave } from "./flock-membership.mjs";
 
 const PORT = Number(process.env.PORT) || 8080;
 const ALLOWED_REPO = (
@@ -1431,14 +1432,8 @@ export async function kickV3FlockMember(
 
     const kickedPeers = [];
     for (const [peerKey, m] of Object.entries(f.members || {})) {
-      const matchesUser =
-        (cleanTargetUser && m.githubUser === cleanTargetUser) ||
-        (targetGitHubUserId && Number(m.githubUserId) === Number(targetGitHubUserId));
-      const matchesDevice =
-        (targetDeviceId && m.deviceId === String(targetDeviceId).toLowerCase()) ||
-        (cleanTargetMachine &&
-          m.machineId.toLowerCase() === String(cleanTargetMachine).toLowerCase());
-      if (matchesUser || matchesDevice) {
+      if (matchesMember(m, { targetUser: cleanTargetUser, targetGitHubUserId,
+        targetDeviceId, targetMachineId: cleanTargetMachine })) {
         kickedPeers.push(m);
         delete f.members[peerKey];
         if (!isSelfLeave) {
@@ -1452,7 +1447,7 @@ export async function kickV3FlockMember(
     }
 
     // Invalidate any unredeemed vouchers for the kicked user
-    if (cleanTargetUser || targetGitHubUserId) {
+    if (!targetDeviceId && !cleanTargetMachine && (cleanTargetUser || targetGitHubUserId)) {
       for (const [vId, v] of Object.entries(f.vouchers || {})) {
         if (
           (cleanTargetUser && v.invitedUser === cleanTargetUser) ||
@@ -1489,6 +1484,103 @@ export async function kickV3FlockMember(
       })),
       evictionResults,
     };
+  });
+}
+
+async function deleteLegacyPeerSubscription(member) {
+  const token = await acquireServiceBusToken();
+  if (!token || !SERVICEBUS_NAMESPACE) {
+    return { confirmed: false, reason: "Service Bus management authorization unavailable" };
+  }
+  const sub = `sub-${sanitizeSbEntityName(member.machineId)}`;
+  const response = await fetch(`https://${SERVICEBUS_NAMESPACE}/${encodeURIComponent(SERVICEBUS_TOPIC)}/subscriptions/${encodeURIComponent(sub)}?api-version=2017-04`, {
+    method: "DELETE", redirect: "error", signal: AbortSignal.timeout(6000),
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  return { confirmed: response.ok || response.status === 404, status: response.status };
+}
+
+export function planV3DeviceLeave(request, { storePath = V3_FLOCKS_PATH } = {}) {
+  if (request.flockId !== "*") throw new Error("Leave inventory requires an explicit all-flocks signature");
+  const store = loadV3FlockStore(storePath);
+  const matching = Object.values(store.flocks).flatMap((flock) =>
+    [...Object.values(flock.members || {}), ...Object.values(flock.leaveReceipts || {}).map((receipt) => receipt.member)]
+      .filter((member) => matchesMember(member, { targetDeviceId: request.deviceId, targetMachineId: request.machineId })));
+  if (!matching.length) throw new Error("Cannot authenticate device inventory; no retained device proof");
+  for (const member of matching) verifyLeave(request, member.publicKey);
+  return { ok: true, flockIds: Object.entries(store.flocks).filter(([, flock]) =>
+    Object.values(flock.members || {}).some((member) =>
+      matchesMember(member, { targetDeviceId: request.deviceId, targetMachineId: request.machineId })) ||
+    Object.values(flock.leaveReceipts || {}).some((receipt) => !receipt.confirmed &&
+      matchesMember(receipt.member, { targetDeviceId: request.deviceId, targetMachineId: request.machineId })))
+    .map(([id]) => id) };
+}
+
+export async function leaveV3Device(request, {
+  storePath = V3_FLOCKS_PATH,
+  membersPath = null,
+  deleteSubscription = deleteLegacyPeerSubscription,
+  evict = (member, flock) => evictSignalRHubUserImmediate({
+    connectionString: process.env.SIGNALR_CONNECTION_STRING || "",
+    hub: flock.hubName, userId: member.peerId,
+  }),
+} = {}) {
+  return withFlockStoreLock(async () => {
+    const store = loadV3FlockStore(storePath);
+    const flock = store.flocks[request.flockId];
+    if (!flock) throw new Error("Cannot acknowledge leave from an unknown flock");
+    const old = flock.leaveReceipts?.[request.requestId];
+    const entries = Object.entries(flock.members || {}).filter(([, member]) =>
+      matchesMember(member, { targetDeviceId: request.deviceId, targetMachineId: request.machineId }));
+    if (entries.length > 1) throw new Error("Ambiguous device leave; refusing to remove multiple peers");
+    const member = old?.member || entries[0]?.[1];
+    if (!member) throw new Error("Device not enrolled and no authenticated leave receipt exists");
+    if (!matchesMember(member, { targetDeviceId: request.deviceId, targetMachineId: request.machineId })) {
+      throw new Error("Leave receipt selectors do not match the signed device");
+    }
+    verifyLeave(request, member.publicKey);
+    if (old?.confirmed) return { ok: true, confirmed: true, flockId: request.flockId, peerId: member.peerId };
+    if (old && entries.length) throw new Error("Device re-enrolled after leave; stale leave cannot remove it");
+    flock.leaveReceipts ||= {};
+    if (!old) {
+      delete flock.members[entries[0][0]];
+      flock.rosterEpoch = (Number(flock.rosterEpoch) || 1) + 1;
+      flock.leaveReceipts[request.requestId] = { member, confirmed: false };
+      saveV3FlockStore(store, storePath);
+    }
+    const sameMachineOtherDevice = Object.values(store.flocks).some((other) =>
+      Object.values(other.members || {}).some((peer) =>
+        String(peer.machineId).toLowerCase() === String(member.machineId).toLowerCase() &&
+        peer.deviceId !== member.deviceId));
+    if (sameMachineOtherDevice) {
+      return { ok: false, confirmed: false, flockId: request.flockId,
+        pending: "Legacy machine-named subscription is shared by another device; refusing deletion" };
+    }
+    let subscription;
+    let eviction;
+    try {
+      subscription = await deleteSubscription(member);
+      eviction = await evict(member, flock);
+    } catch (error) {
+      return { ok: false, confirmed: false, flockId: request.flockId, pending: error.message };
+    }
+    const confirmed = subscription?.confirmed === true && eviction?.evicted === true;
+    if (confirmed && membersPath && fs.existsSync(membersPath) &&
+        !Object.values(store.flocks).some((other) => Object.values(other.members || {}).some((peer) =>
+          peer.deviceId === member.deviceId))) {
+      const registry = JSON.parse(fs.readFileSync(membersPath, "utf8"));
+      for (const [id, registered] of Object.entries(registry)) {
+        if (String(registered.machineId).toLowerCase() === String(member.machineId).toLowerCase() &&
+            registered.publicKey?.trim() === member.publicKey?.trim()) delete registry[id];
+      }
+      const temporary = `${membersPath}.${crypto.randomUUID()}.tmp`;
+      fs.writeFileSync(temporary, JSON.stringify(registry, null, 2), { mode: 0o600, flag: "wx" });
+      fs.renameSync(temporary, membersPath);
+    }
+    flock.leaveReceipts[request.requestId].confirmed = confirmed;
+    saveV3FlockStore(store, storePath);
+    return { ok: confirmed, confirmed, flockId: request.flockId, peerId: member.peerId,
+      rosterEpoch: flock.rosterEpoch, subscription, eviction };
   });
 }
 
@@ -1619,6 +1711,17 @@ export function createBootstrapServer({
           code: err.code || "REFRESH_ERROR",
           error: err.message,
         });
+      }
+      return;
+    }
+
+    if ((subPath === "/flocks/leave" || subPath === "/flocks/leave-plan") && req.method === "POST") {
+      try {
+        const out = subPath === "/flocks/leave-plan" ? planV3DeviceLeave(bodyData, { storePath })
+          : await leaveV3Device(bodyData, { storePath, membersPath: MEMBERS_PATH });
+        sendJson(res, out.ok ? 200 : 409, out);
+      } catch (error) {
+        sendJson(res, 403, { ok: false, confirmed: false, error: error.message });
       }
       return;
     }

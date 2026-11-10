@@ -154,3 +154,22 @@ Before merging or releasing **any** change to `copilot-flock`:
    node ~/.copilot/flock/flock.mjs vote-release --branch "<branch>"
    ```
 3. Only merge/push to `main` and run `node ~/.copilot/flock/flock.mjs reprovision` after all online members of the flock vote **`ACCEPT`**.
+
+## 7. Removing the Local Installation
+
+For "Remove Copilot Flock from this PC", execute `node flock.mjs uninstall`
+or the `unenroll_flock` MCP tool with `traceless: true`. `unenroll --traceless`
+and `flock unenroll --traceless` are aliases; `bridge.mjs` supports the same
+commands. This is a local lifecycle operation, not a remote fleet update.
+
+Read [docs/REMOVING_FLOCK.md](docs/REMOVING_FLOCK.md). Signed leave must be
+acknowledged for all discovered memberships before local cleanup. Denial,
+offline owners/brokers, missing subscription-management authority and
+unproven artifact/process ownership are explicit pending/retained outcomes.
+Never silently approve local-only cleanup or claim these are fully removed.
+Preserve conversations, session-state, chats, data.db, source checkouts and
+backups. Do not promise deletion of transcripts or OS audit logs.
+
+The 3.4 crypto primitives in `flock-protocol.mjs` are isolated source work,
+not the active runtime transport. Do not represent this branch as a completed
+broker-free deployment or as passing live Azure release gates.

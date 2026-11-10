@@ -235,7 +235,7 @@ test("broker /health is an actual HTTP alias without credential disclosure", asy
   } finally { await new Promise((resolve) => server.close(resolve)); }
 });
 
-test("ZIP contains exactly the current two broker source files and opens with the Windows archive reader", () => {
+test("ZIP contains exactly the current broker sources and opens with the Windows archive reader", () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "flock-zip-test-"));
   try {
     const zip = path.join(directory, "broker.zip");
@@ -252,7 +252,7 @@ test("ZIP contains exactly the current two broker source files and opens with th
       names.push(name);
       offset += 30 + nameLength + length;
     }
-    assert.deepEqual(names, ["bootstrap-server.mjs", "package.json"]);
+    assert.deepEqual(names, ["bootstrap-server.mjs", "flock-membership.mjs", "package.json"]);
     if (process.platform === "win32") {
       const result = spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command",
         "Expand-Archive -LiteralPath $env:TEST_ZIP -DestinationPath $env:TEST_DEST -ErrorAction Stop"],

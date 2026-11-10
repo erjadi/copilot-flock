@@ -7,6 +7,21 @@ description: Cross-machine ONLY: discover and message GitHub Copilot threads, ma
 
 Use this skill whenever the user wants to discover, message, coordinate with, invite, or share threads across **the flock** (`<owner>/<flock>[/<machineId>]`).
 
+## Removing Flock from This PC
+
+When the user says "Remove Copilot Flock from this PC", execute the local
+`uninstall` entrypoint or `unenroll_flock` with `traceless: true` on their behalf.
+The canonical agent command is `node ~/.copilot/flock/flock.mjs uninstall`;
+`unenroll --traceless` and the legacy entrypoint are also supported.
+
+Report remote leave failures, pending cleanup and retained artifacts, not
+"fully removed". Never silently fall back to local-only deletion. Only after
+explicit approval, `--local-only --approve-local-only` removes local owned
+artifacts while reporting unconfirmed remote memberships. Preserve local
+conversations, chats, session-state, data.db, repositories, worktrees and backups.
+Traceless cannot erase transcripts, OS audit logs or external backups.
+See [removal behavior](../../docs/REMOVING_FLOCK.md) for limitations.
+
 ## Core Rules
 
 1. **Copilot is the Interface**:

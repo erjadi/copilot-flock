@@ -4,6 +4,12 @@ Licensed under [Apache-2.0](./LICENSE). Copyright 2026 Eric Jadi.
 Viewer preview data, hostnames, network addresses and governance examples are
 synthetic, not captured conversations or real signed release evidence.
 
+**3.4 preparation status:** this branch adds guarded local removal and isolated
+broker-free protocol primitives; it is **not a completed 3.4 release**.
+The current Azure deployment and active runtime remain the 3.3.1 broker-backed
+implementation. Scoped Azure transport integration, broker-free lifecycle
+wiring and positive/negative live Azure tests are still required.
+
 **Connect all of your GitHub Copilot computers—Windows desktops, ARM64 laptops, headless Linux GPU servers, and cloud VMs—into one real-time, peer-to-peer flock.**
 
 Ask your laptop's Copilot what your home desktop is building, dispatch a task to your Linux RTX workstation, or give a teammate a 4-hour guest pass to inspect a shared machine—**entirely in plain English**.
@@ -23,6 +29,12 @@ invites.
 The viewer's local server binds to `127.0.0.1` by default. `VIEWER_HOST` is an
 explicit opt-in to another bind address; this administrative viewer has no
 added authentication boundary and must not be exposed to an untrusted network.
+
+To remove the local installation, tell Copilot: *"Remove Copilot Flock from
+this PC and leave all its flocks. Preserve my conversations and repositories."*
+Copilot reports pending remote cleanup or retained artifacts rather than
+claiming success when an owner/broker is offline or authorization is missing.
+See [removal scope and limitations](./docs/REMOVING_FLOCK.md).
 
 ## Managed Azure setup: one approved Copilot-led flow
 

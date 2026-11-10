@@ -62,7 +62,8 @@ export function createBrokerZip(destination) {
   const local = [];
   const central = [];
   let offset = 0;
-  for (const name of ["bootstrap-server.mjs", "package.json"]) {
+  const files = ["bootstrap-server.mjs", "flock-membership.mjs", "package.json"];
+  for (const name of files) {
     const data = fs.readFileSync(path.join(root, name));
     const filename = Buffer.from(name);
     let crc = 0xffffffff;
@@ -96,8 +97,8 @@ export function createBrokerZip(destination) {
   const directory = Buffer.concat(central);
   const end = Buffer.alloc(22);
   end.writeUInt32LE(0x06054b50);
-  end.writeUInt16LE(2, 8);
-  end.writeUInt16LE(2, 10);
+  end.writeUInt16LE(files.length, 8);
+  end.writeUInt16LE(files.length, 10);
   end.writeUInt32LE(directory.length, 12);
   end.writeUInt32LE(offset, 16);
   fs.writeFileSync(destination, Buffer.concat([...local, directory, end]), { mode: 0o600 });
