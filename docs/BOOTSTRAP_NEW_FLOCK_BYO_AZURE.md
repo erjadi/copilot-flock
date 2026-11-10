@@ -11,7 +11,7 @@ Ask Copilot:
 Copilot executes setup; you do not need to copy credentials or type cloud
 commands. Invited machines do not provision Azure. New broker-free enrollment uses a
 device-bound Join Code and independently pinned Welcome Ticket; see
-[the 3.4.0 source-candidate guide](./BROKER_FREE_V34.md).
+[the 3.4.0 protocol guide](./BROKER_FREE_V34.md).
 Existing signed v3 broker invitations use the explicit
 [legacy joining guide](./JOINING_AND_SHARING_GUIDE.md).
 
@@ -135,7 +135,8 @@ SignalR or Service Bus connections.
 
 After an authorized disposable setup, run the explicitly approved
 [live audience/SAS isolation gate](./BROKER_FREE_V34.md#required-live-azure-gate)
-before merge/release. It remains unrun for this source candidate.
+before merge/release. Verify its exact-commit receipt; this guide alone does
+not establish that a candidate passed.
 Windows startup is at user sign-in; strict Linux installation requires
 previously approved `systemd --user` lingering. Broker-free mode does not
 automatically create privileged coordinators. Session sharing is explicit for

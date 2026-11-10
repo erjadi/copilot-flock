@@ -117,7 +117,7 @@ and external backups cannot be erased by runtime uninstall. Returned `removed`,
 the current cleanup does not establish that every historical or live MCP
 process trace is gone.
 
-## 3.4.0 source candidate, not a release claim
+## 3.4.0 protocol and release boundaries
 
 `flock-protocol.mjs` exercises device-bound signed Join Codes, X25519 sealed
 Welcome Tickets, independently pinned owner fingerprints, short MemberCerts,
@@ -139,5 +139,6 @@ daemon, RPC/CLI/MCP, renewal and uninstall. New setup defaults to two services;
 existing installations remain untouched. Full retained recovery, strict JSON
 edits, unproven legacy ownership and live-process retention are intentional
 limitations, not "traceless success." Positive and negative live Azure tests,
-immutable candidate review and the required release vote remain unrun gates.
+immutable candidate review and the required release vote are mandatory gates
+for each exact published candidate, not facts established by this document.
 See [the active protocol and gate reference](./BROKER_FREE_V34.md).

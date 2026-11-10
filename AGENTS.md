@@ -6,7 +6,8 @@ If your human user pointed you at this repository (`https://github.com/erjadi/co
 
 ## 0. Select the Protocol Before Setup
 
-This is a 3.4.0 source candidate, not a released deployment. For new setup,
+This source implements 3.4.0; a version string is not proof of a released or
+validated deployment. Confirm the published tag and exact-commit evidence. For new setup,
 use [the broker-free guide](docs/BROKER_FREE_V34.md): the default provisions
 only SignalR Serverless and Service Bus Standard with narrow Send/Listen
 policies. No default broker, Web App, hosting plan or managed identity.
@@ -212,6 +213,7 @@ Preserve conversations, session-state, chats, data.db, source checkouts and
 backups. Do not promise deletion of transcripts or OS audit logs.
 
 The protocol is wired through active broker-free daemon/RPC/Azure transport,
-onboarding, renewal and removal. Do not represent prepared source as a released
-product or as passing live Azure gates. Positive/negative audience/SAS tests,
-immutable candidate review and the required release vote remain unrun gates.
+onboarding, renewal and removal. Source alone is not proof of a released
+product or passing live Azure gates. Positive/negative audience/SAS tests,
+immutable candidate review and the required release vote must be established
+for each exact candidate; historical receipts and partial votes do not transfer.

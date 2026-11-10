@@ -4,12 +4,13 @@ Licensed under [Apache-2.0](./LICENSE). Copyright 2026 Eric Jadi.
 Viewer preview data, hostnames, network addresses and governance examples are
 synthetic, not captured conversations or real signed release evidence.
 
-**3.4.0 source candidate, not released:** broker-free onboarding, scoped Azure
+**3.4.0 broker-free runtime:** broker-free onboarding, scoped Azure
 issuance/renewal, encrypted active RPC, owner-mediated leave/kick and guarded
 uninstall are wired. New setup defaults to two Azure services, not a hosted
-broker. Existing installations are untouched. Positive/negative live Azure
-isolation, immutable candidate review and the all-online ACCEPT release vote
-remain unrun merge/release gates. See the
+broker. Existing installations are untouched. A source version alone does not
+establish release or deployment readiness: exact-commit positive/negative live
+Azure isolation, immutable review and the all-online ACCEPT release vote are
+required gates. Confirm the published tag and its evidence before upgrading. See the
 [current broker-free behavior and limitations](./docs/BROKER_FREE_V34.md).
 
 **Connect all of your GitHub Copilot computers—Windows desktops, ARM64 laptops, headless Linux GPU servers, and cloud VMs—into one real-time, peer-to-peer flock.**

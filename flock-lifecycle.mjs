@@ -77,20 +77,30 @@ export function atomicJson(filename, value, expected) {
     const fd = fs.openSync(temporary, "wx", 0o600);
     try { fs.writeFileSync(fd, text); fs.fsyncSync(fd); }
     finally { fs.closeSync(fd); }
-    JSON.parse(fs.readFileSync(temporary, "utf8"));
-    assertNoLinks(filename);
-    const current = fs.existsSync(filename) ? fs.readFileSync(filename) : null;
-    if (before === null ? current !== null : !current?.equals(before)) {
-      throw new Error(`Concurrent config change: ${filename}`);
+    JSON.parse(fs.readFileSync(assertNoLinks(temporary), "utf8"));
+    for (let attempt = 0; ; attempt++) {
+      assertNoLinks(filename);
+      assertNoLinks(temporary);
+      const current = fs.existsSync(filename) ? fs.readFileSync(filename) : null;
+      if (before === null ? current !== null : !current?.equals(before)) {
+        throw new Error(`Concurrent config change: ${filename}`);
+      }
+      try {
+        fs.renameSync(temporary, filename);
+        break;
+      } catch (error) {
+        // Sharing violations can outlive close(); never unlink the destination to bypass them.
+        if (!["EPERM", "EACCES", "EBUSY"].includes(error.code) || attempt >= 8) throw error;
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Math.min(10 * 2 ** attempt, 200));
+      }
     }
-    fs.renameSync(temporary, filename);
     if (process.platform !== "win32") {
       const directory = fs.openSync(path.dirname(filename), "r");
       try { fs.fsyncSync(directory); }
       finally { fs.closeSync(directory); }
     }
   } finally {
-    if (fs.existsSync(temporary)) fs.unlinkSync(temporary);
+    if (fs.existsSync(temporary)) fs.unlinkSync(assertNoLinks(temporary));
   }
 }
 

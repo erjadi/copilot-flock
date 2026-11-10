@@ -298,6 +298,113 @@ test("unproven live clients and service failures keep recovery instead of claimi
   }
 });
 
+test("atomic JSON retries transient replacement locks without unlinking the destination", (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "flock-atomic-retry-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const rename = fs.renameSync;
+  const delays = [];
+  t.mock.method(Atomics, "wait", (_buffer, _index, _value, timeout) => {
+    delays.push(timeout);
+    return "timed-out";
+  });
+  let calls = 0;
+  let code;
+  t.mock.method(fs, "renameSync", (source, destination) => {
+    assert.deepEqual(JSON.parse(fs.readFileSync(destination)), { before: true });
+    if (++calls <= 2) throw Object.assign(new Error("fixture replacement lock"), { code });
+    return rename(source, destination);
+  });
+  for (code of ["EPERM", "EACCES", "EBUSY"]) {
+    const filename = path.join(root, `${code}.json`);
+    const before = Buffer.from('{"before":true}');
+    fs.writeFileSync(filename, before);
+    calls = 0;
+    delays.length = 0;
+    atomicJson(filename, { after: true }, before);
+    assert.equal(calls, 3);
+    assert.deepEqual(delays, [10, 20]);
+    assert.deepEqual(JSON.parse(fs.readFileSync(filename)), { after: true });
+  }
+  assert.deepEqual(fs.readdirSync(root).sort(), ["EACCES.json", "EBUSY.json", "EPERM.json"]);
+});
+
+test("atomic JSON bounds replacement retries and propagates permanent errors without changing the original", (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "flock-atomic-denied-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const delays = [];
+  t.mock.method(Atomics, "wait", (_buffer, _index, _value, timeout) => {
+    delays.push(timeout);
+    return "timed-out";
+  });
+  let calls = 0;
+  let failure;
+  t.mock.method(fs, "renameSync", () => { calls++; throw failure; });
+  for (const code of ["EPERM", "EACCES", "EBUSY", "EIO", "ENOSPC"]) {
+    const filename = path.join(root, `${code}.json`);
+    const before = Buffer.from('{"before":true}');
+    fs.writeFileSync(filename, before);
+    failure = Object.assign(new Error("fixture replacement denied"), { code });
+    calls = 0;
+    delays.length = 0;
+    assert.throws(() => atomicJson(filename, { after: true }, before), (error) => error === failure);
+    const retryable = ["EPERM", "EACCES", "EBUSY"].includes(code);
+    assert.equal(calls, retryable ? 9 : 1);
+    assert.deepEqual(delays, retryable ? [10, 20, 40, 80, 160, 200, 200, 200] : []);
+    assert.deepEqual(fs.readFileSync(filename), before);
+  }
+  assert.equal(fs.readdirSync(root).length, 5, "Failed staged writes must be cleaned up");
+});
+
+test("atomic JSON replacement retries reject intervening shared-config writes", (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "flock-atomic-concurrent-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const filename = path.join(root, "config.json");
+  fs.writeFileSync(filename, '{"before":true}');
+  const concurrent = Buffer.from('{"external":"preserve"}');
+  let calls = 0;
+  t.mock.method(Atomics, "wait", () => "timed-out");
+  t.mock.method(fs, "renameSync", () => {
+    calls++;
+    fs.writeFileSync(filename, concurrent);
+    throw Object.assign(new Error("fixture replacement lock"), { code: "EPERM" });
+  });
+  assert.throws(() => atomicJson(filename, { after: true }), /Concurrent config change/);
+  assert.equal(calls, 1, "A retry must not overwrite an intervening write");
+  assert.deepEqual(fs.readFileSync(filename), concurrent);
+  assert.deepEqual(fs.readdirSync(root), ["config.json"]);
+});
+
+test("atomic JSON replacement retries and cleanup reject a parent junction swap", (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "flock-atomic-path-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const directory = path.join(root, "owned");
+  const retained = path.join(root, "retained");
+  const outside = path.join(root, "outside");
+  fs.mkdirSync(directory);
+  fs.mkdirSync(outside);
+  const filename = path.join(directory, "config.json");
+  fs.writeFileSync(filename, '{"before":true}');
+  fs.writeFileSync(path.join(outside, "config.json"), '{"external":"preserve"}');
+  const rename = fs.renameSync;
+  let displacedTemporary;
+  let calls = 0;
+  t.mock.method(Atomics, "wait", () => "timed-out");
+  t.mock.method(fs, "renameSync", (source) => {
+    calls++;
+    rename(directory, retained);
+    displacedTemporary = path.join(outside, path.basename(source));
+    fs.writeFileSync(displacedTemporary, "external evidence");
+    fs.symlinkSync(outside, directory, process.platform === "win32" ? "junction" : "dir");
+    throw Object.assign(new Error("fixture replacement lock"), { code: "EPERM" });
+  });
+  assert.throws(() => atomicJson(filename, { after: true }), /link|junction|escape/);
+  assert.equal(calls, 1);
+  assert.equal(fs.readFileSync(displacedTemporary, "utf8"), "external evidence");
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(outside, "config.json"))), { external: "preserve" });
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(retained, "config.json"))), { before: true });
+  assert.equal(fs.readdirSync(retained).length, 2, "Unsafe-path cleanup retains the original staged evidence");
+});
+
 test("source checkout and concurrent shared-config writes are rejected without erasing evidence", async () => {
   const f = fixture();
   try {

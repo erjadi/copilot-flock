@@ -1,9 +1,10 @@
-# Broker-free 3.4.0 source candidate
+# Broker-free 3.4.0
 
-This is prepared source, not a released or production-validated deployment.
-Existing installations are not migrated. Live Azure isolation tests, immutable
-implementation review and the all-online-member ACCEPT release vote remain
-merge/release gates. Preparing this candidate does not authorize deployment.
+This source does not by itself establish a released or production-validated
+deployment. Existing installations are not migrated. Exact-commit live Azure
+isolation tests, immutable implementation review and the all-online-member
+ACCEPT release vote are required gates. Confirm the published tag and its
+evidence; preparing or reviewing source does not authorize deployment.
 
 ## Copilot-led setup and joining
 
@@ -100,6 +101,14 @@ and does not automatically repeat ambiguous dispatch. A crashed receive lock
 needs reconciliation. Credential/certificate expiry and epoch rotation can
 make old queued work inadmissible; offline delivery is not unconditional.
 Payload plaintext is capped at 128 KiB and encoded transport at 240 KiB.
+
+Atomic JSON persistence fsyncs a same-directory staging file before replacing
+the destination. Replacement sharing violations (`EPERM`, `EACCES`, `EBUSY`)
+receive at most eight retries with less than one second of total backoff.
+Each attempt rechecks path safety and the original destination bytes; the
+destination is never unlinked to bypass a lock. Persistent denial and other
+filesystem errors fail explicitly. Cleanup also rejects junction/path swaps,
+retaining staged evidence rather than deleting through an unsafe path.
 
 ## Renewal, removal and availability
 

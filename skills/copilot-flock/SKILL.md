@@ -42,8 +42,9 @@ pending leaves/approvals, not reported as traceless success.
 
 The one-step `invite_to_flock` / `enroll_from_invite_json` path and broader
 administrative tools below are explicit legacy compatibility, not this new
-protocol. This 3.4.0 source candidate has not passed live Azure isolation,
-immutable review or the release vote; do not infer production authorization.
+protocol. Verify the exact installed version's published tag, live Azure
+isolation evidence, immutable review and complete release vote; a source
+version or this skill alone does not establish production authorization.
 
 1. **Copilot is the Interface**:
    - Never ask the human user to type CLI commands manually. Run the `copilot-flock` MCP tools (`flock_status`, `list_flocks`, `invite_to_flock`, `enroll_from_invite_json`, `share_thread`, `unshare_thread`, `list_shared_threads`, `kick_flock_member`, `flock_topology`, `send_remote_session_message`, `broadcast_remote_session_message`) or `node ~/.copilot/flock/flock.mjs ...` on their behalf.
