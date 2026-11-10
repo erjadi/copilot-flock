@@ -2402,10 +2402,10 @@ export class RawWebSocketClient {
 
   close() {
     if (this.closed) return;
-    this.closed = true;
     try {
       this._sendFrame(0x08, Buffer.alloc(0));
     } catch {}
+    this.closed = true;
     setTimeout(() => {
       try {
         this.socket?.end();

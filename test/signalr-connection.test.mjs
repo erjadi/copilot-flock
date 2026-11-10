@@ -38,6 +38,38 @@ function mockTlsSocket(t, respond, { timeout = false } = {}) {
   return sockets;
 }
 
+test("both raw WebSocket entrypoints send one masked close frame before marking closed and bound unresponsive-peer cleanup", (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  for (const implementation of implementations) {
+    const ws = new implementation.RawWebSocketClient("ws://127.0.0.1/fixture");
+    const frames = [];
+    let ended = 0;
+    let destroyed = 0;
+    ws.socket = {
+      write(frame) { assert.equal(ws.closed, false); frames.push(frame); },
+      end() { ended++; },
+      destroy() { destroyed++; },
+    };
+    ws.close();
+    ws.close();
+    assert.equal(ws.closed, true);
+    assert.equal(frames.length, 1);
+    assert.equal(frames[0][0], 0x88);
+    assert.equal(frames[0][1], 0x80);
+    assert.equal(frames[0].length, 6);
+    t.mock.timers.tick(99);
+    assert.equal(ended, 0);
+    t.mock.timers.tick(1);
+    assert.equal(ended, 1);
+    t.mock.timers.tick(249);
+    assert.equal(destroyed, 0);
+    t.mock.timers.tick(1);
+    assert.equal(destroyed, 1);
+    ws.close();
+    assert.equal(frames.length, 1);
+  }
+});
+
 test("both SignalR entrypoints surface delayed rejected upgrades without leaking credentials or unhandled handshake rejections", async (t) => {
   const sockets = new Set();
   const closed = [];

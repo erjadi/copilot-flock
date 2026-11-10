@@ -7,6 +7,7 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const root = fileURLToPath(new URL("../", import.meta.url));
+const powerShell = process.platform === "win32" ? "powershell.exe" : "pwsh";
 const subscription = "11111111-2222-3333-4444-555555555555";
 const metadata = Object.fromEntries(Object.entries({
   subscriptionId: subscription, signalrName: "demo-signalr",
@@ -99,14 +100,16 @@ else {
 }
 & $env:SETUP @a
 `);
-    return f.result(spawnSync("powershell.exe",
+    const result = spawnSync(powerShell,
       ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", path.join(f.directory, "wrapper.ps1")],
       { cwd: root, encoding: "utf8", timeout: 30000, env: {
         ...env, FIXTURE: f.directory, JOURNAL: f.journal, REAL_NODE: process.execPath,
         SETUP: path.join(root, "setup.ps1"), SUBSCRIPTION: subscription,
         OUTPUTS: fail === "malformed" ? "{invalid" : fail === "metadata" ? "{}" : f.outputs(skip),
         MOCK_FAIL: fail, SKIP: skip ? "1" : "", LEGACY: legacy ? "1" : "", GITHUB_USER: githubUser,
-      } }));
+      } });
+    assert.ifError(result.error);
+    return f.result(result);
   } finally { f.close(); }
 }
 
@@ -129,7 +132,7 @@ function checkManaged(result, skip = false, githubUser = "demo-owner") {
   assert.doesNotMatch(result.stdout + result.stderr + JSON.stringify(result.events), /synthetic-key-do-not-print/);
 }
 
-test("PowerShell actual entrypoint installs CLI, authenticates, selects subscription and deploys default/omitted broker", { skip: process.platform !== "win32" }, () => {
+test("PowerShell actual entrypoint installs CLI, authenticates, selects subscription and deploys default/omitted broker", () => {
   for (const skip of [false, true]) {
     const result = runPowerShell({ skip });
     checkManaged(result, skip);
@@ -141,7 +144,7 @@ test("PowerShell actual entrypoint installs CLI, authenticates, selects subscrip
   assert.ok(github.events.some((event) => event.kind === "gh" && event.args.includes(".login")));
 });
 
-test("PowerShell actual entrypoint fails before local install and preserves direct setup", { skip: process.platform !== "win32" }, () => {
+test("PowerShell actual entrypoint fails before local install and preserves direct setup", () => {
   for (const fail of ["cli", "login", "group", "deployment", "malformed", "metadata", "keys"]) {
     const result = runPowerShell({ fail });
     assert.notEqual(result.status, 0, `${fail}: ${result.stdout}\n${result.stderr}`);
@@ -154,7 +157,8 @@ test("PowerShell actual entrypoint fails before local install and preserves dire
 });
 
 const bashAvailable = spawnSync("bash", ["--version"], { encoding: "utf8", timeout: 5000 }).status === 0;
-test("Bash syntax and actual managed/direct entrypoint flow with synthetic cloud adapters", { skip: !bashAvailable }, () => {
+test("Bash syntax and actual managed/direct entrypoint flow with synthetic cloud adapters", () => {
+  assert.ok(bashAvailable, "Bash is required to exercise the actual setup entrypoint; missing tools must not skip release coverage");
   assert.equal(spawnSync("bash", ["-n", "setup.sh"], { cwd: root }).status, 0);
   const f = fixture();
   try {

@@ -178,11 +178,20 @@ positive delivery checks or the overall test still fail.
 Pre-upgrade EOF and timeout reject the upgrade promise; a close event cannot
 replace a parsed HTTP rejection with an unrelated JSON-handshake error.
 Credential-redacted connection errors preserve a structured HTTP status.
+The raw client sends its masked WebSocket Close frame before marking itself
+closed. Repeated close calls are idempotent; bounded TCP end/destroy timers
+still clean up an unresponsive peer.
 The live harness records that status and each positive delivery milestone,
 continues independent delivery checks after a failed wrong-hub probe, and
 still requires the original HTTP 401/403 boundary for an aggregate pass.
 
 ## Release and existing-client upgrades
+
+The full offline suite requires Node.js 22.5 or newer, Bash, and PowerShell:
+Windows uses `powershell.exe`; Linux and macOS use PowerShell 7 (`pwsh`).
+Both actual setup entrypoints execute with synthetic cloud adapters on every
+platform. Missing shell tools fail validation instead of silently skipping
+tests; no Azure resources or real enrollment are needed for this suite.
 
 Live provider experiments on an edited checkout are diagnostic evidence, not
 approval of its original commit. A source or harness fix creates a new full
