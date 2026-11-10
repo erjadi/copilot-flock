@@ -159,6 +159,14 @@ both exact fixture subscriptions and reports failures. Never point it at
 enrolled/production resources, infer permission from environment flags, or
 mark an unexecuted gate passed.
 
+SignalR startup observes both the HTTP upgrade and JSON handshake from the
+start. Rejected upgrades, early closes and handshake timeouts reject the
+caller explicitly, close the socket and clear the handshake timer; they do not
+become an unhandled background rejection or successful connection. A wrong-hub
+HTTP 400 is reported as a request failure, not silently counted as an
+authorization denial. Negative probe results alone are insufficient when the
+positive delivery checks or the overall test still fail.
+
 ## Release and existing-client upgrades
 
 Live provider experiments on an edited checkout are diagnostic evidence, not

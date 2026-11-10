@@ -22,7 +22,7 @@
     "viewer": "node viewer/viewer-server.mjs",
     "self-test": "node flock.mjs self-test",
     "test:azure-live": "node --test test/flock-azure.live.test.mjs",
-    "test": "node --test --test-concurrency=1 test/flock.test.mjs test/bridge.test.mjs test/enrollment-hotfixes.test.mjs test/setup.test.mjs test/managed-azure-setup.test.mjs test/flock-lifecycle.test.mjs test/flock-protocol.test.mjs test/flock-broker-free.test.mjs test/azure-negative-probes.test.mjs"
+    "test": "node --test --test-concurrency=1 test/flock.test.mjs test/bridge.test.mjs test/enrollment-hotfixes.test.mjs test/setup.test.mjs test/managed-azure-setup.test.mjs test/flock-lifecycle.test.mjs test/flock-protocol.test.mjs test/flock-broker-free.test.mjs test/azure-negative-probes.test.mjs test/signalr-connection.test.mjs"
   },
   "engines": {
     "node": ">=18.0.0"

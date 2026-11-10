@@ -2438,6 +2438,14 @@ export async function connectSignalRClient(cfg, { userId, onInvocation, onClose 
     resolveHandshake = res;
     rejectHandshake = rej;
   });
+  let hsTimer = null;
+  const settleHandshake = (error) => {
+    if (handshakeResolved) return;
+    handshakeResolved = true;
+    if (hsTimer) clearTimeout(hsTimer);
+    if (error) rejectHandshake(error);
+    else resolveHandshake();
+  };
 
   let textRemainder = "";
   let lastFrameAt = Date.now();
@@ -2458,13 +2466,12 @@ export async function connectSignalRClient(cfg, { userId, onInvocation, onClose 
       }
 
       if (!handshakeResolved) {
-        handshakeResolved = true;
         if (msg.error) {
-          rejectHandshake(new Error(`SignalR handshake error: ${msg.error}`));
+          settleHandshake(new Error(`SignalR handshake error: ${msg.error}`));
           ws.close();
           return;
         }
-        resolveHandshake();
+        settleHandshake();
         continue;
       }
 
@@ -2486,36 +2493,36 @@ export async function connectSignalRClient(cfg, { userId, onInvocation, onClose 
   };
 
   ws.onClose = (closeInfo) => {
-    if (!handshakeResolved) {
-      rejectHandshake(new Error("SignalR connection closed before handshake completed"));
-    }
+    settleHandshake(new Error("SignalR connection closed before handshake completed"));
     if (onClose) onClose(closeInfo || { code: ws.closeCode, reason: ws.closeReason });
   };
 
-  try { await ws.connect(); }
-  catch (error) {
-    ws.close();
-    if (cfg.protocol === "broker-free-v34") {
-      const status = error.message.match(/HTTP\/1\.[01] (\d{3})/)?.[1];
-      throw new Error(`Scoped SignalR WebSocket failed${status ? ` (HTTP ${status})` : ""}; credential-bearing details withheld`);
+  const upgradeAndSendHandshake = async () => {
+    try { await ws.connect(); }
+    catch (error) {
+      if (cfg.protocol === "broker-free-v34") {
+        const status = error.message.match(/HTTP\/1\.[01] (\d{3})/)?.[1];
+        throw new Error(`Scoped SignalR WebSocket failed${status ? ` (HTTP ${status})` : ""}; credential-bearing details withheld`);
+      }
+      throw error;
     }
-    throw error;
-  }
-  ws.sendText(JSON.stringify({ protocol: "json", version: 1 }) + RECORD_SEP);
-  let hsTimer = null;
+    if (handshakeResolved) return;
+    ws.sendText(JSON.stringify({ protocol: "json", version: 1 }) + RECORD_SEP);
+    if (!handshakeResolved) {
+      hsTimer = setTimeout(() => {
+        settleHandshake(new Error("SignalR JSON handshake timed out after 10000ms"));
+        ws.close();
+      }, 10000);
+      hsTimer.unref?.();
+    }
+  };
   try {
-    await Promise.race([
-      handshakePromise,
-      new Promise((_, rej) => {
-        hsTimer = setTimeout(() => {
-          if (!handshakeResolved) {
-            ws.close();
-            rej(new Error("SignalR JSON handshake timed out after 10000ms"));
-          }
-        }, 10000);
-        hsTimer.unref?.();
-      }),
-    ]);
+    // Observe both rejection paths before either upgrade or JSON handshake can fail.
+    await Promise.all([handshakePromise, upgradeAndSendHandshake()]);
+  } catch (error) {
+    settleHandshake(error);
+    ws.close();
+    throw error;
   } finally {
     if (hsTimer) clearTimeout(hsTimer);
   }
