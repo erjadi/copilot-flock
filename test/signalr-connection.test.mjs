@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import net from "node:net";
 import tls from "node:tls";
+import { EventEmitter } from "node:events";
 import { setImmediate as nextTurn } from "node:timers/promises";
 import * as canonical from "../flock.mjs";
 import * as legacy from "../bridge.mjs";
@@ -10,6 +11,32 @@ const implementations = [canonical, legacy];
 const cfg = { protocol: "broker-free-v34", endpoint: "https://fixture.service.signalr.net",
   host: "fixture.service.signalr.net", hub: "fixture-forbidden", clientToken: "fixture-private-token",
   credentialExpiresAt: Number.MAX_SAFE_INTEGER };
+
+function mockTlsSocket(t, respond, { timeout = false } = {}) {
+  const sockets = [];
+  t.mock.method(tls, "connect", () => {
+    const socket = new EventEmitter();
+    socket.destroyed = false;
+    socket.setTimeout = (milliseconds) => {
+      clearTimeout(socket.timer);
+      if (timeout && milliseconds) socket.timer = setTimeout(() => socket.emit("timeout"), 5);
+    };
+    socket.write = (bytes) => respond(socket, bytes);
+    socket.destroy = (error) => {
+      if (socket.destroyed) return;
+      socket.destroyed = true;
+      clearTimeout(socket.timer);
+      if (error) socket.emit("error", error);
+      socket.emit("close");
+    };
+    socket.end = () => socket.destroy();
+    sockets.push(socket);
+    setImmediate(() => socket.emit("secureConnect"));
+    return socket;
+  });
+  t.after(() => sockets.forEach((socket) => socket.destroy()));
+  return sockets;
+}
 
 test("both SignalR entrypoints surface delayed rejected upgrades without leaking credentials or unhandled handshake rejections", async (t) => {
   const sockets = new Set();
@@ -39,8 +66,11 @@ test("both SignalR entrypoints surface delayed rejected upgrades without leaking
     for (status of [401, 403, 400]) {
       let closes = 0;
       await assert.rejects(implementation.connectSignalRClient(cfg, { userId: "fixture-peer",
-        onClose: () => { closes++; } }),
-      { message: `Scoped SignalR WebSocket failed (HTTP ${status}); credential-bearing details withheld` });
+        onClose: () => { closes++; } }), (error) => {
+        assert.equal(error.message, `Scoped SignalR WebSocket failed (HTTP ${status}); credential-bearing details withheld`);
+        assert.equal(error.statusCode, status);
+        return true;
+      });
       await closed.at(-1);
       assert.equal(closes, 1);
     }
@@ -48,26 +78,48 @@ test("both SignalR entrypoints surface delayed rejected upgrades without leaking
   await nextTurn();
 });
 
-test("both SignalR entrypoints reject an early close even if upgrade never settles and ignore a late upgrade", async (t) => {
+test("both SignalR entrypoints preserve typed rejection status when data and close fire synchronously before the upgrade catch resumes", async (t) => {
+  let status = 401;
+  const sockets = mockTlsSocket(t, (socket) => {
+    socket.emit("data", Buffer.from(`HTTP/1.1 ${status} Fixture denial mentioning 101\r\n\r\nfixture-private-response-body`));
+    socket.destroy();
+    socket.emit("data", Buffer.from("HTTP/1.1 101 Switching Protocols\r\n\r\n"));
+  });
   for (const implementation of implementations) {
-    let finishUpgrade;
-    let ws;
-    let sends = 0;
-    t.mock.method(implementation.RawWebSocketClient.prototype, "connect", function () {
-      ws = this;
-      setImmediate(() => this.onClose({ code: 1006, reason: "fixture-early-close" }));
-      return new Promise((resolve) => { finishUpgrade = resolve; });
-    });
-    t.mock.method(implementation.RawWebSocketClient.prototype, "sendText", () => { sends++; });
-    let closes = 0;
-    const connecting = implementation.connectSignalRClient(cfg, { userId: "fixture-peer",
-      onClose: () => { closes++; } });
-    await assert.rejects(connecting, /connection closed before handshake completed/);
-    assert.equal(ws.closed, true);
-    assert.equal(closes, 1);
-    finishUpgrade();
+    for (status of [401, 403, 400]) {
+      let closes = 0;
+      await assert.rejects(implementation.connectSignalRClient(cfg, { userId: "fixture-peer",
+        onClose: () => { closes++; } }), (error) => {
+        assert.equal(error.message, `Scoped SignalR WebSocket failed (HTTP ${status}); credential-bearing details withheld`);
+        assert.equal(error.statusCode, status);
+        return true;
+      });
+      assert.equal(closes, 1);
+      assert.equal(sockets.at(-1).destroyed, true);
+    }
     await nextTurn();
-    assert.equal(sends, 0, "A late upgrade must not send or start a new handshake after failure");
+  }
+});
+
+test("both SignalR entrypoints reject pre-upgrade EOF, connect timeout and successful-upgrade immediate close without hanging or inventing authorization status", async (t) => {
+  for (const mode of ["eof", "timeout", "upgraded-close"]) {
+    const sockets = mockTlsSocket(t, (socket) => {
+      if (mode === "timeout") return;
+      if (mode === "upgraded-close") socket.emit("data", Buffer.from("HTTP/1.1 101 Switching Protocols\r\n\r\n"));
+      socket.destroy();
+    }, { timeout: mode === "timeout" });
+    for (const implementation of implementations) {
+      let closes = 0;
+      await assert.rejects(implementation.connectSignalRClient(cfg, { userId: "fixture-peer",
+        onClose: () => { closes++; } }), (error) => {
+        assert.ok(error.statusCode == null);
+        assert.match(error.message, /Scoped SignalR WebSocket failed|SignalR connection closed before handshake completed/);
+        assert.doesNotMatch(error.message, /401|403|fixture-private-token/);
+        return true;
+      });
+      assert.equal(closes, 1);
+      assert.equal(sockets.at(-1).destroyed, true);
+    }
   }
 });
 
@@ -82,6 +134,7 @@ test("both SignalR entrypoints preserve JSON handshake errors received during up
     await assert.rejects(implementation.connectSignalRClient(cfg, { userId: "fixture-peer" }),
       /SignalR handshake error: fixture-handshake-rejected/);
     assert.equal(ws.closed, true);
+    assert.equal(ws.onTextMessage, null);
     await nextTurn();
   }
 });
@@ -103,6 +156,7 @@ test("both SignalR entrypoints reject JSON handshake timeout explicitly and clos
     t.mock.timers.tick(10000);
     await rejected;
     assert.equal(ws.closed, true);
+    assert.equal(ws.onTextMessage, null);
     ws.onClose({ code: 1006, reason: "fixture-timeout-close" });
     await nextTurn();
     t.mock.timers.tick(350);

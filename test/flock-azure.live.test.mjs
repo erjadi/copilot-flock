@@ -5,7 +5,7 @@ import crypto from "node:crypto";
 import { AzureTransport, azureEndpoints, parseAzureConnection, HUB, TOPIC, jwt, sas } from "../flock-azure.mjs";
 import { createDeviceIdentity, createOwnerState, createJoinCode, approveJoin, acceptWelcome, ownerFingerprint, peerSubscription } from "../flock-protocol.mjs";
 import { connectSignalRClient } from "../flock.mjs";
-import { runAzureNegativeProbes } from "./azure-negative-probes.mjs";
+import { runAzureNegativeProbes, classifySignalRClientDenial } from "./azure-negative-probes.mjs";
 
 // Deliberately excluded from npm test. Never point this gate at an enrolled/production namespace.
 test("LIVE RELEASE GATE: scoped Azure clients, REST JWTs and subscription-only SAS isolation", {
@@ -61,6 +61,7 @@ test("LIVE RELEASE GATE: scoped Azure clients, REST JWTs and subscription-only S
     for (const result of results) t.diagnostic(JSON.stringify({ kind: "live-gate-negative-probe", ...result }));
     const probe = crypto.randomUUID();
     const received = new Set();
+    let clientIsolation;
     for (const [peerId, transport] of [[state.localPeerId, ownerTransport], [code.body.peerId, welcome.transport]]) {
       const cfg = { protocol: "broker-free-v34", endpoint: signalr.endpoint,
         host: new URL(signalr.endpoint).hostname, hub: HUB, clientToken: transport.signalrClientToken,
@@ -68,24 +69,30 @@ test("LIVE RELEASE GATE: scoped Azure clients, REST JWTs and subscription-only S
       clients.push(await connectSignalRClient(cfg, { userId: peerId, onInvocation: (target, args) => {
         if (target === "flock34" && args[0]?.probe === probe) received.add(peerId);
       } }));
+      t.diagnostic(JSON.stringify({ kind: "live-gate-positive-probe",
+        operation: peerId === state.localPeerId ? "owner-client-connect" : "peer-client-connect", outcome: "passed" }));
       if (peerId === code.body.peerId) {
-        let rejected = false;
         try {
           const invalid = await connectSignalRClient({ ...cfg, hub: "fixture-forbidden" }, { userId: peerId, onInvocation() {} });
           invalid.close();
-        } catch (error) { rejected = /\b(?:401|403)\b/.test(error.message); }
-        assert.ok(rejected, "Client JWT must be denied on another hub; network/timeouts do not pass this gate");
+          clientIsolation = classifySignalRClientDenial({ statusCode: 101 });
+        } catch (error) { clientIsolation = classifySignalRClientDenial(error); }
+        t.diagnostic(JSON.stringify({ kind: "live-gate-websocket-negative-probe", ...clientIsolation }));
       }
     }
     await azure.publish(welcome.transport, { type: "fixture-probe", probe });
     const deadline = Date.now() + 10000;
     while (received.size !== 2 && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 50));
     assert.equal(received.size, 2, "Scoped REST send and both fixed-peer client JWTs must work");
+    t.diagnostic(JSON.stringify({ kind: "live-gate-positive-probe", operation: "rest-send-and-both-client-receive", outcome: "passed" }));
     let queued = false;
     await azure.drain(welcome.transport, async (message) => { if (message.probe === probe) queued = true; return true; });
     assert.ok(queued, "Own-subscription Listen SAS must receive the Send-only topic message");
+    t.diagnostic(JSON.stringify({ kind: "live-gate-positive-probe", operation: "topic-send-and-own-subscription-listen", outcome: "passed" }));
     assert.deepEqual(results.filter((result) => result.outcome !== "denied"), [],
       "All original isolation probes require HTTP 401/403; acceptance, missing entities and request failures fail the gate");
+    assert.equal(clientIsolation?.outcome, "denied",
+      "Client JWT must be denied on another hub with typed HTTP 401/403; HTTP400/close/network/timeouts do not pass this gate");
   } finally {
     clients.forEach((client) => client.close());
     // Exactly the two freshly generated fixture peers, never a namespace/topic or preexisting subscription.

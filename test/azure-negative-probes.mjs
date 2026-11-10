@@ -1,6 +1,12 @@
 import { HUB, TOPIC } from "../flock-azure.mjs";
 import { peerSubscription } from "../flock-protocol.mjs";
 
+export function classifySignalRClientDenial(error) {
+  const status = Number.isInteger(error?.statusCode) && error.statusCode >= 100 && error.statusCode <= 599 ? error.statusCode : null;
+  return { operation: "client-jwt-cannot-connect-other-hub", method: "GET", status,
+    outcome: [401, 403].includes(status) ? "denied" : status === null ? "request-failed" : "failed" };
+}
+
 export async function runAzureNegativeProbes({ request, signalrEndpoint, serviceBusEndpoint,
   ownerPeerId, peerId, transport, expiredRestToken, expiredListenSas }) {
   const hub = `${signalrEndpoint}/api/v1/hubs/${HUB}`;

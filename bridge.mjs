@@ -2211,8 +2211,11 @@ export class RawWebSocketClient {
       const port = Number(this.url.port) || (isSecure ? 443 : 80);
       const host = this.url.hostname;
       const wsKey = crypto.randomBytes(16).toString("base64");
+      let connectSettled = false;
 
       const onConnectError = (err) => {
+        if (connectSettled) return;
+        connectSettled = true;
         cleanupConnect();
         reject(err);
       };
@@ -2260,6 +2263,7 @@ export class RawWebSocketClient {
       }
 
       rawSocket.on("data", (chunk) => {
+        if (this.closed || (connectSettled && !handshakeDone)) return;
         if (!handshakeDone) {
           headerBuf = Buffer.concat([headerBuf, chunk]);
           const headerEnd = headerBuf.indexOf("\r\n\r\n");
@@ -2267,10 +2271,11 @@ export class RawWebSocketClient {
 
           const headerText = headerBuf.slice(0, headerEnd).toString("utf8");
           const firstLine = headerText.split("\r\n")[0] || "";
-          if (!firstLine.includes("101")) {
+          const statusCode = Number(firstLine.match(/^HTTP\/1\.[01] (\d{3})(?:\s|$)/)?.[1]) || null;
+          if (statusCode !== 101) {
             const rest = headerBuf.slice(headerEnd + 4).toString("utf8");
+            onConnectError(Object.assign(new Error(`WebSocket upgrade failed (${firstLine}): ${rest}`), { statusCode }));
             rawSocket.destroy();
-            reject(new Error(`WebSocket upgrade failed (${firstLine}): ${rest}`));
             return;
           }
 
@@ -2283,6 +2288,7 @@ export class RawWebSocketClient {
 
           const leftover = headerBuf.slice(headerEnd + 4);
           headerBuf = Buffer.alloc(0);
+          connectSettled = true;
           resolve();
           if (leftover.length > 0) {
             this._consumeFrames(leftover);
@@ -2295,6 +2301,7 @@ export class RawWebSocketClient {
 
       rawSocket.on("close", () => {
         this.closed = true;
+        if (!handshakeDone) onConnectError(new Error("WebSocket connection closed before upgrade completed"));
         if (this.onClose) this.onClose({ code: this.closeCode, reason: this.closeReason });
       });
     });
@@ -2431,6 +2438,7 @@ export async function connectSignalRClient(cfg, { userId, onInvocation, onClose 
   const wsUrl = `wss://${cfg.host}/client/?hub=${encodeURIComponent(cfg.hub)}&access_token=${encodeURIComponent(accessToken)}`;
   const ws = new RawWebSocketClient(wsUrl, { timeoutMs: 12000 });
 
+  let upgradeSucceeded = false;
   let handshakeResolved = false;
   let resolveHandshake;
   let rejectHandshake;
@@ -2493,7 +2501,7 @@ export async function connectSignalRClient(cfg, { userId, onInvocation, onClose 
   };
 
   ws.onClose = (closeInfo) => {
-    settleHandshake(new Error("SignalR connection closed before handshake completed"));
+    if (upgradeSucceeded) settleHandshake(new Error("SignalR connection closed before handshake completed"));
     if (onClose) onClose(closeInfo || { code: ws.closeCode, reason: ws.closeReason });
   };
 
@@ -2501,11 +2509,14 @@ export async function connectSignalRClient(cfg, { userId, onInvocation, onClose 
     try { await ws.connect(); }
     catch (error) {
       if (cfg.protocol === "broker-free-v34") {
-        const status = error.message.match(/HTTP\/1\.[01] (\d{3})/)?.[1];
-        throw new Error(`Scoped SignalR WebSocket failed${status ? ` (HTTP ${status})` : ""}; credential-bearing details withheld`);
+        const statusCode = Number.isInteger(error.statusCode) ? error.statusCode : null;
+        throw Object.assign(new Error(`Scoped SignalR WebSocket failed${statusCode ? ` (HTTP ${statusCode})` : ""}; credential-bearing details withheld`),
+          { statusCode });
       }
       throw error;
     }
+    upgradeSucceeded = true;
+    if (ws.closed) throw new Error("SignalR connection closed before handshake completed");
     if (handshakeResolved) return;
     ws.sendText(JSON.stringify({ protocol: "json", version: 1 }) + RECORD_SEP);
     if (!handshakeResolved) {
@@ -2521,6 +2532,7 @@ export async function connectSignalRClient(cfg, { userId, onInvocation, onClose 
     await Promise.all([handshakePromise, upgradeAndSendHandshake()]);
   } catch (error) {
     settleHandshake(error);
+    ws.onTextMessage = null;
     ws.close();
     throw error;
   } finally {

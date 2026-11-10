@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { runAzureNegativeProbes } from "./azure-negative-probes.mjs";
+import { runAzureNegativeProbes, classifySignalRClientDenial } from "./azure-negative-probes.mjs";
 import { peerSubscription } from "../flock-protocol.mjs";
 
 const fixture = {
@@ -61,4 +61,16 @@ test("Azure gate never treats network errors, server failures or missing entitie
     { status: null, outcome: "request-failed" }, { status: 500, outcome: "failed" }, { status: 404, outcome: "failed" },
   ]);
   assert.doesNotMatch(JSON.stringify(results), /sensitive-token|https:|fixture-rest|fixture-send|fixture-listen/);
+  for (const status of [401, 403]) {
+    assert.equal(classifySignalRClientDenial({ statusCode: status }).outcome, "denied");
+  }
+  for (const status of [400, 404, 500, 101]) {
+    assert.equal(classifySignalRClientDenial({ statusCode: status }).outcome, "failed");
+  }
+  for (const error of [new Error("HTTP 401 with sensitive-token"), { statusCode: "401" }, {}, null]) {
+    const result = classifySignalRClientDenial(error);
+    assert.equal(result.outcome, "request-failed");
+    assert.equal(result.status, null);
+    assert.doesNotMatch(JSON.stringify(result), /sensitive-token|HTTP 401/);
+  }
 });

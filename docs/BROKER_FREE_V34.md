@@ -166,6 +166,12 @@ become an unhandled background rejection or successful connection. A wrong-hub
 HTTP 400 is reported as a request failure, not silently counted as an
 authorization denial. Negative probe results alone are insufficient when the
 positive delivery checks or the overall test still fail.
+Pre-upgrade EOF and timeout reject the upgrade promise; a close event cannot
+replace a parsed HTTP rejection with an unrelated JSON-handshake error.
+Credential-redacted connection errors preserve a structured HTTP status.
+The live harness records that status and each positive delivery milestone,
+continues independent delivery checks after a failed wrong-hub probe, and
+still requires the original HTTP 401/403 boundary for an aggregate pass.
 
 ## Release and existing-client upgrades
 
