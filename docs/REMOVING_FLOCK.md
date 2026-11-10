@@ -73,7 +73,13 @@ JSON edits with validation, concurrent-change checks and atomic replacement.
 JSON-with-comments or otherwise malformed configuration is retained with an
 explicit error, not rewritten or guessed.
 
-New skill and startup artifact installations record content hashes.
+New runtime entrypoints/modules, skill and startup artifact installations record
+individual content hashes. Every present runtime script must match its own
+installation-manifest hash before local cleanup starts, and is checked again
+before deletion. A matching sibling script, filename or version/daemon marker
+is not proof of ownership. Modified or unmanifested legacy runtime scripts
+retain the installation with explicit paths/reasons; retries preserve this
+evidence rather than adopting the current file as owned.
 Cleanup removes matching known artifacts, not arbitrary `flock*` paths.
 Modified or unproven artifacts are retained and reported. Legacy skills without
 a recorded content hash are retained rather than guessed from their titles.
@@ -95,6 +101,11 @@ without a creation-identity pin require coordination and are retained.
 Other runtime-referencing Node processes are discovered but not terminated
 without a creation-identity proof. They retain the installation and require
 their host to close them before retrying cleanup.
+On Linux, process enumeration first checks `/proc` ownership and skips processes
+proven to belong to another OS user, including protected root processes.
+Access denial for a same-user process or an unprovable owner retains the
+runtime; it is not evidence that no client exists. Disappeared processes are
+distinguished from permission errors. macOS enumeration is also UID-scoped.
 
 ## Meaning of traceless
 

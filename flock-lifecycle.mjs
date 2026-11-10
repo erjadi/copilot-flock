@@ -96,7 +96,10 @@ export function atomicJson(filename, value, expected) {
 
 export function recordInstalledArtifact(root, filename, paths = lifecyclePaths()) {
   if (!paths.roots.includes(root) ||
-      ![...paths.skills, ...paths.persistence].includes(filename)) throw new Error("Artifact is outside the installation allowlist");
+      ![...paths.skills, ...paths.persistence,
+        ...runtimeFiles.filter((name) => name.endsWith(".mjs")).map((name) => path.join(root, name))].includes(filename)) {
+    throw new Error("Artifact is outside the installation allowlist");
+  }
   assertNoLinks(root);
   assertNoLinks(filename);
   const manifestPath = path.join(root, "installation.json");
@@ -127,7 +130,7 @@ export function inspectProcess(pid, platform = process.platform) {
     return text ? { pid, start: text.slice(0, 24), executable: process.execPath,
       command: text.slice(25).trim() } : null;
   } catch (error) {
-    if (error.code === "ENOENT" || error.status === 1) return null;
+    if (error.code === "ENOENT" || error.code === "ESRCH" || error.status === 1) return null;
     throw error;
   }
 }
@@ -301,7 +304,9 @@ ConvertTo-Json -InputObject @($results) -Compress`;
   return JSON.parse(output);
 }
 
-export function findRuntimeClients(paths) {
+export function findRuntimeClients(paths, {
+  inspect = inspectProcess, readdir = fs.readdirSync, stat = fs.statSync, uid = process.getuid?.(),
+} = {}) {
   const scripts = paths.scripts;
   if (paths.platform === "win32") {
     const output = execFileSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", `
@@ -323,14 +328,30 @@ ConvertTo-Json -InputObject @($found) -Compress`], {
     });
     return JSON.parse(output);
   }
-  const pids = paths.platform === "linux" ? fs.readdirSync("/proc").filter((id) => /^\d+$/.test(id)).map(Number)
-    : execFileSync("ps", ["-axo", "pid="], { encoding: "utf8", timeout: 5000 }).trim().split(/\s+/).map(Number);
+  if (!Number.isSafeInteger(uid) || uid < 0) throw new Error("Cannot establish process ownership for runtime cleanup");
+  const pids = paths.platform === "linux" ? readdir("/proc").filter((id) => /^\d+$/.test(id)).map(Number)
+    : execFileSync("ps", ["-axo", "uid=,pid="], { encoding: "utf8", timeout: 5000 }).split("\n")
+      .map((line) => /^\s*(\d+)\s+(\d+)\s*$/.exec(line)).filter((match) => match && Number(match[1]) === uid)
+      .map((match) => Number(match[2]));
   const results = [];
   for (const pid of pids) {
     if (pid === process.pid) continue;
     let identity;
-    try { identity = inspectProcess(pid, paths.platform); }
-    catch (error) { if (error.code === "ESRCH") continue; throw error; }
+    try {
+      if (paths.platform === "linux") {
+        const owner = stat(`/proc/${pid}`).uid;
+        if (!Number.isSafeInteger(owner) || owner < 0) throw new Error("Process ownership unavailable; runtime retained");
+        if (owner !== uid) continue;
+      }
+      identity = inspect(pid, paths.platform);
+    } catch (error) {
+      if (error.code === "ESRCH" || error.code === "ENOENT") continue;
+      if (error.code === "EACCES" || error.code === "EPERM") {
+        results.push({ pid, reason: "Process ownership or identity is uninspectable; runtime retained" });
+        continue;
+      }
+      throw error;
+    }
     if (identity && (identity.argv?.some((arg) => scripts.includes(arg)) ||
         scripts.some((script) => identity.command?.includes(script)))) {
       results.push({ pid, reason: "Runtime-referencing process requires creation-identity proof before termination" });
@@ -450,9 +471,18 @@ export async function uninstallFlock({
   }
   // Preflight links before stopping processes or changing any shared configuration.
   for (const filename of [...paths.skills, ...paths.persistence, ...paths.configs.map((config) => config.path)]) assertNoLinks(filename);
-  for (const { root, ownedRuntimeFiles } of installations) {
-    for (const filename of ownedRuntimeFiles) assertNoLinks(path.join(root, filename));
+  for (const { root, ownedRuntimeFiles, manifest } of installations) {
+    for (const filename of ownedRuntimeFiles) {
+      const target = assertNoLinks(path.join(root, filename));
+      if (filename.endsWith(".mjs") && fs.existsSync(target)) {
+        if (!fs.lstatSync(target).isFile() || manifest.type !== "copilot-flock-installation-v1" ||
+            manifest.artifacts?.[target] !== hash(fs.readFileSync(target))) {
+          report.retained.push({ path: target, reason: "Runtime script ownership hash missing or changed; installation retained" });
+        }
+      }
+    }
   }
+  if (report.retained.some(({ path: filename }) => paths.roots.some((root) => filename === root || filename.startsWith(root + path.sep)))) return report;
   if (installations.length) {
     try {
       for (const result of await removeTasks(paths)) {
@@ -505,14 +535,19 @@ export async function uninstallFlock({
     catch (error) { report.retained.push({ path: config.path, reason: error.message }); }
   }
   if (report.retained.some(({ path: filename }) => paths.configs.some((config) => config.path === filename))) return report;
-  for (const { root, ownedRuntimeFiles } of installations) {
+  for (const { root, ownedRuntimeFiles, manifest } of installations) {
     // Unknown files are never erased, even inside a dedicated runtime directory.
     for (const filename of ownedRuntimeFiles.filter((name) => name !== "flock.mjs" && name !== "bridge.mjs" && name !== "installation.json")
-      .concat(["installation.json", "bridge.mjs", "flock.mjs"])) {
+      .concat(["bridge.mjs", "flock.mjs", "installation.json"])) {
       const target = path.join(root, filename);
       assertNoLinks(target);
       if (!fs.existsSync(target)) continue;
       if (!fs.lstatSync(target).isFile()) { report.retained.push({ path: target, reason: "Unexpected non-file" }); continue; }
+      if (filename.endsWith(".mjs") && manifest.artifacts?.[target] !== hash(fs.readFileSync(target))) {
+        report.retained.push({ path: target, reason: "Runtime script changed during cleanup; preserved" });
+        continue;
+      }
+      if (filename === "installation.json" && report.retained.some(({ path: retained }) => retained.startsWith(root + path.sep))) continue;
       fs.unlinkSync(target);
       report.removed.push(target);
     }

@@ -7,7 +7,7 @@ import crypto from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { lifecyclePaths, atomicJson, recordInstalledArtifact, uninstallFlock as runUninstall, stopPinnedDaemon,
-  assertNoLinks, inspectProcess } from "../flock-lifecycle.mjs";
+  assertNoLinks, inspectProcess, findRuntimeClients } from "../flock-lifecycle.mjs";
 import { matchesMember, signLeave, verifyLeave } from "../flock-membership.mjs";
 import { leaveV3Device, kickV3FlockMember, planV3DeviceLeave } from "../bootstrap-server.mjs";
 
@@ -21,6 +21,7 @@ function fixture(platform = "win32") {
   fs.mkdirSync(root, { recursive: true });
   fs.writeFileSync(path.join(root, "flock.mjs"),
     'export const BRIDGE_VERSION = "test";\nexport async function runDaemon() {}');
+  recordInstalledArtifact(root, path.join(root, "flock.mjs"), paths);
   const identity = crypto.generateKeyPairSync("ed25519", {
     publicKeyEncoding: { type: "spki", format: "pem" }, privateKeyEncoding: { type: "pkcs8", format: "pem" },
   });
@@ -172,6 +173,109 @@ test("unknown/modified skills, source checkouts and artifacts survive with hones
   } finally { f.close(); }
 });
 
+test("each canonical/legacy runtime script requires its own unchanged ownership hash, including retries", async () => {
+  for (const name of ["flock.mjs", "bridge.mjs", "flock-lifecycle.mjs"]) {
+    for (const change of ["modified", "unmanifested"]) {
+      const f = fixture();
+      try {
+        const canonical = path.join(f.root, "flock.mjs");
+        const target = path.join(f.root, name);
+        fs.copyFileSync(canonical, path.join(f.root, "bridge.mjs"));
+        recordInstalledArtifact(f.root, path.join(f.root, "bridge.mjs"), f.paths);
+        if (name === "flock-lifecycle.mjs") {
+          fs.writeFileSync(target, "export const owned = true;");
+          recordInstalledArtifact(f.root, target, f.paths);
+        }
+        if (change === "modified") fs.appendFileSync(target, "\n// locally modified");
+        else {
+          const manifestPath = path.join(f.root, "installation.json");
+          const manifest = JSON.parse(fs.readFileSync(manifestPath));
+          delete manifest.artifacts[target];
+          atomicJson(manifestPath, manifest);
+        }
+        const expected = fs.readFileSync(target);
+        let leaves = 0;
+        const options = { paths: f.paths, leave: async (request) => { leaves++; return confirm(request); },
+          removeTasks: async () => { throw new Error("Must retain runtime before local cleanup"); } };
+        for (let retry = 0; retry < 2; retry++) {
+          const report = await uninstallFlock(options);
+          assert.equal(report.fullyRemoved, false);
+          assert.ok(report.retained.some((entry) => entry.path === target && /ownership hash/.test(entry.reason)), JSON.stringify(report));
+          assert.deepEqual(fs.readFileSync(target), expected);
+          assert.ok(fs.existsSync(path.join(f.root, "installation.json")));
+          assert.ok(fs.existsSync(path.join(f.root, "identity.json")));
+          assert.ok(fs.existsSync(path.join(f.preserved, "events.jsonl")));
+        }
+        assert.equal(leaves, 2, "Confirmed leaves are not repeated when artifact cleanup is retained");
+      } finally { f.close(); }
+    }
+  }
+});
+
+test("runtime changes after preflight are preserved with their ownership manifest", async () => {
+  const f = fixture();
+  try {
+    const target = path.join(f.root, "flock.mjs");
+    const report = await uninstallFlock({ paths: f.paths, leave: confirm, removeTasks: async () => [],
+      findProcesses: async () => { fs.appendFileSync(target, "\n// concurrent edit"); return []; } });
+    assert.equal(report.fullyRemoved, false);
+    assert.ok(report.retained.some((entry) => entry.path === target && /changed during cleanup/.test(entry.reason)));
+    assert.match(fs.readFileSync(target, "utf8"), /concurrent edit/);
+    assert.ok(fs.existsSync(path.join(f.root, "installation.json")));
+  } finally { f.close(); }
+});
+
+test("Linux process inspection never treats access denial as proof that a process exited", () => {
+  const pid = 2147483647;
+  const read = fs.readFileSync;
+  const link = fs.readlinkSync;
+  try {
+    fs.readFileSync = (filename, ...args) => filename === `/proc/${pid}/stat`
+      ? `${pid} (node) S ${Array(25).fill("1").join(" ")}` : read(filename, ...args);
+    for (const code of ["EACCES", "EPERM", "ESRCH", "ENOENT", "EIO"]) {
+      fs.readlinkSync = (filename, ...args) => {
+        if (filename === `/proc/${pid}/exe`) throw Object.assign(new Error(`fixture ${code}`), { code });
+        return link(filename, ...args);
+      };
+      if (code === "ESRCH" || code === "ENOENT") assert.equal(inspectProcess(pid, "linux"), null);
+      else assert.throws(() => inspectProcess(pid, "linux"), (error) => error.code === code);
+    }
+  } finally { fs.readFileSync = read; fs.readlinkSync = link; }
+});
+
+test("Linux enumeration skips proven other-user processes but retains denied same-user/unknown clients", async () => {
+  const f = fixture("linux");
+  try {
+    const inspected = [];
+    const options = {
+      uid: 1000,
+      readdir: () => ["1", "42", "43", "44", "45", "46", "47", "48", "49"],
+      stat: (filename) => {
+        const pid = Number(path.basename(filename));
+        if (pid === 48 || pid === 49) throw Object.assign(new Error("fixture ownership unavailable"), { code: pid === 48 ? "EACCES" : "ESRCH" });
+        return { uid: pid === 1 ? 0 : 1000 };
+      },
+      inspect: (pid) => {
+        inspected.push(pid);
+        const code = { 1: "EACCES", 42: "EACCES", 43: "EPERM", 44: "ESRCH", 45: "ENOENT" }[pid];
+        if (code) throw Object.assign(new Error("fixture inaccessible process"), { code });
+        return { pid, argv: [process.execPath, pid === 47 ? path.join(f.root, "flock.mjs") : "unrelated.mjs"] };
+      },
+    };
+    const clients = findRuntimeClients(f.paths, options);
+    assert.deepEqual(clients.map((client) => client.pid), [42, 43, 47, 48]);
+    assert.equal(inspected.includes(1), false, "Root-owned /proc/1/exe must not be inspected by another user's cleanup");
+    const retained = await uninstallFlock({ paths: f.paths, leave: confirm, removeTasks: async () => [],
+      findProcesses: () => findRuntimeClients(f.paths, options) });
+    assert.equal(retained.fullyRemoved, false);
+    assert.ok(retained.retained.some((entry) => entry.path === "Process:42"));
+    assert.ok(fs.existsSync(path.join(f.root, "identity.json")));
+    const removed = await uninstallFlock({ paths: f.paths, leave: confirm, removeTasks: async () => [],
+      findProcesses: () => findRuntimeClients(f.paths, { ...options, readdir: () => ["1"] }) });
+    assert.equal(removed.fullyRemoved, true, JSON.stringify(removed));
+  } finally { f.close(); }
+});
+
 test("unproven live clients and service failures keep recovery instead of claiming full removal", async () => {
   for (const stage of ["process", "service", "inventory"]) {
     const f = fixture();
@@ -253,22 +357,33 @@ test("invalid shared config fails explicitly and retains runtime for retry; no s
 
 test("canonical and legacy CLI uninstall in a synthetic home without live transports/processes", () => {
   for (const [entry, args] of [["flock.mjs", ["uninstall"]], ["bridge.mjs", ["flock", "unenroll", "--traceless"]]]) {
-    const f = fixture();
+    const f = fixture(process.platform);
     try {
+      const persistence = f.paths.persistence[0];
+      fs.mkdirSync(path.dirname(persistence), { recursive: true });
+      fs.writeFileSync(persistence, "owned synthetic persistence");
+      recordInstalledArtifact(f.root, persistence, f.paths);
       const preload = path.join(f.home, "isolate.mjs");
       fs.writeFileSync(preload, `
 import os from "node:os";
 import cp from "node:child_process";
+import fs from "node:fs";
+import path from "node:path";
 import { syncBuiltinESMExports } from "node:module";
 os.homedir = () => process.env.FIXTURE_HOME;
+const readdir = fs.readdirSync;
+fs.readdirSync = (filename, ...args) => filename === "/proc" ? [] : readdir(filename, ...args);
 cp.execFileSync = (command, args) => {
   if (command === "powershell.exe" && /FLOCK_TASK_NAMES|FLOCK_RUNTIME_SCRIPTS/.test(args.at(-1))) return "[]";
+  if (command === "systemctl" && JSON.stringify(args) === JSON.stringify(["--user", "disable", "--now", path.basename(process.env.FIXTURE_PERSISTENCE)])) return "";
+  if (command === "launchctl" && JSON.stringify(args) === JSON.stringify(["bootout", "gui/" + process.getuid(), process.env.FIXTURE_PERSISTENCE])) return "";
+  if (command === "ps" && JSON.stringify(args) === JSON.stringify(["-axo", "uid=,pid="])) return "";
   throw new Error("Unexpected native command in isolated uninstall fixture: " + command);
 };
 syncBuiltinESMExports();
 `);
       const env = { ...process.env, COPILOT_HOME: f.paths.copilotHome, FIXTURE_HOME: f.home,
-        APPDATA: path.join(f.home, "AppData", "Roaming") };
+        APPDATA: path.join(f.home, "AppData", "Roaming"), FIXTURE_PERSISTENCE: persistence };
       for (const key of Object.keys(env)) {
         if (key.startsWith("NODE_TEST_") || key === "NODE_OPTIONS") delete env[key];
       }

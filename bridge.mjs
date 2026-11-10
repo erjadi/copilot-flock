@@ -77,11 +77,15 @@ function ipv4Lookup(hostname, options, callback) {
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-function copyRuntimeModules(sourceDirectory, destinationDirectory) {
+function copyRuntimeModules(sourceDirectory, destinationDirectory, installedEntrypoints) {
   for (const module of ["flock-lifecycle.mjs", "flock-membership.mjs", "flock-protocol.mjs", "flock-azure.mjs", "flock-broker-free.mjs"]) {
     const source = path.join(sourceDirectory, module);
     const destination = assertNoLinks(path.join(destinationDirectory, module));
     if (path.resolve(source) !== path.resolve(destination)) fs.copyFileSync(source, destination);
+    recordInstalledArtifact(destinationDirectory, destination);
+  }
+  for (const name of installedEntrypoints) {
+    recordInstalledArtifact(destinationDirectory, path.join(destinationDirectory, name));
   }
 }
 
@@ -5697,7 +5701,7 @@ export async function handleRpcAction(cfg, req) {
     const compatScript = path.join(getBridgeHome(), "bridge.mjs");
     fs.copyFileSync(updatedRepoScript, targetScript);
     fs.copyFileSync(updatedRepoScript, compatScript);
-    copyRuntimeModules(path.dirname(updatedRepoScript), getBridgeHome());
+    copyRuntimeModules(path.dirname(updatedRepoScript), getBridgeHome(), ["flock.mjs", "bridge.mjs"]);
 
     // Spawn `node flock.mjs install` detached after 300ms so the RPC reply returns first
     setTimeout(() => {
@@ -9173,7 +9177,7 @@ export async function updateFleetMachines(
           windowsHide: true,
         });
         fs.copyFileSync(path.join(repoDir, "bridge.mjs"), path.join(getBridgeHome(), "bridge.mjs"));
-        copyRuntimeModules(repoDir, getBridgeHome());
+        copyRuntimeModules(repoDir, getBridgeHome(), ["bridge.mjs"]);
       } catch {}
     }
     localUpdate = await installBridge({
@@ -9457,7 +9461,7 @@ export async function reprovisionLocalBridge(cfg, { syncInstall = false } = {}) 
         windowsHide: true,
       }).trim();
       fs.copyFileSync(path.join(activeRepoDir, "bridge.mjs"), path.join(bridgeHome, "bridge.mjs"));
-      copyRuntimeModules(activeRepoDir, bridgeHome);
+      copyRuntimeModules(activeRepoDir, bridgeHome, ["bridge.mjs"]);
     }
   }
 
@@ -10606,13 +10610,13 @@ export async function installBridge({
   if (path.resolve(__filename) !== path.resolve(compatScript)) {
     fs.copyFileSync(__filename, compatScript);
   }
-  copyRuntimeModules(__dirname, getBridgeHome());
+  copyRuntimeModules(__dirname, getBridgeHome(), ["flock.mjs", "bridge.mjs"]);
   // Also update legacy ~/.copilot/signalr-bridge/bridge.mjs if that directory exists so running sessions stay in sync
   const legacyScript = path.join(getLegacyBridgeHome(), "bridge.mjs");
   if (fs.existsSync(getLegacyBridgeHome()) && path.resolve(__filename) !== path.resolve(legacyScript)) {
     try {
       fs.copyFileSync(__filename, legacyScript);
-      copyRuntimeModules(__dirname, getLegacyBridgeHome());
+      copyRuntimeModules(__dirname, getLegacyBridgeHome(), ["bridge.mjs"]);
     } catch {}
   }
 
@@ -10958,7 +10962,7 @@ async function installBrokerFreeLocal(config, enrollment) {
     const target = assertNoLinks(path.join(root, name));
     if (path.resolve(__filename) !== target) fs.copyFileSync(__filename, target);
   }
-  copyRuntimeModules(__dirname, root);
+  copyRuntimeModules(__dirname, root, ["flock.mjs", "bridge.mjs"]);
   atomicJson(getConfigPath(), config);
   const mcpPath = path.join(getCopilotDir(), "mcp-config.json");
   assertNoLinks(mcpPath);

@@ -109,6 +109,10 @@ Uninstall leaves every enrolled flock before removing owned local artifacts.
 Pending leaves retain the runtime/credentials/journal for recovery, not a
 minimal recovery bundle. Unaccepted Join Codes can correspond to unconfirmed
 owner approvals and prevent a full-removal claim until reconciled.
+Modified/unmanifested runtime scripts also retain the installation: each
+entrypoint/module requires its individual recorded ownership hash. A
+same-user process that cannot be inspected is retained, not silently excluded
+from the runtime-client census.
 See [removal scope and retained-artifact rules](./REMOVING_FLOCK.md).
 
 ## Required live Azure gate

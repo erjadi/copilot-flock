@@ -7,7 +7,7 @@ import crypto from "node:crypto";
 import { AzureTransport, azureEndpoints, validateTransport, sas } from "../flock-azure.mjs";
 import { BrokerFreeRuntime } from "../flock-broker-free.mjs";
 import { encryptEnvelope, ownerFingerprint } from "../flock-protocol.mjs";
-import { lifecyclePaths, atomicJson, uninstallFlock } from "../flock-lifecycle.mjs";
+import { lifecyclePaths, atomicJson, uninstallFlock, recordInstalledArtifact } from "../flock-lifecycle.mjs";
 import { pathToFileURL } from "node:url";
 
 const endpoints = azureEndpoints("https://fixture.service.signalr.net", "https://fixture.servicebus.windows.net");
@@ -204,6 +204,7 @@ test("broker-free uninstall retains offline recovery, then leaves every flock an
   fs.mkdirSync(root, { recursive: true });
   fs.copyFileSync(f.peer.filename, path.join(root, "broker-free.json"));
   fs.writeFileSync(path.join(root, "flock.mjs"), 'export const BRIDGE_VERSION = "test";\nexport async function runDaemon() {}');
+  recordInstalledArtifact(root, path.join(root, "flock.mjs"), paths);
   atomicJson(path.join(root, "config.json"), { protocol: "broker-free-v34", machineId: "PEER", scope: "personal" });
   const preserved = path.join(paths.copilotHome, "session-state", "keep");
   fs.mkdirSync(preserved, { recursive: true });
