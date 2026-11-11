@@ -10,10 +10,18 @@ export interface Flock {
 }
 export interface SharedThread { sessionId: string; title: string; machineId: string; sharingMode: "approved-snapshot" | "dedicated-collaborator-session"; boundFlockId: string }
 export interface FlockState { flocks: Flock[]; sharedThreads: SharedThread[]; maintainer: Record<string, unknown> }
+export interface FlockSnapshot { base: string; mode: Mode; state: FlockState; error: string | null }
 export interface InviteInput { targetPath: string; githubHandle: string; durationMinutes: number | null; maxDevices: number }
 export interface InviteResult { copilotPrompt: string; enrollment: Record<string, unknown>; simulated?: boolean }
 export const GUEST_DURATIONS = [120, 480, 1440] as const;
 export const HARD_WALLS = ["Pre-LLM Daemon Enforcement", "Owner-Only Auto-Trackers", "HMAC boundFlockId Taint-Tagging", "Flock-Partitioned Storage & Live Eviction"];
+
+export function currentFlocks(snapshot: FlockSnapshot | null, base: string, mode: Mode, overviewBase: string | null): { state: FlockState; error: string | null } {
+  if (overviewBase !== base || !snapshot || snapshot.base !== base || snapshot.mode !== mode) {
+    return { state: { flocks: [], sharedThreads: [], maintainer: {} }, error: "Loading flock authority..." };
+  }
+  return { state: snapshot.state, error: snapshot.error };
+}
 
 export function seedFlocks(members: Member[]): FlockState {
   const paths = ["erjadi", "example/personal", "example/work", "example/studio-team", "example/work/CLOUD-DEV-VM"];
@@ -51,7 +59,7 @@ export async function fetchFlocks(base: string): Promise<FlockState> {
 }
 
 export function filterFlock(data: Overview, flock: Flock | undefined, threads: SharedThread[], now = Date.now()): Overview {
-  if (!flock) return { ...data, members: [], sessions: [], events: [] };
+  if (!flock) return { ...data, members: [], sessions: [], events: [], topology: { nodes: [], edges: [] } };
   const ids = new Set(flock.members.filter((m) => !m.membershipExpiresAt || new Date(m.membershipExpiresAt).getTime() > now).map((m) => m.machineId));
   const permitted = new Set(threads.filter((t) => t.boundFlockId === flock.flockId).map((t) => t.sessionId));
   const external = flock.sessionVisibility !== "all";
