@@ -224,7 +224,7 @@ export function TopologyView({ ctx, flocks, flockError }: { ctx: Ctx; flocks: Fl
         <IconBtn onClick={replay} className="h-10 w-10 rounded-full md:h-8 md:w-8" aria-label="Replay recent history" title="Replay recent history"><History className="h-3 w-3" /></IconBtn>
       </GlassPanel>}
 
-      {mode === "flocks" ? <FlockMembershipGraph flocks={flocks} error={flockError} W={W} H={H} portrait={portrait} /> : mode === "matrix" ? <Matrix topo={topo} onPick={(k) => { setSelEdge(k); setSelNode(null); }} sel={selEdge} /> : (
+      {mode === "flocks" ? <FlockMembershipGraph flocks={flocks} error={flockError} /> : mode === "matrix" ? <Matrix topo={topo} onPick={(k) => { setSelEdge(k); setSelNode(null); }} sel={selEdge} /> : (
         <svg ref={svgRef} viewBox={`0 0 ${W} ${H}`} className="relative block h-full w-full cursor-grab touch-none select-none active:cursor-grabbing"
           onPointerDown={(e) => onDown(e)} onPointerMove={onMove} onPointerUp={onUp} onPointerCancel={onUp} role="img" aria-label="Fleet connection graph. Line brightness and thickness show communication volume.">
           <defs>
