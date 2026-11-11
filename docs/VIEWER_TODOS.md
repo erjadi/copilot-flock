@@ -14,11 +14,19 @@ data, old snapshot or synthetic fallback is returned. The page loads on entry
 and on **Refresh TODOs**; it has no polling automation. A refresh error hides
 the ranking rather than presenting it as current.
 
-**Enabling this endpoint is a publication decision.** The legacy viewer has no
-built-in HTTP authentication. Configure the path only after the deployment
-owner verifies that the viewer's binding, firewall or authenticated reverse
-proxy restricts access to the authorized tracker audience. Same-origin checks
-and absence of wildcard CORS are browser protections, not authentication.
+**Private TODO data is loopback-only**, even when the legacy viewer listens on
+all interfaces. With a configured path, the route rejects sockets other than
+`127.0.0.1`, `::1` and `::ffff:127.0.0.1` with HTTP 403. Forwarded-IP headers
+cannot bypass this check. Remote access uses the host's existing authenticated
+SSH local port-forward to its loopback viewer; Copilot sets up that connection
+for an authorized user. This does not add a new authentication service or
+expose the data to other LAN/VPN clients.
+
+The legacy viewer has no built-in HTTP authentication. Do not put an
+unauthenticated reverse proxy in front of `/api/todos`: a loopback proxy
+would satisfy the socket guard. Any proxy must authenticate the authorized
+tracker audience itself. Same-origin checks and absence of wildcard CORS
+are browser protections, not authentication.
 The tracker is viewer-wide, not scoped by the active flock selector, and
 membership in a flock does not grant tracker access.
 Keep the file outside the source checkout/static assets in an owner-only

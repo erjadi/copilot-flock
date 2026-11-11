@@ -23,6 +23,9 @@ export async function handleTodoRequest(req, res, { snapshotPath = process.env.V
   }
   if (req.method !== "GET") return reply(405, { error: "TODO snapshots are read-only" }, { Allow: "GET" });
   if (!snapshotPath) return reply(503, { error: "TODO snapshot is not configured for this viewer" });
+  if (!["127.0.0.1", "::1", "::ffff:127.0.0.1"].includes(req.socket?.remoteAddress)) {
+    return reply(403, { error: "Private TODO data requires a loopback connection or authenticated SSH tunnel" });
+  }
   let file;
   try {
     file = await open(snapshotPath, "r");

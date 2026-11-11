@@ -109,3 +109,17 @@ test("TODO publication is private, atomic and refuses stale/conflicting updates"
   await writeFile(source, JSON.stringify(oversized));
   await assert.rejects(publishTodos(source, destination), /exceeds 1 MiB/);
 });
+
+test("configured private TODO data rejects non-loopback sockets regardless of proxy headers", async () => {
+  for (const remoteAddress of ["192.0.2.10", "::ffff:192.0.2.10", undefined]) {
+    let status, body;
+    await handleTodoRequest({
+      url: "/api/todos", method: "GET", socket: { remoteAddress },
+      headers: { host: "localhost", "x-forwarded-for": "127.0.0.1" },
+    }, {
+      writeHead(code) { status = code; }, end(value) { body = JSON.parse(value); },
+    }, { snapshotPath: "must-not-be-read.json" });
+    assert.equal(status, 403);
+    assert.match(body.error, /loopback connection/);
+  }
+});
