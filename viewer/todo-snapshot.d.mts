@@ -1,3 +1,6 @@
+export type TodoDimension = "riskReduction" | "userImpact" | "reach" | "urgency" | "unblockingValue" | "effortAndChangeRisk";
+export type TodoSortKey = "editorial" | TodoDimension;
+export const TODO_DIMENSIONS: ReadonlyArray<{ key: TodoDimension; label: string; meaning: string }>;
 export interface TodoIssue {
   todoId: string;
   number: number;
@@ -12,6 +15,9 @@ export interface TodoIssue {
   nextStep: string;
   details: string[];
   relatedIssues: number[];
+  scores?: Record<TodoDimension, number>;
+  evidenceConfidence?: "reported" | "reproduced" | "independently_verified";
+  acceptanceCriteria?: string[];
 }
 export interface TodoSnapshot {
   schemaVersion: 1;
@@ -21,3 +27,4 @@ export interface TodoSnapshot {
   issues: TodoIssue[];
 }
 export function validateTodoSnapshot(value: unknown): TodoSnapshot;
+export function sortTodoIssues(issues: readonly TodoIssue[], key?: TodoSortKey, direction?: "asc" | "desc"): TodoIssue[];

@@ -91,6 +91,43 @@ be unique. Empty issue lists are valid; invalid data fails as a whole.
 Files are limited to 1 MiB and snapshots to 1,000 issues.
 The page does not modify items or claim proposals were selected/implemented.
 
+### Scoring and sorting (backward-compatible version 1 extension)
+
+New tracker exports should supply every item with `scores`,
+`evidenceConfidence` and `acceptanceCriteria`. They remain optional so existing
+version-1 snapshots can be loaded safely; missing data is explicitly displayed
+as **Unscored**, **Unknown**, or **Not supplied**, never invented or inferred.
+Supplied fields must be valid; a partial `scores` object rejects the snapshot.
+The publisher and API preserve these fields through their validated projection.
+
+`scores` has all six integer values from 1 to 5:
+
+| Key | Meaning |
+| --- | --- |
+| `riskReduction` | Security, data-loss, upgrade or session risk prevented |
+| `userImpact` | Workflow severity |
+| `reach` | Machines, users or workflows benefited |
+| `urgency` | Active failure, deadline or worsening conditions |
+| `unblockingValue` | Important dependencies or repeated blockers removed |
+| `effortAndChangeRisk` | Implementation, rollout and regression exposure; **5 means harder or riskier**, not better |
+
+`evidenceConfidence` is `reported`, `reproduced`, or
+`independently_verified`. It is displayed separately, not used as a priority
+penalty. `acceptanceCriteria` is an array of nonempty strings describing
+verifiable completion conditions; an absent or empty array is not readiness.
+
+The tracker owns editorial rank and its explanation. Risk reduction and user
+impact lead, then urgency and unblocking value; reach and effort are
+tiebreakers. No aggregate score is calculated. Priority never implies
+implementation readiness or authorization.
+
+The default view sorts editorial rank ascending. A **Sort by** selector
+supports each of the six dimensions, with explicit ascending/descending score
+direction. Unscored items always appear last in either direction. Ties use
+editorial rank ascending, then stable ID in code-point order. Sorting does
+not change the visible editorial rank labels or the source data. Search,
+status and kind filters continue to work; acceptance criteria are searchable.
+
 ## Verification and release
 
 Focused checks: `node --test test/viewer-todos.test.mjs`, then viewer

@@ -1,10 +1,11 @@
 import { useEffect, useMemo, useState } from "react";
 import { ChevronDown, RefreshCw, Search } from "lucide-react";
 import { req } from "@/lib/fleet/api";
-import { validateTodoSnapshot, type TodoSnapshot } from "../../../todo-snapshot.mjs";
+import { TODO_DIMENSIONS, sortTodoIssues, validateTodoSnapshot, type TodoSnapshot, type TodoSortKey } from "../../../todo-snapshot.mjs";
 import { Btn, Input, Panel, Pill, Select } from "./ui";
 
 const statusLabels = { pending: "Pending", in_progress: "In progress", blocked: "Blocked", done: "Done" };
+const confidenceLabels = { reported: "Reported", reproduced: "Reproduced", independently_verified: "Independently verified" };
 
 export function TodosView() {
   const [snapshot, setSnapshot] = useState<TodoSnapshot | null>(null);
@@ -14,6 +15,8 @@ export function TodosView() {
   const [query, setQuery] = useState("");
   const [status, setStatus] = useState("all");
   const [kind, setKind] = useState("all");
+  const [sortKey, setSortKey] = useState<TodoSortKey>("editorial");
+  const [direction, setDirection] = useState<"asc" | "desc">("asc");
 
   useEffect(() => {
     let active = true;
@@ -34,12 +37,12 @@ export function TodosView() {
   }, [refresh]);
 
   const items = snapshot?.issues ?? [];
-  const filtered = useMemo(() => items.filter((item) =>
+  const filtered = useMemo(() => sortTodoIssues(items.filter((item) =>
     (status === "all" || item.status === status) &&
     (kind === "all" || item.type === kind) &&
-    [item.title, item.todoId, `Local #${item.number}`, item.rankingExplanation, item.evidence, item.nextStep, ...item.details]
+    [item.title, item.todoId, `Local #${item.number}`, item.rankingExplanation, item.evidence, item.nextStep, ...item.details, ...(item.acceptanceCriteria ?? [])]
       .join(" ").toLowerCase().includes(query.trim().toLowerCase())
-  ), [items, status, kind, query]);
+  ), sortKey, direction), [items, status, kind, query, sortKey, direction]);
   const clearFilters = () => { setQuery(""); setStatus("all"); setKind("all"); };
 
   return <section className="mx-auto max-w-4xl" aria-labelledby="todos-title" aria-busy={loading}>
@@ -71,6 +74,23 @@ export function TodosView() {
       <Select aria-label="TODO status" value={status} onChange={(event) => setStatus(event.target.value)}><option value="all">All statuses</option>{Object.entries(statusLabels).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</Select>
       <Select aria-label="TODO kind" value={kind} onChange={(event) => setKind(event.target.value)}><option value="all">All kinds</option><option value="bug">Bug</option><option value="architecture">Architecture</option></Select>
     </div>
+    <div className="mt-3 flex flex-wrap items-center gap-2">
+      <label htmlFor="todo-sort" className="text-xs text-muted-foreground">Sort by</label>
+      <Select id="todo-sort" aria-label="TODO sort dimension" value={sortKey} onChange={(event) => {
+        const key = TODO_DIMENSIONS.find(dimension => dimension.key === event.target.value)?.key;
+        if (key || event.target.value === "editorial") setSortKey(key ?? "editorial");
+      }}><option value="editorial">Editorial rank (default)</option>{TODO_DIMENSIONS.map(({ key, label }) => <option key={key} value={key}>{label}</option>)}</Select>
+      <Select aria-label="TODO sort direction" value={direction} onChange={(event) => { if (event.target.value === "asc" || event.target.value === "desc") setDirection(event.target.value); }}>
+        <option value="asc">{sortKey === "editorial" ? "Ascending rank" : "Ascending score (1 to 5)"}</option>
+        <option value="desc">{sortKey === "editorial" ? "Descending rank" : "Descending score (5 to 1)"}</option>
+      </Select>
+    </div>
+    <p className="mt-3 text-xs leading-5 text-muted-foreground">Scores: 1 = low, 5 = high. Effort and change risk: 5 = harder or riskier, not better. Unscored items sort last in either direction; ties use editorial rank, then stable ID. Rank labels stay editorial.</p>
+    <details className="mt-3 rounded-lg border border-border/60 p-3 text-xs text-muted-foreground">
+      <summary className="cursor-pointer">How priority and scores work</summary>
+      <p className="mt-2 leading-5">The tracker owns editorial order: risk reduction and user impact lead, then urgency and unblocking value; reach and effort break ties. No aggregate score is calculated. Evidence confidence is separate, not a rank penalty. Priority is not readiness or authorization.</p>
+      <dl className="mt-3 grid gap-3 sm:grid-cols-2">{TODO_DIMENSIONS.map(({ key, label, meaning }) => <div key={key}><dt className="font-medium text-foreground">{label}</dt><dd className="mt-1 leading-5">{meaning}</dd></div>)}</dl>
+    </details>
     <ol className="mt-4 space-y-3">
       {filtered.map((item) => <li key={item.todoId} value={item.rank}>
         <Panel>
@@ -81,6 +101,10 @@ export function TodosView() {
                 <div className="flex flex-wrap items-center gap-2"><span className="font-mono text-[10px] text-muted-foreground">Local #{item.number} · {item.todoId}</span><Pill>{item.type}</Pill><Pill tone={item.status === "done" ? "online" : item.status === "blocked" ? "destructive" : "gpu"}>{statusLabels[item.status]}</Pill></div>
                 <h2 className="mt-2 break-words text-base font-medium sm:text-lg">{item.title}</h2>
                 <p className="mt-2 text-sm leading-6 text-muted-foreground">{item.rankingExplanation}</p>
+                <dl className="mt-3 grid grid-cols-2 gap-3 sm:grid-cols-3">
+                  {TODO_DIMENSIONS.map(({ key, label, meaning }) => <div key={key} title={meaning}><dt className="text-[10px] text-muted-foreground">{label}</dt><dd className="mt-1 font-mono text-xs">{item.scores ? `${item.scores[key]}/5` : "Unscored"}</dd></div>)}
+                </dl>
+                <p className="mt-3 text-xs text-muted-foreground">Evidence confidence: <span className="text-foreground">{item.evidenceConfidence ? confidenceLabels[item.evidenceConfidence] : "Unknown"}</span></p>
               </div>
               <ChevronDown aria-hidden="true" className="mt-1 h-4 w-4 shrink-0 text-muted-foreground transition-transform group-open/todo:rotate-180" />
             </summary>
@@ -88,6 +112,12 @@ export function TodosView() {
               <dl className="grid gap-5 text-sm sm:grid-cols-2">
                 {[["Ranking basis", item.rankingBasis], ["Evidence", item.evidence], ["Implementation", item.implementationStatus], ["Proposed next step", item.nextStep]].map(([label, text]) => <div key={label}><dt className="text-[10px] uppercase tracking-widest text-muted-foreground">{label}</dt><dd className="mt-2 whitespace-pre-wrap break-words leading-6">{text}</dd></div>)}
               </dl>
+              <div className="mt-5 border-t border-border/50 pt-4">
+                <h3 className="text-[10px] uppercase tracking-widest text-muted-foreground">Acceptance criteria</h3>
+                {item.acceptanceCriteria?.length
+                  ? <ul className="mt-2 list-disc space-y-2 pl-4 text-sm leading-6">{item.acceptanceCriteria.map((criterion, index) => <li key={index} className="whitespace-pre-wrap break-words">{criterion}</li>)}</ul>
+                  : <p className="mt-2 text-sm text-muted-foreground">Not supplied. Readiness or completion is not inferred.</p>}
+              </div>
               {item.details.length > 0 && <ul className="mt-5 list-disc space-y-2 border-t border-border/50 pt-4 pl-4 text-sm leading-6 text-muted-foreground">{item.details.map((detail, index) => <li key={index} className="whitespace-pre-wrap break-words">{detail}</li>)}</ul>}
               <p className="mt-4 text-xs text-muted-foreground">Related local items: {item.relatedIssues.length ? item.relatedIssues.map((number) => `#${number}`).join(", ") : "None"}. Related does not mean prerequisite.</p>
             </div>

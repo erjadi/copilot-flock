@@ -6,7 +6,7 @@ import path from "node:path";
 import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { handleTodoRequest } from "../viewer/todo-api.mjs";
-import { validateTodoSnapshot } from "../viewer/todo-snapshot.mjs";
+import { TODO_DIMENSIONS, sortTodoIssues, validateTodoSnapshot } from "../viewer/todo-snapshot.mjs";
 import { publishTodos } from "../viewer/publish-todos.mjs";
 
 const issue = (number, rank = number) => ({
@@ -19,6 +19,49 @@ const issue = (number, rank = number) => ({
 const snapshot = () => ({
   schemaVersion: 1, revision: 1, updatedAt: "2026-11-11T17:00:00Z",
   source: "Synthetic test tracker", issues: [issue(2), issue(1)],
+});
+const scores = (value) => Object.fromEntries(TODO_DIMENSIONS.map(({ key }) => [key, value]));
+
+test("optional scoring contract preserves old snapshots and rejects partial or invalid supplied metadata", () => {
+  const legacy = validateTodoSnapshot(snapshot()).issues[0];
+  assert.equal(Object.hasOwn(legacy, "scores"), false);
+  assert.equal(Object.hasOwn(legacy, "evidenceConfidence"), false);
+  assert.equal(Object.hasOwn(legacy, "acceptanceCriteria"), false);
+  const value = snapshot();
+  Object.assign(value.issues[0], {
+    scores: { ...scores(3), effortAndChangeRisk: 5, secret: "not projected" },
+    evidenceConfidence: "reported", acceptanceCriteria: ["Reproduce the reported omission", "Verify scoped behavior"],
+  });
+  const result = validateTodoSnapshot(value).issues.find(item => item.number === 2);
+  assert.deepEqual(result.scores, { ...scores(3), effortAndChangeRisk: 5 });
+  assert.equal(result.evidenceConfidence, "reported");
+  assert.deepEqual(result.acceptanceCriteria, value.issues[0].acceptanceCriteria);
+  for (const metadata of [
+    { scores: {} }, { scores: null }, { scores: scores(0) }, { scores: scores(6) },
+    { scores: scores(1.5) }, { scores: scores("3") },
+    { evidenceConfidence: "probably true" }, { evidenceConfidence: null },
+    { acceptanceCriteria: "Done" }, { acceptanceCriteria: [" "] },
+  ]) {
+    const invalid = snapshot(); Object.assign(invalid.issues[0], metadata);
+    assert.throws(() => validateTodoSnapshot(invalid), /Invalid TODO snapshot/);
+  }
+});
+
+test("all six dimension sorts support both directions, stable editorial ties and unscored-last without confidence penalties", () => {
+  for (const { key } of TODO_DIMENSIONS) {
+    const low = { ...issue(1), scores: { ...scores(5), [key]: 1 }, evidenceConfidence: "independently_verified" };
+    const high = { ...issue(2), scores: { ...scores(1), [key]: 5 }, evidenceConfidence: "reported" };
+    const tied = { ...issue(3), scores: high.scores };
+    const missing = { ...issue(4), rank: 1 };
+    const input = [missing, tied, high, low];
+    assert.deepEqual(sortTodoIssues(input, key, "asc").map(i => i.number), [1, 2, 3, 4], key);
+    assert.deepEqual(sortTodoIssues(input, key, "desc").map(i => i.number), [2, 3, 1, 4], key);
+    assert.deepEqual(input.map(i => i.number), [4, 3, 2, 1]);
+  }
+  const tied = [issue(1, 2), issue(2, 2)].reverse();
+  assert.deepEqual(sortTodoIssues(tied).map(i => i.number), [1, 2]);
+  assert.deepEqual(sortTodoIssues([issue(2), issue(1)]).map(i => i.rank), [1, 2]);
+  assert.deepEqual(sortTodoIssues([issue(1), issue(2)], "editorial", "desc").map(i => i.rank), [2, 1]);
 });
 
 test("TODO contract sorts explicit ranks, projects only approved fields and rejects ambiguous/incomplete data", () => {
@@ -71,9 +114,13 @@ test("TODO endpoint is opt-in, read-only, same-origin and reloads durable data w
   }
   assert.equal((await fetch(`${base}/api/todos`, { headers: { Origin: "https://other.invalid" } })).status, 403);
   assert.equal((await fetch(`${base}/api/todos`, { headers: { "Sec-Fetch-Site": "cross-site" } })).status, 403);
-  const updated = { ...snapshot(), revision: 2, issues: [] };
+  const updated = { ...snapshot(), revision: 2 };
+  Object.assign(updated.issues[0], { scores: scores(4), evidenceConfidence: "reproduced", acceptanceCriteria: ["Verify result"] });
   await writeFile(file, JSON.stringify(updated));
-  assert.equal((await (await fetch(`${base}/api/todos`)).json()).revision, 2);
+  const scored = await (await fetch(`${base}/api/todos`)).json();
+  assert.equal(scored.revision, 2);
+  assert.deepEqual(scored.issues[1].scores, scores(4));
+  assert.equal(scored.issues[1].evidenceConfidence, "reproduced");
   await writeFile(file, "{broken");
   const failed = await fetch(`${base}/api/todos`);
   assert.equal(failed.status, 503);
@@ -92,9 +139,13 @@ test("TODO publication is private, atomic and refuses stale/conflicting updates"
   await publishTodos(source, destination);
   if (process.platform !== "win32") assert.equal((await stat(destination)).mode & 0o777, 0o600);
   await publishTodos(source, destination);
-  const newer = { ...snapshot(), revision: 2, updatedAt: "2026-11-11T18:00:00Z", issues: [] };
+  const newer = { ...snapshot(), revision: 2, updatedAt: "2026-11-11T18:00:00Z" };
+  Object.assign(newer.issues[0], { scores: scores(5), evidenceConfidence: "reported", acceptanceCriteria: ["Scoped acceptance"] });
   await writeFile(source, JSON.stringify(newer));
   await publishTodos(source, destination);
+  const published = JSON.parse(await readFile(destination, "utf8"));
+  assert.deepEqual(published.issues[1].scores, scores(5));
+  assert.deepEqual(published.issues[1].acceptanceCriteria, ["Scoped acceptance"]);
   await writeFile(source, JSON.stringify(snapshot()));
   await assert.rejects(publishTodos(source, destination), /older TODO revision/);
   await writeFile(source, JSON.stringify({ ...newer, issues: [issue(1)] }));

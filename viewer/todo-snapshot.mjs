@@ -1,5 +1,28 @@
 const statuses = new Set(["pending", "in_progress", "blocked", "done"]);
 
+export const TODO_DIMENSIONS = [
+  { key: "riskReduction", label: "Risk reduction", meaning: "Security, data-loss, upgrade or session risk prevented" },
+  { key: "userImpact", label: "User impact", meaning: "Severity of the affected workflow" },
+  { key: "reach", label: "Reach", meaning: "Machines, users or workflows benefited" },
+  { key: "urgency", label: "Urgency", meaning: "Active failures, deadlines or worsening conditions" },
+  { key: "unblockingValue", label: "Unblocking value", meaning: "Important dependencies or repeated blockers removed" },
+  { key: "effortAndChangeRisk", label: "Effort and change risk", meaning: "Implementation, rollout and regression exposure; 5 means harder or riskier" },
+];
+
+export function sortTodoIssues(issues, key = "editorial", direction = "asc") {
+  if (key !== "editorial" && !TODO_DIMENSIONS.some(dimension => dimension.key === key)) throw new Error("Invalid TODO sort dimension");
+  if (!["asc", "desc"].includes(direction)) throw new Error("Invalid TODO sort direction");
+  return [...issues].sort((a, b) => {
+    const first = key === "editorial" ? a.rank : a.scores?.[key];
+    const second = key === "editorial" ? b.rank : b.scores?.[key];
+    if (first === undefined && second !== undefined) return 1;
+    if (second === undefined && first !== undefined) return -1;
+    const difference = first === undefined ? 0 : first - second;
+    return (direction === "asc" ? difference : -difference) ||
+      a.rank - b.rank || (a.todoId < b.todoId ? -1 : a.todoId > b.todoId ? 1 : 0);
+  });
+}
+
 export function validateTodoSnapshot(value) {
   const invalid = () => { throw new Error("Invalid TODO snapshot"); };
   const text = (input) => {
@@ -24,6 +47,22 @@ export function validateTodoSnapshot(value) {
       nextStep: text(item.nextStep), details: item.details.map(text),
       relatedIssues: item.relatedIssues.map(positive),
     };
+    if (Object.hasOwn(item, "scores")) {
+      if (!item.scores || typeof item.scores !== "object" || Array.isArray(item.scores)) invalid();
+      issue.scores = Object.fromEntries(TODO_DIMENSIONS.map(({ key }) => {
+        const score = item.scores[key];
+        if (!Number.isInteger(score) || score < 1 || score > 5) invalid();
+        return [key, score];
+      }));
+    }
+    if (Object.hasOwn(item, "evidenceConfidence")) {
+      if (!["reported", "reproduced", "independently_verified"].includes(item.evidenceConfidence)) invalid();
+      issue.evidenceConfidence = item.evidenceConfidence;
+    }
+    if (Object.hasOwn(item, "acceptanceCriteria")) {
+      if (!Array.isArray(item.acceptanceCriteria)) invalid();
+      issue.acceptanceCriteria = item.acceptanceCriteria.map(text);
+    }
     if (ids.has(issue.todoId) || numbers.has(issue.number) || ranks.has(issue.rank)) invalid();
     ids.add(issue.todoId); numbers.add(issue.number); ranks.add(issue.rank);
     return issue;
