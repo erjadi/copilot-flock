@@ -14,16 +14,26 @@ data, old snapshot or synthetic fallback is returned. The page loads on entry
 and on **Refresh TODOs**; it has no polling automation. A refresh error hides
 the ranking rather than presenting it as current.
 
-**Private TODO data is loopback-only**, even when the legacy viewer listens on
-all interfaces. With a configured path, the route rejects sockets other than
-`127.0.0.1`, `::1` and `::ffff:127.0.0.1` with HTTP 403. Forwarded-IP headers
-cannot bypass this check. Remote access uses the host's existing authenticated
-SSH local port-forward to its loopback viewer; Copilot sets up that connection
-for an authorized user. This does not add a new authentication service or
-expose the data to other LAN/VPN clients.
+**Private TODO data defaults to loopback-only**, even when the legacy viewer
+listens on all interfaces. Loopback sockets `127.0.0.1`, `::1` and
+`::ffff:127.0.0.1` retain access, including existing authenticated SSH tunnels.
+After explicit owner approval, `VIEWER_TODOS_LAN_CIDR` can additionally allow
+one IPv4 LAN subnet (for example `192.168.42.0/24`). Copilot must validate the
+actual home LAN interface/subnet before configuring it; do not infer approval
+for Meshnet, VPN, Docker, WAN, or all private networks. An unset value does
+not allow LAN access. Malformed/noncanonical CIDRs fail closed with HTTP 503
+and a server log; `/0` is rejected.
+
+The route matches the actual socket address, including dotted IPv4-mapped
+IPv6 addresses, against that exact subnet. Other IPv6 addresses remain denied
+except `::1`. All other clients receive HTTP 403. Forwarded-IP headers cannot
+bypass this check, and browser cross-origin checks remain active for LAN
+clients. The UI explains 403 as an access restriction rather than a missing
+snapshot. LAN access grants the configured audience read-only tracker access;
+it does not permit modification or automatically grant any flock/thread access.
 
 The legacy viewer has no built-in HTTP authentication. Do not put an
-unauthenticated reverse proxy in front of `/api/todos`: a loopback proxy
+unauthenticated reverse proxy in front of `/api/todos`: a permitted proxy
 would satisfy the socket guard. Any proxy must authenticate the authorized
 tracker audience itself. Same-origin checks and absence of wildcard CORS
 are browser protections, not authentication.

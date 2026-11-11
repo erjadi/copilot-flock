@@ -120,6 +120,43 @@ test("configured private TODO data rejects non-loopback sockets regardless of pr
       writeHead(code) { status = code; }, end(value) { body = JSON.parse(value); },
     }, { snapshotPath: "must-not-be-read.json" });
     assert.equal(status, 403);
-    assert.match(body.error, /loopback connection/);
+    assert.match(body.error, /restricted to loopback/);
+  }
+});
+
+test("configured LAN access permits only its exact subnet and loopback without trusting forwarded addresses", async (t) => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "flock-lan-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const file = path.join(dir, "snapshot.json");
+  await writeFile(file, JSON.stringify(snapshot()));
+  const request = async (remoteAddress, lanCidr = "192.168.42.0/24", headers = {}) => {
+    let status, body;
+    await handleTodoRequest({
+      url: "/api/todos", method: "GET", socket: { remoteAddress },
+      headers: { host: "viewer.example:8099", ...headers },
+    }, {
+      writeHead(code) { status = code; }, end(value) { body = JSON.parse(value); },
+    }, { snapshotPath: file, lanCidr, log() {} });
+    return { status, body };
+  };
+  for (const address of ["192.168.42.1", "192.168.42.254", "::ffff:192.168.42.17", "127.0.0.1", "::1", "::ffff:127.0.0.1"]) {
+    const result = await request(address);
+    assert.equal(result.status, 200, address);
+    assert.equal(result.body.revision, 1);
+  }
+  for (const address of ["192.168.41.255", "192.168.43.0", "10.1.2.3", "172.20.0.1", "100.70.20.234", "::ffff:100.70.20.234", "203.0.113.8", "2001:db8::1", undefined]) {
+    const result = await request(address, "192.168.42.0/24", {
+      "x-forwarded-for": "192.168.42.1", "x-real-ip": "127.0.0.1",
+      forwarded: "for=192.168.42.1", origin: "http://viewer.example:8099",
+    });
+    assert.equal(result.status, 403, String(address));
+    assert.equal(result.body.issues, undefined);
+  }
+  assert.equal((await request("192.168.42.17", "")).status, 403);
+  assert.equal((await request("192.168.42.17", "192.168.42.17/32")).status, 200);
+  assert.equal((await request("192.168.42.18", "192.168.42.17/32")).status, 403);
+  assert.equal((await request("192.168.42.17", "192.168.42.0/24", { origin: "http://other.example" })).status, 403);
+  for (const cidr of ["192.168.42.1/24", "0.0.0.0/0", "192.168.42.0/33", "192.168.42.0", "192.168.42.0/24,10.0.0.0/8", "::/0"]) {
+    assert.equal((await request("127.0.0.1", cidr)).status, 503, cidr);
   }
 });

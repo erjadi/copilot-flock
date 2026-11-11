@@ -24,7 +24,11 @@ export function TodosView() {
     req<unknown>("", "/api/todos")
       .then(validateTodoSnapshot)
       .then((value) => { if (active) setSnapshot(value); })
-      .catch((cause: unknown) => { if (active) setError(`Could not load the tracker snapshot (${cause instanceof Error ? cause.message : "request failed"}). Check viewer configuration and retry.`); })
+      .catch((cause: unknown) => {
+        if (active) setError(cause instanceof Error && cause.message === "403"
+          ? "Access is restricted to the configured home LAN or an authenticated SSH connection. Other networks are not permitted."
+          : `Could not load the tracker snapshot (${cause instanceof Error ? cause.message : "request failed"}). Check viewer configuration and retry.`);
+      })
       .finally(() => { if (active) setLoading(false); });
     return () => { active = false; };
   }, [refresh]);
