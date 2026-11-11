@@ -12,6 +12,7 @@ import path from "node:path";
 import http from "node:http";
 import crypto from "node:crypto";
 import { fileURLToPath } from "node:url";
+import { handleTodoRequest } from "./todo-api.mjs";
 
 import {
   BRIDGE_VERSION,
@@ -714,6 +715,7 @@ const MIME_TYPES = {
 };
 
 const server = http.createServer(async (req, res) => {
+  if (await handleTodoRequest(req, res)) return;
   if (req.method === "OPTIONS") {
     res.writeHead(204, {
       "Access-Control-Allow-Origin": "*",

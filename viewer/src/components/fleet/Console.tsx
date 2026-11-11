@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Command, Plus, RefreshCw, Settings2, Network, Server, MessagesSquare, Radio, Activity, ShieldCheck, Layers, Sun, Moon } from "lucide-react";
+import { Command, Plus, RefreshCw, Settings2, Network, Server, MessagesSquare, Radio, Activity, ShieldCheck, Layers, Sun, Moon, ListTodo } from "lucide-react";
 import { resolveTheme, THEME_KEY, type Theme } from "@/lib/fleet/theme";
 import { fetchOverview, getSeed, normalizeLegacyScopes, type Mode } from "@/lib/fleet/api";
 import { fakeEvent } from "@/lib/fleet/seed";
@@ -11,6 +11,7 @@ import { BroadcastView } from "./BroadcastView";
 import { WireView } from "./WireView";
 import { TopologyView } from "./TopologyView";
 import { GovernanceView } from "./GovernanceView";
+import { TodosView } from "./TodosView";
 import { FlocksView } from "./FlocksView";
 import { NewSessionModal, InspectDrawer } from "./Modals";
 import { fetchFlocks, filterFlock, seedFlocks, type FlockState } from "@/lib/fleet/flocks";
@@ -23,6 +24,7 @@ export interface Ctx {
 
 const TABS = [
   { id: "topology", label: "Topology", icon: Network },
+  { id: "todos", label: "TODOs", icon: ListTodo },
   { id: "flocks", label: "Flocks", icon: Layers },
   { id: "fleet", label: "Fleet", icon: Server },
   { id: "sessions", label: "Sessions", icon: MessagesSquare },
@@ -59,7 +61,12 @@ export function Console() {
   const [scope, setScope] = useState<ScopeFilter>("all");
   const [auto, setAuto] = useState(true);
   const [loading, setLoading] = useState(false);
-  const [tab, setTab] = useState<(typeof TABS)[number]["id"]>("topology");
+  const [tab, setTab] = useState<(typeof TABS)[number]["id"]>(() => window.location.hash === "#todos" ? "todos" : "topology");
+  useEffect(() => {
+    if (tab === "todos" || window.location.hash === "#todos") {
+      window.history.replaceState(null, "", `${window.location.pathname}${window.location.search}${tab === "todos" ? "#todos" : ""}`);
+    }
+  }, [tab]);
   const [selected, setSelected] = useState<Session | null>(null);
   const [inspectId, setInspectId] = useState<string | null>(null);
   const [newOpen, setNewOpen] = useState(false);
@@ -177,12 +184,13 @@ export function Console() {
         </div>
       </header>
 
-      <nav className="fixed inset-x-0 bottom-0 z-40 grid grid-cols-7 border-t border-border/60 bg-background/95 px-1 pt-1 pb-[calc(4px+env(safe-area-inset-bottom))] backdrop-blur-xl xl:hidden" aria-label="Mobile console views">
+      <nav className="fixed inset-x-0 bottom-0 z-40 grid grid-cols-8 border-t border-border/60 bg-background/95 px-1 pt-1 pb-[calc(4px+env(safe-area-inset-bottom))] backdrop-blur-xl xl:hidden" aria-label="Mobile console views">
         {TABS.map(({ id, label, icon: Icon }) => <Btn key={id} onClick={() => { setTab(id); setSettings(false); }} aria-current={tab === id ? "page" : undefined} className={`h-14 min-w-0 flex-col gap-1 px-0 text-[8px] ${tab === id ? "text-foreground" : "text-muted-foreground"}`}><Icon className={`h-4 w-4 shrink-0 ${tab === id ? "text-busy" : ""}`} /><span>{label}</span></Btn>)}
       </nav>
 
       <main className={tab === "topology" ? "p-2 md:p-3 lg:p-4" : "mx-auto min-w-0 max-w-[1500px] px-3 py-5 sm:px-5 lg:px-8 lg:py-9"}>
         {tab === "topology" && <TopologyView key={flockId} ctx={ctx} flocks={flocks.flocks} flockError={flockError} />}
+        {tab === "todos" && <TodosView />}
         {tab === "flocks" && <FlocksView ctx={ctx} state={flocks} setState={setFlocks} refresh={refreshFlocks} error={flockError} />}
         {tab === "fleet" && <FleetView ctx={ctx} />}
         {tab === "sessions" && <SessionsView key={flockId} ctx={ctx} selected={selected} setSelected={setSelected} />}
