@@ -13,7 +13,7 @@ test("LIVE RELEASE GATE: scoped Azure clients, REST JWTs and subscription-only S
   timeout: 240000,
 }, async (t) => {
   const files = ["flock.mjs", "bridge.mjs", "flock-azure.mjs", "flock-protocol.mjs", "flock-broker-free.mjs",
-    "flock-lifecycle.mjs", "test/flock-azure.live.test.mjs", "test/azure-negative-probes.mjs"];
+    "flock-lifecycle.mjs", "flock-registry.mjs", "test/flock-azure.live.test.mjs", "test/azure-negative-probes.mjs"];
   t.diagnostic(JSON.stringify({ kind: "live-gate-source-hashes", sha256: Object.fromEntries(files.map((file) =>
     [file, crypto.createHash("sha256").update(fs.readFileSync(new URL(`../${file}`, import.meta.url))).digest("hex")])) }));
   const config = JSON.parse(fs.readFileSync(process.env.COPILOT_FLOCK_LIVE_AZURE_CONFIG, "utf8"));

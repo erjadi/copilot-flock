@@ -206,7 +206,7 @@ export function authorizeAction(member, action, payload) {
   if (typeof action !== "string" || action.length > 64) throw new Error("Invalid action");
   if (member.role === "owner") return;
   if (action === "list_roster" && member.role === "collaborator") return;
-  if (["ping", "list_shared_threads", "list_sessions", "rpc_response", "leave", "renew"].includes(action)) return;
+  if (["ping", "list_shared_threads", "list_sessions", "rpc_response", "leave", "renew", "roster_sync"].includes(action)) return;
   if ((action === "send_message" || action === "get_transcript") &&
       member.sessionIds.includes(payload?.params?.targetSession || payload?.params?.session) &&
       !payload.params.delegate && !payload.params.newSession) return;

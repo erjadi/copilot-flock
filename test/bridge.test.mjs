@@ -63,7 +63,14 @@ import {
   validatePinnedBootstrapOrigin,
   recordSandboxManifestResource,
   teardownLocalSandbox,
+  FlockMembershipRegistry,
+  createSignedRosterSnapshot,
+  createSignedRosterDelta,
+  computeRosterHash,
 } from "../bridge.mjs";
+import { AzureTransport, azureEndpoints } from "../flock-azure.mjs";
+import { BrokerFreeRuntime } from "../flock-broker-free.mjs";
+import { createDeviceIdentity, ownerFingerprint } from "../flock-protocol.mjs";
 
 import {
   verifyGitHubRepoAccess,
@@ -2292,6 +2299,7 @@ test("v3.0.0 multi-flock platform: universal <owner>/<flock>[/<machineId>] addre
         "README.md",
         "docs/BOOTSTRAP_NEW_FLOCK_BYO_AZURE.md",
         "docs/JOINING_AND_SHARING_GUIDE.md",
+        "docs/FLOCK_MEMBERSHIP_REGISTRY.md",
         "skills/flock-topology/SKILL.md",
         "skills/copilot-flock/SKILL.md",
         "docs/assets/flock-topology-light.svg",
@@ -2409,4 +2417,40 @@ test("TODO #9: bridge compatibility entrypoint enforces explicit flock selectors
     else process.env.COPILOT_HOME = prevCopilotHome;
     fs.rmSync(tempRoot, { recursive: true, force: true });
   }
+});
+
+test("durable v3 broker-backed membership registry (bridge.mjs): offline collaborators, cryptographic indexing, tombstones, and rollback rejection", async (t) => {
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-registry-v3-"));
+  t.after(() => fs.rmSync(tempRoot, { recursive: true, force: true }));
+  const registryPath = path.join(tempRoot, "flock-registry.json");
+  let clockNow = 1_750_000_000_000;
+  const registry = new FlockMembershipRegistry(registryPath, { clock: () => clockNow });
+
+  registry.reconcileV3BrokerFlock({
+    flockId: "erjadi/studio-team",
+    rosterEpoch: 1,
+    members: [
+      { peerId: "erjadi:fp-owner", keyFingerprint: "fp-owner", machineId: "OWNER-PC", githubUser: "erjadi", trustTier: "owner", scope: "personal" },
+      { peerId: "alice:fp-alice", keyFingerprint: "fp-alice", machineId: "OFFLINE-LAPTOP", githubUser: "alice", trustTier: "collaborator", scope: "work" },
+    ],
+  });
+  const view = registry.getFlockView("erjadi/studio-team");
+  assert.equal(view.totalMembers, 2);
+  assert.equal(view.members.find((m) => m.peerId === "alice:fp-alice").presenceStatus, "unknown");
+
+  const reloaded = new FlockMembershipRegistry(registryPath, { clock: () => clockNow + 400_000 });
+  assert.equal(reloaded.getFlockView("erjadi/studio-team").isStale, true);
+  reloaded.reconcileV3BrokerFlock({
+    flockId: "erjadi/studio-team",
+    rosterEpoch: 2,
+    members: [
+      { peerId: "erjadi:fp-owner", keyFingerprint: "fp-owner", machineId: "OWNER-PC", githubUser: "erjadi", trustTier: "owner", scope: "personal" },
+    ],
+  });
+  assert.equal(reloaded.getFlockView("erjadi/studio-team").tombstoneCount, 1);
+  assert.throws(
+    () => reloaded.reconcileV3BrokerFlock({ flockId: "erjadi/studio-team", rosterEpoch: 1, members: [] }),
+    (err) => err.code === "ROSTER_ROLLBACK_REJECTED"
+  );
+  assert.ok(createSignedRosterSnapshot && createSignedRosterDelta && computeRosterHash && AzureTransport && azureEndpoints && BrokerFreeRuntime && createDeviceIdentity && ownerFingerprint);
 });
