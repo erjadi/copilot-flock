@@ -9027,6 +9027,109 @@ test("NEXUS-V2 regressions: live cutover inspection safety, fs.renameSync post-C
         );
       }
     }
+
+    // 4. P1 #4: Fail-closed rollback when fs.renameSync throws EACCES during recovery (retains backupDir & journal,
+    // records RUNTIME_CUTOVER_RECOVERY_FAILED, and succeeds idempotently on retry once EACCES clears)
+    const eaccesCrashSub = spawnSync(
+      process.execPath,
+      [
+        "--input-type=module",
+        "-e",
+        `import { stageAndActivateRuntime } from ${JSON.stringify(
+          pathToFileURL(path.join(repoRoot, "flock-lifecycle.mjs")).href
+        )};
+        stageAndActivateRuntime({
+          sourceDir: ${JSON.stringify(v2Source)},
+          targetDir: ${JSON.stringify(crossTarget)},
+          verifyImports: false,
+          onDuringCutover: ({ index }) => { if (index === 2) process.exit(77); },
+        });`,
+      ],
+      { encoding: "utf8", timeout: 15000 }
+    );
+    assert.equal(eaccesCrashSub.status, 77);
+    const journalPath = path.join(crossTarget, RUNTIME_CUTOVER_JOURNAL_FILENAME);
+    assert.equal(fs.existsSync(journalPath), true);
+    const savedJournal = JSON.parse(fs.readFileSync(journalPath, "utf8"));
+    assert.ok(savedJournal.previousFileHashes?.["flock-azure.mjs"]);
+
+    // 4a. Direct recoverInterruptedRuntimeCutover with injected EACCES on flock-azure.mjs fails closed and retains backupDir + journal
+    const origRename = fs.renameSync;
+    fs.renameSync = function (oldP, newP) {
+      if (String(newP).endsWith("flock-azure.mjs")) {
+        const err = new Error("EACCES: simulated sharing violation on flock-azure.mjs");
+        err.code = "EACCES";
+        throw err;
+      }
+      return origRename.call(fs, oldP, newP);
+    };
+    let failedRec;
+    try {
+      failedRec = recoverInterruptedRuntimeCutover(crossTarget);
+    } finally {
+      fs.renameSync = origRename;
+    }
+    assert.equal(failedRec.recovered, false);
+    assert.equal(failedRec.recoveryFailed, true);
+    assert.equal(failedRec.code, "RUNTIME_CUTOVER_RECOVERY_FAILED");
+    assert.equal(fs.existsSync(journalPath), true, "Journal must be retained when rollback fails");
+    assert.equal(fs.existsSync(savedJournal.backupDir), true, "backupDir must be retained when rollback fails");
+    const stateAfterFailedRec = JSON.parse(
+      fs.readFileSync(path.join(crossTarget, "runtime-state.json"), "utf8")
+    );
+    assert.equal(stateAfterFailedRec.staged?.code, "RUNTIME_CUTOVER_RECOVERY_FAILED");
+
+    // 4b. Module-load autoRecoverInterruptedCutoverOnModuleLoad with injected EACCES also fails closed and retains backupDir + journal
+    const bootEaccesRes = spawnSync(
+      process.execPath,
+      [
+        "--input-type=module",
+        "-e",
+        `import fs from "node:fs";
+        const orig = fs.renameSync;
+        fs.renameSync = function(a, b) {
+          if (String(b).endsWith("flock-azure.mjs")) {
+            const e = new Error("EACCES: locked");
+            e.code = "EACCES";
+            throw e;
+          }
+          return orig.call(fs, a, b);
+        };
+        await import(${JSON.stringify(pathToFileURL(path.join(crossTarget, "flock-azure.mjs")).href)});`,
+      ],
+      { encoding: "utf8", timeout: 15000 }
+    );
+    assert.notEqual(bootEaccesRes.status, 0, "Module load must fail closed when rollback fails");
+    assert.match(bootEaccesRes.stderr, /RUNTIME_CUTOVER_RECOVERY_FAILED/);
+    assert.equal(fs.existsSync(journalPath), true, "Journal must still be retained after module-load EACCES");
+    assert.equal(fs.existsSync(savedJournal.backupDir), true, "backupDir must still be retained after module-load EACCES");
+
+    // 4c. Retry after EACCES clears succeeds idempotently (even though flock-membership.mjs was already restored in 4a!),
+    // restores flock-azure.mjs, verifies all digests, writes RUNTIME_CUTOVER_INTERRUPTED_RECOVERED, and removes backupDir + journal
+    const bootRetryRes = spawnSync(
+      process.execPath,
+      [path.join(crossTarget, "flock.mjs"), "--version"],
+      {
+        encoding: "utf8",
+        timeout: 15000,
+        env: { ...process.env, COPILOT_HOME: scratchRoot },
+      }
+    );
+    assert.equal(
+      bootRetryRes.status,
+      0,
+      `Expected retry after EACCES cleared to recover cleanly, got ${bootRetryRes.status}: ${bootRetryRes.stderr}`
+    );
+    assert.equal(fs.existsSync(journalPath), false, "Journal must be unlinked after verified complete rollback");
+    assert.equal(fs.existsSync(savedJournal.backupDir), false, "backupDir must be removed after verified complete rollback");
+    const stateAfterRetry = JSON.parse(
+      fs.readFileSync(path.join(crossTarget, "runtime-state.json"), "utf8")
+    );
+    assert.equal(stateAfterRetry.staged?.code, "RUNTIME_CUTOVER_INTERRUPTED_RECOVERED");
+    for (const [fName, fEntry] of Object.entries(oldManifest.files)) {
+      const actualSha = hashRuntimeModule(fs.readFileSync(path.join(crossTarget, fName)));
+      assert.equal(actualSha, fEntry.sha256, `Restored ${fName} must match old generation SHA-256`);
+    }
   } finally {
     fs.rmSync(scratchRoot, { recursive: true, force: true });
   }

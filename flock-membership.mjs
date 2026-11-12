@@ -6,70 +6,143 @@ import { atomicJson, assertNoLinks } from "./flock-lifecycle.mjs";
 import { canonical, ownerFingerprint, signedControl, verifyControl } from "./flock-protocol.mjs";
 
 (function autoRecoverInterruptedCutoverOnModuleLoad() {
+  const dir = path.dirname(fileURLToPath(import.meta.url));
+  const journalPath = path.join(dir, ".runtime-cutover-journal.json");
+  let journal;
   try {
-    const dir = path.dirname(fileURLToPath(import.meta.url));
-    const journalPath = path.join(dir, ".runtime-cutover-journal.json");
     if (!fs.existsSync(journalPath) || !fs.lstatSync(journalPath).isFile()) return;
-    const journal = JSON.parse(fs.readFileSync(journalPath, "utf8"));
-    if (!journal || journal.type !== "copilot-flock-cutover-journal-v1") return;
-    const pid = Number(journal.pid);
-    if (Number.isInteger(pid) && pid > 0) {
-      if (pid === process.pid) return;
-      try {
-        process.kill(pid, 0);
-        return;
-      } catch (err) {
-        if (err && err.code === "EPERM") return;
-      }
+    journal = JSON.parse(fs.readFileSync(journalPath, "utf8"));
+  } catch {
+    return;
+  }
+  if (!journal || journal.type !== "copilot-flock-cutover-journal-v1") return;
+  const pid = Number(journal.pid);
+  if (Number.isInteger(pid) && pid > 0) {
+    if (pid === process.pid) return;
+    try {
+      process.kill(pid, 0);
+      return;
+    } catch (err) {
+      if (err && err.code === "EPERM") return;
     }
-    const backupDir = journal.backupDir ? path.resolve(journal.backupDir) : null;
-    const stageDir = journal.stageDir ? path.resolve(journal.stageDir) : null;
-    const managedNames = Array.isArray(journal.managedNames) ? journal.managedNames : [];
-    const existedBefore = new Set(Array.isArray(journal.existedBefore) ? journal.existedBefore : []);
-    const backedUpFiles = new Set(Array.isArray(journal.backedUpFiles) ? journal.backedUpFiles : []);
-    for (const name of managedNames) {
-      const activeFile = path.join(dir, name);
-      const backupFile = backupDir ? path.join(backupDir, name) : null;
-      try {
-        if (existedBefore.has(name) && backedUpFiles.has(name) && backupFile && fs.existsSync(backupFile)) {
-          fs.renameSync(backupFile, activeFile);
-        } else if (!existedBefore.has(name) && fs.existsSync(activeFile)) {
-          fs.unlinkSync(activeFile);
+  }
+  const hashNormalized = (buf) =>
+    crypto
+      .createHash("sha256")
+      .update(Buffer.from(buf.toString("utf8").replace(/\r\n/g, "\n"), "utf8"))
+      .digest("hex");
+  const backupDir = journal.backupDir ? path.resolve(journal.backupDir) : null;
+  const stageDir = journal.stageDir ? path.resolve(journal.stageDir) : null;
+  const managedNames = Array.isArray(journal.managedNames) ? journal.managedNames : [];
+  const existedBefore = new Set(Array.isArray(journal.existedBefore) ? journal.existedBefore : []);
+  const backedUpFiles = new Set(Array.isArray(journal.backedUpFiles) ? journal.backedUpFiles : []);
+  const previousFileHashes =
+    journal.previousFileHashes && typeof journal.previousFileHashes === "object"
+      ? journal.previousFileHashes
+      : {};
+  const restoreErrors = [];
+
+  for (const name of managedNames) {
+    const activeFile = path.join(dir, name);
+    const backupFile = backupDir ? path.join(backupDir, name) : null;
+    const expectedPrevHash =
+      typeof previousFileHashes[name] === "string" ? previousFileHashes[name] : null;
+    try {
+      if (existedBefore.has(name)) {
+        if (
+          expectedPrevHash &&
+          fs.existsSync(activeFile) &&
+          hashNormalized(fs.readFileSync(activeFile)) === expectedPrevHash
+        ) {
+          continue;
         }
-      } catch {}
+        if (!backedUpFiles.has(name) || !backupFile || !fs.existsSync(backupFile)) {
+          restoreErrors.push(`${name}: missing rollback backup file`);
+          continue;
+        }
+        fs.renameSync(backupFile, activeFile);
+        if (!fs.existsSync(activeFile)) {
+          restoreErrors.push(`${name}: restored file missing after rename`);
+        } else if (
+          expectedPrevHash &&
+          hashNormalized(fs.readFileSync(activeFile)) !== expectedPrevHash
+        ) {
+          restoreErrors.push(`${name}: restored file digest mismatch`);
+        }
+      } else if (fs.existsSync(activeFile)) {
+        fs.unlinkSync(activeFile);
+        if (fs.existsSync(activeFile)) {
+          restoreErrors.push(`${name}: failed to remove newly added file`);
+        }
+      }
+    } catch (err) {
+      restoreErrors.push(`${name}: ${err?.code || err?.message || String(err)}`);
     }
+  }
+
+  const writeState = (stagedPatch) => {
     try {
       const statePath = path.join(dir, "runtime-state.json");
-      let current = { type: "copilot-flock-runtime-state-v1", staged: null, installed: null, verified: null };
+      let current = {
+        type: "copilot-flock-runtime-state-v1",
+        staged: null,
+        installed: null,
+        verified: null,
+      };
       if (fs.existsSync(statePath)) {
         try {
           const parsed = JSON.parse(fs.readFileSync(statePath, "utf8"));
           if (parsed && parsed.type === "copilot-flock-runtime-state-v1") current = parsed;
         } catch {}
       }
-      current.staged = {
-        status: "failed",
-        version: journal.targetVersion || null,
-        manifestDigest: journal.targetManifestDigest || null,
-        stageDir: null,
-        closureVerified: false,
-        importVerified: false,
-        error: "Recovered interrupted runtime cutover by rolling back to previous generation",
-        code: "RUNTIME_CUTOVER_INTERRUPTED_RECOVERED",
-        updatedAt: new Date().toISOString(),
-      };
+      current.staged = stagedPatch;
       current.updatedAt = new Date().toISOString();
       fs.writeFileSync(statePath, JSON.stringify(current, null, 2) + "\n", "utf8");
     } catch {}
-    if (stageDir && fs.existsSync(stageDir)) {
-      try { fs.rmSync(stageDir, { recursive: true, force: true }); } catch {}
-    }
-    if (backupDir && fs.existsSync(backupDir)) {
-      try { fs.rmSync(backupDir, { recursive: true, force: true }); } catch {}
-    }
+  };
+
+  if (restoreErrors.length > 0) {
+    const errMsg = `Interrupted runtime cutover rollback incomplete: ${restoreErrors.join("; ")}`;
+    writeState({
+      status: "failed",
+      version: journal.targetVersion || null,
+      manifestDigest: journal.targetManifestDigest || null,
+      stageDir: null,
+      closureVerified: false,
+      importVerified: false,
+      error: errMsg,
+      code: "RUNTIME_CUTOVER_RECOVERY_FAILED",
+      updatedAt: new Date().toISOString(),
+    });
+    const recoveryErr = new Error(errMsg);
+    recoveryErr.code = "RUNTIME_CUTOVER_RECOVERY_FAILED";
+    recoveryErr.errors = restoreErrors;
+    throw recoveryErr;
+  }
+
+  writeState({
+    status: "failed",
+    version: journal.targetVersion || null,
+    manifestDigest: journal.targetManifestDigest || null,
+    stageDir: null,
+    closureVerified: false,
+    importVerified: false,
+    error: "Recovered interrupted runtime cutover by rolling back to previous generation",
+    code: "RUNTIME_CUTOVER_INTERRUPTED_RECOVERED",
+    updatedAt: new Date().toISOString(),
+  });
+  if (stageDir && fs.existsSync(stageDir)) {
     try {
-      if (fs.existsSync(journalPath)) fs.unlinkSync(journalPath);
+      fs.rmSync(stageDir, { recursive: true, force: true });
     } catch {}
+  }
+  if (backupDir && fs.existsSync(backupDir)) {
+    try {
+      fs.rmSync(backupDir, { recursive: true, force: true });
+    } catch {}
+  }
+  try {
+    if (fs.existsSync(journalPath)) fs.unlinkSync(journalPath);
   } catch {}
 })();
 

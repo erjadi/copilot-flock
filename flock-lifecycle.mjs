@@ -1767,7 +1767,7 @@ const EMBEDDED_RUNTIME_MANIFEST_FALLBACK = (() => {
       },
       "flock-azure.mjs": {
         role: "companion",
-        sha256: "e0020aa7a54d223123393946b264d275cda7d38232b8133d2dd07515b925c7c1",
+        sha256: "73fd4f9945554c6765898359439a35470c7e3104b5f4d959f8d1d4bd31769458",
         imports: ["./flock-protocol.mjs"],
       },
       "flock-broker-free.mjs": {
@@ -1787,7 +1787,7 @@ const EMBEDDED_RUNTIME_MANIFEST_FALLBACK = (() => {
       },
       "flock-membership.mjs": {
         role: "companion",
-        sha256: "df3e84516d6a15d2bdb7e212b7dfc85cb7776c76de8b1ed102af8598d26b9a25",
+        sha256: "3c180a66b7ac4455c98ff115ac276020d6b63180114c2f390cee7756d681941d",
         imports: [
           "./flock-lifecycle.mjs",
           "./flock-protocol.mjs",
@@ -1815,11 +1815,14 @@ const EMBEDDED_RUNTIME_MANIFEST_FALLBACK = (() => {
 })();
 
 function loadInitialRuntimeManifest(dir) {
-  try {
-    if (fs.existsSync(path.join(dir, RUNTIME_CUTOVER_JOURNAL_FILENAME))) {
-      recoverInterruptedRuntimeCutover(dir);
+  if (fs.existsSync(path.join(dir, RUNTIME_CUTOVER_JOURNAL_FILENAME))) {
+    const rec = recoverInterruptedRuntimeCutover(dir);
+    if (rec?.recoveryFailed) {
+      throw runtimeError("RUNTIME_CUTOVER_RECOVERY_FAILED", rec.error || "Interrupted runtime cutover rollback incomplete", {
+        errors: rec.errors || [],
+      });
     }
-  } catch {}
+  }
   try {
     const manifestPath = path.join(dir, RUNTIME_MANIFEST_FILENAME);
     if (fs.existsSync(manifestPath)) {
@@ -2197,18 +2200,75 @@ export function recoverInterruptedRuntimeCutover(targetDir, { force = false } = 
     : [...REQUIRED_RUNTIME_MODULES, RUNTIME_MANIFEST_FILENAME, "installation.json"];
   const existedBefore = new Set(Array.isArray(journal.existedBefore) ? journal.existedBefore : []);
   const backedUpFiles = new Set(Array.isArray(journal.backedUpFiles) ? journal.backedUpFiles : []);
+  const previousFileHashes =
+    journal.previousFileHashes && typeof journal.previousFileHashes === "object"
+      ? journal.previousFileHashes
+      : {};
+  const restoreErrors = [];
 
   for (const name of managedNames) {
     const activeFile = path.join(resolvedTarget, name);
     const backupFile = backupDir ? path.join(backupDir, name) : null;
+    const expectedPrevHash =
+      typeof previousFileHashes[name] === "string" ? previousFileHashes[name] : null;
     try {
       assertNoLinks(activeFile);
-      if (existedBefore.has(name) && backedUpFiles.has(name) && backupFile && fs.existsSync(backupFile)) {
+      if (existedBefore.has(name)) {
+        if (
+          expectedPrevHash &&
+          fs.existsSync(activeFile) &&
+          hashRuntimeModule(fs.readFileSync(activeFile)) === expectedPrevHash
+        ) {
+          continue;
+        }
+        if (!backedUpFiles.has(name) || !backupFile || !fs.existsSync(backupFile)) {
+          restoreErrors.push(`${name}: missing rollback backup file`);
+          continue;
+        }
         atomicReplaceFile(backupFile, activeFile);
-      } else if (!existedBefore.has(name) && fs.existsSync(activeFile)) {
+        if (!fs.existsSync(activeFile)) {
+          restoreErrors.push(`${name}: restored file missing after rename`);
+        } else if (
+          expectedPrevHash &&
+          hashRuntimeModule(fs.readFileSync(activeFile)) !== expectedPrevHash
+        ) {
+          restoreErrors.push(`${name}: restored file digest mismatch`);
+        }
+      } else if (fs.existsSync(activeFile)) {
         fs.unlinkSync(activeFile);
+        if (fs.existsSync(activeFile)) {
+          restoreErrors.push(`${name}: failed to remove newly added file`);
+        }
       }
+    } catch (err) {
+      restoreErrors.push(`${name}: ${err?.code || err?.message || String(err)}`);
+    }
+  }
+
+  if (restoreErrors.length > 0) {
+    const errMsg = `Interrupted runtime cutover rollback incomplete: ${restoreErrors.join("; ")}`;
+    try {
+      updateRuntimeState(resolvedTarget, {
+        staged: {
+          status: "failed",
+          version: journal.targetVersion || null,
+          manifestDigest: journal.targetManifestDigest || null,
+          stageDir: null,
+          closureVerified: false,
+          importVerified: false,
+          error: errMsg,
+          code: "RUNTIME_CUTOVER_RECOVERY_FAILED",
+          updatedAt: new Date().toISOString(),
+        },
+      });
     } catch {}
+    return {
+      recovered: false,
+      recoveryFailed: true,
+      code: "RUNTIME_CUTOVER_RECOVERY_FAILED",
+      error: errMsg,
+      errors: restoreErrors,
+    };
   }
 
   try {
@@ -2779,7 +2839,10 @@ export function stageRuntimeRelease({
   }
   const targetExistedBefore = fs.existsSync(resolvedTarget);
   if (targetExistedBefore) {
-    recoverInterruptedRuntimeCutover(resolvedTarget);
+    const rec = recoverInterruptedRuntimeCutover(resolvedTarget);
+    if (rec?.recoveryFailed) {
+      throw runtimeError("RUNTIME_CUTOVER_RECOVERY_FAILED", rec.error, { errors: rec.errors || [] });
+    }
   }
   fs.mkdirSync(resolvedTarget, { recursive: true });
 
@@ -2905,7 +2968,10 @@ export function activateStagedRuntime({
     throw runtimeError("RUNTIME_UNSAFE_TARGET", `Refusing to activate runtime into source checkout: ${resolvedTarget}`);
   }
   if (fs.existsSync(resolvedTarget)) {
-    recoverInterruptedRuntimeCutover(resolvedTarget);
+    const rec = recoverInterruptedRuntimeCutover(resolvedTarget);
+    if (rec?.recoveryFailed) {
+      throw runtimeError("RUNTIME_CUTOVER_RECOVERY_FAILED", rec.error, { errors: rec.errors || [] });
+    }
   }
 
   const resolvedManifest = manifest ? validateRuntimeManifest(manifest) : loadRuntimeManifest(resolvedStage);
@@ -2948,8 +3014,10 @@ export function activateStagedRuntime({
   assertNoLinks(journalPath);
   fs.mkdirSync(backupDir, { mode: 0o700 });
   const backedUpFiles = new Set();
+  const previousFileHashes = {};
   const touchedDuringCutover = new Set();
   let cutoverStarted = false;
+  let rollbackIncomplete = false;
   const targetKey = path.resolve(resolvedTarget).toLowerCase();
 
   const companionPriority = [
@@ -2983,7 +3051,9 @@ export function activateStagedRuntime({
       if (typeof onDuringBackup === "function") {
         onDuringBackup({ filename: name, index: backupIndex, targetDir: resolvedTarget, backupDir });
       }
-      writeBinarySecure(path.join(backupDir, name), fs.readFileSync(currentPath));
+      const prevBytes = fs.readFileSync(currentPath);
+      writeBinarySecure(path.join(backupDir, name), prevBytes);
+      previousFileHashes[name] = hashRuntimeModule(prevBytes);
       backedUpFiles.add(name);
     }
 
@@ -2999,6 +3069,7 @@ export function activateStagedRuntime({
       managedNames,
       existedBefore: [...existedBefore],
       backedUpFiles: [...backedUpFiles],
+      previousFileHashes,
       startedAt: new Date().toISOString(),
     });
 
@@ -3088,23 +3159,47 @@ export function activateStagedRuntime({
     }
   } catch (err) {
     // Only roll back target files if cutover actually started; backup failures must never delete or mutate preexisting files
+    const rollbackErrors = [];
     if (cutoverStarted) {
       for (const name of touchedDuringCutover) {
         const activeFile = path.join(resolvedTarget, name);
         const backupFile = path.join(backupDir, name);
+        const expectedPrevHash = previousFileHashes[name] || null;
         try {
           assertNoLinks(activeFile);
-          if (existedBefore.has(name) && backedUpFiles.has(name) && fs.existsSync(backupFile)) {
+          if (existedBefore.has(name)) {
+            if (
+              expectedPrevHash &&
+              fs.existsSync(activeFile) &&
+              hashRuntimeModule(fs.readFileSync(activeFile)) === expectedPrevHash
+            ) {
+              continue;
+            }
+            if (!backedUpFiles.has(name) || !fs.existsSync(backupFile)) {
+              rollbackErrors.push(`${name}: missing rollback backup file`);
+              continue;
+            }
             atomicReplaceFile(backupFile, activeFile);
-          } else if (!existedBefore.has(name) && fs.existsSync(activeFile)) {
+            if (
+              !fs.existsSync(activeFile) ||
+              (expectedPrevHash && hashRuntimeModule(fs.readFileSync(activeFile)) !== expectedPrevHash)
+            ) {
+              rollbackErrors.push(`${name}: post-rollback digest mismatch`);
+            }
+          } else if (fs.existsSync(activeFile)) {
             fs.unlinkSync(activeFile);
           }
-        } catch {}
+        } catch (rbErr) {
+          rollbackErrors.push(`${name}: ${rbErr?.code || rbErr?.message || String(rbErr)}`);
+        }
       }
     }
-    try {
-      if (fs.existsSync(journalPath)) fs.unlinkSync(assertNoLinks(journalPath));
-    } catch {}
+    rollbackIncomplete = rollbackErrors.length > 0;
+    if (!rollbackIncomplete) {
+      try {
+        if (fs.existsSync(journalPath)) fs.unlinkSync(assertNoLinks(journalPath));
+      } catch {}
+    }
     try {
       updateRuntimeState(resolvedTarget, {
         staged: {
@@ -3114,8 +3209,12 @@ export function activateStagedRuntime({
           stageDir: null,
           closureVerified: false,
           importVerified: false,
-          error: err.message,
-          code: err.code || "RUNTIME_CUTOVER_FAILED",
+          error: rollbackIncomplete
+            ? `${err.message} (rollback incomplete: ${rollbackErrors.join("; ")})`
+            : err.message,
+          code: rollbackIncomplete
+            ? "RUNTIME_CUTOVER_RECOVERY_FAILED"
+            : err.code || "RUNTIME_CUTOVER_FAILED",
           updatedAt: new Date().toISOString(),
         },
       });
@@ -3124,10 +3223,12 @@ export function activateStagedRuntime({
   } finally {
     activeCutoverTargets.delete(targetKey);
     cleanupDirectorySafe(resolvedStage);
-    cleanupDirectorySafe(backupDir);
-    try {
-      if (fs.existsSync(journalPath)) fs.unlinkSync(assertNoLinks(journalPath));
-    } catch {}
+    if (!rollbackIncomplete) {
+      cleanupDirectorySafe(backupDir);
+      try {
+        if (fs.existsSync(journalPath)) fs.unlinkSync(assertNoLinks(journalPath));
+      } catch {}
+    }
   }
 
   const states = inspectRuntimeGenerations(resolvedTarget, { resident });
