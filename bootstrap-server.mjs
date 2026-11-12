@@ -14,7 +14,7 @@ import path from "node:path";
 import http from "node:http";
 import https from "node:https";
 import crypto from "node:crypto";
-import { matchesMember, verifyLeave } from "./flock-membership.mjs";
+import { matchesMember, verifyLeave, isPrincipalRevokedInFlock } from "./flock-membership.mjs";
 
 const PORT = Number(process.env.PORT) || 8080;
 const ALLOWED_REPO = (
@@ -984,9 +984,25 @@ export async function enrollV3Device(
           err.statusCode = 403;
           throw err;
         }
+        const isAuthenticatedBuiltInOwner =
+          numUserId > 0 &&
+          !targetFlock.targetMachineId &&
+          (targetFlock.flockType === "owner_root" || targetFlock.flockType === "owner_scope") &&
+          targetFlock.ownerGitHubUser === cleanUser &&
+          (!targetFlock.ownerGitHubUserId || Number(targetFlock.ownerGitHubUserId) === numUserId);
+        const existingOwnerMember =
+          isAuthenticatedBuiltInOwner &&
+          targetFlock.members?.[peerId]?.trustTier === "owner" &&
+          Number(targetFlock.members?.[peerId]?.githubUserId) === numUserId;
         const previous = targetFlocksToJoin.get(targetFlock.flockId);
-        // Only the authenticated principal's built-ins above confer owner authority.
-        if (previous?.trustTier !== "owner") {
+        // Only the authenticated principal's built-ins confer owner authority; never downgrade them via lower-role vouchers.
+        if (previous?.trustTier === "owner" || isAuthenticatedBuiltInOwner || existingOwnerMember) {
+          targetFlocksToJoin.set(targetFlock.flockId, {
+            flock: targetFlock,
+            trustTier: "owner",
+            membershipExpiresAtMs: null,
+          });
+        } else {
           const expirations = [previous?.membershipExpiresAtMs, membershipExpiresAtMs]
             .filter((expiry) => expiry != null);
           targetFlocksToJoin.set(targetFlock.flockId, {
@@ -1035,7 +1051,11 @@ export async function enrollV3Device(
       if (f.removedMachines) {
         delete f.removedMachines[`${cleanUser}:${cleanMachine.toLowerCase()}`];
       }
-      if (!prevMember || prevMember.publicKey !== publicKey) {
+      if (
+        !prevMember ||
+        prevMember.publicKey !== publicKey ||
+        prevMember.trustTier !== item.trustTier
+      ) {
         f.rosterEpoch = (Number(f.rosterEpoch) || 1) + 1;
       }
 
@@ -1605,11 +1625,206 @@ export async function leaveV3Device(request, {
   });
 }
 
+export async function syncV3DeviceMemberships(
+  {
+    githubUser,
+    githubUserId,
+    deviceId,
+    machineId = null,
+    signature = null,
+    timestamp = null,
+    requireSignature = false,
+  },
+  {
+    storePath = V3_FLOCKS_PATH,
+    connectionString = process.env.SIGNALR_CONNECTION_STRING || "",
+  } = {}
+) {
+  const cleanUser = String(githubUser || "").trim().toLowerCase();
+  const numUserId = Number(githubUserId);
+  const cleanDevice = String(deviceId || "").trim().toLowerCase();
+  const cleanMachine = machineId ? String(machineId).trim() : "";
+
+  if (!cleanUser || !Number.isSafeInteger(numUserId) || numUserId <= 0 || !cleanDevice) {
+    const err = new Error("Authenticated githubUser, numeric githubUserId, and deviceId are required for membership sync");
+    err.statusCode = 400;
+    throw err;
+  }
+
+  return await withFlockStoreLock(async () => {
+    const store = loadV3FlockStore(storePath);
+    const now = Date.now();
+    const peerId = `${numUserId}:${cleanDevice}`;
+
+    if (requireSignature || signature || timestamp) {
+      if (typeof signature !== "string" || !signature || typeof timestamp !== "string" || !timestamp) {
+        const err = new Error("Signed device membership sync proof is required");
+        err.statusCode = 401;
+        throw err;
+      }
+      const tsMs = Date.parse(timestamp);
+      if (!Number.isFinite(tsMs) || Math.abs(now - tsMs) > 300000) {
+        const err = new Error("Membership sync signature timestamp out of bounds");
+        err.statusCode = 401;
+        throw err;
+      }
+      const pinnedKeys = new Set();
+      for (const f of Object.values(store.flocks || {})) {
+        for (const m of Object.values(f.members || {})) {
+          if (
+            m.deviceId === cleanDevice &&
+            Number(m.githubUserId) === numUserId &&
+            m.publicKey
+          ) {
+            pinnedKeys.add(m.publicKey);
+          }
+        }
+      }
+      if (pinnedKeys.size === 0) {
+        const err = new Error(`No enrolled device key pinned for "${peerId}"`);
+        err.statusCode = 403;
+        throw err;
+      }
+      const canonical = `sync|v3|${cleanDevice}|${cleanMachine}|${timestamp}`;
+      const sigBuf = Buffer.from(String(signature), "base64");
+      for (const pubKey of pinnedKeys) {
+        const ok = crypto.verify(null, Buffer.from(canonical, "utf8"), pubKey, sigBuf);
+        if (!ok) {
+          const err = new Error("Invalid Ed25519 membership sync signature");
+          err.statusCode = 401;
+          throw err;
+        }
+      }
+    }
+
+    const enrolledFlocks = [];
+    const revokedFlockIds = [];
+    const expiredFlockIds = [];
+    let mutated = false;
+
+    for (const f of Object.values(store.flocks || {})) {
+      if (
+        isPrincipalRevokedInFlock(f, {
+          githubUser: cleanUser,
+          githubUserId: numUserId,
+          peerId,
+          deviceId: cleanDevice,
+        })
+      ) {
+        revokedFlockIds.push(f.flockId);
+        continue;
+      }
+
+      const memberEntry = Object.entries(f.members || {}).find(
+        ([, m]) =>
+          m &&
+          m.deviceId === cleanDevice &&
+          Number(m.githubUserId) === numUserId &&
+          String(m.githubUser || "").toLowerCase() === cleanUser
+      );
+      if (!memberEntry) continue;
+      const [memberKey, member] = memberEntry;
+
+      if (
+        (member.membershipExpiresAtMs && Number(member.membershipExpiresAtMs) <= now) ||
+        (f.expiresAtMs && Number(f.expiresAtMs) <= now)
+      ) {
+        delete f.members[memberKey];
+        f.rosterEpoch = (Number(f.rosterEpoch) || 1) + 1;
+        mutated = true;
+        expiredFlockIds.push(f.flockId);
+        await evictSignalRHubUserImmediate({
+          connectionString,
+          hub: f.hubName,
+          userId: member.peerId,
+        });
+        continue;
+      }
+
+      const isAuthenticatedBuiltInOwner =
+        !f.targetMachineId &&
+        (f.flockType === "owner_root" || f.flockType === "owner_scope") &&
+        f.ownerGitHubUser === cleanUser &&
+        (!f.ownerGitHubUserId || Number(f.ownerGitHubUserId) === numUserId);
+
+      if (
+        isAuthenticatedBuiltInOwner &&
+        (member.trustTier !== "owner" || member.membershipExpiresAtMs != null || member.membershipExpiresAt != null)
+      ) {
+        member.trustTier = "owner";
+        member.membershipExpiresAtMs = null;
+        member.membershipExpiresAt = null;
+        f.ownerGitHubUserId = numUserId;
+        f.rosterEpoch = (Number(f.rosterEpoch) || 1) + 1;
+        mutated = true;
+      }
+
+      const tokenExpMs = member.membershipExpiresAtMs
+        ? Math.min(now + 3600 * 1000, Number(member.membershipExpiresAtMs))
+        : now + 3600 * 1000;
+      const hubCred = mintSignalRHubToken({
+        connectionString,
+        hub: f.hubName,
+        userId: member.peerId,
+        expiresAtMs: tokenExpMs,
+        role: member.trustTier,
+      });
+      const serverNonce = issueRefreshNonceForPeer(store, {
+        deviceId: cleanDevice,
+        githubUserId: numUserId,
+        flockUuid: f.flockUuid,
+      });
+      member.lastSeenAt = new Date(now).toISOString();
+      mutated = true;
+
+      enrolledFlocks.push({
+        flockId: f.flockId,
+        flockUuid: f.flockUuid,
+        hubName: f.hubName,
+        flockType: f.flockType,
+        ownerGitHubUser: f.ownerGitHubUser,
+        ownerGitHubUserId: f.ownerGitHubUserId,
+        trustTier: member.trustTier,
+        allowedScopes: f.allowedScopes,
+        targetMachineId: f.targetMachineId || null,
+        rosterEpoch: f.rosterEpoch,
+        membershipExpiresAt: member.membershipExpiresAt || null,
+        membershipExpiresAtMs: member.membershipExpiresAtMs || null,
+        hubToken: hubCred?.hubToken || null,
+        endpoint: hubCred?.endpoint || null,
+        tokenExpiresAt: hubCred?.expiresAt || null,
+        serverNonce,
+        members: Object.values(f.members),
+      });
+    }
+
+    if (mutated) {
+      saveV3FlockStore(store, storePath);
+    }
+
+    return {
+      ok: true,
+      v: 3,
+      peerId,
+      githubUser: cleanUser,
+      githubUserId: numUserId,
+      deviceId: cleanDevice,
+      machineId: cleanMachine || null,
+      enrolledFlocks,
+      revokedFlockIds,
+      expiredFlockIds,
+    };
+  });
+}
+
 export async function listV3UserFlocks(
   { githubUser, githubUserId = null, deviceId = null },
   { storePath = V3_FLOCKS_PATH } = {}
 ) {
   const cleanUser = String(githubUser || "").trim().toLowerCase();
+  const numUserId = githubUserId && Number.isSafeInteger(Number(githubUserId)) && Number(githubUserId) > 0
+    ? Number(githubUserId)
+    : null;
   const cleanDevice = deviceId ? String(deviceId).trim().toLowerCase() : null;
   const store = loadV3FlockStore(storePath);
   const now = Date.now();
@@ -1634,6 +1849,7 @@ export async function listV3UserFlocks(
       hubName: f.hubName,
       flockType: f.flockType,
       ownerGitHubUser: f.ownerGitHubUser,
+      ownerGitHubUserId: f.ownerGitHubUserId || null,
       allowedScopes: f.allowedScopes,
       targetMachineId: f.targetMachineId || null,
       rosterEpoch: f.rosterEpoch,
@@ -1641,6 +1857,8 @@ export async function listV3UserFlocks(
       members: activeMembers.map((m) => ({
         peerId: m.peerId,
         githubUser: m.githubUser,
+        githubUserId: m.githubUserId || null,
+        deviceId: m.deviceId || null,
         machineId: m.machineId,
         scope: m.scope,
         trustTier: m.trustTier,
@@ -1649,15 +1867,26 @@ export async function listV3UserFlocks(
         joinedAt: m.joinedAt || null,
         lastSeenAt: m.lastSeenAt || null,
         membershipExpiresAt: m.membershipExpiresAt || null,
+        membershipExpiresAtMs: m.membershipExpiresAtMs || null,
       })),
     };
-    if (isOwner) {
+    if (
+      isOwner ||
+      f.ownerGitHubUser === cleanUser ||
+      (numUserId && f.ownerGitHubUserId && Number(f.ownerGitHubUserId) === numUserId)
+    ) {
       ownedFlocks.push({
         ...summary,
         removedMachines: Object.values(f.removedMachines || {}),
       });
     }
     if (
+      !isPrincipalRevokedInFlock(f, {
+        githubUser: cleanUser,
+        githubUserId: numUserId,
+        peerId: numUserId && cleanDevice ? `${numUserId}:${cleanDevice}` : null,
+        deviceId: cleanDevice,
+      }) &&
       activeMembers.some(
         (m) =>
           (m.githubUser === cleanUser ||
@@ -1673,6 +1902,9 @@ export async function listV3UserFlocks(
     ok: true,
     fetchedAt: new Date(now).toISOString(),
     githubUser: cleanUser,
+    githubUserId: numUserId,
+    deviceId: cleanDevice,
+    peerId: numUserId && cleanDevice ? `${numUserId}:${cleanDevice}` : null,
     ownedFlocks,
     joinedFlocks,
   };
@@ -1786,7 +2018,8 @@ export function createBootstrapServer({
     const privilegedVerification = await verifyGitHubRepoAccess(githubToken, apiGet);
     const isEnrollment = subPath === "/enroll" && req.method === "POST";
     const isMyFlocks = subPath === "/my-flocks" && req.method === "GET";
-    const verification = !privilegedVerification.ok && (isEnrollment || isMyFlocks)
+    const isFlocksSync = subPath === "/flocks/sync" && req.method === "POST";
+    const verification = !privilegedVerification.ok && (isEnrollment || isMyFlocks || isFlocksSync)
       ? verifiedGitHubIdentity(await apiGet("/user", githubToken))
       : privilegedVerification;
     if (!verification.ok) {
@@ -1838,6 +2071,32 @@ export function createBootstrapServer({
         return;
       }
 
+      if (isFlocksSync) {
+        if (bodyData.sandboxPrincipalOverride && !privilegedVerification.ok) {
+          sendJson(res, 403, { ok: false, error: "Membership sync cannot override the authenticated GitHub identity" });
+          return;
+        }
+        const effectiveUser =
+          isPreview && bodyData.sandboxPrincipalOverride?.githubUser
+            ? String(bodyData.sandboxPrincipalOverride.githubUser).toLowerCase()
+            : callerGitHubUser;
+        const effectiveUserId =
+          isPreview && bodyData.sandboxPrincipalOverride?.githubUserId
+            ? Number(bodyData.sandboxPrincipalOverride.githubUserId)
+            : callerGitHubUserId;
+        const out = await syncV3DeviceMemberships(
+          {
+            ...bodyData,
+            githubUser: effectiveUser,
+            githubUserId: effectiveUserId,
+            requireSignature: !privilegedVerification.ok,
+          },
+          { storePath }
+        );
+        sendJson(res, 200, out);
+        return;
+      }
+
       if (isMyFlocks) {
         const requestedUser = (url.searchParams.get("githubUser") || callerGitHubUser).trim().toLowerCase();
         if (!privilegedVerification.ok && requestedUser !== callerGitHubUser) {
@@ -1847,7 +2106,7 @@ export function createBootstrapServer({
         const out = await listV3UserFlocks(
           {
             githubUser: requestedUser,
-            githubUserId: callerGitHubUserId,
+            githubUserId: requestedUser === callerGitHubUser ? callerGitHubUserId : null,
             deviceId: url.searchParams.get("deviceId") || null,
           },
           { storePath }

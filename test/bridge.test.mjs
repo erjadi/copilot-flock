@@ -71,6 +71,11 @@ import {
   createSignedRosterSnapshot,
   createSignedRosterDelta,
   computeRosterHash,
+  applyV3EnrollmentResult,
+  reconcileAuthoritativeFlockMemberships,
+  syncFlockMemberships,
+  signV3MembershipSyncRequest,
+  hasVerifiedOwnerAuthority,
 } from "../bridge.mjs";
 import {
   verifyGitHubRepoAccess,
@@ -84,6 +89,7 @@ import {
   createV3FlockInvite,
   kickV3FlockMember,
   listV3UserFlocks,
+  syncV3DeviceMemberships,
 } from "../bootstrap-server.mjs";
 import {
   AzureTransport,
@@ -2528,4 +2534,77 @@ test(
   await assert.rejects(executeMcpTool(cfg, "send_remote_session_message", { to_machine: "MISSING", to_session: "s1", message: "hi" }, opts), /No active, non-expired authorized broker-free route/);
   now += 660000;
   await assert.rejects(executeMcpTool(cfg, "send_remote_session_message", { to_machine: "PEER-B", to_session: "s1", message: "hi" }, opts), /expired/);
+});
+
+test("bridge entrypoint reconciles authenticated owner/collaborator/guest roles, enforces epoch monotonicity, and preserves sharing settings", async () => {
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-reconcile-roles-"));
+  const brokerStorePath = path.join(tempRoot, "v3-flocks.json");
+  const localFlocksPath = path.join(tempRoot, "flocks.json");
+  const testConnStr = "Endpoint=https://unit-test.service.signalr.net;AccessKey=dGVzdGtleQ==;Version=1.0;";
+  const ownerKeys = crypto.generateKeyPairSync("ed25519", {
+    publicKeyEncoding: { type: "spki", format: "pem" },
+    privateKeyEncoding: { type: "pkcs8", format: "pem" },
+  });
+  try {
+    const ownerCfg = { githubUser: "erjadi", machineId: "MAIN-PC", scope: "personal" };
+    const enrolled = await enrollV3Device(
+      {
+        githubUser: "erjadi",
+        githubUserId: 1001,
+        deviceId: "fp-bridge-owner",
+        machineId: "MAIN-PC",
+        scope: "personal",
+        publicKey: ownerKeys.publicKey,
+        keyFingerprint: "fp-bridge-owner",
+      },
+      { storePath: brokerStorePath, connectionString: testConnStr }
+    );
+    applyV3EnrollmentResult(ownerCfg, enrolled, localFlocksPath);
+    shareThreadWithFlock(
+      ownerCfg,
+      {
+        flockId: "erjadi/personal",
+        sessionId: "bridge-shared-1",
+        title: "Shared session",
+        summarySnapshot: "Clean bridge snapshot",
+      },
+      localFlocksPath
+    );
+
+    const disk = JSON.parse(fs.readFileSync(localFlocksPath, "utf8"));
+    disk.flocks["erjadi/personal"].trustTier = "collaborator";
+    disk.flocks["erjadi/personal"].rosterEpoch = 9;
+    disk.flocks["erjadi/personal"].sessionVisibility = "explicit_opt_in_only";
+    disk.flocks["erjadi/personal"].shareSpecs = "summary";
+    fs.writeFileSync(localFlocksPath, JSON.stringify(disk, null, 2), "utf8");
+
+    const brokerDisk = JSON.parse(fs.readFileSync(brokerStorePath, "utf8"));
+    brokerDisk.flocks["erjadi/personal"].rosterEpoch = 12;
+    fs.writeFileSync(brokerStorePath, JSON.stringify(brokerDisk, null, 2), "utf8");
+
+    const synced = await syncV3DeviceMemberships(
+      {
+        githubUser: "erjadi",
+        githubUserId: 1001,
+        deviceId: "fp-bridge-owner",
+        machineId: "MAIN-PC",
+      },
+      { storePath: brokerStorePath, connectionString: testConnStr }
+    );
+    const rec = reconcileAuthoritativeFlockMemberships(ownerCfg, synced, localFlocksPath);
+    assert.ok(rec.healedFlockIds.includes("erjadi/personal"));
+
+    const healed = JSON.parse(fs.readFileSync(localFlocksPath, "utf8")).flocks["erjadi/personal"];
+    assert.equal(healed.trustTier, "owner");
+    assert.equal(healed.rosterEpoch, 12);
+    assert.equal(healed.sessionVisibility, "all");
+    assert.equal(healed.shareSpecs, "full");
+    assert.deepEqual(healed.sharedSessionIds, ["bridge-shared-1"]);
+    assert.equal(
+      healed.sharedSnapshots["bridge-shared-1"].summarySnapshot,
+      "Clean bridge snapshot"
+    );
+  } finally {
+    fs.rmSync(tempRoot, { recursive: true, force: true });
+  }
 });

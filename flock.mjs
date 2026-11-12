@@ -19,6 +19,7 @@ import crypto from "node:crypto";
 import { spawn, execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { uninstallFlock, lifecyclePaths, recordInstalledArtifact, pinDaemonIdentity, atomicJson, assertNoLinks, stopPinnedDaemon, inspectProcess } from "./flock-lifecycle.mjs";
+import { isSyntheticBuiltInFlock, hasVerifiedOwnerAuthority, verifyAuthoritativeFlockRecord } from "./flock-membership.mjs";
 import { BrokerFreeRuntime } from "./flock-broker-free.mjs";
 import { authorizeAction, ownerFingerprint } from "./flock-protocol.mjs";
 import {
@@ -1328,74 +1329,373 @@ export function loadLocalFlocksConfig(cfg = null, customPath = getFlocksConfigPa
   };
 }
 
-export function saveLocalFlocksConfig(flocksConfig, customPath = getFlocksConfigPath()) {
-  writeConfigFileSecure(flocksConfig, customPath);
+export { hasVerifiedOwnerAuthority };
+
+export function atomicWriteFlocksConfig(customPath, flocksConfig, expectedRaw = undefined) {
+  const targetPath = path.resolve(customPath);
+  fs.mkdirSync(path.dirname(targetPath), { recursive: true });
+  try {
+    if (fs.lstatSync(targetPath).isSymbolicLink()) {
+      throw new Error(`Refusing to write flocks config through symlink: ${targetPath}`);
+    }
+  } catch (err) {
+    if (err.code !== "ENOENT") throw err;
+  }
+
+  const before = fs.existsSync(targetPath) ? fs.readFileSync(targetPath) : null;
+  if (
+    expectedRaw !== undefined &&
+    (expectedRaw === null ? before !== null : !before?.equals(expectedRaw))
+  ) {
+    const err = new Error(`Concurrent flocks config change: ${targetPath}`);
+    err.code = "CONCURRENT_FLOCK_CONFIG_CHANGE";
+    throw err;
+  }
+
+  const tmpPath = `${targetPath}.${process.pid}.${crypto.randomUUID()}.tmp`;
+  try {
+    const serialized = JSON.stringify(flocksConfig, null, 2);
+    const fd = fs.openSync(tmpPath, "wx", 0o600);
+    try {
+      fs.writeFileSync(fd, serialized, "utf8");
+      fs.fsyncSync(fd);
+    } finally {
+      fs.closeSync(fd);
+    }
+    JSON.parse(fs.readFileSync(tmpPath, "utf8"));
+
+    for (let attempt = 0; ; attempt++) {
+      try {
+        if (fs.lstatSync(targetPath).isSymbolicLink()) {
+          throw new Error(`Refusing to write flocks config through symlink: ${targetPath}`);
+        }
+      } catch (err) {
+        if (err.code !== "ENOENT") throw err;
+      }
+      const current = fs.existsSync(targetPath) ? fs.readFileSync(targetPath) : null;
+      if (before === null ? current !== null : !current?.equals(before)) {
+        const err = new Error(`Concurrent flocks config change: ${targetPath}`);
+        err.code = "CONCURRENT_FLOCK_CONFIG_CHANGE";
+        throw err;
+      }
+      try {
+        fs.renameSync(tmpPath, targetPath);
+        break;
+      } catch (err) {
+        if (!["EPERM", "EACCES", "EBUSY"].includes(err.code) || attempt >= 8) {
+          throw err;
+        }
+        Atomics.wait(
+          new Int32Array(new SharedArrayBuffer(4)),
+          0,
+          0,
+          Math.min(10 * 2 ** attempt, 200)
+        );
+      }
+    }
+    try {
+      fs.chmodSync(targetPath, 0o600);
+    } catch {}
+  } finally {
+    try {
+      if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath);
+    } catch {}
+  }
   return flocksConfig;
 }
 
-export function applyV3EnrollmentResult(cfg, result, customPath = getFlocksConfigPath()) {
-  const principal = normalizeGitHubUser(result?.githubUser)?.toLowerCase();
-  const principalId = Number(result?.githubUserId);
-  if (!result?.ok || !principal || !Number.isSafeInteger(principalId) || principalId <= 0 ||
-      !Array.isArray(result.enrolledFlocks) || result.enrolledFlocks.length === 0) {
-    throw new Error("Enrollment response is missing its authenticated GitHub principal or flock records");
+export function saveLocalFlocksConfig(flocksConfig, customPath = getFlocksConfigPath()) {
+  return atomicWriteFlocksConfig(customPath, flocksConfig);
+}
+
+export function reconcileAuthoritativeFlockMemberships(
+  cfg,
+  authResult,
+  customPath = getFlocksConfigPath(),
+  { requireMemberProof = true, now = Date.now(), onBeforeCommit = null } = {}
+) {
+  const principal = normalizeGitHubUser(authResult?.githubUser)?.toLowerCase();
+  const principalId = Number(authResult?.githubUserId);
+  const deviceId = String(authResult?.deviceId || "").trim().toLowerCase();
+  const expectedPeerId = `${principalId}:${deviceId}`;
+  const peerId =
+    authResult?.peerId !== undefined && authResult?.peerId !== null
+      ? String(authResult.peerId).trim()
+      : expectedPeerId;
+  const incomingList = Array.isArray(authResult?.enrolledFlocks)
+    ? authResult.enrolledFlocks
+    : Array.isArray(authResult?.flocks)
+      ? authResult.flocks
+      : null;
+  const revokedFlockIds = Array.isArray(authResult?.revokedFlockIds)
+    ? authResult.revokedFlockIds
+    : [];
+  const expiredFlockIds = Array.isArray(authResult?.expiredFlockIds)
+    ? authResult.expiredFlockIds
+    : [];
+
+  if (
+    !authResult?.ok ||
+    !principal ||
+    !Number.isSafeInteger(principalId) ||
+    principalId <= 0 ||
+    !incomingList ||
+    (incomingList.length === 0 && revokedFlockIds.length === 0 && expiredFlockIds.length === 0)
+  ) {
+    const err = new Error(
+      "Enrollment response is missing its authenticated GitHub principal or flock records"
+    );
+    err.code = "UNAUTHENTICATED_AUTHORITY";
+    throw err;
   }
-  const records = result.enrolledFlocks.map((flock) => {
-    const address = parseFlockAddress(flock.flockId);
-    if (address.machineId) throw new Error("Enrollment response must identify a flock, not a machine");
-    const ownerMember = flock.members?.find((member) =>
-      member.peerId === result.peerId &&
-      Number(member.githubUserId) === principalId &&
-      normalizeGitHubUser(member.githubUser)?.toLowerCase() === principal &&
-      member.deviceId === result.deviceId &&
-      member.trustTier === "owner");
-    const isOwner = flock.trustTier === "owner" &&
-      address.owner === principal &&
-      normalizeGitHubUser(flock.ownerGitHubUser)?.toLowerCase() === principal &&
-      (!flock.ownerGitHubUserId || Number(flock.ownerGitHubUserId) === principalId) &&
-      !flock.targetMachineId &&
-      ((address.isOwnerRoot && flock.flockType === "owner_root") ||
-       (!address.isOwnerRoot && address.isBuiltInScope && flock.flockType === "owner_scope")) &&
-      Boolean(ownerMember);
-    if (!isOwner && flock.trustTier !== "collaborator" && flock.trustTier !== "guest") {
-      throw new Error(`Enrollment response has unverified owner authority for "${address.flockId}"`);
+
+  const auth = { githubUser: principal, githubUserId: principalId, peerId, deviceId, now };
+  for (const rawFlock of incomingList) {
+    if (rawFlock?.trustTier === "owner") {
+      verifyAuthoritativeFlockRecord(rawFlock, auth, { requireMemberProof });
     }
+  }
+  const records = incomingList.map((rawFlock) => {
+    const { flock, isOwner } = verifyAuthoritativeFlockRecord(rawFlock, auth, {
+      requireMemberProof,
+    });
     return {
-      flock: { ...flock, flockId: address.flockId },
+      flock,
+      isOwner,
       rank: isOwner ? 0 : flock.trustTier === "guest" ? 1 : 2,
-      serialized: JSON.stringify(flock),
+      serialized: JSON.stringify(rawFlock),
     };
   });
-  // Select only fresh broker records, never cached owner privileges or invite labels.
-  records.sort((a, b) => a.rank - b.rank ||
-    (Number(b.flock.rosterEpoch) || 0) - (Number(a.flock.rosterEpoch) || 0) ||
-    (a.serialized < b.serialized ? -1 : a.serialized > b.serialized ? 1 : 0));
+
+  // Select only fresh verified broker records, never cached unverified privileges or invite labels.
+  records.sort(
+    (a, b) =>
+      (a.isOwner === b.isOwner ? 0 : a.isOwner ? -1 : 1) ||
+      (Number(b.flock.rosterEpoch) || 0) - (Number(a.flock.rosterEpoch) || 0) ||
+      a.rank - b.rank ||
+      (a.serialized < b.serialized ? -1 : a.serialized > b.serialized ? 1 : 0)
+  );
   const selected = new Map();
   for (const { flock } of records) {
     const previous = selected.get(flock.flockId);
     if (!previous) {
       selected.set(flock.flockId, { ...flock });
     } else if (previous.trustTier !== "owner") {
-      const expirations = [previous.membershipExpiresAtMs, flock.membershipExpiresAtMs]
-        .filter((expiry) => expiry != null);
-      previous.membershipExpiresAtMs = expirations.length ? Math.min(...expirations) : null;
-      previous.membershipExpiresAt = previous.membershipExpiresAtMs
-        ? new Date(previous.membershipExpiresAtMs).toISOString() : null;
+      const prevEpochInBatch = Number(previous.rosterEpoch) || 0;
+      const curEpochInBatch = Number(flock.rosterEpoch) || 0;
+      if (curEpochInBatch === prevEpochInBatch) {
+        const expirations = [previous.membershipExpiresAtMs, flock.membershipExpiresAtMs].filter(
+          (expiry) => expiry != null
+        );
+        previous.membershipExpiresAtMs = expirations.length ? Math.min(...expirations) : null;
+        previous.membershipExpiresAt = previous.membershipExpiresAtMs
+          ? new Date(previous.membershipExpiresAtMs).toISOString()
+          : null;
+      }
     }
   }
-  const localFlocks = loadLocalFlocksConfig({ ...cfg, githubUser: principal, scope: result.scope }, customPath);
-  for (const flock of selected.values()) {
-    const previous = localFlocks.flocks[flock.flockId];
-    localFlocks.flocks[flock.flockId] = {
-      ...flock,
-      sharedSessionIds: previous?.sharedSessionIds || [],
-      sharedSnapshots: previous?.sharedSnapshots || {},
-      sessionVisibility: flock.trustTier === "owner" ? "all" : "explicit_opt_in_only",
-      shareSpecs: flock.trustTier === "owner" ? "full" : "summary",
-    };
+
+  for (let casAttempt = 0; casAttempt < 5; casAttempt++) {
+    const rawBefore = fs.existsSync(customPath) ? fs.readFileSync(customPath) : null;
+    let diskParsed = { flocks: {}, threadBindings: {} };
+    if (rawBefore !== null) {
+      let parsed;
+      try {
+        parsed = JSON.parse(rawBefore.toString("utf8"));
+      } catch (parseErr) {
+        const err = new Error(
+          `Cannot reconcile corrupt flocks config at ${customPath}: ${parseErr.message}`
+        );
+        err.code = "CORRUPT_FLOCK_CONFIG";
+        throw err;
+      }
+      if (
+        !parsed ||
+        typeof parsed !== "object" ||
+        (parsed.flocks !== undefined &&
+          (!parsed.flocks || typeof parsed.flocks !== "object" || Array.isArray(parsed.flocks)))
+      ) {
+        const err = new Error(`Invalid flocks config structure at ${customPath}`);
+        err.code = "CORRUPT_FLOCK_CONFIG";
+        throw err;
+      }
+      diskParsed = parsed;
+    }
+
+    const localFlocks = loadLocalFlocksConfig(
+      { ...cfg, githubUser: principal, scope: authResult.scope ?? cfg?.scope },
+      customPath
+    );
+    const persistedFlocks = diskParsed.flocks || {};
+
+    const enrolledOut = [];
+    const healedFlockIds = [];
+    const preservedOwnerFlockIds = [];
+    const quarantinedFlockIds = [];
+
+    for (const flock of selected.values()) {
+      const persistedPrevious = persistedFlocks[flock.flockId];
+      const hasRealPersisted = Boolean(
+        persistedPrevious && !isSyntheticBuiltInFlock(persistedPrevious)
+      );
+      const prevEpoch = hasRealPersisted ? Number(persistedPrevious.rosterEpoch) || 0 : 0;
+      const incomingEpoch = Number(flock.rosterEpoch) || 1;
+      const previousHasVerifiedOwner =
+        hasRealPersisted && hasVerifiedOwnerAuthority(persistedPrevious, auth);
+
+      const existingSource = persistedPrevious || localFlocks.flocks[flock.flockId];
+      const preservedSharedIds = Array.isArray(existingSource?.sharedSessionIds)
+        ? [...existingSource.sharedSessionIds]
+        : [];
+      const preservedSnapshots =
+        existingSource?.sharedSnapshots &&
+        typeof existingSource.sharedSnapshots === "object" &&
+        !Array.isArray(existingSource.sharedSnapshots)
+          ? structuredClone(existingSource.sharedSnapshots)
+          : {};
+
+      if (hasRealPersisted && incomingEpoch < prevEpoch) {
+        const err = new Error(
+          `Stale authoritative rosterEpoch ${incomingEpoch} < persisted ${prevEpoch} for "${flock.flockId}"`
+        );
+        err.code = "STALE_ROSTER_EPOCH";
+        throw err;
+      }
+
+      if (previousHasVerifiedOwner && flock.trustTier !== "owner") {
+        const preserved = {
+          ...structuredClone(persistedPrevious),
+          sharedSessionIds: preservedSharedIds,
+          sharedSnapshots: preservedSnapshots,
+          sessionVisibility: persistedPrevious.sessionVisibility || "all",
+          shareSpecs: persistedPrevious.shareSpecs || "full",
+        };
+        localFlocks.flocks[flock.flockId] = preserved;
+        enrolledOut.push(preserved);
+        preservedOwnerFlockIds.push(flock.flockId);
+        continue;
+      }
+
+      const wasDowngradedOrStale =
+        hasRealPersisted &&
+        (persistedPrevious.trustTier !== flock.trustTier ||
+          incomingEpoch > prevEpoch ||
+          Boolean(persistedPrevious.revoked));
+
+      const nextEntry = {
+        ...flock,
+        sharedSessionIds: preservedSharedIds,
+        sharedSnapshots: preservedSnapshots,
+        sessionVisibility:
+          flock.trustTier === "owner"
+            ? previousHasVerifiedOwner && persistedPrevious.sessionVisibility
+              ? persistedPrevious.sessionVisibility
+              : "all"
+            : "explicit_opt_in_only",
+        shareSpecs:
+          flock.trustTier === "owner"
+            ? previousHasVerifiedOwner && persistedPrevious.shareSpecs
+              ? persistedPrevious.shareSpecs
+              : "full"
+            : "summary",
+      };
+      if (flock.trustTier === "owner") {
+        nextEntry.membershipExpiresAt = null;
+        nextEntry.membershipExpiresAtMs = null;
+      } else if (
+        flock.membershipExpiresAtMs !== undefined ||
+        flock.membershipExpiresAt !== undefined
+      ) {
+        const expMs =
+          flock.membershipExpiresAtMs != null
+            ? Number(flock.membershipExpiresAtMs)
+            : flock.membershipExpiresAt != null
+              ? Date.parse(String(flock.membershipExpiresAt))
+              : null;
+        nextEntry.membershipExpiresAtMs = expMs;
+        nextEntry.membershipExpiresAt = expMs != null ? new Date(expMs).toISOString() : null;
+      }
+
+      localFlocks.flocks[flock.flockId] = nextEntry;
+      enrolledOut.push(nextEntry);
+      if (wasDowngradedOrStale) {
+        healedFlockIds.push(flock.flockId);
+      }
+    }
+
+    for (const [revokedList, flagName] of [
+      [revokedFlockIds, "revoked"],
+      [expiredFlockIds, "expired"],
+    ]) {
+      for (const rawId of revokedList) {
+        let normId;
+        try {
+          normId = parseFlockAddress(rawId).flockId;
+        } catch {
+          continue;
+        }
+        const existing = persistedFlocks[normId];
+        if (!existing || isSyntheticBuiltInFlock(existing) || hasVerifiedOwnerAuthority(existing, auth)) {
+          continue;
+        }
+        const nextQuarantined = {
+          ...structuredClone(existing),
+          sharedSessionIds: Array.isArray(existing.sharedSessionIds)
+            ? [...existing.sharedSessionIds]
+            : [],
+          sharedSnapshots:
+            existing.sharedSnapshots &&
+            typeof existing.sharedSnapshots === "object" &&
+            !Array.isArray(existing.sharedSnapshots)
+              ? structuredClone(existing.sharedSnapshots)
+              : {},
+          sessionVisibility: "explicit_opt_in_only",
+          shareSpecs: "summary",
+          revoked: flagName === "revoked" ? true : Boolean(existing.revoked),
+          membershipExpiresAtMs:
+            flagName === "expired"
+              ? Math.min(Number(existing.membershipExpiresAtMs) || now - 1, now - 1)
+              : (existing.membershipExpiresAtMs ?? null),
+        };
+        delete nextQuarantined.hubToken;
+        delete nextQuarantined.tokenExpiresAt;
+        delete nextQuarantined.serverNonce;
+        localFlocks.flocks[normId] = nextQuarantined;
+        quarantinedFlockIds.push(normId);
+      }
+    }
+
+    if (typeof onBeforeCommit === "function") {
+      onBeforeCommit(casAttempt);
+    }
+
+    try {
+      atomicWriteFlocksConfig(customPath, localFlocks, rawBefore);
+      return {
+        ...authResult,
+        enrolledFlocks: enrolledOut,
+        reconciledFlockIds: enrolledOut.map((f) => f.flockId),
+        healedFlockIds,
+        preservedOwnerFlockIds,
+        quarantinedFlockIds,
+      };
+    } catch (writeErr) {
+      if (writeErr?.code === "CONCURRENT_FLOCK_CONFIG_CHANGE" && casAttempt < 4) {
+        continue;
+      }
+      throw writeErr;
+    }
   }
-  saveLocalFlocksConfig(localFlocks, customPath);
-  const enrolledWithMembers = [...selected.values()].filter(
+  const err = new Error(`Failed to atomically commit reconciled flocks config at ${customPath}`);
+  err.code = "CONCURRENT_FLOCK_CONFIG_CHANGE";
+  throw err;
+}
+
+export function applyV3EnrollmentResult(cfg, result, customPath = getFlocksConfigPath()) {
+  const reconciled = reconcileAuthoritativeFlockMemberships(cfg, result, customPath, {
+    requireMemberProof: false,
+  });
+  const enrolledWithMembers = (reconciled.enrolledFlocks || []).filter(
     (flock) => Array.isArray(flock.members) && flock.members.length > 0
   );
   if (enrolledWithMembers.length > 0) {
@@ -1403,7 +1703,61 @@ export function applyV3EnrollmentResult(cfg, result, customPath = getFlocksConfi
       openFlockMembershipRegistry(customPath).reconcileV3Broker({ enrolledFlocks: enrolledWithMembers });
     } catch {}
   }
-  return { ...result, enrolledFlocks: [...selected.values()] };
+  return { ...result, enrolledFlocks: reconciled.enrolledFlocks };
+}
+
+export function signV3MembershipSyncRequest(
+  { deviceId, machineId = "" } = {},
+  identity = ensureMachineIdentityKeypair(),
+  now = Date.now()
+) {
+  const cleanDevice = String(deviceId || identity?.fingerprint || "").trim().toLowerCase();
+  const cleanMachine = String(machineId || "").trim();
+  const timestamp = new Date(now).toISOString();
+  const canonical = `sync|v3|${cleanDevice}|${cleanMachine}|${timestamp}`;
+  return {
+    deviceId: cleanDevice,
+    machineId: cleanMachine,
+    timestamp,
+    signature: crypto
+      .sign(null, Buffer.from(canonical, "utf8"), identity.privateKey)
+      .toString("base64"),
+  };
+}
+
+export async function syncFlockMemberships(
+  cfg,
+  {
+    customPath = getFlocksConfigPath(),
+    callEndpoint = callBootstrapV3Endpoint,
+    identityKeypair = null,
+    sandbox = isSandboxV3Mode(),
+    now = Date.now(),
+  } = {}
+) {
+  if (cfg?.protocol === "broker-free-v34") {
+    throw new Error(
+      "Broker-free installations use owner-signed MemberCert renewal, not broker membership sync"
+    );
+  }
+  const idKey = identityKeypair || ensureMachineIdentityKeypair();
+  const signedBody = signV3MembershipSyncRequest(
+    { deviceId: idKey.fingerprint, machineId: cfg?.machineId || os.hostname() },
+    idKey,
+    now
+  );
+  const res = await callEndpoint(cfg, "/flocks/sync", {
+    method: "POST",
+    sandbox,
+    body: signedBody,
+  });
+  if (!res?.ok) {
+    throw new Error(res?.error || "Failed to sync authoritative flock memberships from broker");
+  }
+  return reconcileAuthoritativeFlockMemberships(cfg, res, customPath, {
+    requireMemberProof: true,
+    now,
+  });
 }
 
 export function shareThreadWithFlock(
@@ -1924,6 +2278,15 @@ export function enforceFlockPolicyAndWalls(
 ) {
   if (!flockPolicy) return;
   const now = Date.now();
+
+  if (flockPolicy.revoked === true) {
+    const err = new Error(
+      `Membership in flock "${flockPolicy.flockId}" has been revoked`
+    );
+    err.code = "MEMBERSHIP_REVOKED";
+    err.statusCode = 403;
+    throw err;
+  }
 
   // Wall 1: Time-Bound Expiry Check (Fail Closed Locally)
   if (
@@ -8158,6 +8521,11 @@ const MCP_TOOLS = [
           description:
             "Optionally probe live SignalR presence alongside authenticated roster lookup (default: false).",
         },
+        reconcile: {
+          type: "boolean",
+          description:
+            "When true, perform an explicit authenticated membership sync against the broker to heal stale or downgraded local flock roles/epochs while preserving sharedSessionIds and sharedSnapshots.",
+        },
       },
     },
   },
@@ -8185,6 +8553,15 @@ const MCP_TOOLS = [
           description: "In broker-free v3.4 mode, fetch the latest owner-signed roster snapshot from the designated owner before reading (default: false; never pings other peers).",
         },
       },
+    },
+  },
+  {
+    name: "sync_flock_memberships",
+    description:
+      "Explicitly reconcile local flocks.json from verified newer authoritative broker memberships (rosterEpoch) without losing sharedSessionIds or sharedSnapshots.",
+    inputSchema: {
+      type: "object",
+      properties: {},
     },
   },
   {
@@ -9321,7 +9698,15 @@ export async function executeMcpTool(cfg, name, args = {}, options = {}) {
     });
   }
 
+  if (name === "sync_flock_memberships") {
+    return await syncFlockMemberships(cfg);
+  }
+
   if (name === "list_flocks") {
+    let reconciliation = null;
+    if (args.reconcile === true) {
+      reconciliation = await syncFlockMemberships(cfg);
+    }
     const targetFlock = args.flock || cfg.boundFlockId || null;
     if (targetFlock) {
       parseFlockAddress(targetFlock, cfg.githubUser || "erjadi");
@@ -9389,6 +9774,14 @@ export async function executeMcpTool(cfg, name, args = {}, options = {}) {
         ? {
             onlineMachines: resolved.onlineMachines,
             offlineMembers: resolved.offlineMembers,
+          }
+        : {}),
+      ...(reconciliation
+        ? {
+            reconciledFlockIds: reconciliation.reconciledFlockIds,
+            healedFlockIds: reconciliation.healedFlockIds,
+            preservedOwnerFlockIds: reconciliation.preservedOwnerFlockIds,
+            quarantinedFlockIds: reconciliation.quarantinedFlockIds,
           }
         : {}),
       roster: resolved.roster,
@@ -13980,10 +14373,17 @@ Usage:
     return;
   }
 
+  if (command === "sync-flocks" || command === "reconcile-flocks") {
+    const out = await executeMcpTool(cfg, "sync_flock_memberships", {});
+    console.log(JSON.stringify(out, null, 2));
+    return;
+  }
+
   if (command === "my-flocks" || command === "flocks") {
     const out = await executeMcpTool(cfg, "list_flocks", {
       ...(flags.flock || positional[0] ? { flock: flags.flock || positional[0] } : {}),
       ...(flags["probe-presence"] ? { probe_presence: true } : {}),
+      reconcile: Boolean(flags.reconcile || flags.sync),
     });
     console.log(JSON.stringify(out, null, 2));
     return;

@@ -75,6 +75,10 @@ import {
   computeRosterHash,
   applyV3EnrollmentResult,
   queryFlockMembershipRegistry,
+  reconcileAuthoritativeFlockMemberships,
+  syncFlockMemberships,
+  signV3MembershipSyncRequest,
+  hasVerifiedOwnerAuthority,
 } from "../flock.mjs";
 import {
   verifyGitHubRepoAccess,
@@ -89,6 +93,7 @@ import {
   kickV3FlockMember,
   listV3UserFlocks,
   saveMemberRegistration,
+  syncV3DeviceMemberships,
 } from "../bootstrap-server.mjs";
 import {
   AzureTransport,
@@ -5032,4 +5037,766 @@ test("broker-free MCP unique route inference, ambiguity fail-closed, zero/expire
   );
   assert.equal(publishedMessages.length, publishedBeforeExplicitInvalid, "Explicit invalid/unauthorized flock must send zero messages");
   assert.equal(connectCount, connectsBeforeExplicitInvalid, "Explicit invalid/unauthorized flock must open zero sockets");
+});
+
+test("reconcileAuthoritativeFlockMemberships heals downgraded owner roles, enforces epoch monotonicity across owner/collaborator/guest, preserves sharing atomically, and rejects stale/revoked/forged claims", async () => {
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "flock-reconcile-roles-"));
+  const brokerStorePath = path.join(tempRoot, "v3-flocks.json");
+  const ownerFlocksPath = path.join(tempRoot, "owner-flocks.json");
+  const peerFlocksPath = path.join(tempRoot, "peer-flocks.json");
+  const testConnStr = "Endpoint=https://unit-test.service.signalr.net;AccessKey=dGVzdGtleQ==;Version=1.0;";
+
+  const ownerKeys = crypto.generateKeyPairSync("ed25519", {
+    publicKeyEncoding: { type: "spki", format: "pem" },
+    privateKeyEncoding: { type: "pkcs8", format: "pem" },
+  });
+  const ownerIdentity = {
+    fingerprint: "fp-owner-main",
+    publicKey: ownerKeys.publicKey,
+    privateKey: ownerKeys.privateKey,
+  };
+  const aliceKeys = crypto.generateKeyPairSync("ed25519", {
+    publicKeyEncoding: { type: "spki", format: "pem" },
+    privateKeyEncoding: { type: "pkcs8", format: "pem" },
+  });
+  const aliceIdentity = {
+    fingerprint: "fp-alice-work",
+    publicKey: aliceKeys.publicKey,
+    privateKey: aliceKeys.privateKey,
+  };
+
+  const previousAllowlist = process.env.ALLOWED_GITHUB_USERS;
+  const previousMaintainer = process.env.PLATFORM_MAINTAINER_USER;
+  const fullName = process.env.ALLOWED_GITHUB_REPO || process.env.ALLOWED_REPO || "erjadi/copilot-flock";
+  const principals = {
+    ownerToken: { login: "erjadi", id: 1001 },
+    aliceToken: { login: "alice", id: 2002 },
+  };
+  const server = createBootstrapServer({
+    v3StorePath: brokerStorePath,
+    v3PreviewStorePath: brokerStorePath,
+    apiGet: async (apiPath, token) =>
+      apiPath === "/user"
+        ? { statusCode: principals[token] ? 200 : 401, body: principals[token] || {} }
+        : {
+            statusCode: 200,
+            body: {
+              full_name: fullName,
+              owner: { login: "erjadi" },
+              private: false,
+              permissions: { pull: true, push: token === "ownerToken", admin: token === "ownerToken" },
+            },
+          },
+  });
+
+  try {
+    delete process.env.ALLOWED_GITHUB_USERS;
+    process.env.PLATFORM_MAINTAINER_USER = "erjadi";
+    await new Promise((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(0, "127.0.0.1", resolve);
+    });
+
+    async function brokerHttp(endpoint, token, body = null) {
+      return await new Promise((resolve, reject) => {
+        const payload = body === null ? null : JSON.stringify(body);
+        const req = http.request(
+          {
+            hostname: "127.0.0.1",
+            port: server.address().port,
+            path: endpoint,
+            method: payload === null ? "GET" : "POST",
+            headers: {
+              Authorization: `Bearer ${token}`,
+              ...(payload === null
+                ? {}
+                : {
+                    "Content-Type": "application/json",
+                    "Content-Length": Buffer.byteLength(payload),
+                  }),
+            },
+          },
+          (res) => {
+            let raw = "";
+            res.setEncoding("utf8");
+            res.on("data", (chunk) => {
+              raw += chunk;
+            });
+            res.on("end", () => {
+              try {
+                resolve({ status: res.statusCode, body: JSON.parse(raw) });
+              } catch (err) {
+                reject(err);
+              }
+            });
+          }
+        );
+        req.on("error", reject);
+        req.end(payload);
+      });
+    }
+
+    const ownerCfg = { githubUser: "erjadi", machineId: "MAIN-WORKSTATION", scope: "personal" };
+
+    // 1. Initial owner enrollment on broker + client; share two threads on `erjadi/personal`
+    const initialOwnerEnroll = await enrollV3Device(
+      {
+        githubUser: "erjadi",
+        githubUserId: 1001,
+        deviceId: ownerIdentity.fingerprint,
+        machineId: "MAIN-WORKSTATION",
+        scope: "personal",
+        publicKey: ownerIdentity.publicKey,
+        keyFingerprint: ownerIdentity.fingerprint,
+      },
+      { storePath: brokerStorePath, connectionString: testConnStr }
+    );
+    applyV3EnrollmentResult(ownerCfg, initialOwnerEnroll, ownerFlocksPath);
+
+    shareThreadWithFlock(
+      ownerCfg,
+      {
+        flockId: "erjadi/personal",
+        sessionId: "sess-keep-1",
+        title: "Architecture review",
+        summarySnapshot: "Approved snapshot 1",
+      },
+      ownerFlocksPath
+    );
+    shareThreadWithFlock(
+      ownerCfg,
+      {
+        flockId: "erjadi/personal",
+        sessionId: "sess-keep-2",
+        title: "GPU render pipeline",
+        summarySnapshot: "Approved snapshot 2",
+      },
+      ownerFlocksPath
+    );
+
+    // Advance broker `erjadi/personal` rosterEpoch to 12 and give local owner custom visibility to verify preservation
+    const brokerStore = JSON.parse(fs.readFileSync(brokerStorePath, "utf8"));
+    brokerStore.flocks["erjadi/personal"].rosterEpoch = 12;
+    brokerStore.flocks["erjadi/personal"].allowedScopes = ["personal", "work"];
+    fs.writeFileSync(brokerStorePath, JSON.stringify(brokerStore, null, 2), "utf8");
+
+    const syncedAt12 = await syncV3DeviceMemberships(
+      {
+        githubUser: "erjadi",
+        githubUserId: 1001,
+        deviceId: ownerIdentity.fingerprint,
+        machineId: "MAIN-WORKSTATION",
+      },
+      { storePath: brokerStorePath, connectionString: testConnStr }
+    );
+    reconcileAuthoritativeFlockMemberships(ownerCfg, syncedAt12, ownerFlocksPath);
+
+    // Customize owner visibility setting on verified owner record to confirm lower-role invites never overwrite it
+    const ownerStoredAt12 = JSON.parse(fs.readFileSync(ownerFlocksPath, "utf8"));
+    ownerStoredAt12.flocks["erjadi/personal"].sessionVisibility = "all_owner_threads";
+    ownerStoredAt12.threadBindings = { "bound-sess-1": "erjadi/studio-team" };
+    fs.writeFileSync(ownerFlocksPath, JSON.stringify(ownerStoredAt12, null, 2), "utf8");
+    assert.equal(
+      hasVerifiedOwnerAuthority(ownerStoredAt12.flocks["erjadi/personal"], {
+        githubUser: "erjadi",
+        githubUserId: 1001,
+        deviceId: ownerIdentity.fingerprint,
+        peerId: `1001:${ownerIdentity.fingerprint}`,
+      }),
+      true
+    );
+
+    // 2. Prevent lower-role invitation redemption (both broker cross-scope & client response) from downgrading owner
+    const personalCollabInvite = await createV3FlockInvite(
+      {
+        callerGitHubUser: "erjadi",
+        callerGitHubUserId: 1001,
+        targetAddress: "erjadi/personal",
+        invitedUser: "erjadi",
+        invitedGitHubUserId: 1001,
+        allowedScopes: ["personal", "work"],
+        trustTier: "collaborator",
+      },
+      { storePath: brokerStorePath }
+    );
+    const teamInviteForOwner = await createV3FlockInvite(
+      {
+        callerGitHubUser: "erjadi",
+        callerGitHubUserId: 1001,
+        targetAddress: "erjadi/studio-team",
+        invitedUser: "erjadi",
+        invitedGitHubUserId: 1001,
+        allowedScopes: ["personal", "work"],
+        trustTier: "collaborator",
+      },
+      { storePath: brokerStorePath }
+    );
+
+    // Redeeming on a `work`-scoped owner call must NOT downgrade `erjadi/personal` on the broker
+    const crossScopeRedeem = await enrollV3Device(
+      {
+        githubUser: "erjadi",
+        githubUserId: 1001,
+        deviceId: ownerIdentity.fingerprint,
+        machineId: "MAIN-WORKSTATION",
+        scope: "work",
+        publicKey: ownerIdentity.publicKey,
+        keyFingerprint: ownerIdentity.fingerprint,
+        enrollmentJson: {
+          flocks: [
+            ...personalCollabInvite.enrollmentJson.flocks,
+            ...teamInviteForOwner.enrollmentJson.flocks,
+          ],
+        },
+      },
+      { storePath: brokerStorePath, connectionString: testConnStr }
+    );
+    const redeemedPersonal = crossScopeRedeem.enrolledFlocks.find(
+      (f) => f.flockId === "erjadi/personal"
+    );
+    assert.equal(redeemedPersonal.trustTier, "owner");
+    assert.equal(redeemedPersonal.membershipExpiresAtMs, null);
+
+    // Even if a lower-role collaborator/guest invite response arrives at the client for `erjadi/personal`,
+    // verified `owner` membership and its visibility/sharing settings are preserved intact
+    for (const lowerRole of ["collaborator", "guest"]) {
+      const syntheticLowerPersonal = {
+        ...redeemedPersonal,
+        trustTier: lowerRole,
+        rosterEpoch: 12,
+        sessionVisibility: "explicit_opt_in_only",
+        shareSpecs: "summary",
+        membershipExpiresAtMs: lowerRole === "guest" ? Date.now() + 60000 : null,
+        serverNonce: `lower-${lowerRole}-nonce`,
+        hubToken: `lower-${lowerRole}-token`,
+        members: redeemedPersonal.members.map((m) => ({
+          ...m,
+          trustTier: lowerRole,
+          membershipExpiresAtMs: lowerRole === "guest" ? Date.now() + 60000 : null,
+        })),
+      };
+      const teamRecord = crossScopeRedeem.enrolledFlocks.find(
+        (f) => f.flockId === "erjadi/studio-team"
+      );
+      const appliedLower = applyV3EnrollmentResult(
+        ownerCfg,
+        {
+          ...crossScopeRedeem,
+          enrolledFlocks: [syntheticLowerPersonal, teamRecord],
+        },
+        ownerFlocksPath
+      );
+      const afterLower = JSON.parse(fs.readFileSync(ownerFlocksPath, "utf8"));
+      assert.equal(afterLower.flocks["erjadi/personal"].trustTier, "owner");
+      assert.equal(afterLower.flocks["erjadi/personal"].sessionVisibility, "all_owner_threads");
+      assert.equal(afterLower.flocks["erjadi/personal"].shareSpecs, "full");
+      assert.equal(afterLower.flocks["erjadi/personal"].membershipExpiresAtMs, null);
+      assert.notEqual(afterLower.flocks["erjadi/personal"].hubToken, `lower-${lowerRole}-token`);
+      assert.deepEqual(afterLower.flocks["erjadi/personal"].sharedSessionIds, [
+        "sess-keep-1",
+        "sess-keep-2",
+      ]);
+      assert.equal(
+        afterLower.flocks["erjadi/personal"].sharedSnapshots["sess-keep-1"].summarySnapshot,
+        "Approved snapshot 1"
+      );
+      assert.equal(afterLower.flocks["erjadi/studio-team"].trustTier, "collaborator");
+      assert.equal(
+        appliedLower.enrolledFlocks.find((f) => f.flockId === "erjadi/personal").trustTier,
+        "owner"
+      );
+    }
+
+    // 3. Simulate pre-existing downgraded local `flocks.json` (`erjadi/personal` as `collaborator` at epoch 9
+    // while authoritative broker is `owner` at epoch 12), verify unverified username never elevates,
+    // and heal atomically (including concurrent shareThreadWithFlock CAS retry!)
+    const expectedSnapshots = structuredClone(
+      JSON.parse(fs.readFileSync(ownerFlocksPath, "utf8")).flocks["erjadi/personal"].sharedSnapshots
+    );
+    const downgradedDisk = JSON.parse(fs.readFileSync(ownerFlocksPath, "utf8"));
+    downgradedDisk.flocks["erjadi/personal"] = {
+      ...downgradedDisk.flocks["erjadi/personal"],
+      trustTier: "collaborator",
+      rosterEpoch: 9,
+      sessionVisibility: "explicit_opt_in_only",
+      shareSpecs: "summary",
+      membershipExpiresAtMs: Date.now() + 120000,
+      membershipExpiresAt: new Date(Date.now() + 120000).toISOString(),
+      members: downgradedDisk.flocks["erjadi/personal"].members.map((m) => ({
+        ...m,
+        trustTier: "collaborator",
+      })),
+    };
+    fs.writeFileSync(ownerFlocksPath, JSON.stringify(downgradedDisk, null, 2), "utf8");
+
+    // Unverified local username (`loadLocalFlocksConfig` or unauthenticated sync call) MUST NOT elevate privileges
+    const passiveLoaded = loadLocalFlocksConfig(
+      { githubUser: "erjadi", scope: "personal" },
+      ownerFlocksPath
+    );
+    assert.equal(passiveLoaded.flocks["erjadi/personal"].trustTier, "collaborator");
+    assert.equal(passiveLoaded.flocks["erjadi/personal"].rosterEpoch, 9);
+
+    assert.throws(
+      () =>
+        reconcileAuthoritativeFlockMemberships(
+          ownerCfg,
+          {
+            ok: true,
+            githubUser: "erjadi",
+            deviceId: ownerIdentity.fingerprint,
+            enrolledFlocks: [redeemedPersonal],
+          },
+          ownerFlocksPath
+        ),
+      (err) => err.code === "UNAUTHENTICATED_AUTHORITY"
+    );
+    assert.throws(
+      () =>
+        reconcileAuthoritativeFlockMemberships(
+          ownerCfg,
+          {
+            ok: true,
+            githubUser: "erjadi",
+            githubUserId: 1001,
+            deviceId: ownerIdentity.fingerprint,
+            peerId: `1001:${ownerIdentity.fingerprint}`,
+            enrolledFlocks: [
+              { ...redeemedPersonal, flockUuid: "builtin-erjadi-personal" },
+            ],
+          },
+          ownerFlocksPath
+        ),
+      (err) => err.code === "UNVERIFIED_AUTHORITY"
+    );
+    assert.equal(
+      JSON.parse(fs.readFileSync(ownerFlocksPath, "utf8")).flocks["erjadi/personal"].trustTier,
+      "collaborator"
+    );
+
+    // Simulate concurrent `shareThreadWithFlock` happening mid-reconciliation on first CAS attempt,
+    // and heal via live HTTP `/api/v3/flocks/sync` + `reconcileAuthoritativeFlockMemberships`
+    const signedOwnerSync = signV3MembershipSyncRequest(
+      { deviceId: ownerIdentity.fingerprint, machineId: "MAIN-WORKSTATION" },
+      ownerIdentity
+    );
+    const httpSyncRes = await brokerHttp("/api/v3/flocks/sync", "ownerToken", signedOwnerSync);
+    assert.equal(httpSyncRes.status, 200);
+    assert.equal(httpSyncRes.body.ok, true);
+
+    let injectedConcurrentShare = false;
+    const healedRes = reconcileAuthoritativeFlockMemberships(
+      ownerCfg,
+      httpSyncRes.body,
+      ownerFlocksPath,
+      {
+        onBeforeCommit: (attempt) => {
+          if (attempt === 0 && !injectedConcurrentShare) {
+            injectedConcurrentShare = true;
+            shareThreadWithFlock(
+              ownerCfg,
+              {
+                flockId: "erjadi/personal",
+                sessionId: "sess-concurrent-3",
+                title: "Concurrent share during sync",
+                summarySnapshot: "Approved snapshot 3",
+              },
+              ownerFlocksPath
+            );
+          }
+        },
+      }
+    );
+    assert.equal(injectedConcurrentShare, true);
+    assert.ok(healedRes.healedFlockIds.includes("erjadi/personal"));
+
+    const healedDisk = JSON.parse(fs.readFileSync(ownerFlocksPath, "utf8"));
+    assert.equal(healedDisk.flocks["erjadi/personal"].trustTier, "owner");
+    assert.equal(healedDisk.flocks["erjadi/personal"].rosterEpoch, 12);
+    assert.equal(healedDisk.flocks["erjadi/personal"].sessionVisibility, "all");
+    assert.equal(healedDisk.flocks["erjadi/personal"].shareSpecs, "full");
+    assert.equal(healedDisk.flocks["erjadi/personal"].membershipExpiresAt, null);
+    assert.equal(healedDisk.flocks["erjadi/personal"].membershipExpiresAtMs, null);
+    assert.deepEqual(healedDisk.flocks["erjadi/personal"].sharedSessionIds, [
+      "sess-keep-1",
+      "sess-keep-2",
+      "sess-concurrent-3",
+    ]);
+    assert.equal(
+      healedDisk.flocks["erjadi/personal"].sharedSnapshots["sess-keep-1"].summarySnapshot,
+      expectedSnapshots["sess-keep-1"].summarySnapshot
+    );
+    assert.equal(
+      healedDisk.flocks["erjadi/personal"].sharedSnapshots["sess-keep-2"].summarySnapshot,
+      expectedSnapshots["sess-keep-2"].summarySnapshot
+    );
+    assert.equal(
+      healedDisk.flocks["erjadi/personal"].sharedSnapshots["sess-concurrent-3"].summarySnapshot,
+      "Approved snapshot 3"
+    );
+    assert.deepEqual(healedDisk.threadBindings, { "bound-sess-1": "erjadi/studio-team" });
+    assert.equal(
+      fs.readdirSync(tempRoot).filter((name) => name.endsWith(".tmp")).length,
+      0
+    );
+
+    // Also verify broker-side healing via `syncFlockMemberships` when broker member entry itself was corrupted
+    const corruptedBroker = JSON.parse(fs.readFileSync(brokerStorePath, "utf8"));
+    corruptedBroker.flocks["erjadi/personal"].members[`1001:${ownerIdentity.fingerprint}`].trustTier =
+      "collaborator";
+    corruptedBroker.flocks["erjadi/personal"].rosterEpoch = 14;
+    fs.writeFileSync(brokerStorePath, JSON.stringify(corruptedBroker, null, 2), "utf8");
+
+    const fullSyncOut = await syncFlockMemberships(ownerCfg, {
+      customPath: ownerFlocksPath,
+      identityKeypair: ownerIdentity,
+      callEndpoint: async (_cfg, subPath, opts) => {
+        assert.equal(subPath, "/flocks/sync");
+        const r = await brokerHttp(`/api/v3${subPath}`, "ownerToken", opts.body);
+        return r.body;
+      },
+    });
+    assert.ok(fullSyncOut.healedFlockIds.includes("erjadi/personal"));
+    const afterBrokerHeal = JSON.parse(fs.readFileSync(ownerFlocksPath, "utf8"));
+    assert.equal(afterBrokerHeal.flocks["erjadi/personal"].trustTier, "owner");
+    assert.equal(afterBrokerHeal.flocks["erjadi/personal"].rosterEpoch, 15);
+    assert.deepEqual(afterBrokerHeal.flocks["erjadi/personal"].sharedSessionIds, [
+      "sess-keep-1",
+      "sess-keep-2",
+      "sess-concurrent-3",
+    ]);
+
+    // Stale owner epoch (< 15) must be rejected without modifying `flocks.json`
+    const snapshotAt15 = fs.readFileSync(ownerFlocksPath, "utf8");
+    assert.throws(
+      () =>
+        reconcileAuthoritativeFlockMemberships(
+          ownerCfg,
+          { ...httpSyncRes.body }, // epoch 12 < 15
+          ownerFlocksPath
+        ),
+      (err) => err.code === "STALE_ROSTER_EPOCH"
+    );
+    assert.equal(fs.readFileSync(ownerFlocksPath, "utf8"), snapshotAt15);
+
+    // 4. Collaborator <-> Guest role reconciliation, epoch monotonicity, sharing preservation,
+    // forged claims, and revoked/expired authority rejection
+    const aliceCfg = { githubUser: "alice", machineId: "ALICE-LAPTOP", scope: "work" };
+    const aliceGuestInvite = await createV3FlockInvite(
+      {
+        callerGitHubUser: "erjadi",
+        callerGitHubUserId: 1001,
+        targetAddress: "erjadi/studio-team",
+        invitedUser: "alice",
+        invitedGitHubUserId: 2002,
+        allowedScopes: ["work"],
+        trustTier: "guest",
+        durationMinutes: 30,
+      },
+      { storePath: brokerStorePath }
+    );
+    const aliceInitial = await enrollV3Device(
+      {
+        githubUser: "alice",
+        githubUserId: 2002,
+        deviceId: aliceIdentity.fingerprint,
+        machineId: "ALICE-LAPTOP",
+        scope: "work",
+        publicKey: aliceIdentity.publicKey,
+        keyFingerprint: aliceIdentity.fingerprint,
+        enrollmentJson: aliceGuestInvite.enrollmentJson,
+      },
+      { storePath: brokerStorePath, connectionString: testConnStr }
+    );
+    applyV3EnrollmentResult(aliceCfg, aliceInitial, peerFlocksPath);
+
+    shareThreadWithFlock(
+      aliceCfg,
+      {
+        flockId: "erjadi/studio-team",
+        sessionId: "alice-shared-sess",
+        title: "Alice API contract",
+        summarySnapshot: "Alice approved summary",
+      },
+      peerFlocksPath
+    );
+
+    const aliceTeamInitial = JSON.parse(fs.readFileSync(peerFlocksPath, "utf8")).flocks[
+      "erjadi/studio-team"
+    ];
+    assert.equal(aliceTeamInitial.trustTier, "guest");
+    assert.ok(aliceTeamInitial.membershipExpiresAtMs > Date.now());
+    const guestEpoch = aliceTeamInitial.rosterEpoch;
+
+    // Promote Alice from `guest` -> `collaborator` at newer epoch (`guestEpoch + 3`), clearing expiry and preserving sharing
+    const promotedEpoch = guestEpoch + 3;
+    const alicePromotedRecord = {
+      ...aliceInitial.enrolledFlocks.find((f) => f.flockId === "erjadi/studio-team"),
+      trustTier: "collaborator",
+      rosterEpoch: promotedEpoch,
+      membershipExpiresAt: null,
+      membershipExpiresAtMs: null,
+      members: aliceInitial.enrolledFlocks
+        .find((f) => f.flockId === "erjadi/studio-team")
+        .members.map((m) =>
+          m.peerId === `2002:${aliceIdentity.fingerprint}`
+            ? { ...m, trustTier: "collaborator", membershipExpiresAt: null, membershipExpiresAtMs: null }
+            : m
+        ),
+    };
+    const promRes = reconcileAuthoritativeFlockMemberships(
+      aliceCfg,
+      {
+        ok: true,
+        githubUser: "alice",
+        githubUserId: 2002,
+        deviceId: aliceIdentity.fingerprint,
+        peerId: `2002:${aliceIdentity.fingerprint}`,
+        enrolledFlocks: [alicePromotedRecord],
+      },
+      peerFlocksPath
+    );
+    assert.ok(promRes.healedFlockIds.includes("erjadi/studio-team"));
+    const afterPromote = JSON.parse(fs.readFileSync(peerFlocksPath, "utf8")).flocks[
+      "erjadi/studio-team"
+    ];
+    assert.equal(afterPromote.trustTier, "collaborator");
+    assert.equal(afterPromote.rosterEpoch, promotedEpoch);
+    assert.equal(afterPromote.membershipExpiresAtMs, null);
+    assert.equal(afterPromote.membershipExpiresAt, null);
+    assert.equal(afterPromote.sessionVisibility, "explicit_opt_in_only");
+    assert.equal(afterPromote.shareSpecs, "summary");
+    assert.deepEqual(afterPromote.sharedSessionIds, ["alice-shared-sess"]);
+    assert.equal(
+      afterPromote.sharedSnapshots["alice-shared-sess"].summarySnapshot,
+      "Alice approved summary"
+    );
+
+    // Stale collaborator/guest epoch (`promotedEpoch - 1`) must fail closed
+    assert.throws(
+      () =>
+        reconcileAuthoritativeFlockMemberships(
+          aliceCfg,
+          {
+            ok: true,
+            githubUser: "alice",
+            githubUserId: 2002,
+            deviceId: aliceIdentity.fingerprint,
+            peerId: `2002:${aliceIdentity.fingerprint}`,
+            enrolledFlocks: [{ ...alicePromotedRecord, rosterEpoch: promotedEpoch - 1 }],
+          },
+          peerFlocksPath
+        ),
+      (err) => err.code === "STALE_ROSTER_EPOCH"
+    );
+
+    // Restrict Alice from `collaborator` -> time-bound `guest` at newer epoch (`promotedEpoch + 2`), preserving sharing
+    const restrictedEpoch = promotedEpoch + 2;
+    const guestExpiryMs = Date.now() + 900000;
+    const aliceRestrictedRecord = {
+      ...alicePromotedRecord,
+      trustTier: "guest",
+      rosterEpoch: restrictedEpoch,
+      membershipExpiresAtMs: guestExpiryMs,
+      membershipExpiresAt: new Date(guestExpiryMs).toISOString(),
+      members: alicePromotedRecord.members.map((m) =>
+        m.peerId === `2002:${aliceIdentity.fingerprint}`
+          ? {
+              ...m,
+              trustTier: "guest",
+              membershipExpiresAtMs: guestExpiryMs,
+              membershipExpiresAt: new Date(guestExpiryMs).toISOString(),
+            }
+          : m
+      ),
+    };
+    reconcileAuthoritativeFlockMemberships(
+      aliceCfg,
+      {
+        ok: true,
+        githubUser: "alice",
+        githubUserId: 2002,
+        deviceId: aliceIdentity.fingerprint,
+        peerId: `2002:${aliceIdentity.fingerprint}`,
+        enrolledFlocks: [aliceRestrictedRecord],
+      },
+      peerFlocksPath
+    );
+    const afterRestrict = JSON.parse(fs.readFileSync(peerFlocksPath, "utf8")).flocks[
+      "erjadi/studio-team"
+    ];
+    assert.equal(afterRestrict.trustTier, "guest");
+    assert.equal(afterRestrict.rosterEpoch, restrictedEpoch);
+    assert.equal(afterRestrict.membershipExpiresAtMs, guestExpiryMs);
+    assert.deepEqual(afterRestrict.sharedSessionIds, ["alice-shared-sess"]);
+
+    // Reject forged claims, expired claims, and revoked authority without mutating `peerFlocksPath`
+    const beforeNegativeRaw = fs.readFileSync(peerFlocksPath, "utf8");
+
+    // Forged role elevation (`trustTier: "collaborator"` while roster says `"guest"`)
+    assert.throws(
+      () =>
+        reconcileAuthoritativeFlockMemberships(
+          aliceCfg,
+          {
+            ok: true,
+            githubUser: "alice",
+            githubUserId: 2002,
+            deviceId: aliceIdentity.fingerprint,
+            peerId: `2002:${aliceIdentity.fingerprint}`,
+            enrolledFlocks: [
+              { ...aliceRestrictedRecord, trustTier: "collaborator", rosterEpoch: restrictedEpoch + 1 },
+            ],
+          },
+          peerFlocksPath
+        ),
+      (err) => err.code === "FORGED_AUTHORITY"
+    );
+
+    // Forged `owner` claim on a `shared` flock
+    assert.throws(
+      () =>
+        reconcileAuthoritativeFlockMemberships(
+          aliceCfg,
+          {
+            ok: true,
+            githubUser: "alice",
+            githubUserId: 2002,
+            deviceId: aliceIdentity.fingerprint,
+            peerId: `2002:${aliceIdentity.fingerprint}`,
+            enrolledFlocks: [
+              {
+                ...aliceRestrictedRecord,
+                trustTier: "owner",
+                ownerGitHubUser: "alice",
+                ownerGitHubUserId: 2002,
+                rosterEpoch: restrictedEpoch + 1,
+              },
+            ],
+          },
+          peerFlocksPath
+        ),
+      (err) => err.code === "UNVERIFIED_OWNER_AUTHORITY"
+    );
+
+    // Missing authoritative `members` roster proof
+    const withoutMembers = { ...aliceRestrictedRecord, rosterEpoch: restrictedEpoch + 1 };
+    delete withoutMembers.members;
+    assert.throws(
+      () =>
+        reconcileAuthoritativeFlockMemberships(
+          aliceCfg,
+          {
+            ok: true,
+            githubUser: "alice",
+            githubUserId: 2002,
+            deviceId: aliceIdentity.fingerprint,
+            peerId: `2002:${aliceIdentity.fingerprint}`,
+            enrolledFlocks: [withoutMembers],
+          },
+          peerFlocksPath
+        ),
+      (err) => err.code === "UNVERIFIED_AUTHORITY"
+    );
+
+    // Expired membership claim
+    assert.throws(
+      () =>
+        reconcileAuthoritativeFlockMemberships(
+          aliceCfg,
+          {
+            ok: true,
+            githubUser: "alice",
+            githubUserId: 2002,
+            deviceId: aliceIdentity.fingerprint,
+            peerId: `2002:${aliceIdentity.fingerprint}`,
+            enrolledFlocks: [
+              {
+                ...aliceRestrictedRecord,
+                rosterEpoch: restrictedEpoch + 1,
+                membershipExpiresAtMs: Date.now() - 1000,
+              },
+            ],
+          },
+          peerFlocksPath
+        ),
+      (err) => err.code === "EXPIRED_AUTHORITY"
+    );
+
+    // Revoked principal in incoming claim
+    assert.throws(
+      () =>
+        reconcileAuthoritativeFlockMemberships(
+          aliceCfg,
+          {
+            ok: true,
+            githubUser: "alice",
+            githubUserId: 2002,
+            deviceId: aliceIdentity.fingerprint,
+            peerId: `2002:${aliceIdentity.fingerprint}`,
+            enrolledFlocks: [
+              {
+                ...aliceRestrictedRecord,
+                rosterEpoch: restrictedEpoch + 1,
+                revokedPrincipals: { "2002": new Date().toISOString() },
+              },
+            ],
+          },
+          peerFlocksPath
+        ),
+      (err) => err.code === "REVOKED_AUTHORITY"
+    );
+
+    assert.equal(fs.readFileSync(peerFlocksPath, "utf8"), beforeNegativeRaw);
+
+    // Forged Ed25519 signature on HTTP `/api/v3/flocks/sync` for invited user must be rejected (HTTP 401)
+    const forgedSyncReq = signV3MembershipSyncRequest(
+      { deviceId: aliceIdentity.fingerprint, machineId: "ALICE-LAPTOP" },
+      ownerIdentity // wrong key!
+    );
+    const badHttpSync = await brokerHttp("/api/v3/flocks/sync", "aliceToken", forgedSyncReq);
+    assert.equal(badHttpSync.status, 401);
+
+    // Kick Alice on broker -> authenticated `syncFlockMemberships` quarantines `erjadi/studio-team` locally
+    // while preserving `sharedSessionIds` / `sharedSnapshots`, and `enforceFlockPolicyAndWalls` fails closed
+    await kickV3FlockMember(
+      {
+        callerGitHubUser: "erjadi",
+        callerGitHubUserId: 1001,
+        flockId: "erjadi/studio-team",
+        targetUser: "alice",
+      },
+      { storePath: brokerStorePath, connectionString: testConnStr }
+    );
+
+    const alicePostKickSync = await syncFlockMemberships(aliceCfg, {
+      customPath: peerFlocksPath,
+      identityKeypair: aliceIdentity,
+      callEndpoint: async (_cfg, subPath, opts) => {
+        const r = await brokerHttp(`/api/v3${subPath}`, "aliceToken", opts.body);
+        assert.equal(r.status, 200);
+        return r.body;
+      },
+    });
+    assert.ok(alicePostKickSync.quarantinedFlockIds.includes("erjadi/studio-team"));
+    const afterKickDisk = JSON.parse(fs.readFileSync(peerFlocksPath, "utf8")).flocks[
+      "erjadi/studio-team"
+    ];
+    assert.equal(afterKickDisk.revoked, true);
+    assert.equal(afterKickDisk.hubToken, undefined);
+    assert.equal(afterKickDisk.serverNonce, undefined);
+    assert.deepEqual(afterKickDisk.sharedSessionIds, ["alice-shared-sess"]);
+    assert.throws(
+      () => enforceFlockPolicyAndWalls(aliceCfg, afterKickDisk, { action: "ping" }),
+      (err) => err.code === "MEMBERSHIP_REVOKED" && err.statusCode === 403
+    );
+  } finally {
+    if (previousAllowlist === undefined) delete process.env.ALLOWED_GITHUB_USERS;
+    else process.env.ALLOWED_GITHUB_USERS = previousAllowlist;
+    if (previousMaintainer === undefined) delete process.env.PLATFORM_MAINTAINER_USER;
+    else process.env.PLATFORM_MAINTAINER_USER = previousMaintainer;
+    server.closeAllConnections();
+    await new Promise((resolve) => server.close(resolve));
+    fs.rmSync(tempRoot, { recursive: true, force: true });
+  }
 });
