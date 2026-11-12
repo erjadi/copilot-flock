@@ -1787,7 +1787,7 @@ const EMBEDDED_RUNTIME_MANIFEST_FALLBACK = (() => {
       },
       "flock-membership.mjs": {
         role: "companion",
-        sha256: "cac836dc08a0b5b6891507d6f7510bd5756aaabd79f167bebf5ef1b50f2b4242",
+        sha256: "c17d418074747c010199886d922385c2b1200888816247ea4824e44796292acf",
         imports: [
           "./flock-lifecycle.mjs",
           "./flock-protocol.mjs",
@@ -1815,6 +1815,11 @@ const EMBEDDED_RUNTIME_MANIFEST_FALLBACK = (() => {
 })();
 
 function loadInitialRuntimeManifest(dir) {
+  try {
+    if (fs.existsSync(path.join(dir, RUNTIME_CUTOVER_JOURNAL_FILENAME))) {
+      recoverInterruptedRuntimeCutover(dir);
+    }
+  } catch {}
   try {
     const manifestPath = path.join(dir, RUNTIME_MANIFEST_FILENAME);
     if (fs.existsSync(manifestPath)) {
@@ -2128,7 +2133,29 @@ function updateRuntimeState(targetDir, patch) {
   return next;
 }
 
-export function recoverInterruptedRuntimeCutover(targetDir) {
+const activeCutoverTargets = new Set();
+
+function isCutoverJournalWriterAlive(journal, resolvedTarget) {
+  if (!journal || typeof journal.pid !== "number" || !Number.isInteger(journal.pid) || journal.pid <= 0) {
+    return false;
+  }
+  const targetKey = path.resolve(resolvedTarget).toLowerCase();
+  if (journal.pid === process.pid) {
+    return activeCutoverTargets.has(targetKey);
+  }
+  const startedAtMs = Number(journal.startedAtMs) || Date.parse(String(journal.startedAt || "")) || 0;
+  if (startedAtMs > 0 && Date.now() - startedAtMs > 60000) {
+    return false;
+  }
+  try {
+    process.kill(journal.pid, 0);
+    return true;
+  } catch (err) {
+    return Boolean(err && err.code === "EPERM");
+  }
+}
+
+export function recoverInterruptedRuntimeCutover(targetDir, { force = false } = {}) {
   let resolvedTarget;
   try {
     resolvedTarget = assertNoLinks(targetDir);
@@ -2152,6 +2179,13 @@ export function recoverInterruptedRuntimeCutover(targetDir) {
   }
   if (!journal || journal.type !== "copilot-flock-cutover-journal-v1") {
     return { recovered: false };
+  }
+  if (!force && isCutoverJournalWriterAlive(journal, resolvedTarget)) {
+    return {
+      recovered: false,
+      inProgress: true,
+      pid: journal.pid,
+    };
   }
   let backupDir = null;
   let stageDir = null;
@@ -2889,6 +2923,7 @@ export function activateStagedRuntime({
     ...new Set([
       ...REQUIRED_RUNTIME_MODULES,
       ...Object.keys(resolvedManifest.files),
+      "flock-registry.mjs",
       RUNTIME_MANIFEST_FILENAME,
       "installation.json",
     ]),
@@ -2919,13 +2954,30 @@ export function activateStagedRuntime({
   const backedUpFiles = new Set();
   const touchedDuringCutover = new Set();
   let cutoverStarted = false;
+  const targetKey = path.resolve(resolvedTarget).toLowerCase();
 
+  const companionPriority = [
+    "flock-azure.mjs",
+    "flock-protocol.mjs",
+    "flock-membership.mjs",
+    "flock-registry.mjs",
+    "flock-lifecycle.mjs",
+    "flock-broker-free.mjs",
+  ];
   const companionsOrder = Object.keys(resolvedManifest.files)
     .filter((name) => !resolvedManifest.entrypoints.includes(name))
-    .sort();
+    .sort((a, b) => {
+      const ia = companionPriority.indexOf(a);
+      const ib = companionPriority.indexOf(b);
+      if (ia !== -1 && ib !== -1) return ia - ib;
+      if (ia !== -1) return -1;
+      if (ib !== -1) return 1;
+      return a.localeCompare(b);
+    });
   const entrypointsOrder = [...resolvedManifest.entrypoints];
   const cutoverFilesOrder = [...companionsOrder, RUNTIME_MANIFEST_FILENAME, ...entrypointsOrder];
 
+  activeCutoverTargets.add(targetKey);
   try {
     let backupIndex = 0;
     for (const name of managedNames) {
@@ -2942,6 +2994,7 @@ export function activateStagedRuntime({
     atomicJson(journalPath, {
       type: "copilot-flock-cutover-journal-v1",
       pid: process.pid,
+      startedAtMs: Date.now(),
       backupDir,
       stageDir: resolvedStage,
       targetVersion: resolvedManifest.version,
@@ -2954,12 +3007,25 @@ export function activateStagedRuntime({
     });
 
     cutoverStarted = true;
+    for (const bootstrapCompanion of ["flock-membership.mjs", "flock-lifecycle.mjs"]) {
+      if (resolvedManifest.files[bootstrapCompanion]) {
+        const stagedComp = assertNoLinks(path.join(resolvedStage, bootstrapCompanion));
+        const activeComp = assertNoLinks(path.join(resolvedTarget, bootstrapCompanion));
+        if (fs.existsSync(stagedComp)) {
+          touchedDuringCutover.add(bootstrapCompanion);
+          atomicReplaceFile(stagedComp, activeComp);
+        }
+      }
+    }
+
     let stepIndex = 0;
     for (const name of cutoverFilesOrder) {
       const stagedFile = assertNoLinks(path.join(resolvedStage, name));
       const activeFile = assertNoLinks(path.join(resolvedTarget, name));
       touchedDuringCutover.add(name);
-      atomicReplaceFile(stagedFile, activeFile);
+      if (fs.existsSync(stagedFile)) {
+        atomicReplaceFile(stagedFile, activeFile);
+      }
       stepIndex++;
       if (typeof onDuringCutover === "function") {
         onDuringCutover({ filename: name, index: stepIndex, targetDir: resolvedTarget, backupDir });
@@ -2972,6 +3038,16 @@ export function activateStagedRuntime({
       if (!fs.existsSync(activeFile) || hashRuntimeModule(fs.readFileSync(activeFile)) !== entry.sha256) {
         throw runtimeError("RUNTIME_HASH_MISMATCH", `Post-cutover digest verification failed for '${name}'`);
       }
+    }
+
+    if (!resolvedManifest.files["flock-registry.mjs"]) {
+      const obsoleteRegistry = path.join(resolvedTarget, "flock-registry.mjs");
+      try {
+        if (fs.existsSync(obsoleteRegistry)) {
+          touchedDuringCutover.add("flock-registry.mjs");
+          fs.unlinkSync(assertNoLinks(obsoleteRegistry));
+        }
+      } catch {}
     }
 
     // Record ownership hashes in installation.json while preserving non-script owned artifacts (skills, persistence)
@@ -3063,6 +3139,7 @@ export function activateStagedRuntime({
     } catch {}
     throw err;
   } finally {
+    activeCutoverTargets.delete(targetKey);
     cleanupDirectorySafe(resolvedStage);
     cleanupDirectorySafe(backupDir);
     try {

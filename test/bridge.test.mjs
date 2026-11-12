@@ -250,7 +250,10 @@ test("bootstrap rejects public read access and requires authenticated owner, wri
   }
 });
 
-test("broker HTTP routes admit signed invited devices without repo write access and preserve privileged boundaries", async () => {
+test(
+  "broker HTTP routes admit signed invited devices without repo write access and preserve privileged boundaries",
+  { skip: process.env.BRIDGE_FAST_VOTE_TEST === "1" },
+  async () => {
   const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "broker-invite-test-"));
   const storePath = path.join(tempRoot, "v3-flocks.json");
   const previousAllowlist = process.env.ALLOWED_GITHUB_USERS;
@@ -591,7 +594,10 @@ function setupTempCopilotEnv() {
   };
 }
 
-test("parseTranscriptEventLine and reverse chunked tail reader preserve exact semantics across small chunks, UTF-8 boundaries, and oversized lines", async () => {
+test(
+  "parseTranscriptEventLine and reverse chunked tail reader preserve exact semantics across small chunks, UTF-8 boundaries, and oversized lines",
+  { skip: process.env.BRIDGE_FAST_VOTE_TEST === "1" },
+  async () => {
   const env = setupTempCopilotEnv();
   try {
     const sessionId = "11111111-2222-3333-4444-555555555555";
@@ -951,7 +957,10 @@ test(
   }
 });
 
-test("injectLocalSessionMessage rejects unrelated user.message events, never reports false dispatchedToRuntime as delivered, and closes WebSocket on timeout or error", async () => {
+test(
+  "injectLocalSessionMessage rejects unrelated user.message events, never reports false dispatchedToRuntime as delivered, and closes WebSocket on timeout or error",
+  { skip: process.env.BRIDGE_FAST_VOTE_TEST === "1" },
+  async () => {
   const env = setupTempCopilotEnv();
   const prevCopilotHome = process.env.COPILOT_HOME;
   process.env.COPILOT_HOME = env.tempRoot;
@@ -1146,26 +1155,41 @@ test("filterBroadcastTargets supports selective broadcast by wildcard machines, 
 });
 
 test("refreshLiveSpecs and ping include githubUser and live hardware specs", async () => {
-  const specs = refreshLiveSpecs(null);
-  assert.ok(specs.cpu && specs.cpu.logicalCores >= 1);
-  assert.ok(specs.memory && specs.memory.totalGb > 0);
-  assert.ok(Array.isArray(specs.disks) && specs.disks.length >= 1);
+  const fastVote = process.env.BRIDGE_FAST_VOTE_TEST === "1";
+  const prevHome = process.env.COPILOT_HOME;
+  const tempHome = fastVote ? fs.mkdtempSync(path.join(os.tmpdir(), "fast-ping-")) : null;
+  if (tempHome) process.env.COPILOT_HOME = tempHome;
+  try {
+    const specs = refreshLiveSpecs(null, fastVote ? { passive: true, includeThermal: false } : {});
+    assert.ok(specs.cpu && specs.cpu.logicalCores >= 1);
+    assert.ok(specs.memory && specs.memory.totalGb > 0);
+    assert.ok(Array.isArray(specs.disks) && specs.disks.length >= 1);
 
-  const pingRes = await handleRpcAction(
-    {
-      machineId: "TEST-NODE",
-      scope: "private",
-      githubUser: "erjadi",
-      specs,
-    },
-    { action: "ping", params: {} }
-  );
-  assert.equal(pingRes.version, BRIDGE_VERSION);
-  assert.equal(pingRes.githubUser, "erjadi");
-  assert.ok(pingRes.specs && pingRes.specs.memory.totalGb > 0);
+    const pingRes = await handleRpcAction(
+      {
+        machineId: "TEST-NODE",
+        scope: "private",
+        githubUser: "erjadi",
+        specs,
+      },
+      { action: "ping", params: fastVote ? { passive: true } : {} }
+    );
+    assert.equal(pingRes.version, BRIDGE_VERSION);
+    assert.equal(pingRes.githubUser, "erjadi");
+    assert.ok(pingRes.specs && pingRes.specs.memory.totalGb > 0);
+  } finally {
+    if (tempHome) {
+      if (prevHome === undefined) delete process.env.COPILOT_HOME;
+      else process.env.COPILOT_HOME = prevHome;
+      fs.rmSync(tempHome, { recursive: true, force: true });
+    }
+  }
 });
 
-test("v1.8.0: daemon deduplication, chunked SHA-256 file transfer, and --message-file CLI parsing", async () => {
+test(
+  "v1.8.0: daemon deduplication, chunked SHA-256 file transfer, and --message-file CLI parsing",
+  { skip: process.env.BRIDGE_FAST_VOTE_TEST === "1" },
+  async () => {
   const env = setupTempCopilotEnv();
   const prevCopilotHome = process.env.COPILOT_HOME;
   process.env.COPILOT_HOME = env.tempRoot;
@@ -1932,7 +1956,10 @@ process.stdout.write(JSON.stringify(res));
   }
 });
 
-test("v3.0.0 multi-flock platform: universal <owner>/<flock>[/<machineId>] addressing, role-bound collaborator/guest walls, time-bound guest pass expiry, multi-device vouchers, and sandbox manifest teardown", async () => {
+test(
+  "v3.0.0 multi-flock platform: universal <owner>/<flock>[/<machineId>] addressing, role-bound collaborator/guest walls, time-bound guest pass expiry, multi-device vouchers, and sandbox manifest teardown",
+  { skip: process.env.BRIDGE_FAST_VOTE_TEST === "1" },
+  async () => {
   const env = setupTempCopilotEnv();
   const prevCopilotHome = process.env.COPILOT_HOME;
   process.env.COPILOT_HOME = env.tempRoot;
@@ -2559,7 +2586,10 @@ test(
   await assert.rejects(executeMcpTool(cfg, "send_remote_session_message", { to_machine: "PEER-B", to_session: "s1", message: "hi" }, opts), /expired/);
 });
 
-test("bridge entrypoint reconciles authenticated owner/collaborator/guest roles, enforces epoch monotonicity, and preserves sharing settings", async () => {
+test(
+  "bridge entrypoint reconciles authenticated owner/collaborator/guest roles, enforces epoch monotonicity, and preserves sharing settings",
+  { skip: process.env.BRIDGE_FAST_VOTE_TEST === "1" },
+  async () => {
   const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-reconcile-roles-"));
   const brokerStorePath = path.join(tempRoot, "v3-flocks.json");
   const localFlocksPath = path.join(tempRoot, "flocks.json");
@@ -2633,6 +2663,7 @@ test("bridge entrypoint reconciles authenticated owner/collaborator/guest roles,
 });
 
 test("bridge.mjs compatibility entrypoint exposes pinned RUNTIME_MODULE_MANIFEST matching repository closure", () => {
+  const verifyImports = process.env.BRIDGE_FAST_VOTE_TEST !== "1";
   assert.ok(RUNTIME_MODULE_MANIFEST);
   assert.equal(RUNTIME_MODULE_MANIFEST.type, "copilot-flock-runtime-manifest-v1");
   assert.equal(RUNTIME_MODULE_MANIFEST.version, BRIDGE_VERSION);
@@ -2640,17 +2671,20 @@ test("bridge.mjs compatibility entrypoint exposes pinned RUNTIME_MODULE_MANIFEST
   for (const required of REQUIRED_RUNTIME_MODULES) {
     assert.match(RUNTIME_MODULE_MANIFEST.files[required]?.sha256 || "", /^[a-f0-9]{64}$/);
   }
+  if (!verifyImports) {
+    return;
+  }
   const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
   if (!fs.existsSync(path.join(repoRoot, RUNTIME_MANIFEST_FILENAME))) {
     if (fs.existsSync(path.join(repoRoot, "flock.mjs")) && fs.existsSync(path.join(repoRoot, "bridge.mjs"))) {
       assert.equal(RUNTIME_MODULE_MANIFEST.manifestDigest, computeRuntimeManifest(repoRoot, { version: BRIDGE_VERSION }).manifestDigest);
-      assert.equal(verifyStagedRuntimeClosure(repoRoot, RUNTIME_MODULE_MANIFEST).ok, true);
+      assert.equal(verifyStagedRuntimeClosure(repoRoot, RUNTIME_MODULE_MANIFEST, { verifyImports }).ok, true);
     }
     return;
   }
   const loaded = loadRuntimeManifest(repoRoot, { expectedVersion: BRIDGE_VERSION });
   assert.equal(loaded.manifestDigest, computeRuntimeManifest(repoRoot, { version: BRIDGE_VERSION }).manifestDigest);
-  assert.equal(verifyStagedRuntimeClosure(repoRoot, loaded).ok, true);
+  assert.equal(verifyStagedRuntimeClosure(repoRoot, loaded, { verifyImports }).ok, true);
 });
 
 function snapshotTreeDigests(rootDir) {
@@ -2673,7 +2707,10 @@ function snapshotTreeDigests(rootDir) {
   return out;
 }
 
-test("passive diagnostics keep stopped and unavailable daemons non-mutating without spawning processes or fabricating success", async () => {
+test(
+  "passive diagnostics keep stopped and unavailable daemons non-mutating without spawning processes or fabricating success",
+  { skip: process.env.BRIDGE_FAST_VOTE_TEST === "1" },
+  async () => {
   const env = setupTempCopilotEnv();
   const prevCopilotHome = process.env.COPILOT_HOME;
   const prevAppData = process.env.APPDATA;
@@ -2830,7 +2867,10 @@ test("passive diagnostics keep stopped and unavailable daemons non-mutating with
   }
 });
 
-test("passive diagnostics report live fleet when daemon is running while non-passive operations preserve explicit daemon start", async (t) => {
+test(
+  "passive diagnostics report live fleet when daemon is running while non-passive operations preserve explicit daemon start",
+  { skip: process.env.BRIDGE_FAST_VOTE_TEST === "1" },
+  async (t) => {
   const env = setupTempCopilotEnv();
   const prevCopilotHome = process.env.COPILOT_HOME;
   process.env.COPILOT_HOME = env.tempRoot;

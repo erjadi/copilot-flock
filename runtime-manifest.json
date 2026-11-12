@@ -36,14 +36,14 @@
     },
     "flock-lifecycle.mjs": {
       "role": "companion",
-      "sha256": "94164e4fc0b1db63f90cea160bd7063f76c0f6784ce82c206211dda265afd722",
+      "sha256": "c07696ee4d31866b0eb07ff8b53ed0eea4b6363b0286bf616195762b51307d44",
       "imports": [
         "./flock-membership.mjs"
       ]
     },
     "flock-membership.mjs": {
       "role": "companion",
-      "sha256": "cac836dc08a0b5b6891507d6f7510bd5756aaabd79f167bebf5ef1b50f2b4242",
+      "sha256": "c17d418074747c010199886d922385c2b1200888816247ea4824e44796292acf",
       "imports": [
         "./flock-lifecycle.mjs",
         "./flock-protocol.mjs"
@@ -67,5 +67,5 @@
       ]
     }
   },
-  "manifestDigest": "2585ca05897410b4abba36d684474e169df2d3653cd2717821e50a397167c5db"
+  "manifestDigest": "490c6b609ec19b4c1236fe47c3804d9863b0a8075145eb6e1239e215c4d5f909"
 }

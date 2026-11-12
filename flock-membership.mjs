@@ -979,6 +979,81 @@ function mergeFlockStatesMonotonic(diskFlock, memFlock) {
   return next;
 }
 
+const activeRegistrySaveLocks = new Set();
+const latestCommittedRegistryByPath = new Map();
+let registryCommitSeq = 0;
+
+function isLockPidAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  if (pid === process.pid) return true;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return err && err.code === "EPERM";
+  }
+}
+
+function withRegistryFileLock(filename, fn) {
+  const resolvedFile = assertNoLinks(path.resolve(String(filename)));
+  const key = resolvedFile.toLowerCase();
+  if (activeRegistrySaveLocks.has(key)) {
+    return fn({ reentrant: true, key });
+  }
+  const lockPath = `${resolvedFile}.lock`;
+  const deadline = Date.now() + 5000;
+  let acquiredFd = null;
+  while (acquiredFd === null) {
+    try {
+      assertNoLinks(lockPath);
+      acquiredFd = fs.openSync(lockPath, "wx", 0o600);
+      fs.writeFileSync(
+        acquiredFd,
+        JSON.stringify({ pid: process.pid, acquiredAtMs: Date.now() }),
+        "utf8"
+      );
+    } catch (err) {
+      if (err && err.code === "EEXIST") {
+        try {
+          const rawLock = fs.readFileSync(lockPath, "utf8");
+          const parsedLock = JSON.parse(rawLock);
+          const lockAgeMs = Date.now() - Number(parsedLock?.acquiredAtMs || 0);
+          if (!isLockPidAlive( Number(parsedLock?.pid)) || lockAgeMs > 10000) {
+            fs.unlinkSync(lockPath);
+            continue;
+          }
+        } catch {
+          if (Date.now() > deadline) {
+            try {
+              fs.unlinkSync(lockPath);
+              continue;
+            } catch {}
+          }
+        }
+        if (Date.now() <= deadline) {
+          Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);
+          continue;
+        }
+      }
+      break;
+    }
+  }
+  activeRegistrySaveLocks.add(key);
+  try {
+    return fn({ reentrant: false, key });
+  } finally {
+    activeRegistrySaveLocks.delete(key);
+    if (acquiredFd !== null) {
+      try {
+        fs.closeSync(acquiredFd);
+      } catch {}
+      try {
+        if (fs.existsSync(lockPath)) fs.unlinkSync(lockPath);
+      } catch {}
+    }
+  }
+}
+
 export class FlockMembershipRegistry {
   constructor(rootOrFilename, {
     clock = Date.now,
@@ -1025,45 +1100,79 @@ export class FlockMembershipRegistry {
       data = { schema: REGISTRY_SCHEMA_VERSION, type: REGISTRY_TYPE, updatedAtMs: 0, flocks: {} };
     }
     fs.mkdirSync(this.root, { recursive: true });
-    for (let attempt = 0; ; attempt++) {
-      assertNoLinks(this.filename);
-      const diskRaw = fs.existsSync(this.filename) ? fs.readFileSync(this.filename) : null;
-      let diskParsed = null;
-      if (diskRaw !== null) {
+    return withRegistryFileLock(this.filename, ({ key }) => {
+      for (let attempt = 0; ; attempt++) {
+        assertNoLinks(this.filename);
+        const diskRaw = fs.existsSync(this.filename) ? fs.readFileSync(this.filename) : null;
+        let diskParsed = null;
+        if (diskRaw !== null) {
+          try {
+            const candidate = JSON.parse(diskRaw.toString("utf8"));
+            if (candidate && candidate.type === REGISTRY_TYPE && candidate.schema === REGISTRY_SCHEMA_VERSION &&
+                candidate.flocks && typeof candidate.flocks !== "undefined" && typeof candidate.flocks === "object" && !Array.isArray(candidate.flocks)) {
+              diskParsed = candidate;
+            }
+          } catch {}
+        }
+        const mergedFlocks = {};
+        const allIds = new Set([
+          ...Object.keys(diskParsed?.flocks || {}),
+          ...Object.keys(data.flocks || {}),
+        ]);
+        for (const fid of allIds) {
+          mergedFlocks[fid] = mergeFlockStatesMonotonic(diskParsed?.flocks?.[fid], data.flocks?.[fid]);
+        }
+        let toWrite = {
+          schema: REGISTRY_SCHEMA_VERSION,
+          type: REGISTRY_TYPE,
+          updatedAtMs: Math.trunc(this.clock()),
+          flocks: mergedFlocks,
+        };
+        const seqBefore = registryCommitSeq;
         try {
-          const candidate = JSON.parse(diskRaw.toString("utf8"));
-          if (candidate && candidate.type === REGISTRY_TYPE && candidate.schema === REGISTRY_SCHEMA_VERSION &&
-              candidate.flocks && typeof candidate.flocks === "object" && !Array.isArray(candidate.flocks)) {
-            diskParsed = candidate;
+          atomicJson(this.filename, toWrite, diskRaw);
+          if (registryCommitSeq > seqBefore) {
+            const concurrentCommitted = latestCommittedRegistryByPath.get(key)?.state;
+            if (concurrentCommitted && concurrentCommitted.flocks) {
+              const postMergedFlocks = {};
+              const postIds = new Set([
+                ...Object.keys(concurrentCommitted.flocks || {}),
+                ...Object.keys(toWrite.flocks || {}),
+              ]);
+              for (const fid of postIds) {
+                postMergedFlocks[fid] = mergeFlockStatesMonotonic(
+                  concurrentCommitted.flocks?.[fid],
+                  toWrite.flocks?.[fid]
+                );
+              }
+              toWrite = {
+                schema: REGISTRY_SCHEMA_VERSION,
+                type: REGISTRY_TYPE,
+                updatedAtMs: Math.max(
+                  toWrite.updatedAtMs,
+                  Number(concurrentCommitted.updatedAtMs) || 0
+                ),
+                flocks: postMergedFlocks,
+              };
+              atomicJson(this.filename, toWrite);
+            }
           }
-        } catch {}
+          registryCommitSeq++;
+          latestCommittedRegistryByPath.set(key, {
+            seq: registryCommitSeq,
+            state: structuredClone(toWrite),
+          });
+          data.schema = toWrite.schema;
+          data.type = toWrite.type;
+          data.updatedAtMs = toWrite.updatedAtMs;
+          data.flocks = structuredClone(toWrite.flocks);
+          this.state = structuredClone(toWrite);
+          return toWrite;
+        } catch (err) {
+          if (!/Concurrent config change/.test(err.message) || attempt >= 5) throw err;
+        }
       }
-      const mergedFlocks = {};
-      const allIds = new Set([
-        ...Object.keys(diskParsed?.flocks || {}),
-        ...Object.keys(data.flocks || {}),
-      ]);
-      for (const fid of allIds) {
-        mergedFlocks[fid] = mergeFlockStatesMonotonic(diskParsed?.flocks?.[fid], data.flocks?.[fid]);
-      }
-      const toWrite = {
-        schema: REGISTRY_SCHEMA_VERSION,
-        type: REGISTRY_TYPE,
-        updatedAtMs: Math.trunc(this.clock()),
-        flocks: mergedFlocks,
-      };
-      try {
-        atomicJson(this.filename, toWrite, diskRaw);
-        data.schema = toWrite.schema;
-        data.type = toWrite.type;
-        data.updatedAtMs = toWrite.updatedAtMs;
-        data.flocks = structuredClone(toWrite.flocks);
-        this.state = structuredClone(toWrite);
-        return toWrite;
-      } catch (err) {
-        if (!/Concurrent config change/.test(err.message) || attempt >= 5) throw err;
-      }
-    }
+    });
   }
 
   hasFlock(flockId) {

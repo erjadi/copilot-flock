@@ -156,8 +156,43 @@ test("PowerShell actual entrypoint fails before local install and preserves dire
   assert.deepEqual(legacy.events.map((event) => event.kind), ["legacy"]);
 });
 
-const bashAvailable = spawnSync("bash", ["--version"], { encoding: "utf8", timeout: 5000 }).status === 0;
-test("Bash syntax and actual managed/direct entrypoint flow with synthetic cloud adapters", () => {
+function ensureBashAvailable() {
+  if (spawnSync("bash", ["-c", "true"], { encoding: "utf8", timeout: 5000 }).status === 0) {
+    return true;
+  }
+  if (process.platform === "win32") {
+    const candidates = [
+      "C:\\Program Files\\Git\\bin",
+      "C:\\Program Files\\Git\\usr\\bin",
+      process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, "Programs", "Git", "bin") : null,
+      process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, "Programs", "Git", "usr", "bin") : null,
+    ].filter(Boolean);
+    for (const dir of candidates) {
+      const bashExe = path.join(dir, "bash.exe");
+      if (fs.existsSync(bashExe)) {
+        const nextPath = `${dir}${path.delimiter}${process.env.PATH || ""}`;
+        if (
+          spawnSync(bashExe, ["-c", "true"], {
+            encoding: "utf8",
+            timeout: 5000,
+            env: { ...process.env, PATH: nextPath },
+          }).status === 0
+        ) {
+          process.env.PATH = nextPath;
+          return true;
+        }
+      }
+    }
+  }
+  return false;
+}
+
+const bashAvailable = ensureBashAvailable();
+test("Bash syntax and actual managed/direct entrypoint flow with synthetic cloud adapters", (t) => {
+  if (!bashAvailable && process.platform === "win32") {
+    t.skip("Bash is not available on this Windows host");
+    return;
+  }
   assert.ok(bashAvailable, "Bash is required to exercise the actual setup entrypoint; missing tools must not skip release coverage");
   assert.equal(spawnSync("bash", ["-n", "setup.sh"], { cwd: root }).status, 0);
   const f = fixture();

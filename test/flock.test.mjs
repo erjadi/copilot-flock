@@ -8745,3 +8745,237 @@ test("TODO #15 & #16: ping uses non-blocking cached specs skipping network mount
     env.cleanup();
   }
 });
+
+test("NEXUS-V2 regressions: live cutover inspection safety, fs.renameSync post-CAS registry race, and pre-import cross-layout crash recovery across all cutover indices", async () => {
+  const scratchRoot = fs.mkdtempSync(path.join(os.tmpdir(), "flock-nexus-v2-regressions-"));
+  const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+  try {
+    // 1. P1 #2: Deterministic fs.renameSync hook after atomicJson byte comparison must not drop epoch 2 or Alice's tombstone
+    const regDir = path.join(scratchRoot, "registry-race");
+    fs.mkdirSync(regDir, { recursive: true });
+    const reg1 = new FlockMembershipRegistry(regDir);
+    const reg2 = new FlockMembershipRegistry(regDir);
+
+    reg1.reconcileV3BrokerFlock(
+      {
+        flockId: "erjadi/studio-team",
+        ownerGitHubUser: "erjadi",
+        ownerGitHubUserId: 1001,
+        rosterEpoch: 1,
+        members: [
+          {
+            githubUser: "erjadi",
+            githubUserId: 1001,
+            machineId: "OWNER-PC",
+            keyFingerprint: "fp-owner",
+            trustTier: "owner",
+          },
+          {
+            githubUser: "alice",
+            githubUserId: 2002,
+            machineId: "ALICE-PC",
+            keyFingerprint: "fp-alice",
+            trustTier: "collaborator",
+          },
+        ],
+      },
+      { now: 1000 }
+    );
+    reg2.read();
+
+    const origRenameSync = fs.renameSync;
+    let interceptedPresenceRename = false;
+    fs.renameSync = function (oldPath, newPath) {
+      if (
+        !interceptedPresenceRename &&
+        String(newPath).endsWith("flock-registry.json")
+      ) {
+        interceptedPresenceRename = true;
+        reg2.reconcileV3BrokerFlock(
+          {
+            flockId: "erjadi/studio-team",
+            ownerGitHubUser: "erjadi",
+            ownerGitHubUserId: 1001,
+            rosterEpoch: 2,
+            members: [
+              {
+                githubUser: "erjadi",
+                githubUserId: 1001,
+                machineId: "OWNER-PC",
+                keyFingerprint: "fp-owner",
+                trustTier: "owner",
+              },
+            ],
+          },
+          { now: 2000 }
+        );
+      }
+      return origRenameSync.call(fs, oldPath, newPath);
+    };
+    try {
+      reg1.recordPresence(
+        "erjadi/studio-team",
+        [{ machineId: "OWNER-PC", keyFingerprint: "fp-owner", githubUserId: 1001 }],
+        { now: 1500 }
+      );
+    } finally {
+      fs.renameSync = origRenameSync;
+    }
+
+    assert.equal(interceptedPresenceRename, true);
+    const verifyReg = new FlockMembershipRegistry(regDir);
+    const activeViewAfterRace = verifyReg.getFlockView("erjadi/studio-team", { now: 2500 });
+    assert.equal(activeViewAfterRace.rosterEpoch, 2, "Epoch 2 must survive fs.renameSync race");
+    assert.equal(activeViewAfterRace.tombstoneCount, 1, "Alice tombstone must survive fs.renameSync race");
+    assert.equal(
+      activeViewAfterRace.members.some((m) => m.githubUser === "alice"),
+      false,
+      "Removed collaborator Alice must not be resurrected by stale rename"
+    );
+    const fullViewAfterRace = verifyReg.getFlockView("erjadi/studio-team", {
+      includeRemoved: true,
+      now: 2500,
+    });
+    assert.equal(
+      fullViewAfterRace.members.some(
+        (m) => m.githubUser === "alice" && m.removed === true && m.membershipStatus === "removed"
+      ),
+      true,
+      "Alice must be recorded as removed tombstone at epoch 2"
+    );
+
+    // 2. P1 #1: Calling inspectRuntimeGenerations and recoverInterruptedRuntimeCutover during a live cutover must NOT abort or roll back
+    const liveCutoverTarget = path.join(scratchRoot, "live-cutover-target");
+    const v1Source = path.join(scratchRoot, "v1-source");
+    const v2Source = path.join(scratchRoot, "v2-source");
+    for (const modName of REQUIRED_RUNTIME_MODULES) {
+      fs.mkdirSync(v1Source, { recursive: true });
+      fs.mkdirSync(v2Source, { recursive: true });
+      const srcBytes = fs.readFileSync(path.join(repoRoot, modName), "utf8");
+      fs.writeFileSync(
+        path.join(v1Source, modName),
+        srcBytes.replace(/export const BRIDGE_VERSION = "[^"]+";/, 'export const BRIDGE_VERSION = "3.4.9";'),
+        "utf8"
+      );
+      fs.writeFileSync(path.join(v2Source, modName), srcBytes, "utf8");
+    }
+    fs.writeFileSync(
+      path.join(v1Source, RUNTIME_MANIFEST_FILENAME),
+      JSON.stringify(computeRuntimeManifest(v1Source, { version: "3.4.9" }), null, 2),
+      "utf8"
+    );
+    fs.writeFileSync(
+      path.join(v2Source, RUNTIME_MANIFEST_FILENAME),
+      JSON.stringify(computeRuntimeManifest(v2Source, { version: BRIDGE_VERSION }), null, 2),
+      "utf8"
+    );
+
+    stageAndActivateRuntime({ sourceDir: v1Source, targetDir: liveCutoverTarget, verifyImports: false });
+    let midCutoverCheckRan = false;
+    const liveUpgradeRes = stageAndActivateRuntime({
+      sourceDir: v2Source,
+      targetDir: liveCutoverTarget,
+      verifyImports: false,
+      onDuringCutover: ({ index }) => {
+        if (index === 1) {
+          midCutoverCheckRan = true;
+          const rec = recoverInterruptedRuntimeCutover(liveCutoverTarget);
+          assert.equal(rec.recovered, false);
+          assert.equal(rec.inProgress, true);
+          const inspected = inspectRuntimeGenerations(liveCutoverTarget);
+          assert.ok(inspected);
+          assert.equal(
+            fs.existsSync(path.join(liveCutoverTarget, RUNTIME_CUTOVER_JOURNAL_FILENAME)),
+            true,
+            "Cutover journal must remain intact while writer is alive"
+          );
+        }
+      },
+    });
+    assert.equal(midCutoverCheckRan, true);
+    assert.equal(liveUpgradeRes.installed.status, "installed");
+    assert.equal(liveUpgradeRes.installed.version, BRIDGE_VERSION);
+
+    // 3. P1 #3: Cross-layout upgrade (from old layout with flock-registry.mjs and without FlockMembershipRegistry in flock-membership.mjs)
+    // crashing at cutover indices 1, 2, 3, and 4 recovers cleanly when `node target/flock.mjs self-info` runs
+    const oldLayoutSource = path.join(scratchRoot, "old-layout-147e2d1");
+    fs.mkdirSync(oldLayoutSource, { recursive: true });
+    for (const modName of REQUIRED_RUNTIME_MODULES) {
+      let text = fs.readFileSync(path.join(repoRoot, modName), "utf8");
+      if (modName === "flock-membership.mjs") {
+        // Strip FlockMembershipRegistry exports from old flock-membership.mjs and put them in flock-registry.mjs
+        fs.writeFileSync(path.join(oldLayoutSource, "flock-registry.mjs"), text, "utf8");
+        const splitIdx = text.indexOf("export const REGISTRY_SCHEMA_VERSION");
+        text = splitIdx > 0 ? text.slice(0, splitIdx) : text;
+      } else if (modName === "flock-broker-free.mjs") {
+        text = text.replace(
+          'from "./flock-membership.mjs";',
+          'from "./flock-registry.mjs";'
+        );
+      } else if (modName === "flock.mjs" || modName === "bridge.mjs") {
+        text = text
+          .replace(/export const BRIDGE_VERSION = "[^"]+";/, 'export const BRIDGE_VERSION = "3.4.8";')
+          .replace(
+            '  FlockMembershipRegistry,\n  createSignedRosterSnapshot,\n  verifySignedRosterSnapshot,\n  createSignedRosterDelta,\n  verifySignedRosterDelta,\n  computeRosterHash,\n  resolveMemberIdentityKey,\n  deriveKeyFingerprint,\n  compareRosterVersion,\n} from "./flock-membership.mjs";',
+            '} from "./flock-membership.mjs";\nimport {\n  FlockMembershipRegistry,\n  createSignedRosterSnapshot,\n  verifySignedRosterSnapshot,\n  createSignedRosterDelta,\n  verifySignedRosterDelta,\n  computeRosterHash,\n  resolveMemberIdentityKey,\n  deriveKeyFingerprint,\n  compareRosterVersion,\n} from "./flock-registry.mjs";'
+          );
+      }
+      fs.writeFileSync(path.join(oldLayoutSource, modName), text, "utf8");
+    }
+    const oldManifest = computeRuntimeManifest(oldLayoutSource, {
+      version: "3.4.8",
+      requiredModules: [...REQUIRED_RUNTIME_MODULES, "flock-registry.mjs"],
+    });
+    fs.writeFileSync(
+      path.join(oldLayoutSource, RUNTIME_MANIFEST_FILENAME),
+      JSON.stringify(oldManifest, null, 2),
+      "utf8"
+    );
+
+    const crossTarget = path.join(scratchRoot, "cross-layout-target");
+    stageAndActivateRuntime({ sourceDir: oldLayoutSource, targetDir: crossTarget, verifyImports: false });
+
+    for (const crashIdx of [1, 2, 4]) {
+      const crashSub = spawnSync(
+        process.execPath,
+        [
+          "--input-type=module",
+          "-e",
+          `import { stageAndActivateRuntime } from ${JSON.stringify(
+            pathToFileURL(path.join(repoRoot, "flock-lifecycle.mjs")).href
+          )};
+          stageAndActivateRuntime({
+            sourceDir: ${JSON.stringify(v2Source)},
+            targetDir: ${JSON.stringify(crossTarget)},
+            verifyImports: false,
+            onDuringCutover: ({ index }) => { if (index === ${crashIdx}) process.exit(77); },
+          });`,
+        ],
+        { encoding: "utf8", timeout: 15000 }
+      );
+      assert.equal(crashSub.status, 77, `Expected exit 77 at cutover index ${crashIdx}`);
+
+      // Now run `node crossTarget/flock.mjs --version` in a child process and verify static ESM imports link and auto-recover!
+      const bootRes = spawnSync(
+        process.execPath,
+        [path.join(crossTarget, "flock.mjs"), "--version"],
+        {
+          encoding: "utf8",
+          timeout: 15000,
+          env: { ...process.env, COPILOT_HOME: scratchRoot },
+        }
+      );
+      assert.equal(
+        bootRes.status,
+        0,
+        `Expected target/flock.mjs --version to boot & recover after crash at index ${crashIdx}, got status=${bootRes.status}: ${bootRes.stderr}`
+      );
+      const afterBoot = inspectRuntimeGenerations(crossTarget);
+      assert.equal(afterBoot.installed.status, "installed");
+      assert.equal(afterBoot.installed.version, "3.4.8");
+      assert.equal(fs.existsSync(path.join(crossTarget, RUNTIME_CUTOVER_JOURNAL_FILENAME)), false);
+    }
+  } finally {
+    fs.rmSync(scratchRoot, { recursive: true, force: true });
+  }
+});
