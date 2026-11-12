@@ -19,7 +19,7 @@
     },
     "flock-azure.mjs": {
       "role": "companion",
-      "sha256": "10cb6cc02c0be5cff5ff9a2849ee0bc96b3113dd3ff19381771ec791fac1ec33",
+      "sha256": "e0020aa7a54d223123393946b264d275cda7d38232b8133d2dd07515b925c7c1",
       "imports": [
         "./flock-protocol.mjs"
       ]
@@ -36,14 +36,14 @@
     },
     "flock-lifecycle.mjs": {
       "role": "companion",
-      "sha256": "c07696ee4d31866b0eb07ff8b53ed0eea4b6363b0286bf616195762b51307d44",
+      "sha256": "c3de793994bc7919009e22953656d0beba7fddaeb26ed29df3ed7632aad933f1",
       "imports": [
         "./flock-membership.mjs"
       ]
     },
     "flock-membership.mjs": {
       "role": "companion",
-      "sha256": "c17d418074747c010199886d922385c2b1200888816247ea4824e44796292acf",
+      "sha256": "df3e84516d6a15d2bdb7e212b7dfc85cb7776c76de8b1ed102af8598d26b9a25",
       "imports": [
         "./flock-lifecycle.mjs",
         "./flock-protocol.mjs"
@@ -67,5 +67,5 @@
       ]
     }
   },
-  "manifestDigest": "490c6b609ec19b4c1236fe47c3804d9863b0a8075145eb6e1239e215c4d5f909"
+  "manifestDigest": "bc78195185425aaecc11069082e239217f789a9d799d9aca3778a2b085f45853"
 }

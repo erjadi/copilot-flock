@@ -8844,7 +8844,38 @@ test("NEXUS-V2 regressions: live cutover inspection safety, fs.renameSync post-C
       "Alice must be recorded as removed tombstone at epoch 2"
     );
 
-    // 2. P1 #1: Calling inspectRuntimeGenerations and recoverInterruptedRuntimeCutover during a live cutover must NOT abort or roll back
+    // 1b. Live process lock on flock-registry.json.lock must NEVER fail-open or be stolen by age alone
+    const lockSleeper = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+      stdio: "ignore",
+      windowsHide: true,
+    });
+    const regLockPath = path.join(regDir, "flock-registry.json.lock");
+    try {
+      fs.writeFileSync(
+        regLockPath,
+        JSON.stringify({ pid: lockSleeper.pid, startedAt: Date.now() - 120000 }),
+        "utf8"
+      );
+      const impatientReg = new FlockMembershipRegistry(regDir, { lockTimeoutMs: 120 });
+      assert.throws(
+        () =>
+          impatientReg.recordPresence(
+            "erjadi/studio-team",
+            [{ machineId: "OWNER-PC", keyFingerprint: "fp-owner", githubUserId: 1001 }],
+            { now: 3000 }
+          ),
+        (err) => err && err.code === "REGISTRY_LOCK_TIMEOUT" && err.holderPid === lockSleeper.pid,
+        "Registry lock held by live PID must fail closed on timeout, never fail-open or steal by age"
+      );
+      assert.equal(fs.existsSync(regLockPath), true, "Live PID lock file must not be unlinked");
+    } finally {
+      try {
+        lockSleeper.kill();
+      } catch {}
+    }
+
+    // 2. P1 #1: Calling inspectRuntimeGenerations and recoverInterruptedRuntimeCutover during a live cutover
+    // (even after a +120000ms Date.now jump!) must NOT abort or roll back
     const liveCutoverTarget = path.join(scratchRoot, "live-cutover-target");
     const v1Source = path.join(scratchRoot, "v1-source");
     const v2Source = path.join(scratchRoot, "v2-source");
@@ -8879,16 +8910,22 @@ test("NEXUS-V2 regressions: live cutover inspection safety, fs.renameSync post-C
       onDuringCutover: ({ index }) => {
         if (index === 1) {
           midCutoverCheckRan = true;
-          const rec = recoverInterruptedRuntimeCutover(liveCutoverTarget);
-          assert.equal(rec.recovered, false);
-          assert.equal(rec.inProgress, true);
-          const inspected = inspectRuntimeGenerations(liveCutoverTarget);
-          assert.ok(inspected);
-          assert.equal(
-            fs.existsSync(path.join(liveCutoverTarget, RUNTIME_CUTOVER_JOURNAL_FILENAME)),
-            true,
-            "Cutover journal must remain intact while writer is alive"
-          );
+          const origDateNow = Date.now;
+          Date.now = () => origDateNow() + 120000;
+          try {
+            const rec = recoverInterruptedRuntimeCutover(liveCutoverTarget);
+            assert.equal(rec.recovered, false);
+            assert.equal(rec.inProgress, true);
+            const inspected = inspectRuntimeGenerations(liveCutoverTarget);
+            assert.ok(inspected);
+            assert.equal(
+              fs.existsSync(path.join(liveCutoverTarget, RUNTIME_CUTOVER_JOURNAL_FILENAME)),
+              true,
+              "Cutover journal must remain intact while writer is alive even after +120s clock advance"
+            );
+          } finally {
+            Date.now = origDateNow;
+          }
         }
       },
     });
@@ -8896,13 +8933,23 @@ test("NEXUS-V2 regressions: live cutover inspection safety, fs.renameSync post-C
     assert.equal(liveUpgradeRes.installed.status, "installed");
     assert.equal(liveUpgradeRes.installed.version, BRIDGE_VERSION);
 
-    // 3. P1 #3: Cross-layout upgrade (from old layout with flock-registry.mjs and without FlockMembershipRegistry in flock-membership.mjs)
-    // crashing at cutover indices 1, 2, 3, and 4 recovers cleanly when `node target/flock.mjs self-info` runs
+    // 3. P1 #3: Cross-layout upgrade (from old layout with flock-registry.mjs, without FlockMembershipRegistry in flock-membership.mjs,
+    // and with NO recovery code in old flock.mjs/flock-lifecycle.mjs) crashing at cutover indices 1, 2, and 4 recovers cleanly on boot
     const oldLayoutSource = path.join(scratchRoot, "old-layout-147e2d1");
     fs.mkdirSync(oldLayoutSource, { recursive: true });
     for (const modName of REQUIRED_RUNTIME_MODULES) {
       let text = fs.readFileSync(path.join(repoRoot, modName), "utf8");
-      if (modName === "flock-membership.mjs") {
+      // Strip autoRecoverInterruptedCutoverOnModuleLoad from old generation to simulate authentic 147e2d1/3.4.1
+      text = text.replace(
+        /\(function autoRecoverInterruptedCutoverOnModuleLoad\(\)[\s\S]*?\}\)\(\);\r?\n?/,
+        ""
+      );
+      if (modName === "flock-lifecycle.mjs") {
+        text = text.replace(
+          /if \(fs\.existsSync\(path\.join\(dir, RUNTIME_CUTOVER_JOURNAL_FILENAME\)\)\) \{\r?\n\s*recoverInterruptedRuntimeCutover\(dir\);\r?\n\s*\}/,
+          ""
+        );
+      } else if (modName === "flock-membership.mjs") {
         // Strip FlockMembershipRegistry exports from old flock-membership.mjs and put them in flock-registry.mjs
         fs.writeFileSync(path.join(oldLayoutSource, "flock-registry.mjs"), text, "utf8");
         const splitIdx = text.indexOf("export const REGISTRY_SCHEMA_VERSION");
@@ -8916,7 +8963,7 @@ test("NEXUS-V2 regressions: live cutover inspection safety, fs.renameSync post-C
         text = text
           .replace(/export const BRIDGE_VERSION = "[^"]+";/, 'export const BRIDGE_VERSION = "3.4.8";')
           .replace(
-            '  FlockMembershipRegistry,\n  createSignedRosterSnapshot,\n  verifySignedRosterSnapshot,\n  createSignedRosterDelta,\n  verifySignedRosterDelta,\n  computeRosterHash,\n  resolveMemberIdentityKey,\n  deriveKeyFingerprint,\n  compareRosterVersion,\n} from "./flock-membership.mjs";',
+            /  FlockMembershipRegistry,[\s\S]*?\} from "\.\/flock-membership\.mjs";/,
             '} from "./flock-membership.mjs";\nimport {\n  FlockMembershipRegistry,\n  createSignedRosterSnapshot,\n  verifySignedRosterSnapshot,\n  createSignedRosterDelta,\n  verifySignedRosterDelta,\n  computeRosterHash,\n  resolveMemberIdentityKey,\n  deriveKeyFingerprint,\n  compareRosterVersion,\n} from "./flock-registry.mjs";'
           );
       }
@@ -8970,10 +9017,15 @@ test("NEXUS-V2 regressions: live cutover inspection safety, fs.renameSync post-C
         0,
         `Expected target/flock.mjs --version to boot & recover after crash at index ${crashIdx}, got status=${bootRes.status}: ${bootRes.stderr}`
       );
-      const afterBoot = inspectRuntimeGenerations(crossTarget);
-      assert.equal(afterBoot.installed.status, "installed");
-      assert.equal(afterBoot.installed.version, "3.4.8");
       assert.equal(fs.existsSync(path.join(crossTarget, RUNTIME_CUTOVER_JOURNAL_FILENAME)), false);
+      for (const [fName, fEntry] of Object.entries(oldManifest.files)) {
+        const actualSha = hashRuntimeModule(fs.readFileSync(path.join(crossTarget, fName)));
+        assert.equal(
+          actualSha,
+          fEntry.sha256,
+          `After crash at index ${crashIdx}, ${fName} must be restored to exact old generation digest`
+        );
+      }
     }
   } finally {
     fs.rmSync(scratchRoot, { recursive: true, force: true });

@@ -1767,7 +1767,7 @@ const EMBEDDED_RUNTIME_MANIFEST_FALLBACK = (() => {
       },
       "flock-azure.mjs": {
         role: "companion",
-        sha256: "10cb6cc02c0be5cff5ff9a2849ee0bc96b3113dd3ff19381771ec791fac1ec33",
+        sha256: "e0020aa7a54d223123393946b264d275cda7d38232b8133d2dd07515b925c7c1",
         imports: ["./flock-protocol.mjs"],
       },
       "flock-broker-free.mjs": {
@@ -1787,7 +1787,7 @@ const EMBEDDED_RUNTIME_MANIFEST_FALLBACK = (() => {
       },
       "flock-membership.mjs": {
         role: "companion",
-        sha256: "c17d418074747c010199886d922385c2b1200888816247ea4824e44796292acf",
+        sha256: "df3e84516d6a15d2bdb7e212b7dfc85cb7776c76de8b1ed102af8598d26b9a25",
         imports: [
           "./flock-lifecycle.mjs",
           "./flock-protocol.mjs",
@@ -2142,10 +2142,6 @@ function isCutoverJournalWriterAlive(journal, resolvedTarget) {
   const targetKey = path.resolve(resolvedTarget).toLowerCase();
   if (journal.pid === process.pid) {
     return activeCutoverTargets.has(targetKey);
-  }
-  const startedAtMs = Number(journal.startedAtMs) || Date.parse(String(journal.startedAt || "")) || 0;
-  if (startedAtMs > 0 && Date.now() - startedAtMs > 60000) {
-    return false;
   }
   try {
     process.kill(journal.pid, 0);
@@ -2958,10 +2954,10 @@ export function activateStagedRuntime({
 
   const companionPriority = [
     "flock-azure.mjs",
-    "flock-protocol.mjs",
     "flock-membership.mjs",
-    "flock-registry.mjs",
     "flock-lifecycle.mjs",
+    "flock-protocol.mjs",
+    "flock-registry.mjs",
     "flock-broker-free.mjs",
   ];
   const companionsOrder = Object.keys(resolvedManifest.files)
@@ -3007,25 +3003,12 @@ export function activateStagedRuntime({
     });
 
     cutoverStarted = true;
-    for (const bootstrapCompanion of ["flock-membership.mjs", "flock-lifecycle.mjs"]) {
-      if (resolvedManifest.files[bootstrapCompanion]) {
-        const stagedComp = assertNoLinks(path.join(resolvedStage, bootstrapCompanion));
-        const activeComp = assertNoLinks(path.join(resolvedTarget, bootstrapCompanion));
-        if (fs.existsSync(stagedComp)) {
-          touchedDuringCutover.add(bootstrapCompanion);
-          atomicReplaceFile(stagedComp, activeComp);
-        }
-      }
-    }
-
     let stepIndex = 0;
     for (const name of cutoverFilesOrder) {
       const stagedFile = assertNoLinks(path.join(resolvedStage, name));
       const activeFile = assertNoLinks(path.join(resolvedTarget, name));
       touchedDuringCutover.add(name);
-      if (fs.existsSync(stagedFile)) {
-        atomicReplaceFile(stagedFile, activeFile);
-      }
+      atomicReplaceFile(stagedFile, activeFile);
       stepIndex++;
       if (typeof onDuringCutover === "function") {
         onDuringCutover({ filename: name, index: stepIndex, targetDir: resolvedTarget, backupDir });

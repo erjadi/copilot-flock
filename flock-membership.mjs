@@ -1,8 +1,77 @@
 import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
+import { fileURLToPath } from "node:url";
 import { atomicJson, assertNoLinks } from "./flock-lifecycle.mjs";
 import { canonical, ownerFingerprint, signedControl, verifyControl } from "./flock-protocol.mjs";
+
+(function autoRecoverInterruptedCutoverOnModuleLoad() {
+  try {
+    const dir = path.dirname(fileURLToPath(import.meta.url));
+    const journalPath = path.join(dir, ".runtime-cutover-journal.json");
+    if (!fs.existsSync(journalPath) || !fs.lstatSync(journalPath).isFile()) return;
+    const journal = JSON.parse(fs.readFileSync(journalPath, "utf8"));
+    if (!journal || journal.type !== "copilot-flock-cutover-journal-v1") return;
+    const pid = Number(journal.pid);
+    if (Number.isInteger(pid) && pid > 0) {
+      if (pid === process.pid) return;
+      try {
+        process.kill(pid, 0);
+        return;
+      } catch (err) {
+        if (err && err.code === "EPERM") return;
+      }
+    }
+    const backupDir = journal.backupDir ? path.resolve(journal.backupDir) : null;
+    const stageDir = journal.stageDir ? path.resolve(journal.stageDir) : null;
+    const managedNames = Array.isArray(journal.managedNames) ? journal.managedNames : [];
+    const existedBefore = new Set(Array.isArray(journal.existedBefore) ? journal.existedBefore : []);
+    const backedUpFiles = new Set(Array.isArray(journal.backedUpFiles) ? journal.backedUpFiles : []);
+    for (const name of managedNames) {
+      const activeFile = path.join(dir, name);
+      const backupFile = backupDir ? path.join(backupDir, name) : null;
+      try {
+        if (existedBefore.has(name) && backedUpFiles.has(name) && backupFile && fs.existsSync(backupFile)) {
+          fs.renameSync(backupFile, activeFile);
+        } else if (!existedBefore.has(name) && fs.existsSync(activeFile)) {
+          fs.unlinkSync(activeFile);
+        }
+      } catch {}
+    }
+    try {
+      const statePath = path.join(dir, "runtime-state.json");
+      let current = { type: "copilot-flock-runtime-state-v1", staged: null, installed: null, verified: null };
+      if (fs.existsSync(statePath)) {
+        try {
+          const parsed = JSON.parse(fs.readFileSync(statePath, "utf8"));
+          if (parsed && parsed.type === "copilot-flock-runtime-state-v1") current = parsed;
+        } catch {}
+      }
+      current.staged = {
+        status: "failed",
+        version: journal.targetVersion || null,
+        manifestDigest: journal.targetManifestDigest || null,
+        stageDir: null,
+        closureVerified: false,
+        importVerified: false,
+        error: "Recovered interrupted runtime cutover by rolling back to previous generation",
+        code: "RUNTIME_CUTOVER_INTERRUPTED_RECOVERED",
+        updatedAt: new Date().toISOString(),
+      };
+      current.updatedAt = new Date().toISOString();
+      fs.writeFileSync(statePath, JSON.stringify(current, null, 2) + "\n", "utf8");
+    } catch {}
+    if (stageDir && fs.existsSync(stageDir)) {
+      try { fs.rmSync(stageDir, { recursive: true, force: true }); } catch {}
+    }
+    if (backupDir && fs.existsSync(backupDir)) {
+      try { fs.rmSync(backupDir, { recursive: true, force: true }); } catch {}
+    }
+    try {
+      if (fs.existsSync(journalPath)) fs.unlinkSync(journalPath);
+    } catch {}
+  } catch {}
+})();
 
 export function matchesMember(member, selectors) {
   const checks = [
@@ -982,6 +1051,7 @@ function mergeFlockStatesMonotonic(diskFlock, memFlock) {
 const activeRegistrySaveLocks = new Set();
 const latestCommittedRegistryByPath = new Map();
 let registryCommitSeq = 0;
+export const DEFAULT_REGISTRY_LOCK_TIMEOUT_MS = 30000;
 
 function isLockPidAlive(pid) {
   if (!Number.isInteger(pid) || pid <= 0) return false;
@@ -990,52 +1060,64 @@ function isLockPidAlive(pid) {
     process.kill(pid, 0);
     return true;
   } catch (err) {
-    return err && err.code === "EPERM";
+    return Boolean(err && err.code === "EPERM");
   }
 }
 
-function withRegistryFileLock(filename, fn) {
+function withRegistryFileLock(filename, fn, { timeoutMs = DEFAULT_REGISTRY_LOCK_TIMEOUT_MS } = {}) {
   const resolvedFile = assertNoLinks(path.resolve(String(filename)));
   const key = resolvedFile.toLowerCase();
   if (activeRegistrySaveLocks.has(key)) {
     return fn({ reentrant: true, key });
   }
   const lockPath = `${resolvedFile}.lock`;
-  const deadline = Date.now() + 5000;
+  const effectiveTimeoutMs = Math.max(50, Number(timeoutMs) || DEFAULT_REGISTRY_LOCK_TIMEOUT_MS);
+  const deadline = Date.now() + effectiveTimeoutMs;
   let acquiredFd = null;
+  let lastHolderPid = null;
   while (acquiredFd === null) {
     try {
       assertNoLinks(lockPath);
       acquiredFd = fs.openSync(lockPath, "wx", 0o600);
       fs.writeFileSync(
         acquiredFd,
-        JSON.stringify({ pid: process.pid, acquiredAtMs: Date.now() }),
+        JSON.stringify({ pid: process.pid, startedAt: Date.now() }),
         "utf8"
       );
+      fs.fsyncSync(acquiredFd);
     } catch (err) {
       if (err && err.code === "EEXIST") {
+        let holderPid = null;
         try {
           const rawLock = fs.readFileSync(lockPath, "utf8");
-          const parsedLock = JSON.parse(rawLock);
-          const lockAgeMs = Date.now() - Number(parsedLock?.acquiredAtMs || 0);
-          if (!isLockPidAlive( Number(parsedLock?.pid)) || lockAgeMs > 10000) {
-            fs.unlinkSync(lockPath);
-            continue;
+          if (rawLock.trim().length > 0) {
+            const parsedLock = JSON.parse(rawLock);
+            holderPid = Number(parsedLock?.pid);
+            if (Number.isInteger(holderPid) && holderPid > 0) {
+              lastHolderPid = holderPid;
+              if (!isLockPidAlive(holderPid)) {
+                try {
+                  fs.unlinkSync(lockPath);
+                } catch {}
+                continue;
+              }
+            }
           }
-        } catch {
-          if (Date.now() > deadline) {
-            try {
-              fs.unlinkSync(lockPath);
-              continue;
-            } catch {}
-          }
-        }
-        if (Date.now() <= deadline) {
-          Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);
+        } catch {}
+        if (Date.now() < deadline) {
+          Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
           continue;
         }
+        const timeoutErr = new Error(
+          `Timed out after ${effectiveTimeoutMs}ms waiting for registry lock ${lockPath}${
+            lastHolderPid ? ` held by live PID ${lastHolderPid}` : ""
+          }`
+        );
+        timeoutErr.code = "REGISTRY_LOCK_TIMEOUT";
+        timeoutErr.holderPid = lastHolderPid;
+        throw timeoutErr;
       }
-      break;
+      throw err;
     }
   }
   activeRegistrySaveLocks.add(key);
@@ -1059,6 +1141,7 @@ export class FlockMembershipRegistry {
     clock = Date.now,
     staleAfterMs = DEFAULT_STALE_AFTER_MS,
     presenceTtlMs = DEFAULT_PRESENCE_TTL_MS,
+    lockTimeoutMs = DEFAULT_REGISTRY_LOCK_TIMEOUT_MS,
   } = {}) {
     const resolved = assertNoLinks(path.resolve(String(rootOrFilename)));
     if (resolved.endsWith(".json")) {
@@ -1071,6 +1154,7 @@ export class FlockMembershipRegistry {
     this.clock = clock;
     this.staleAfterMs = staleAfterMs;
     this.presenceTtlMs = presenceTtlMs;
+    this.lockTimeoutMs = lockTimeoutMs;
     this.state = null;
   }
 
@@ -1172,7 +1256,7 @@ export class FlockMembershipRegistry {
           if (!/Concurrent config change/.test(err.message) || attempt >= 5) throw err;
         }
       }
-    });
+    }, { timeoutMs: this.lockTimeoutMs });
   }
 
   hasFlock(flockId) {

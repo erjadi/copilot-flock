@@ -1,5 +1,76 @@
+import fs from "node:fs";
+import path from "node:path";
 import crypto from "node:crypto";
+import { fileURLToPath } from "node:url";
 import { validateCert, peerSubscription } from "./flock-protocol.mjs";
+
+(function autoRecoverInterruptedCutoverOnModuleLoad() {
+  try {
+    const dir = path.dirname(fileURLToPath(import.meta.url));
+    const journalPath = path.join(dir, ".runtime-cutover-journal.json");
+    if (!fs.existsSync(journalPath) || !fs.lstatSync(journalPath).isFile()) return;
+    const journal = JSON.parse(fs.readFileSync(journalPath, "utf8"));
+    if (!journal || journal.type !== "copilot-flock-cutover-journal-v1") return;
+    const pid = Number(journal.pid);
+    if (Number.isInteger(pid) && pid > 0) {
+      if (pid === process.pid) return;
+      try {
+        process.kill(pid, 0);
+        return;
+      } catch (err) {
+        if (err && err.code === "EPERM") return;
+      }
+    }
+    const backupDir = journal.backupDir ? path.resolve(journal.backupDir) : null;
+    const stageDir = journal.stageDir ? path.resolve(journal.stageDir) : null;
+    const managedNames = Array.isArray(journal.managedNames) ? journal.managedNames : [];
+    const existedBefore = new Set(Array.isArray(journal.existedBefore) ? journal.existedBefore : []);
+    const backedUpFiles = new Set(Array.isArray(journal.backedUpFiles) ? journal.backedUpFiles : []);
+    for (const name of managedNames) {
+      const activeFile = path.join(dir, name);
+      const backupFile = backupDir ? path.join(backupDir, name) : null;
+      try {
+        if (existedBefore.has(name) && backedUpFiles.has(name) && backupFile && fs.existsSync(backupFile)) {
+          fs.renameSync(backupFile, activeFile);
+        } else if (!existedBefore.has(name) && fs.existsSync(activeFile)) {
+          fs.unlinkSync(activeFile);
+        }
+      } catch {}
+    }
+    try {
+      const statePath = path.join(dir, "runtime-state.json");
+      let current = { type: "copilot-flock-runtime-state-v1", staged: null, installed: null, verified: null };
+      if (fs.existsSync(statePath)) {
+        try {
+          const parsed = JSON.parse(fs.readFileSync(statePath, "utf8"));
+          if (parsed && parsed.type === "copilot-flock-runtime-state-v1") current = parsed;
+        } catch {}
+      }
+      current.staged = {
+        status: "failed",
+        version: journal.targetVersion || null,
+        manifestDigest: journal.targetManifestDigest || null,
+        stageDir: null,
+        closureVerified: false,
+        importVerified: false,
+        error: "Recovered interrupted runtime cutover by rolling back to previous generation",
+        code: "RUNTIME_CUTOVER_INTERRUPTED_RECOVERED",
+        updatedAt: new Date().toISOString(),
+      };
+      current.updatedAt = new Date().toISOString();
+      fs.writeFileSync(statePath, JSON.stringify(current, null, 2) + "\n", "utf8");
+    } catch {}
+    if (stageDir && fs.existsSync(stageDir)) {
+      try { fs.rmSync(stageDir, { recursive: true, force: true }); } catch {}
+    }
+    if (backupDir && fs.existsSync(backupDir)) {
+      try { fs.rmSync(backupDir, { recursive: true, force: true }); } catch {}
+    }
+    try {
+      if (fs.existsSync(journalPath)) fs.unlinkSync(journalPath);
+    } catch {}
+  } catch {}
+})();
 
 export const HUB = "copilotbridge";
 export const TOPIC = "copilot-bridge-offline";
