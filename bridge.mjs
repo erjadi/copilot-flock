@@ -445,6 +445,37 @@ export function parseFlockAddress(targetStr, defaultOwner = null) {
   };
 }
 
+export function parseExplicitFlockSelector(rawSelector) {
+  if (typeof rawSelector !== "string") {
+    const err = new Error(`Invalid explicit flock selector: "${rawSelector}"`);
+    err.code = "INVALID_FLOCK_SELECTOR";
+    err.statusCode = 400;
+    throw err;
+  }
+  const trimmed = rawSelector.trim();
+  if (
+    !trimmed ||
+    trimmed.startsWith("/") ||
+    trimmed.endsWith("/") ||
+    trimmed.includes("//") ||
+    trimmed === "*" ||
+    trimmed.toLowerCase() === "all"
+  ) {
+    const err = new Error(`Invalid explicit flock selector: "${rawSelector}"`);
+    err.code = "INVALID_FLOCK_SELECTOR";
+    err.statusCode = 400;
+    throw err;
+  }
+  try {
+    return parseFlockAddress(trimmed);
+  } catch (cause) {
+    const err = new Error(cause.message, { cause });
+    err.code = "INVALID_FLOCK_SELECTOR";
+    err.statusCode = 400;
+    throw err;
+  }
+}
+
 export function detectMachineScopeRecommendation(specs = null) {
   const signals = [];
   let workScore = 0;
@@ -1455,12 +1486,397 @@ export function listSharedThreadsForMachine(cfg, customPath = getFlocksConfigPat
   };
 }
 
-export function enforceFlockPolicyAndWalls(cfg, flockPolicy, req, senderIdentity = null) {
+function readRawStoredFlocksConfig(cfg = null, customPath = getFlocksConfigPath()) {
+  let stored = { flocks: {}, threadBindings: {} };
+  if (customPath && fs.existsSync(customPath)) {
+    try {
+      stored = JSON.parse(fs.readFileSync(customPath, "utf8")) || { flocks: {}, threadBindings: {} };
+    } catch (error) {
+      const err = new Error("Cannot read local flock sharing policy", { cause: error });
+      err.code = "FLOCK_CONFIG_CORRUPT";
+      err.statusCode = 500;
+      throw err;
+    }
+  }
+  const mergedFlocks = {};
+  for (const [k, v] of Object.entries(stored.flocks || {})) {
+    if (v && typeof v === "object") mergedFlocks[String(k).toLowerCase()] = v;
+  }
+  for (const [k, v] of Object.entries(cfg?.flocks || {})) {
+    if (v && typeof v === "object") mergedFlocks[String(k).toLowerCase()] = v;
+  }
+  return {
+    flocks: mergedFlocks,
+    threadBindings: { ...(stored.threadBindings || {}), ...(cfg?.threadBindings || {}) },
+  };
+}
+
+export function isExplicitOptInFlockPolicy(flockPolicy) {
+  if (!flockPolicy) return false;
+  if ((flockPolicy.trustTier || "collaborator") !== "owner") return true;
+  if (flockPolicy.sessionVisibility && flockPolicy.sessionVisibility !== "all") return true;
+  if (flockPolicy.flockType && !["owner_root", "owner_scope"].includes(flockPolicy.flockType)) {
+    return flockPolicy.sessionVisibility !== "all";
+  }
+  return false;
+}
+
+export function isSessionAuthorizedForFlock(sessionId, flockPolicy, localFlocks = null) {
+  const cleanSid = String(sessionId || "").trim();
+  if (!cleanSid) return false;
+  if (!flockPolicy) return true;
+
+  const boundFlock = localFlocks?.threadBindings?.[cleanSid] || null;
+  if (
+    boundFlock &&
+    flockPolicy.flockId &&
+    String(boundFlock).toLowerCase() !== String(flockPolicy.flockId).toLowerCase()
+  ) {
+    return false;
+  }
+
+  if (isExplicitOptInFlockPolicy(flockPolicy)) {
+    if (cleanSid.toLowerCase() === "latest") return false;
+    const sharedIds = Array.isArray(flockPolicy.sharedSessionIds)
+      ? flockPolicy.sharedSessionIds
+      : [];
+    return (
+      sharedIds.includes(cleanSid) ||
+      Boolean(flockPolicy.sharedSnapshots && flockPolicy.sharedSnapshots[cleanSid])
+    );
+  }
+
+  return true;
+}
+
+function extractPolicyMembersList(flockPolicy) {
+  if (!flockPolicy?.members) return [];
+  if (Array.isArray(flockPolicy.members)) return flockPolicy.members.filter(Boolean);
+  if (typeof flockPolicy.members === "object") return Object.values(flockPolicy.members).filter(Boolean);
+  return [];
+}
+
+function isPrincipalRevokedInFlock(flockPolicy, { githubUser = null, machineId = null, peerId = null } = {}) {
+  const revoked = flockPolicy?.revokedPrincipals;
+  if (!revoked || typeof revoked !== "object") return false;
+  const keys = [
+    githubUser ? String(githubUser).toLowerCase() : null,
+    machineId ? String(machineId).toLowerCase() : null,
+    machineId ? String(machineId) : null,
+    peerId ? String(peerId) : null,
+  ].filter(Boolean);
+  return keys.some((k) => Boolean(revoked[k]));
+}
+
+export function authorizeCallerFlockSelection(cfg, rawSelector, options = {}) {
+  const parsed = parseExplicitFlockSelector(rawSelector);
+  const now = Date.now();
+
+  if (cfg?.protocol === "broker-free-v34") {
+    if (!parsed.flockName) {
+      const err = new Error(`Broker-free flock selector must be <owner>/<flock>: "${rawSelector}"`);
+      err.code = "INVALID_FLOCK_SELECTOR";
+      err.statusCode = 400;
+      throw err;
+    }
+    const runtime = brokerFreeRuntime(cfg);
+    const record = runtime.assertActive(runtime.select(parsed.flockId));
+    if (parsed.machineId) {
+      const hasTargetMember = Object.values(record.members || {}).some(
+        (entry) =>
+          !entry?.removed &&
+          String(entry?.cert?.body?.machineId || "").toLowerCase() === parsed.machineId.toLowerCase()
+      );
+      if (!hasTargetMember) {
+        const err = new Error(
+          `Target machine "${parsed.machineId}" is not an active member of broker-free flock "${record.flockId}"`
+        );
+        err.code = "FLOCK_NON_MEMBER";
+        err.statusCode = 403;
+        throw err;
+      }
+    }
+    return {
+      flockId: record.flockId,
+      canonicalPath: parsed.canonicalPath,
+      targetMachineId: parsed.machineId || null,
+      parsed,
+    };
+  }
+
+  const customPath = options.flocksConfigPath || cfg?.flocksConfigPath || getFlocksConfigPath();
+  const rawStored = readRawStoredFlocksConfig(cfg, customPath);
+  const callerOwner = normalizeGitHubUser(cfg?.githubUser)?.toLowerCase() || null;
+  const callerMachine = String(cfg?.machineId || "").trim();
+  const callerScope = cfg?.scope ? normalizeScope(cfg.scope, "work") : null;
+  const isSameOwnerBuiltIn = Boolean(
+    callerOwner && parsed.owner === callerOwner && (parsed.isOwnerRoot || parsed.isBuiltInScope)
+  );
+
+  const policy = rawStored.flocks[parsed.flockId] || null;
+  if (!policy) {
+    if (!isSameOwnerBuiltIn) {
+      const err = new Error(
+        `403 Forbidden: Caller "${callerMachine || "local"}" is not enrolled in or authorized for explicit flock "${parsed.canonicalPath}".`
+      );
+      err.code = "FLOCK_NOT_ENROLLED";
+      err.statusCode = 403;
+      throw err;
+    }
+    return {
+      flockId: parsed.flockId,
+      canonicalPath: parsed.canonicalPath,
+      targetMachineId: parsed.machineId || null,
+      parsed,
+    };
+  }
+
+  if (
+    (policy.membershipExpiresAtMs && Number(policy.membershipExpiresAtMs) <= now) ||
+    (policy.expiresAtMs && Number(policy.expiresAtMs) <= now)
+  ) {
+    const err = new Error(`Time-bound access to flock "${parsed.flockId}" has expired`);
+    err.code = "MEMBERSHIP_EXPIRED";
+    err.statusCode = 403;
+    throw err;
+  }
+
+  if (isPrincipalRevokedInFlock(policy, { githubUser: callerOwner, machineId: callerMachine })) {
+    const err = new Error(`Caller membership in flock "${parsed.flockId}" has been revoked`);
+    err.code = "FLOCK_MEMBER_REVOKED";
+    err.statusCode = 403;
+    throw err;
+  }
+
+  if (
+    parsed.machineId &&
+    policy.targetMachineId &&
+    String(policy.targetMachineId).toLowerCase() !== parsed.machineId.toLowerCase()
+  ) {
+    const err = new Error(
+      `Flock "${parsed.flockId}" is restricted to target machine "${policy.targetMachineId}" (cannot target "${parsed.machineId}")`
+    );
+    err.code = "GUEST_TARGET_MISMATCH";
+    err.statusCode = 403;
+    throw err;
+  }
+
+  if (!isSameOwnerBuiltIn && callerScope && Array.isArray(policy.allowedScopes) && policy.allowedScopes.length > 0) {
+    const allowedScopes = policy.allowedScopes.map((s) => normalizeScope(s, "")).filter(Boolean);
+    if (allowedScopes.length > 0 && !allowedScopes.includes(callerScope)) {
+      const err = new Error(
+        `Caller scope "${callerScope}" is not permitted in flock "${parsed.flockId}"`
+      );
+      err.code = "FLOCK_SCOPE_FORBIDDEN";
+      err.statusCode = 403;
+      throw err;
+    }
+  }
+
+  const membersList = extractPolicyMembersList(policy);
+  if (membersList.length > 0 && !isSameOwnerBuiltIn) {
+    const callerMember = membersList.find((m) => {
+      if (m?.removed) return false;
+      const mMachine = String(m?.machineId || "").toLowerCase();
+      const mUser = normalizeGitHubUser(m?.githubUser)?.toLowerCase() || null;
+      if (callerMachine && mMachine && mMachine !== callerMachine.toLowerCase()) return false;
+      if (callerOwner && mUser && mUser !== callerOwner) return false;
+      return Boolean((callerMachine && mMachine) || (callerOwner && mUser));
+    });
+    if (!callerMember) {
+      const err = new Error(
+        `Caller "${callerMachine || callerOwner || "local"}" is not an active member of flock "${parsed.flockId}"`
+      );
+      err.code = "FLOCK_NON_MEMBER";
+      err.statusCode = 403;
+      throw err;
+    }
+    if (callerMember.membershipExpiresAtMs && Number(callerMember.membershipExpiresAtMs) <= now) {
+      const err = new Error(`Caller membership in flock "${parsed.flockId}" has expired`);
+      err.code = "MEMBERSHIP_EXPIRED";
+      err.statusCode = 403;
+      throw err;
+    }
+    if (parsed.machineId) {
+      const targetMember = membersList.find(
+        (m) =>
+          !m?.removed &&
+          String(m?.machineId || "").toLowerCase() === parsed.machineId.toLowerCase()
+      );
+      if (!targetMember) {
+        const err = new Error(
+          `Target machine "${parsed.machineId}" is not an active member of flock "${parsed.flockId}"`
+        );
+        err.code = "FLOCK_NON_MEMBER";
+        err.statusCode = 403;
+        throw err;
+      }
+    }
+  }
+
+  return {
+    flockId: parsed.flockId,
+    canonicalPath: parsed.canonicalPath,
+    targetMachineId: parsed.machineId || null,
+    parsed,
+  };
+}
+
+function resolveResponderFlockSelection(cfg, req) {
+  const customPath = req?.flocksConfigPath || cfg?.flocksConfigPath || getFlocksConfigPath();
+  const rawStored = readRawStoredFlocksConfig(cfg, customPath);
+  const localFlocks = loadLocalFlocksConfig(cfg, customPath);
+  localFlocks.threadBindings = { ...(localFlocks.threadBindings || {}), ...(rawStored.threadBindings || {}) };
+  for (const [k, v] of Object.entries(rawStored.flocks)) {
+    localFlocks.flocks[k] = v;
+  }
+
+  const rawFields = [];
+  if (req?.flockId !== undefined && req?.flockId !== null) rawFields.push(["flockId", req.flockId]);
+  if (req?.flock !== undefined && req?.flock !== null) rawFields.push(["flock", req.flock]);
+  if (req?.params?.flock !== undefined && req?.params?.flock !== null) {
+    rawFields.push(["params.flock", req.params.flock]);
+  }
+
+  if (rawFields.length === 0) {
+    return {
+      hasExplicitFlock: false,
+      parsedSelector: null,
+      flockPolicy: req?.flockPolicy || null,
+      localFlocks,
+    };
+  }
+
+  const parsedEntries = rawFields.map(([field, val]) => [field, parseExplicitFlockSelector(val)]);
+  const primary = parsedEntries[0][1];
+  let explicitMachineId = primary.machineId || null;
+  for (const [, parsed] of parsedEntries.slice(1)) {
+    if (parsed.flockId !== primary.flockId) {
+      const err = new Error(
+        `Mismatched explicit flock selectors in RPC request ("${primary.canonicalPath}" vs "${parsed.canonicalPath}")`
+      );
+      err.code = "FLOCK_SELECTOR_MISMATCH";
+      err.statusCode = 400;
+      throw err;
+    }
+    if (parsed.machineId) {
+      if (explicitMachineId && explicitMachineId.toLowerCase() !== parsed.machineId.toLowerCase()) {
+        const err = new Error(
+          `Mismatched target machines in explicit flock selectors ("${explicitMachineId}" vs "${parsed.machineId}")`
+        );
+        err.code = "FLOCK_SELECTOR_MISMATCH";
+        err.statusCode = 400;
+        throw err;
+      }
+      explicitMachineId = parsed.machineId;
+    }
+  }
+
+  if (req?.auth && req?.params?.flock === undefined && (req?.flockId !== undefined || req?.flock !== undefined)) {
+    const err = new Error(
+      `Unsigned outer flock selector "${primary.canonicalPath}" rejected on signed RPC request`
+    );
+    err.code = "UNSIGNED_FLOCK_SELECTOR";
+    err.statusCode = 403;
+    throw err;
+  }
+
+  const parsedSelector = {
+    ...primary,
+    machineId: explicitMachineId,
+    canonicalPath: explicitMachineId ? `${primary.flockId}/${explicitMachineId}` : primary.flockId,
+  };
+
+  if (
+    explicitMachineId &&
+    String(cfg?.machineId || "").toLowerCase() !== explicitMachineId.toLowerCase()
+  ) {
+    const err = new Error(
+      `Explicit flock selector "${parsedSelector.canonicalPath}" targets machine "${explicitMachineId}" (rejected by "${cfg?.machineId}")`
+    );
+    err.code = "GUEST_TARGET_MISMATCH";
+    err.statusCode = 403;
+    throw err;
+  }
+
+  if (req?.flockPolicy) {
+    if (
+      req.flockPolicy.flockId &&
+      parseFlockAddress(req.flockPolicy.flockId).flockId !== parsedSelector.flockId
+    ) {
+      const err = new Error(
+        `Explicit flock selector "${parsedSelector.flockId}" does not match flockPolicy "${req.flockPolicy.flockId}"`
+      );
+      err.code = "FLOCK_SELECTOR_MISMATCH";
+      err.statusCode = 400;
+      throw err;
+    }
+    return {
+      hasExplicitFlock: true,
+      parsedSelector,
+      flockPolicy: req.flockPolicy,
+      localFlocks,
+    };
+  }
+
+  let flockPolicy = rawStored.flocks[parsedSelector.flockId] || null;
+  if (!flockPolicy) {
+    const responderOwner = normalizeGitHubUser(cfg?.githubUser)?.toLowerCase() || null;
+    const responderScope = normalizeScope(cfg?.scope, "work");
+    if (
+      responderOwner &&
+      parsedSelector.owner === responderOwner &&
+      (parsedSelector.isOwnerRoot ||
+        (parsedSelector.isBuiltInScope && parsedSelector.flockId === `${responderOwner}/${responderScope}`))
+    ) {
+      flockPolicy = localFlocks.flocks[parsedSelector.flockId] || null;
+    } else if (
+      responderOwner &&
+      parsedSelector.owner === responderOwner &&
+      parsedSelector.isBuiltInScope &&
+      parsedSelector.flockId !== `${responderOwner}/${responderScope}`
+    ) {
+      const err = new Error(
+        `403 Forbidden: Machine "${cfg?.machineId}" (scope "${responderScope}") does not belong to flock "${parsedSelector.flockId}".`
+      );
+      err.code = "FLOCK_SCOPE_FORBIDDEN";
+      err.statusCode = 403;
+      throw err;
+    }
+  }
+
+  if (!flockPolicy) {
+    const err = new Error(
+      `403 Forbidden: Machine "${cfg?.machineId}" is not enrolled in or authorized for flock "${parsedSelector.canonicalPath}".`
+    );
+    err.code = "FLOCK_NOT_ENROLLED";
+    err.statusCode = 403;
+    throw err;
+  }
+
+  return {
+    hasExplicitFlock: true,
+    parsedSelector,
+    flockPolicy,
+    localFlocks,
+  };
+}
+
+export function enforceFlockPolicyAndWalls(
+  cfg,
+  flockPolicy,
+  req,
+  senderIdentity = null,
+  localFlocks = null
+) {
   if (!flockPolicy) return;
   const now = Date.now();
 
   // Wall 1: Time-Bound Expiry Check (Fail Closed Locally)
-  if (flockPolicy.membershipExpiresAtMs && Number(flockPolicy.membershipExpiresAtMs) <= now) {
+  if (
+    (flockPolicy.membershipExpiresAtMs && Number(flockPolicy.membershipExpiresAtMs) <= now) ||
+    (flockPolicy.expiresAtMs && Number(flockPolicy.expiresAtMs) <= now)
+  ) {
     const err = new Error(
       `Time-bound access to flock "${flockPolicy.flockId}" has expired`
     );
@@ -1482,46 +1898,126 @@ export function enforceFlockPolicyAndWalls(cfg, flockPolicy, req, senderIdentity
     throw err;
   }
 
-  // Wall 3: Role-Bound Trust Tier Enforcement (Never bypassed by same-owner identity on collaborator/guest flocks)
-  const effectiveTrustTier = flockPolicy.trustTier || "collaborator";
-  if (effectiveTrustTier === "owner") return;
-
-  const { action, params = {} } = req;
-  const mutatingActions = new Set([
-    "self_update",
-    "reprovision",
-    "send_file_chunk",
-    "pull_file_chunk",
-    "create_session",
-    "acquire_lock",
-    "release_lock",
-    "apply_git_bundle",
-  ]);
-  const isMutatingDiagnose = action === "diagnose" && Boolean(params.fix);
-  const targetLower = String(params.targetSession || params.session || "").trim().toLowerCase();
-  const isMutatingDelegate =
-    action === "send_message" &&
-    (Boolean(params.delegate) || targetLower === "auto-worker" || targetLower === "new-worker");
-
-  if (mutatingActions.has(action) || isMutatingDiagnose || isMutatingDelegate) {
-    const err = new Error(
-      `Flock security policy violation: action "${action}" is forbidden in ${effectiveTrustTier} flock "${flockPolicy.flockId}".`
-    );
-    err.code = "FLOCK_MUTATION_FORBIDDEN";
-    err.statusCode = 403;
-    throw err;
+  // Wall 2b: Allowed Machine Scope Enforcement
+  if (cfg?.scope && Array.isArray(flockPolicy.allowedScopes) && flockPolicy.allowedScopes.length > 0) {
+    const machineScope = normalizeScope(cfg.scope, "work");
+    const allowedScopes = flockPolicy.allowedScopes.map((s) => normalizeScope(s, "")).filter(Boolean);
+    if (allowedScopes.length > 0 && !allowedScopes.includes(machineScope)) {
+      const err = new Error(
+        `Machine "${cfg?.machineId}" (scope "${machineScope}") is not permitted in flock "${flockPolicy.flockId}"`
+      );
+      err.code = "FLOCK_SCOPE_FORBIDDEN";
+      err.statusCode = 403;
+      throw err;
+    }
   }
 
-  // Wall 4: Explicit Session Opt-In Enforcement for Collaborator / Guest Flocks
-  if (action === "get_transcript" || action === "send_message") {
+  // Wall 2c: Sender Principal / Roster Membership Authorization
+  const effectiveTrustTier = flockPolicy.trustTier || "collaborator";
+  const explicitOptInRequired = isExplicitOptInFlockPolicy(flockPolicy);
+  const isBuiltInOwnerFlock =
+    effectiveTrustTier === "owner" &&
+    !explicitOptInRequired &&
+    (!flockPolicy.flockType || ["owner_root", "owner_scope"].includes(flockPolicy.flockType));
+
+  if (senderIdentity) {
+    if (effectiveTrustTier === "owner" && !explicitOptInRequired) {
+      const expectedOwner = normalizeGitHubUser(
+        flockPolicy.ownerGitHubUser || cfg?.githubUser
+      )?.toLowerCase();
+      const senderUser = normalizeGitHubUser(senderIdentity.fromGitHubUser)?.toLowerCase();
+      if (senderIdentity.isCrossUser || (expectedOwner && senderUser && senderUser !== expectedOwner)) {
+        const err = new Error(
+          `403 Forbidden: Sender "@${senderIdentity.fromGitHubUser || "unknown"}" is not authorized for owner flock "${flockPolicy.flockId}".`
+        );
+        err.code = "UNAUTHORIZED_FLOCK";
+        err.statusCode = 403;
+        throw err;
+      }
+    }
+
+    if (
+      isPrincipalRevokedInFlock(flockPolicy, {
+        githubUser: senderIdentity.fromGitHubUser,
+        machineId: senderIdentity.fromMachine !== "unknown" ? senderIdentity.fromMachine : null,
+      })
+    ) {
+      const err = new Error(
+        `403 Forbidden: Sender "${senderIdentity.fromMachine}" is revoked from flock "${flockPolicy.flockId}".`
+      );
+      err.code = "FLOCK_MEMBER_REVOKED";
+      err.statusCode = 403;
+      throw err;
+    }
+
+    const membersList = extractPolicyMembersList(flockPolicy);
+    if (
+      membersList.length > 0 &&
+      senderIdentity.fromMachine &&
+      senderIdentity.fromMachine !== "unknown" &&
+      !(isBuiltInOwnerFlock && !senderIdentity.isCrossUser && senderIdentity.senderVerified)
+    ) {
+      const senderMember = membersList.find((m) => {
+        if (m?.removed) return false;
+        const mMachine = String(m?.machineId || "").toLowerCase();
+        if (mMachine !== String(senderIdentity.fromMachine).toLowerCase()) return false;
+        const senderUser = normalizeGitHubUser(senderIdentity.fromGitHubUser)?.toLowerCase();
+        const mUser = normalizeGitHubUser(m?.githubUser)?.toLowerCase();
+        if (senderUser && mUser && senderUser !== mUser) return false;
+        return true;
+      });
+      if (!senderMember) {
+        const err = new Error(
+          `403 Forbidden: Sender "${senderIdentity.fromMachine}" is not an active member of flock "${flockPolicy.flockId}".`
+        );
+        err.code = "FLOCK_NON_MEMBER";
+        err.statusCode = 403;
+        throw err;
+      }
+      if (senderMember.membershipExpiresAtMs && Number(senderMember.membershipExpiresAtMs) <= now) {
+        const err = new Error(
+          `Time-bound membership for "${senderIdentity.fromMachine}" in flock "${flockPolicy.flockId}" has expired`
+        );
+        err.code = "MEMBERSHIP_EXPIRED";
+        err.statusCode = 403;
+        throw err;
+      }
+    }
+  }
+
+  // Wall 3: Role-Bound Trust Tier Enforcement (Never bypassed by same-owner identity on collaborator/guest flocks)
+  const { action, params = {} } = req;
+  if (effectiveTrustTier !== "owner") {
+    const mutatingActions = new Set([
+      "self_update",
+      "reprovision",
+      "send_file_chunk",
+      "pull_file_chunk",
+      "create_session",
+      "acquire_lock",
+      "release_lock",
+      "apply_git_bundle",
+    ]);
+    const isMutatingDiagnose = action === "diagnose" && Boolean(params.fix);
+    const targetLower = String(params.targetSession || params.session || "").trim().toLowerCase();
+    const isMutatingDelegate =
+      action === "send_message" &&
+      (Boolean(params.delegate) || targetLower === "auto-worker" || targetLower === "new-worker");
+
+    if (mutatingActions.has(action) || isMutatingDiagnose || isMutatingDelegate) {
+      const err = new Error(
+        `Flock security policy violation: action "${action}" is forbidden in ${effectiveTrustTier} flock "${flockPolicy.flockId}".`
+      );
+      err.code = "FLOCK_MUTATION_FORBIDDEN";
+      err.statusCode = 403;
+      throw err;
+    }
+  }
+
+  // Wall 4: Explicit Session Opt-In & Cross-Flock Binding Enforcement
+  if ((action === "get_transcript" || action === "send_message") && explicitOptInRequired) {
     const requestedSession = String(params.session || params.targetSession || "").trim();
-    const sharedIds = Array.isArray(flockPolicy.sharedSessionIds)
-      ? flockPolicy.sharedSessionIds
-      : [];
-    const isShared =
-      sharedIds.includes(requestedSession) ||
-      Boolean(flockPolicy.sharedSnapshots && flockPolicy.sharedSnapshots[requestedSession]);
-    if (!isShared) {
+    if (!isSessionAuthorizedForFlock(requestedSession, flockPolicy, localFlocks)) {
       const err = new Error(
         `403 Forbidden: Session "${requestedSession || "latest"}" is not shared with flock "${flockPolicy.flockId}".`
       );
@@ -4530,11 +5026,107 @@ export async function invokeRemoteRpc(
     flockId = cfg.flockId,
   }
 ) {
-  if (cfg.protocol === "broker-free-v34") {
-    return brokerFreeRuntime(cfg).invoke({ flockId, toMachine, action, params, timeoutMs, collectAll });
+  const hasExplicitFlockId = flockId !== undefined && flockId !== null;
+  const hasParamFlock = params?.flock !== undefined && params?.flock !== null;
+  let flockSel = null;
+  if (hasExplicitFlockId && hasParamFlock) {
+    const parsedTop = parseExplicitFlockSelector(flockId);
+    const parsedParam = parseExplicitFlockSelector(params.flock);
+    if (
+      parsedTop.flockId !== parsedParam.flockId ||
+      (parsedTop.machineId &&
+        parsedParam.machineId &&
+        parsedTop.machineId.toLowerCase() !== parsedParam.machineId.toLowerCase())
+    ) {
+      const err = new Error(
+        `Conflicting explicit flock selectors ("${parsedTop.canonicalPath}" vs "${parsedParam.canonicalPath}")`
+      );
+      err.code = "FLOCK_SELECTOR_MISMATCH";
+      err.statusCode = 400;
+      throw err;
+    }
+    flockSel = authorizeCallerFlockSelection(
+      cfg,
+      parsedParam.machineId ? params.flock : flockId
+    );
+  } else if (hasExplicitFlockId) {
+    flockSel = authorizeCallerFlockSelection(cfg, flockId);
+  } else if (hasParamFlock) {
+    flockSel = authorizeCallerFlockSelection(cfg, params.flock);
   }
+
+  let effectiveToMachine = toMachine || "*";
+  if (flockSel?.targetMachineId) {
+    if (
+      effectiveToMachine !== "*" &&
+      effectiveToMachine.toLowerCase() !== "all" &&
+      effectiveToMachine.toLowerCase() !== flockSel.targetMachineId.toLowerCase()
+    ) {
+      const err = new Error(
+        `Explicit flock selector "${flockSel.canonicalPath}" conflicts with target machine "${effectiveToMachine}"`
+      );
+      err.code = "FLOCK_TARGET_CONFLICT";
+      err.statusCode = 400;
+      throw err;
+    }
+    effectiveToMachine = flockSel.targetMachineId;
+  }
+  const effectiveParams = flockSel ? { ...params, flock: flockSel.canonicalPath } : params;
+
+  if (cfg.protocol === "broker-free-v34") {
+    return brokerFreeRuntime(cfg).invoke({
+      flockId: flockSel ? flockSel.flockId : flockId,
+      toMachine: effectiveToMachine,
+      action,
+      params: effectiveParams,
+      timeoutMs,
+      collectAll,
+    });
+  }
+
   const requestId = crypto.randomUUID();
   const replyUserId = `rpc-${requestId}`;
+  const sentAt = new Date().toISOString();
+  let auth = null;
+  try {
+    auth = signRpcRequest({
+      requestId,
+      sentAt,
+      fromMachine: cfg.machineId,
+      toMachine: effectiveToMachine || "*",
+      action,
+      params: effectiveParams,
+      identity: cfg.identity || null,
+    });
+  } catch {}
+  const rpcPayload = {
+    requestId,
+    replyUserId,
+    fromMachine: cfg.machineId,
+    toMachine: effectiveToMachine || "*",
+    action,
+    params: effectiveParams,
+    ...(flockSel ? { flockId: flockSel.flockId, flock: flockSel.canonicalPath } : {}),
+    sentAt,
+    auth,
+  };
+
+  if (typeof cfg?.rpcTransport === "function") {
+    const rawReplies = await cfg.rpcTransport(rpcPayload, { collectAll, timeoutMs });
+    const replyList = Array.isArray(rawReplies) ? rawReplies : rawReplies ? [rawReplies] : [];
+    if (collectAll) return replyList;
+    const winner = replyList[0];
+    if (!winner) {
+      throw new Error(
+        `Timed out after ${timeoutMs}ms waiting for response from machine "${effectiveToMachine}" (action: ${action}).`
+      );
+    }
+    if (winner.error) {
+      throw new Error(`Remote machine "${winner.fromMachine}" returned error: ${winner.error}`);
+    }
+    return winner;
+  }
+
   const responses = [];
 
   let resolveFirst;
@@ -4555,33 +5147,14 @@ export async function invokeRemoteRpc(
   });
 
   try {
-    const sentAt = new Date().toISOString();
-    let auth = null;
-    try {
-      auth = signRpcRequest({
-        requestId,
-        sentAt,
-        fromMachine: cfg.machineId,
-        toMachine: toMachine || "*",
-        action,
-        params,
-      });
-    } catch {}
-    const rpcPayload = {
-      requestId,
-      replyUserId,
-      fromMachine: cfg.machineId,
-      toMachine: toMachine || "*",
-      action,
-      params,
-      sentAt,
-      auth,
-    };
-
-    if (!toMachine || toMachine === "*" || toMachine.toLowerCase() === "all") {
+    if (
+      !effectiveToMachine ||
+      effectiveToMachine === "*" ||
+      effectiveToMachine.toLowerCase() === "all"
+    ) {
       await sendSignalRBroadcast(cfg, "bridgeRpcRequest", rpcPayload);
     } else {
-      await sendSignalRToUser(cfg, toMachine, "bridgeRpcRequest", rpcPayload);
+      await sendSignalRToUser(cfg, effectiveToMachine, "bridgeRpcRequest", rpcPayload);
     }
 
     if (collectAll) {
@@ -4596,7 +5169,7 @@ export async function invokeRemoteRpc(
           () =>
             rej(
               new Error(
-                `Timed out after ${timeoutMs}ms waiting for response from machine "${toMachine}" (action: ${action}). Ensure the bridge daemon is running on the target machine ('node bridge.mjs daemon' or 'node bridge.mjs install').`
+                `Timed out after ${timeoutMs}ms waiting for response from machine "${effectiveToMachine}" (action: ${action}). Ensure the bridge daemon is running on the target machine ('node bridge.mjs daemon' or 'node bridge.mjs install').`
               )
             ),
           timeoutMs
@@ -4615,12 +5188,18 @@ export async function invokeRemoteRpc(
 
 export async function invokeRemoteRpcBatch(cfg, items, timeoutMs = 18000) {
   if (!items || items.length === 0) return [];
-  if (cfg.protocol === "broker-free-v34") {
+  if (cfg.protocol === "broker-free-v34" || typeof cfg?.rpcTransport === "function") {
     return Promise.all(items.map(async (item) => {
       try { return { item, ok: true, response: await invokeRemoteRpc(cfg, { ...item, timeoutMs }) }; }
       catch (error) { return { item, ok: false, error: error.message }; }
     }));
   }
+  const preparedItems = items.map((item) => {
+    const rawFlock = item.flockId ?? item.params?.flock ?? cfg.flockId;
+    const flockSel =
+      rawFlock !== undefined && rawFlock !== null ? authorizeCallerFlockSelection(cfg, rawFlock) : null;
+    return { item, flockSel };
+  });
   const replyUserId = `rpc-batch-${crypto.randomUUID()}`;
   const pending = new Map();
 
@@ -4639,7 +5218,7 @@ export async function invokeRemoteRpcBatch(cfg, items, timeoutMs = 18000) {
   });
 
   try {
-    const promises = items.map((item) => {
+    const promises = preparedItems.map(({ item, flockSel }) => {
       const requestId = crypto.randomUUID();
       const responsePromise = new Promise((resolve, reject) => {
         const timer = setTimeout(() => {
@@ -4654,7 +5233,8 @@ export async function invokeRemoteRpcBatch(cfg, items, timeoutMs = 18000) {
       });
 
       const sentAt = new Date().toISOString();
-      const itemParams = item.params || {};
+      const baseParams = item.params || {};
+      const itemParams = flockSel ? { ...baseParams, flock: flockSel.canonicalPath } : baseParams;
       let auth = null;
       try {
         auth = signRpcRequest({
@@ -4664,6 +5244,7 @@ export async function invokeRemoteRpcBatch(cfg, items, timeoutMs = 18000) {
           toMachine: item.toMachine || "*",
           action: item.action,
           params: itemParams,
+          identity: cfg.identity || null,
         });
       } catch {}
       const rpcPayload = {
@@ -4673,6 +5254,7 @@ export async function invokeRemoteRpcBatch(cfg, items, timeoutMs = 18000) {
         toMachine: item.toMachine || "*",
         action: item.action,
         params: itemParams,
+        ...(flockSel ? { flockId: flockSel.flockId, flock: flockSel.canonicalPath } : {}),
         sentAt,
         auth,
       };
@@ -4826,6 +5408,7 @@ export async function discoverMachines(
     minRamGb = null,
     minFreeDiskGb = null,
     timeoutMs = 2500,
+    flockId = cfg.flockId,
   } = {}
 ) {
   const replies = await invokeRemoteRpc(cfg, {
@@ -4834,6 +5417,7 @@ export async function discoverMachines(
     params: {},
     timeoutMs,
     collectAll: true,
+    flockId,
   });
 
   const byMachine = new Map();
@@ -4864,7 +5448,11 @@ export async function discoverMachines(
   });
 }
 
-export async function resolveTargetMachine(cfg, toMachine, { allowLoopback = false, scope = null } = {}) {
+export async function resolveTargetMachine(
+  cfg,
+  toMachine,
+  { allowLoopback = false, scope = null, flockId = cfg.flockId } = {}
+) {
   if (toMachine && toMachine !== "*" && toMachine.toLowerCase() !== "auto") {
     if (
       !allowLoopback &&
@@ -4877,7 +5465,7 @@ export async function resolveTargetMachine(cfg, toMachine, { allowLoopback = fal
     return toMachine;
   }
   // Auto-discover online REMOTE peers only (never route cross-machine bridge calls to self by default)
-  const machines = await discoverMachines(cfg, { includeSelf: true, scope, timeoutMs: 2500 });
+  const machines = await discoverMachines(cfg, { includeSelf: true, scope, timeoutMs: 2500, flockId });
   const remotePeers = machines.filter(
     (m) => m.machineId.toLowerCase() !== cfg.machineId.toLowerCase()
   );
@@ -5291,24 +5879,41 @@ export async function handleRpcAction(cfg, req) {
   const senderIdentity = resolveVerifiedSenderIdentity(cfg, req);
   enforceCrossUserInformationalPolicy(cfg, req, senderIdentity);
 
-  let flockPolicy = req.flockPolicy || null;
-  if (!flockPolicy && req.flockId) {
-    const localFlocks = loadLocalFlocksConfig(cfg);
-    flockPolicy = localFlocks.flocks?.[String(req.flockId).toLowerCase()] || null;
+  const { hasExplicitFlock, flockPolicy, localFlocks } = resolveResponderFlockSelection(cfg, req);
+  if (
+    !hasExplicitFlock &&
+    !flockPolicy &&
+    senderIdentity?.isCrossUser &&
+    (action === "list_sessions" || action === "get_transcript")
+  ) {
+    const err = new Error(
+      `403 Forbidden: Cross-user "${action}" requires an explicit shared flock selector (same-owner default route denied).`
+    );
+    err.code = "UNAUTHORIZED_FLOCK";
+    err.statusCode = 403;
+    throw err;
   }
   if (flockPolicy) {
-    enforceFlockPolicyAndWalls(cfg, flockPolicy, req, senderIdentity);
+    enforceFlockPolicyAndWalls(cfg, flockPolicy, req, senderIdentity, localFlocks);
   }
-  const isRestrictedFlock = Boolean(flockPolicy && flockPolicy.trustTier !== "owner");
+  const isRestrictedFlock = isExplicitOptInFlockPolicy(flockPolicy);
   const fromMachine = senderIdentity.fromMachine;
 
   if (action === "ping") {
     const wsInfo = getLocalWsConnectionInfo();
     const sessionLimit = params.includeSessions ? Math.max(8, Number(params.sessionLimit) || 25) : 8;
-    let sessions = queryLocalSessionsFromDb({ limit: sessionLimit });
-    if (isRestrictedFlock) {
-      const sharedSet = new Set(flockPolicy.sharedSessionIds || []);
-      sessions = sessions.filter((s) => sharedSet.has(s.session_id));
+    let sessions = queryLocalSessionsFromDb({
+      limit: flockPolicy ? Math.max(200, sessionLimit) : sessionLimit,
+    });
+    if (flockPolicy) {
+      sessions = sessions
+        .filter(
+          (s) =>
+            (!s.boundFlockId ||
+              String(s.boundFlockId).toLowerCase() === String(flockPolicy.flockId).toLowerCase()) &&
+            isSessionAuthorizedForFlock(s.session_id, flockPolicy, localFlocks)
+        )
+        .slice(0, sessionLimit);
     }
     const githubUser = normalizeGitHubUser(cfg.githubUser || resolveLocalGitHubUser());
     const specs = refreshLiveSpecs(cfg.specs);
@@ -5349,30 +5954,59 @@ export async function handleRpcAction(cfg, req) {
   }
 
   if (action === "list_sessions") {
+    const requestedLimit = Math.max(1, Number(params.limit) || 30);
+    const queryText = String(params.query || "").trim().toLowerCase();
+    const runningOnly = Boolean(params.runningOnly);
     let sessions = queryLocalSessionsFromDb({
       query: params.query || "",
-      limit: Number(params.limit) || 30,
-      runningOnly: Boolean(params.runningOnly),
+      limit: flockPolicy ? Math.max(200, requestedLimit) : requestedLimit,
+      runningOnly,
+      ...(cfg?.sessionsOverride ? { sessionsOverride: cfg.sessionsOverride } : {}),
     });
-    if (isRestrictedFlock) {
-      const sharedSet = new Set(flockPolicy.sharedSessionIds || []);
-      sessions = sessions.filter((s) => sharedSet.has(s.session_id));
-      for (const [sid, snap] of Object.entries(flockPolicy.sharedSnapshots || {})) {
-        if (!sessions.some((s) => s.session_id === sid)) {
-          sessions.push({
-            session_id: sid,
-            title: snap.title || sid,
-            session_type: snap.mode || "approved-snapshot",
-            is_running: false,
-            updated_at: snap.sharedAt || new Date().toISOString(),
-          });
+    if (Array.isArray(cfg?.sessionsOverride)) {
+      sessions = cfg.sessionsOverride.filter((s) => {
+        if (runningOnly && !s.is_running) return false;
+        if (!queryText) return true;
+        return [s.session_id, s.title, s.repo, s.branch]
+          .some((field) => String(field || "").toLowerCase().includes(queryText));
+      });
+    }
+    if (flockPolicy) {
+      sessions = sessions.filter(
+        (s) =>
+          (!s.boundFlockId ||
+            String(s.boundFlockId).toLowerCase() === String(flockPolicy.flockId).toLowerCase()) &&
+          isSessionAuthorizedForFlock(s.session_id, flockPolicy, localFlocks)
+      );
+      if (isRestrictedFlock) {
+        for (const [sid, snap] of Object.entries(flockPolicy.sharedSnapshots || {})) {
+          if (!isSessionAuthorizedForFlock(sid, flockPolicy, localFlocks)) continue;
+          if (runningOnly) continue;
+          if (
+            queryText &&
+            !String(sid).toLowerCase().includes(queryText) &&
+            !String(snap?.title || "").toLowerCase().includes(queryText)
+          ) {
+            continue;
+          }
+          if (!sessions.some((s) => s.session_id === sid)) {
+            sessions.push({
+              session_id: sid,
+              title: snap.title || sid,
+              session_type: snap.mode || "approved-snapshot",
+              is_running: false,
+              updated_at: snap.sharedAt || new Date().toISOString(),
+            });
+          }
         }
       }
+      sessions = sessions.slice(0, requestedLimit);
     }
     return {
       machineId: cfg.machineId,
       scope: normalizeScope(cfg.scope, "work"),
       githubUser: normalizeGitHubUser(cfg.githubUser) || null,
+      ...(flockPolicy ? { flockId: flockPolicy.flockId } : {}),
       count: sessions.length,
       sessions,
     };
@@ -5390,23 +6024,85 @@ export async function handleRpcAction(cfg, req) {
   }
 
   if (action === "get_transcript") {
-    const targetSess = params.session || "latest";
-    if (isRestrictedFlock && flockPolicy.sharedSnapshots?.[targetSess]?.summarySnapshot) {
-      const snap = flockPolicy.sharedSnapshots[targetSess];
-      return {
-        session: {
-          session_id: targetSess,
-          title: snap.title || targetSess,
-          mode: snap.mode || "approved-snapshot",
-        },
-        messages: [
-          {
-            role: "assistant",
-            content: snap.summarySnapshot,
-            timestamp: snap.sharedAt,
+    const targetSess = String(params.session || "latest").trim() || "latest";
+    if (isRestrictedFlock) {
+      if (!isSessionAuthorizedForFlock(targetSess, flockPolicy, localFlocks)) {
+        const err = new Error(
+          `403 Forbidden: Session "${targetSess}" is not shared with flock "${flockPolicy.flockId}".`
+        );
+        err.code = "SESSION_NOT_SHARED";
+        err.statusCode = 403;
+        throw err;
+      }
+      if (flockPolicy.sharedSnapshots?.[targetSess]?.summarySnapshot) {
+        const snap = flockPolicy.sharedSnapshots[targetSess];
+        return {
+          session: {
+            session_id: targetSess,
+            title: snap.title || targetSess,
+            mode: snap.mode || "approved-snapshot",
           },
-        ],
-      };
+          messages: [
+            {
+              role: "assistant",
+              content: snap.summarySnapshot,
+              timestamp: snap.sharedAt,
+            },
+          ],
+        };
+      }
+      const resolved = Array.isArray(cfg?.sessionsOverride)
+        ? cfg.sessionsOverride.find((s) => s.session_id === targetSess) || null
+        : resolveLocalSession(targetSess);
+      if (
+        !resolved ||
+        resolved.session_id !== targetSess ||
+        (resolved.boundFlockId &&
+          String(resolved.boundFlockId).toLowerCase() !== String(flockPolicy.flockId).toLowerCase()) ||
+        !isSessionAuthorizedForFlock(resolved.session_id, flockPolicy, localFlocks)
+      ) {
+        const err = new Error(
+          `403 Forbidden: Session "${targetSess}" is not shared with flock "${flockPolicy.flockId}".`
+        );
+        err.code = "SESSION_NOT_SHARED";
+        err.statusCode = 403;
+        throw err;
+      }
+      if (typeof cfg?.readTranscriptFn === "function") {
+        return await cfg.readTranscriptFn(resolved.session_id, Number(params.limit) || 10);
+      }
+      return await getLocalSessionTranscriptAsync(resolved.session_id, Number(params.limit) || 10);
+    }
+
+    if (flockPolicy) {
+      const resolved = Array.isArray(cfg?.sessionsOverride)
+        ? cfg.sessionsOverride.find(
+            (s) =>
+              s.session_id === targetSess ||
+              (targetSess === "latest" ? true : String(s.title || "").toLowerCase().includes(targetSess.toLowerCase()))
+          ) || null
+        : resolveLocalSession(targetSess);
+      if (
+        !resolved ||
+        (resolved.boundFlockId &&
+          String(resolved.boundFlockId).toLowerCase() !== String(flockPolicy.flockId).toLowerCase()) ||
+        !isSessionAuthorizedForFlock(resolved.session_id, flockPolicy, localFlocks)
+      ) {
+        const err = new Error(
+          `403 Forbidden: Session "${resolved?.session_id || targetSess}" is not authorized for flock "${flockPolicy.flockId}".`
+        );
+        err.code = "SESSION_NOT_SHARED";
+        err.statusCode = 403;
+        throw err;
+      }
+      if (typeof cfg?.readTranscriptFn === "function") {
+        return await cfg.readTranscriptFn(resolved.session_id, Number(params.limit) || 10);
+      }
+      return await getLocalSessionTranscriptAsync(resolved.session_id, Number(params.limit) || 10);
+    }
+
+    if (typeof cfg?.readTranscriptFn === "function") {
+      return await cfg.readTranscriptFn(targetSess, Number(params.limit) || 10);
     }
     return await getLocalSessionTranscriptAsync(targetSess, Number(params.limit) || 10);
   }
@@ -6579,6 +7275,9 @@ export function isLocalDaemonRunning() {
 }
 
 export async function ensureDaemonStarted(cfg) {
+  if (cfg?.skipDaemonEnsure || typeof cfg?.rpcTransport === "function") {
+    return { running: true, pid: process.pid };
+  }
   let status = isLocalDaemonRunning();
   if (cfg.protocol === "broker-free-v34" && status.running) {
     const pinPath = assertNoLinks(path.join(getBridgeHome(), "daemon-identity.json"));
@@ -6732,6 +7431,11 @@ const MCP_TOOLS = [
           type: "boolean",
           description: "If true, only return currently busy/running sessions.",
         },
+        flock: {
+          type: "string",
+          description:
+            "Optional explicit flock selector (<owner>/<flock>[/<machineId>], or <owner> on legacy). Returns only sessions authorized for that exact flock and fails closed if invalid, non-member, or unauthorized. Omit to use the same-owner default route on legacy (required when multiple broker-free flocks are enrolled).",
+        },
       },
     },
   },
@@ -6754,6 +7458,11 @@ const MCP_TOOLS = [
         limit: {
           type: "number",
           description: "Number of recent messages to fetch (default: 10).",
+        },
+        flock: {
+          type: "string",
+          description:
+            "Optional explicit flock selector (<owner>/<flock>[/<machineId>], or <owner> on legacy). Denies transcript reads pre-body unless the session is authorized for that exact flock, and fails closed if invalid, non-member, or unauthorized. Omit to use the same-owner default route on legacy (required when multiple broker-free flocks are enrolled).",
         },
       },
       required: ["session"],
@@ -7433,7 +8142,7 @@ Object.assign(MCP_TOOLS.find((tool) => tool.name === "kick_flock_member").inputS
   operation_id: { type: "string", description: "Stable operation ID for retrying an interrupted owner rotation." },
 });
 
-async function executeMcpTool(cfg, name, args = {}) {
+export async function executeMcpTool(cfg, name, args = {}) {
   if (name === "unenroll_flock") {
     if (args.traceless !== true) throw new Error("Specify traceless=true to remove this installation");
     return uninstallBridge();
@@ -7443,7 +8152,14 @@ async function executeMcpTool(cfg, name, args = {}) {
     return brokerFreeRuntime(cfg).joinRequest({ machineId: cfg.machineId, scope: cfg.scope, flockId: args.flock });
   }
   if (cfg.protocol === "broker-free-v34") {
-    cfg = { ...cfg, flockId: args.flock || cfg.flockId };
+    const hasExplicitFlockArg = args.flock !== undefined && args.flock !== null;
+    if (hasExplicitFlockArg && (typeof args.flock !== "string" || !args.flock.trim())) {
+      const err = new Error(`Invalid explicit flock selector: "${args.flock}"`);
+      err.code = "INVALID_FLOCK_SELECTOR";
+      err.statusCode = 400;
+      throw err;
+    }
+    cfg = { ...cfg, flockId: hasExplicitFlockArg ? args.flock.trim() : cfg.flockId };
     const runtime = brokerFreeRuntime(cfg);
     if (name === "approve_join") return runtime.approve({
       flockId: args.flock, code: args.join_code, role: args.role || "collaborator",
@@ -7498,24 +8214,69 @@ async function executeMcpTool(cfg, name, args = {}) {
   }
 
   if (name === "list_remote_sessions") {
+    const rawFlock = args.flock !== undefined && args.flock !== null ? args.flock : cfg.flockId;
+    const flockSel =
+      rawFlock !== undefined && rawFlock !== null ? authorizeCallerFlockSelection(cfg, rawFlock) : null;
+    let machineArg = args.machine || "*";
+    if (flockSel?.targetMachineId) {
+      if (
+        args.machine &&
+        args.machine !== "*" &&
+        String(args.machine).toLowerCase() !== "all" &&
+        String(args.machine).toLowerCase() !== flockSel.targetMachineId.toLowerCase()
+      ) {
+        const err = new Error(
+          `Explicit flock selector "${flockSel.canonicalPath}" conflicts with machine argument "${args.machine}"`
+        );
+        err.code = "FLOCK_TARGET_CONFLICT";
+        err.statusCode = 400;
+        throw err;
+      }
+      machineArg = flockSel.targetMachineId;
+    }
     await ensureDaemonStarted(cfg);
-    const machineArg = args.machine || "*";
     const scopeFilter =
       args.scope && String(args.scope).toLowerCase() !== "all" && String(args.scope).trim() !== "*"
         ? normalizeScope(args.scope, "")
         : "";
+    const effectiveFlockSelector = flockSel ? flockSel.canonicalPath : undefined;
     if (machineArg === "*" || machineArg.toLowerCase() === "all") {
       const replies = await invokeRemoteRpc(cfg, {
         toMachine: "*",
         action: "list_sessions",
+        flockId: effectiveFlockSelector,
         params: {
           query: args.query || "",
           limit: args.limit || 25,
           runningOnly: Boolean(args.running_only),
+          ...(flockSel ? { flock: effectiveFlockSelector } : {}),
         },
         timeoutMs: 2500,
         collectAll: true,
       });
+      if (flockSel) {
+        const succeeded = replies.filter((r) => Boolean(r.result));
+        if (succeeded.length === 0 && replies.length > 0) {
+          const firstErr = replies[0];
+          throw new Error(
+            `Remote machine "${firstErr.fromMachine}" returned error: ${firstErr.error}`
+          );
+        }
+        const nonMemberCodeRe =
+          /\[(FLOCK_NOT_ENROLLED|FLOCK_NON_MEMBER|FLOCK_SCOPE_FORBIDDEN|GUEST_TARGET_MISMATCH)\]/;
+        const filteredReplies = replies.filter(
+          (r) => Boolean(r.result) || !nonMemberCodeRe.test(String(r.error || ""))
+        );
+        return filteredReplies
+          .map((r) => {
+            if (!r.result) return { machineId: r.fromMachine, error: r.error };
+            return {
+              ...r.result,
+              scope: normalizeScope(r.result.scope, "work"),
+            };
+          })
+          .filter((item) => !scopeFilter || item.scope === scopeFilter);
+      }
       return replies
         .map((r) => {
           if (!r.result) return { machineId: r.fromMachine, error: r.error };
@@ -7526,14 +8287,20 @@ async function executeMcpTool(cfg, name, args = {}) {
         })
         .filter((item) => !scopeFilter || item.scope === scopeFilter);
     } else {
-      const targetMachine = await resolveTargetMachine(cfg, machineArg, { scope: scopeFilter || null });
+      const targetMachine = await resolveTargetMachine(cfg, machineArg, {
+        allowLoopback: Boolean(args.allow_loopback),
+        scope: scopeFilter || null,
+        flockId: effectiveFlockSelector,
+      });
       const res = await invokeRemoteRpc(cfg, {
         toMachine: targetMachine,
         action: "list_sessions",
+        flockId: effectiveFlockSelector,
         params: {
           query: args.query || "",
           limit: args.limit || 25,
           runningOnly: Boolean(args.running_only),
+          ...(flockSel ? { flock: effectiveFlockSelector } : {}),
         },
         timeoutMs: 8000,
       });
@@ -7545,16 +8312,40 @@ async function executeMcpTool(cfg, name, args = {}) {
   }
 
   if (name === "get_remote_session_transcript") {
+    const rawFlock = args.flock !== undefined && args.flock !== null ? args.flock : cfg.flockId;
+    const flockSel =
+      rawFlock !== undefined && rawFlock !== null ? authorizeCallerFlockSelection(cfg, rawFlock) : null;
+    let requestedMachine = args.to_machine;
+    if (flockSel?.targetMachineId) {
+      if (
+        requestedMachine &&
+        requestedMachine !== "*" &&
+        String(requestedMachine).toLowerCase() !== "auto" &&
+        String(requestedMachine).toLowerCase() !== flockSel.targetMachineId.toLowerCase()
+      ) {
+        const err = new Error(
+          `Explicit flock selector "${flockSel.canonicalPath}" conflicts with to_machine argument "${requestedMachine}"`
+        );
+        err.code = "FLOCK_TARGET_CONFLICT";
+        err.statusCode = 400;
+        throw err;
+      }
+      requestedMachine = flockSel.targetMachineId;
+    }
     await ensureDaemonStarted(cfg);
-    const targetMachine = await resolveTargetMachine(cfg, args.to_machine, {
+    const effectiveFlockSelector = flockSel ? flockSel.canonicalPath : undefined;
+    const targetMachine = await resolveTargetMachine(cfg, requestedMachine, {
       allowLoopback: Boolean(args.allow_loopback),
+      flockId: effectiveFlockSelector,
     });
     const res = await invokeRemoteRpc(cfg, {
       toMachine: targetMachine,
       action: "get_transcript",
+      flockId: effectiveFlockSelector,
       params: {
         session: args.session || "latest",
         limit: args.limit || 10,
+        ...(flockSel ? { flock: effectiveFlockSelector } : {}),
       },
       timeoutMs: 10000,
     });
@@ -10891,11 +11682,12 @@ export async function installBridge({
 }
 
 export function brokerFreeRuntime(cfg = {}, options = {}) {
-  return new BrokerFreeRuntime(options.root || getBridgeHome(), {
+  const mergedOptions = { ...(cfg?.brokerFreeOptions || {}), ...options };
+  return new BrokerFreeRuntime(mergedOptions.root || getBridgeHome(), {
     connect: connectSignalRClient,
     dispatch: (request) => dispatchBrokerFreeRpc(cfg, request),
     log: (message) => logDaemon(message),
-    ...options,
+    ...mergedOptions,
   });
 }
 
@@ -10916,6 +11708,16 @@ export function redactFlockSnapshot(text) {
 
 export async function dispatchBrokerFreeRpc(cfg, { member, payload, action, assertAuthorized, flockId }) {
   const params = payload.params || {};
+  if (params.flock !== undefined && params.flock !== null) {
+    const parsed = parseExplicitFlockSelector(params.flock);
+    if (
+      parsed.flockId !== flockId ||
+      (parsed.machineId &&
+        String(cfg?.machineId || "").toLowerCase() !== parsed.machineId.toLowerCase())
+    ) {
+      throw new Error(`Explicit flock selector "${params.flock}" does not match broker-free envelope flock "${flockId}"`);
+    }
+  }
   const shared = () => {
     assertAuthorized();
     authorizeAction(member, action, payload);
@@ -10936,10 +11738,15 @@ export async function dispatchBrokerFreeRpc(cfg, { member, payload, action, asse
   if (action === "ping") return { machineId: cfg.machineId, scope: cfg.scope, version: BRIDGE_VERSION,
     platform: process.platform, activeSessionCount: shared().length };
   if (action === "list_sessions" || action === "list_shared_threads") {
-    const sessions = shared().slice(0, Math.min(100, Math.max(1, Number(params.limit) || 30)))
+    const queryText = String(params.query || "").trim().toLowerCase();
+    const runningOnly = Boolean(params.runningOnly);
+    const sessions = (runningOnly ? [] : shared())
+      .filter(([id, entry]) => !queryText || String(id).toLowerCase().includes(queryText) ||
+        String(entry?.title || "").toLowerCase().includes(queryText))
+      .slice(0, Math.min(100, Math.max(1, Number(params.limit) || 30)))
       .map(([id, entry]) => ({ session_id: id, title: entry.title, session_type: "approved-snapshot",
         is_running: false, updated_at: entry.sharedAt }));
-    return { machineId: cfg.machineId, scope: cfg.scope, count: sessions.length, sessions };
+    return { machineId: cfg.machineId, scope: cfg.scope, flockId, count: sessions.length, sessions };
   }
   if (action === "get_transcript") {
     const entry = snapshot();
@@ -11269,9 +12076,9 @@ Usage:
   node bridge.mjs members [--scope work|private] [--github-user <handle>]
   node bridge.mjs specs [--refresh]
   node bridge.mjs machines [--scope work|private] [--github-user <handle>] [--gpu <text>] [--min-ram-gb <n>] [--min-free-disk-gb <n>]
-  node bridge.mjs sessions [--machine <name>] [--scope work|private] [--query <text>]
+  node bridge.mjs sessions [--machine <name>] [--scope work|private] [--flock <owner/flock>] [--query <text>]
   node bridge.mjs projects [--machine <name>]
-  node bridge.mjs transcript --session <id-or-title> [--to-machine <name>] [--limit 10]
+  node bridge.mjs transcript --session <id-or-title> [--to-machine <name>] [--flock <owner/flock>] [--limit 10]
   node bridge.mjs create-session [--to-machine <name>] [--title <title>] [--repo <owner/repo>] [--workspace-type branch|worktree] [--branch <branch>] [--cwd <path>] [--model <model>] [--message <prompt> | --message-file <path> | --stdin] [--wait]
   node bridge.mjs broadcast [--message <text> | --message-file <path> | --stdin] [--scope work|private] [--machines <m1,m2,DESKTOP-*>] [--exclude <m3>] [--github-user <u1,u2>] [--exclude-user <u3>] [--gpu <text>] [--min-ram-gb <n>] [--min-free-disk-gb <n>] [--has-repo <repo>] [--to-session <selector>] [--new-session] [--title <title>] [--wait] [--dry-run]
   node bridge.mjs send --to-session <id-or-title-or-latest> [--message <text> | --message-file <path> | --stdin] [--to-machine <name>] [--from-session <id>] [--delegate] [--title <worker-title>] [--repo <worker-repo>] [--notify-on-idle] [--wait] [--dry-run]
@@ -11379,7 +12186,7 @@ Usage:
   }
 
   const cfg = loadConfig({ autoFetchAz: true, refreshSpecs: Boolean(flags.refresh) });
-  if (flags.flock) cfg.flockId = flags.flock;
+  if (flags.flock !== undefined) cfg.flockId = flags.flock;
   if (cfg.protocol === "broker-free-v34") {
     if (["members", "enrolled", "flock"].includes(command)) {
       const record = brokerFreeRuntime(cfg).select(cfg.flockId);
@@ -11671,11 +12478,13 @@ Usage:
 
   if (command === "sessions") {
     const out = await executeMcpTool(cfg, "list_remote_sessions", {
+      ...(flags.flock !== undefined ? { flock: flags.flock } : {}),
       machine: flags.machine || flags["to-machine"] || "*",
       scope: flags.scope || flags.profile || null,
       query: flags.query || positional[0] || "",
       limit: Number(flags.limit) || 25,
       running_only: Boolean(flags["running-only"]),
+      allow_loopback: Boolean(flags["allow-loopback"]),
     });
     console.log(JSON.stringify(out, null, 2));
     return;
@@ -11897,6 +12706,7 @@ Usage:
 
   if (command === "transcript") {
     const out = await executeMcpTool(cfg, "get_remote_session_transcript", {
+      ...(flags.flock !== undefined ? { flock: flags.flock } : {}),
       to_machine: flags["to-machine"] || flags.machine || "auto",
       session: flags.session || flags["to-session"] || positional[0] || "latest",
       limit: Number(flags.limit) || 10,

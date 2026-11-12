@@ -47,6 +47,12 @@ import {
   writeConfigFileSecure,
   normalizeScope,
   parseFlockAddress,
+  parseExplicitFlockSelector,
+  isExplicitOptInFlockPolicy,
+  isSessionAuthorizedForFlock,
+  authorizeCallerFlockSelection,
+  executeMcpTool,
+  dispatchBrokerFreeRpc,
   signV3RpcEnvelope,
   verifyV3RpcEnvelope,
   loadLocalFlocksConfig,
@@ -2303,5 +2309,104 @@ test("v3.0.0 multi-flock platform: universal <owner>/<flock>[/<machineId>] addre
     if (prevCopilotHome === undefined) delete process.env.COPILOT_HOME;
     else process.env.COPILOT_HOME = prevCopilotHome;
     env.cleanup();
+  }
+});
+
+test("TODO #9: bridge compatibility entrypoint enforces explicit flock selectors on list_remote_sessions and get_remote_session_transcript", async () => {
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-todo9-"));
+  const prevCopilotHome = process.env.COPILOT_HOME;
+  process.env.COPILOT_HOME = path.join(tempRoot, "copilot-home");
+  try {
+    const callerKey = crypto.generateKeyPairSync("ed25519", {
+      publicKeyEncoding: { type: "spki", format: "pem" },
+      privateKeyEncoding: { type: "pkcs8", format: "pem" },
+    });
+    const identity = { ...callerKey, fingerprint: "fp-bridge-caller" };
+    const registryMembers = [
+      { machineId: "CALLER-PC", githubUser: "owner", scope: "work", publicKey: callerKey.publicKey },
+    ];
+    const hostFlocksPath = path.join(tempRoot, "host-flocks.json");
+    writeConfigFileSecure(
+      {
+        flocks: {
+          "owner/experimental": {
+            flockId: "owner/experimental",
+            flockType: "shared",
+            trustTier: "collaborator",
+            allowedScopes: ["work"],
+            sessionVisibility: "explicit_opt_in_only",
+            sharedSessionIds: ["sess-exp"],
+          },
+          "owner/alpha": {
+            flockId: "owner/alpha",
+            flockType: "shared",
+            trustTier: "collaborator",
+            allowedScopes: ["work"],
+            sessionVisibility: "explicit_opt_in_only",
+            sharedSessionIds: ["sess-alpha"],
+          },
+        },
+      },
+      hostFlocksPath
+    );
+    const readCalls = [];
+    const hostCfg = {
+      machineId: "HOST-PC",
+      githubUser: "owner",
+      scope: "work",
+      hub: "copilotbridge",
+      flocksConfigPath: hostFlocksPath,
+      sessionsOverride: [
+        { session_id: "sess-owner", title: "Owner", session_type: "cli", is_running: false },
+        { session_id: "sess-exp", title: "Exp", session_type: "cli", is_running: false },
+        { session_id: "sess-alpha", title: "Alpha", session_type: "cli", is_running: false },
+      ],
+      readTranscriptFn: async (sid) => {
+        readCalls.push(sid);
+        return { session: { session_id: sid }, messages: [{ role: "assistant", content: `BODY:${sid}` }] };
+      },
+    };
+    const callerCfg = {
+      machineId: "CALLER-PC",
+      githubUser: "owner",
+      scope: "work",
+      hub: "copilotbridge",
+      identity,
+      flocksConfigPath: hostFlocksPath,
+      rpcTransport: async (rpcPayload) => {
+        try {
+          const result = await handleRpcAction(hostCfg, { ...rpcPayload, registryMembers, enforceSignature: true });
+          return [{ requestId: rpcPayload.requestId, fromMachine: hostCfg.machineId, result }];
+        } catch (err) {
+          return [{ requestId: rpcPayload.requestId, fromMachine: hostCfg.machineId, error: formatErrorDetail(err) }];
+        }
+      },
+    };
+
+    const expList = await executeMcpTool(callerCfg, "list_remote_sessions", {
+      flock: "owner/experimental",
+      machine: "HOST-PC",
+    });
+    assert.deepEqual(expList.sessions.map((s) => s.session_id), ["sess-exp"]);
+
+    await assert.rejects(
+      () =>
+        executeMcpTool(callerCfg, "get_remote_session_transcript", {
+          flock: "owner/experimental",
+          to_machine: "HOST-PC",
+          session: "sess-alpha",
+        }),
+      /SESSION_NOT_SHARED/
+    );
+    assert.deepEqual(readCalls, []);
+
+    await assert.rejects(
+      () => executeMcpTool(callerCfg, "list_remote_sessions", { flock: "owner/nonexistent", machine: "HOST-PC" }),
+      (err) => err.code === "FLOCK_NOT_ENROLLED"
+    );
+  } finally {
+    if (prevCopilotHome === undefined) delete process.env.COPILOT_HOME;
+    else process.env.COPILOT_HOME = prevCopilotHome;
+    fs.rmSync(tempRoot, { recursive: true, force: true });
   }
 });

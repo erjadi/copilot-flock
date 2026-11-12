@@ -47,6 +47,12 @@ import {
   writeConfigFileSecure,
   normalizeScope,
   parseFlockAddress,
+  parseExplicitFlockSelector,
+  isExplicitOptInFlockPolicy,
+  isSessionAuthorizedForFlock,
+  authorizeCallerFlockSelection,
+  executeMcpTool,
+  dispatchBrokerFreeRpc,
   signV3RpcEnvelope,
   verifyV3RpcEnvelope,
   loadLocalFlocksConfig,
@@ -2341,3 +2347,945 @@ test("v3.0.0 multi-flock platform: universal <owner>/<flock>[/<machineId>] addre
     env.cleanup();
   }
 });
+
+test("TODO #9: legacy two-flock list_remote_sessions and get_remote_session_transcript propagate args.flock end-to-end, enforce exact session IDs, deny unshared transcripts pre-body, and fail closed on invalid/non-member selectors while preserving omitted-selector owner routes", async () => {
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "flock-todo9-legacy-"));
+  const prevCopilotHome = process.env.COPILOT_HOME;
+  process.env.COPILOT_HOME = path.join(tempRoot, "copilot-home");
+  try {
+    const mkKey = (label) => {
+      const kp = crypto.generateKeyPairSync("ed25519", {
+        publicKeyEncoding: { type: "spki", format: "pem" },
+        privateKeyEncoding: { type: "pkcs8", format: "pem" },
+      });
+      return { ...kp, fingerprint: `fp-${label}` };
+    };
+
+    const callerKey = mkKey("caller");
+    const workHostKey = mkKey("work-host");
+    const personalHostKey = mkKey("personal-host");
+    const aliceKey = mkKey("alice");
+
+    const registryMembers = [
+      { machineId: "CALLER-LAPTOP", githubUser: "owner", scope: "work", publicKey: callerKey.publicKey },
+      { machineId: "HOST-WORK-VM", githubUser: "owner", scope: "work", publicKey: workHostKey.publicKey },
+      { machineId: "HOST-PERSONAL-PC", githubUser: "owner", scope: "personal", publicKey: personalHostKey.publicKey },
+      { machineId: "ALICE-LAPTOP", githubUser: "alice", scope: "work", publicKey: aliceKey.publicKey },
+    ];
+
+    const workSessions = [
+      {
+        session_id: "sess-private-owner",
+        title: "Owner internal roadmap",
+        session_type: "workspace",
+        is_running: true,
+        repo: "owner/private-core",
+        updated_at: "2026-11-12T01:00:00.000Z",
+      },
+      {
+        session_id: "sess-exp-only",
+        title: "Experimental feature review",
+        session_type: "workspace",
+        is_running: false,
+        repo: "owner/experimental-repo",
+        updated_at: "2026-11-12T00:55:00.000Z",
+      },
+      {
+        session_id: "sess-alpha-only",
+        title: "Alpha team API rollout",
+        session_type: "workspace",
+        is_running: false,
+        repo: "owner/alpha-service",
+        updated_at: "2026-11-12T00:50:00.000Z",
+      },
+      {
+        session_id: "sess-shared-both",
+        title: "Cross-flock release checklist",
+        session_type: "chat",
+        is_running: false,
+        repo: null,
+        updated_at: "2026-11-12T00:45:00.000Z",
+      },
+      {
+        session_id: "sess-foreign-bound",
+        title: "Partner isolated thread",
+        session_type: "workspace",
+        is_running: false,
+        repo: "partner/ext",
+        updated_at: "2026-11-12T00:40:00.000Z",
+      },
+    ];
+
+    const personalSessions = [
+      {
+        session_id: "sess-personal-unshared",
+        title: "Home lab notes",
+        session_type: "chat",
+        is_running: false,
+        repo: null,
+        updated_at: "2026-11-12T00:35:00.000Z",
+      },
+    ];
+
+    const workTranscriptBodies = new Map([
+      ["sess-private-owner", "SENTINEL_PRIVATE_OWNER_BODY_DO_NOT_LEAK"],
+      ["sess-exp-only", "LIVE_EXP_TRANSCRIPT_BODY"],
+      ["sess-alpha-only", "SENTINEL_ALPHA_ONLY_BODY_DO_NOT_LEAK"],
+      ["sess-shared-both", "SHARED_BOTH_TRANSCRIPT_BODY"],
+      ["sess-foreign-bound", "SENTINEL_FOREIGN_BOUND_BODY_DO_NOT_LEAK"],
+    ]);
+
+    const transcriptReadCalls = [];
+    const readWorkTranscript = async (selector) => {
+      transcriptReadCalls.push(selector);
+      const target =
+        selector === "latest"
+          ? workSessions[0]
+          : workSessions.find((s) => s.session_id === selector);
+      if (!target) throw new Error(`Session not found: ${selector}`);
+      return {
+        session: target,
+        messages: [
+          {
+            role: "assistant",
+            content: workTranscriptBodies.get(target.session_id),
+            timestamp: target.updated_at,
+          },
+        ],
+      };
+    };
+
+    const sharedMembersRoster = [
+      { machineId: "CALLER-LAPTOP", githubUser: "owner", scope: "work", trustTier: "owner" },
+      { machineId: "HOST-WORK-VM", githubUser: "owner", scope: "work", trustTier: "owner" },
+      { machineId: "ALICE-LAPTOP", githubUser: "alice", scope: "work", trustTier: "collaborator" },
+    ];
+
+    const workHostFlocksPath = path.join(tempRoot, "work-host-flocks.json");
+    writeConfigFileSecure(
+      {
+        flocks: {
+          "owner/experimental": {
+            flockId: "owner/experimental",
+            flockType: "shared",
+            // Even when trustTier is "owner", explicit_opt_in_only must strictly enforce opt-in session IDs!
+            trustTier: "owner",
+            ownerGitHubUser: "owner",
+            allowedScopes: ["work"],
+            sessionVisibility: "explicit_opt_in_only",
+            sharedSessionIds: ["sess-exp-only", "sess-shared-both"],
+            sharedSnapshots: {
+              "sess-exp-only": {
+                sessionId: "sess-exp-only",
+                title: "Experimental feature review",
+                mode: "approved-snapshot",
+                summarySnapshot: "Approved snapshot for owner/experimental only.",
+                sharedAt: "2026-11-12T00:55:00.000Z",
+              },
+            },
+            members: sharedMembersRoster,
+          },
+          "owner/team-alpha": {
+            flockId: "owner/team-alpha",
+            flockType: "shared",
+            trustTier: "collaborator",
+            ownerGitHubUser: "owner",
+            allowedScopes: ["work"],
+            sessionVisibility: "explicit_opt_in_only",
+            sharedSessionIds: ["sess-alpha-only", "sess-shared-both"],
+            sharedSnapshots: {
+              "sess-alpha-only": {
+                sessionId: "sess-alpha-only",
+                title: "Alpha team API rollout",
+                mode: "approved-snapshot",
+                summarySnapshot: "Approved snapshot for owner/team-alpha only.",
+                sharedAt: "2026-11-12T00:50:00.000Z",
+              },
+            },
+            members: sharedMembersRoster,
+          },
+        },
+        threadBindings: {
+          "sess-foreign-bound": "partner/ext-flock",
+        },
+      },
+      workHostFlocksPath
+    );
+
+    const personalHostFlocksPath = path.join(tempRoot, "personal-host-flocks.json");
+    writeConfigFileSecure({ flocks: {}, threadBindings: {} }, personalHostFlocksPath);
+
+    const callerFlocksPath = path.join(tempRoot, "caller-flocks.json");
+    writeConfigFileSecure(
+      {
+        flocks: {
+          "owner/experimental": {
+            flockId: "owner/experimental",
+            flockType: "shared",
+            trustTier: "collaborator",
+            allowedScopes: ["work"],
+            sessionVisibility: "explicit_opt_in_only",
+            members: sharedMembersRoster,
+          },
+          "owner/team-alpha": {
+            flockId: "owner/team-alpha",
+            flockType: "shared",
+            trustTier: "collaborator",
+            allowedScopes: ["work"],
+            sessionVisibility: "explicit_opt_in_only",
+            members: sharedMembersRoster,
+          },
+        },
+      },
+      callerFlocksPath
+    );
+
+    const aliceFlocksPath = path.join(tempRoot, "alice-flocks.json");
+    writeConfigFileSecure(
+      {
+        flocks: {
+          "owner/experimental": {
+            flockId: "owner/experimental",
+            flockType: "shared",
+            trustTier: "collaborator",
+            allowedScopes: ["work"],
+            sessionVisibility: "explicit_opt_in_only",
+            members: sharedMembersRoster,
+          },
+        },
+      },
+      aliceFlocksPath
+    );
+
+    const workHostCfg = {
+      machineId: "HOST-WORK-VM",
+      githubUser: "owner",
+      scope: "work",
+      hub: "copilotbridge",
+      flocksConfigPath: workHostFlocksPath,
+      sessionsOverride: workSessions,
+      readTranscriptFn: readWorkTranscript,
+    };
+    const personalHostCfg = {
+      machineId: "HOST-PERSONAL-PC",
+      githubUser: "owner",
+      scope: "personal",
+      hub: "copilotbridge",
+      flocksConfigPath: personalHostFlocksPath,
+      sessionsOverride: personalSessions,
+      readTranscriptFn: async (selector) => ({
+        session: personalSessions[0],
+        messages: [{ role: "assistant", content: `PERSONAL:${selector}`, timestamp: "2026-11-12T00:35:00.000Z" }],
+      }),
+    };
+
+    const wireLog = [];
+    const simulatedHubTransport = async (rpcPayload) => {
+      wireLog.push(structuredClone(rpcPayload));
+      const targets =
+        !rpcPayload.toMachine || rpcPayload.toMachine === "*" || rpcPayload.toMachine.toLowerCase() === "all"
+          ? [workHostCfg, personalHostCfg]
+          : [workHostCfg, personalHostCfg].filter(
+              (h) => h.machineId.toLowerCase() === rpcPayload.toMachine.toLowerCase()
+            );
+      const replies = [];
+      for (const host of targets) {
+        try {
+          const result = await handleRpcAction(host, {
+            ...rpcPayload,
+            registryMembers,
+            enforceSignature: true,
+          });
+          replies.push({ requestId: rpcPayload.requestId, fromMachine: host.machineId, result });
+        } catch (err) {
+          replies.push({
+            requestId: rpcPayload.requestId,
+            fromMachine: host.machineId,
+            error: formatErrorDetail(err),
+          });
+        }
+      }
+      return replies;
+    };
+
+    const callerCfg = {
+      machineId: "CALLER-LAPTOP",
+      githubUser: "owner",
+      scope: "work",
+      hub: "copilotbridge",
+      identity: callerKey,
+      flocksConfigPath: callerFlocksPath,
+      rpcTransport: simulatedHubTransport,
+    };
+
+    const aliceCfg = {
+      machineId: "ALICE-LAPTOP",
+      githubUser: "alice",
+      scope: "work",
+      hub: "copilotbridge",
+      identity: aliceKey,
+      flocksConfigPath: aliceFlocksPath,
+      rpcTransport: simulatedHubTransport,
+    };
+
+    // 1. Broadcast list_remote_sessions with explicit `flock: "owner/experimental"`:
+    //    propagates signed selector on wire, excludes non-member HOST-PERSONAL-PC,
+    //    and returns ONLY exact session IDs authorized for owner/experimental.
+    const expListBroadcast = await executeMcpTool(callerCfg, "list_remote_sessions", {
+      flock: "owner/experimental",
+    });
+    assert.equal(Array.isArray(expListBroadcast), true);
+    assert.deepEqual(
+      expListBroadcast.map((m) => m.machineId),
+      ["HOST-WORK-VM"]
+    );
+    assert.equal(expListBroadcast[0].flockId, "owner/experimental");
+    assert.deepEqual(
+      expListBroadcast[0].sessions.map((s) => s.session_id).sort(),
+      ["sess-exp-only", "sess-shared-both"]
+    );
+    assert.equal(wireLog.at(-1).flockId, "owner/experimental");
+    assert.equal(wireLog.at(-1).params.flock, "owner/experimental");
+
+    // 2. Targeted list_remote_sessions with explicit `flock: "owner/team-alpha"`:
+    //    returns ONLY exact session IDs authorized for owner/team-alpha (excluding sess-exp-only, sess-private-owner, sess-foreign-bound).
+    const alphaListTargeted = await executeMcpTool(callerCfg, "list_remote_sessions", {
+      flock: "owner/team-alpha",
+      machine: "HOST-WORK-VM",
+    });
+    assert.equal(alphaListTargeted.flockId, "owner/team-alpha");
+    assert.deepEqual(
+      alphaListTargeted.sessions.map((s) => s.session_id).sort(),
+      ["sess-alpha-only", "sess-shared-both"]
+    );
+
+    // 3. Explicit owner scope flock `flock: "owner/work"` includes owner sessions on HOST-WORK-VM
+    //    but STILL excludes foreign-bound `sess-foreign-bound` (`threadBindings`).
+    const ownerWorkList = await executeMcpTool(callerCfg, "list_remote_sessions", {
+      flock: "owner/work",
+      machine: "HOST-WORK-VM",
+    });
+    assert.equal(ownerWorkList.flockId, "owner/work");
+    assert.deepEqual(
+      ownerWorkList.sessions.map((s) => s.session_id).sort(),
+      ["sess-alpha-only", "sess-exp-only", "sess-private-owner", "sess-shared-both"]
+    );
+
+    // 4. get_remote_session_transcript with `to_machine: "auto"` + explicit `flock: "owner/experimental"`
+    //    resolves ONLY member HOST-WORK-VM (ignoring non-member HOST-PERSONAL-PC) and returns authorized transcript/snapshot.
+    transcriptReadCalls.length = 0;
+    const expSnapTranscript = await executeMcpTool(callerCfg, "get_remote_session_transcript", {
+      flock: "owner/experimental",
+      to_machine: "auto",
+      session: "sess-exp-only",
+    });
+    assert.equal(expSnapTranscript.session.session_id, "sess-exp-only");
+    assert.equal(expSnapTranscript.messages[0].content, "Approved snapshot for owner/experimental only.");
+    assert.deepEqual(transcriptReadCalls, []);
+
+    const expSharedLiveTranscript = await executeMcpTool(callerCfg, "get_remote_session_transcript", {
+      flock: "owner/experimental",
+      to_machine: "HOST-WORK-VM",
+      session: "sess-shared-both",
+    });
+    assert.equal(expSharedLiveTranscript.session.session_id, "sess-shared-both");
+    assert.equal(expSharedLiveTranscript.messages[0].content, "SHARED_BOTH_TRANSCRIPT_BODY");
+    assert.deepEqual(transcriptReadCalls, ["sess-shared-both"]);
+
+    // 5. Pre-body transcript denial: requesting unshared, other-flock, foreign-bound, fuzzy-substring, or "latest"
+    //    sessions under `flock: "owner/experimental"` rejects BEFORE reading any transcript body (`transcriptReadCalls` stays empty).
+    transcriptReadCalls.length = 0;
+    for (const forbiddenSession of [
+      "sess-private-owner",
+      "sess-alpha-only",
+      "sess-foreign-bound",
+      "Owner internal",
+      "latest",
+    ]) {
+      await assert.rejects(
+        () =>
+          executeMcpTool(callerCfg, "get_remote_session_transcript", {
+            flock: "owner/experimental",
+            to_machine: "HOST-WORK-VM",
+            session: forbiddenSession,
+          }),
+        (err) => {
+          assert.match(err.message, /SESSION_NOT_SHARED|not shared/i);
+          assert.doesNotMatch(err.message, /SENTINEL_/);
+          return true;
+        }
+      );
+    }
+    assert.deepEqual(
+      transcriptReadCalls,
+      [],
+      "Denied transcript requests must fail pre-body before invoking transcript reader"
+    );
+
+    // Foreign-bound session is also denied pre-body even under explicit `flock: "owner/work"`
+    transcriptReadCalls.length = 0;
+    await assert.rejects(
+      () =>
+        executeMcpTool(callerCfg, "get_remote_session_transcript", {
+          flock: "owner/work",
+          to_machine: "HOST-WORK-VM",
+          session: "sess-foreign-bound",
+        }),
+      /SESSION_NOT_SHARED|not authorized/i
+    );
+    assert.deepEqual(transcriptReadCalls, []);
+
+    // 6. Invalid, non-member, conflicting, or unauthorized explicit `flock` selectors fail closed
+    //    without sending fallback RPCs or falling back to default owner routes.
+    const wireCountBeforeInvalid = wireLog.length;
+    for (const invalidFlock of ["", "   ", "../escape", "owner//experimental", "a/b/c/d", "*", "all"]) {
+      await assert.rejects(
+        () => executeMcpTool(callerCfg, "list_remote_sessions", { flock: invalidFlock }),
+        (err) => err.code === "INVALID_FLOCK_SELECTOR"
+      );
+      await assert.rejects(
+        () =>
+          executeMcpTool(callerCfg, "get_remote_session_transcript", {
+            flock: invalidFlock,
+            to_machine: "HOST-WORK-VM",
+            session: "sess-exp-only",
+          }),
+        (err) => err.code === "INVALID_FLOCK_SELECTOR"
+      );
+    }
+    assert.equal(wireLog.length, wireCountBeforeInvalid, "Invalid selectors must fail closed before wire send");
+
+    for (const nonMemberFlock of ["owner/unjoined-flock", "stranger/secret-team"]) {
+      await assert.rejects(
+        () => executeMcpTool(callerCfg, "list_remote_sessions", { flock: nonMemberFlock }),
+        (err) => err.code === "FLOCK_NOT_ENROLLED" && err.statusCode === 403
+      );
+      await assert.rejects(
+        () =>
+          executeMcpTool(callerCfg, "get_remote_session_transcript", {
+            flock: nonMemberFlock,
+            to_machine: "HOST-WORK-VM",
+            session: "sess-exp-only",
+          }),
+        (err) => err.code === "FLOCK_NOT_ENROLLED" && err.statusCode === 403
+      );
+    }
+
+    // Targeting a non-member machine (`HOST-PERSONAL-PC`) with `flock: "owner/experimental"` fails closed
+    await assert.rejects(
+      () =>
+        executeMcpTool(callerCfg, "list_remote_sessions", {
+          flock: "owner/experimental",
+          machine: "HOST-PERSONAL-PC",
+        }),
+      /FLOCK_NOT_ENROLLED|FLOCK_SCOPE_FORBIDDEN/
+    );
+    await assert.rejects(
+      () =>
+        executeMcpTool(callerCfg, "list_remote_sessions", {
+          flock: "owner/experimental/HOST-PERSONAL-PC",
+        }),
+      (err) => err.code === "FLOCK_NON_MEMBER" && err.statusCode === 403
+    );
+    await assert.rejects(
+      () =>
+        executeMcpTool(callerCfg, "get_remote_session_transcript", {
+          flock: "owner/experimental/HOST-WORK-VM",
+          to_machine: "HOST-PERSONAL-PC",
+          session: "sess-exp-only",
+        }),
+      (err) => err.code === "FLOCK_TARGET_CONFLICT"
+    );
+
+    // Cross-user `@alice`: allowed on enrolled `owner/experimental`, rejected fail-closed on `owner/team-alpha`,
+    // `owner/work`, and omitted-selector default owner routes!
+    const aliceExpList = await executeMcpTool(aliceCfg, "list_remote_sessions", {
+      flock: "owner/experimental",
+      machine: "HOST-WORK-VM",
+    });
+    assert.deepEqual(
+      aliceExpList.sessions.map((s) => s.session_id).sort(),
+      ["sess-exp-only", "sess-shared-both"]
+    );
+    await assert.rejects(
+      () =>
+        executeMcpTool(aliceCfg, "list_remote_sessions", {
+          flock: "owner/team-alpha",
+          machine: "HOST-WORK-VM",
+        }),
+      (err) => err.code === "FLOCK_NOT_ENROLLED" && err.statusCode === 403
+    );
+    await assert.rejects(
+      () =>
+        executeMcpTool(aliceCfg, "list_remote_sessions", {
+          flock: "owner/work",
+          machine: "HOST-WORK-VM",
+        }),
+      (err) => err.code === "FLOCK_NOT_ENROLLED" && err.statusCode === 403
+    );
+    // Direct responder check: even if @alice bypasses caller check and sends `flock: "owner/work"` or omits `flock` on wire, responder rejects pre-body!
+    transcriptReadCalls.length = 0;
+    await assert.rejects(
+      () =>
+        handleRpcAction(workHostCfg, {
+          requestId: "req-alice-owner-steal",
+          fromMachine: "ALICE-LAPTOP",
+          action: "get_transcript",
+          flockId: "owner/work",
+          params: { flock: "owner/work", session: "sess-private-owner" },
+          registryMembers,
+        }),
+      (err) => err.code === "UNAUTHORIZED_FLOCK" && err.statusCode === 403
+    );
+    await assert.rejects(
+      () =>
+        handleRpcAction(workHostCfg, {
+          requestId: "req-alice-omitted-steal",
+          fromMachine: "ALICE-LAPTOP",
+          action: "list_sessions",
+          params: {},
+          registryMembers,
+        }),
+      (err) => err.code === "UNAUTHORIZED_FLOCK" && err.statusCode === 403
+    );
+    // Direct responder check: unsigned outer `flockId` injected onto a signed omitted-flock request is rejected!
+    const sentAt = new Date().toISOString();
+    const signedOmittedAuth = signRpcRequest({
+      requestId: "req-tamper-outer-flock",
+      sentAt,
+      fromMachine: "CALLER-LAPTOP",
+      toMachine: "HOST-WORK-VM",
+      action: "list_sessions",
+      params: { query: "", limit: 25, runningOnly: false },
+      identity: callerKey,
+    });
+    await assert.rejects(
+      () =>
+        handleRpcAction(workHostCfg, {
+          requestId: "req-tamper-outer-flock",
+          sentAt,
+          fromMachine: "CALLER-LAPTOP",
+          toMachine: "HOST-WORK-VM",
+          action: "list_sessions",
+          flockId: "owner/experimental",
+          params: { query: "", limit: 25, runningOnly: false },
+          auth: signedOmittedAuth,
+          registryMembers,
+        }),
+      (err) => err.code === "UNSIGNED_FLOCK_SELECTOR" && err.statusCode === 403
+    );
+    assert.deepEqual(transcriptReadCalls, []);
+
+    // 7. Omitted-selector behavior preserved for same-owner default routes!
+    const omittedOwnerList = await executeMcpTool(callerCfg, "list_remote_sessions", {
+      machine: "HOST-WORK-VM",
+    });
+    assert.equal(omittedOwnerList.flockId, undefined);
+    assert.deepEqual(
+      omittedOwnerList.sessions.map((s) => s.session_id),
+      workSessions.map((s) => s.session_id)
+    );
+    const omittedOwnerTranscript = await executeMcpTool(callerCfg, "get_remote_session_transcript", {
+      to_machine: "HOST-WORK-VM",
+      session: "sess-private-owner",
+    });
+    assert.equal(
+      omittedOwnerTranscript.messages[0].content,
+      "SENTINEL_PRIVATE_OWNER_BODY_DO_NOT_LEAK"
+    );
+
+    // 8. Real on-disk cli-sessions.json + session-state/<id>/events.jsonl verification (no overrides):
+    //    proves fs.promises.open is NEVER called on events.jsonl when transcript access is denied!
+    const diskFlockHome = path.join(process.env.COPILOT_HOME, "flock");
+    fs.mkdirSync(diskFlockHome, { recursive: true });
+    fs.writeFileSync(
+      path.join(diskFlockHome, "cli-sessions.json"),
+      JSON.stringify([
+        { session_id: "disk-sess-owner", title: "Disk Owner Only", session_type: "cli", is_running: false },
+        { session_id: "disk-sess-exp", title: "Disk Exp Shared", session_type: "cli", is_running: false },
+        { session_id: "disk-sess-alpha", title: "Disk Alpha Shared", session_type: "cli", is_running: false },
+      ]),
+      "utf8"
+    );
+    for (const [sid, secretLine] of [
+      ["disk-sess-owner", "DISK_OWNER_PRIVATE_TRANSCRIPT_BODY"],
+      ["disk-sess-exp", "DISK_EXP_AUTHORIZED_TRANSCRIPT_BODY"],
+      ["disk-sess-alpha", "DISK_ALPHA_OTHER_FLOCK_TRANSCRIPT_BODY"],
+    ]) {
+      const sessDir = path.join(process.env.COPILOT_HOME, "session-state", sid);
+      fs.mkdirSync(sessDir, { recursive: true });
+      fs.writeFileSync(
+        path.join(sessDir, "events.jsonl"),
+        JSON.stringify({
+          type: "assistant.message",
+          id: crypto.randomUUID(),
+          data: { content: secretLine },
+          timestamp: "2026-11-12T01:10:00.000Z",
+        }) + "\n",
+        "utf8"
+      );
+    }
+    writeConfigFileSecure(
+      {
+        flocks: {
+          "owner/experimental": {
+            flockId: "owner/experimental",
+            flockType: "shared",
+            trustTier: "collaborator",
+            allowedScopes: ["work"],
+            sessionVisibility: "explicit_opt_in_only",
+            sharedSessionIds: ["disk-sess-exp"],
+          },
+          "owner/team-alpha": {
+            flockId: "owner/team-alpha",
+            flockType: "shared",
+            trustTier: "collaborator",
+            allowedScopes: ["work"],
+            sessionVisibility: "explicit_opt_in_only",
+            sharedSessionIds: ["disk-sess-alpha"],
+          },
+        },
+      },
+      path.join(diskFlockHome, "flocks.json")
+    );
+
+    const diskHostCfg = { machineId: "DISK-WORK-VM", githubUser: "owner", scope: "work" };
+    const diskExpSessions = await handleRpcAction(diskHostCfg, {
+      action: "list_sessions",
+      flockId: "owner/experimental",
+      params: { flock: "owner/experimental" },
+    });
+    assert.deepEqual(
+      diskExpSessions.sessions.map((s) => s.session_id),
+      ["disk-sess-exp"]
+    );
+
+    const openedFiles = [];
+    const origPromisesOpen = fs.promises.open;
+    fs.promises.open = async function (targetPath, ...rest) {
+      openedFiles.push(String(targetPath));
+      return origPromisesOpen.call(this, targetPath, ...rest);
+    };
+    try {
+      await assert.rejects(
+        () =>
+          handleRpcAction(diskHostCfg, {
+            action: "get_transcript",
+            flockId: "owner/experimental",
+            params: { flock: "owner/experimental", session: "disk-sess-alpha" },
+          }),
+        (err) => err.code === "SESSION_NOT_SHARED" && err.statusCode === 403
+      );
+      await assert.rejects(
+        () =>
+          handleRpcAction(diskHostCfg, {
+            action: "get_transcript",
+            flockId: "owner/experimental",
+            params: { flock: "owner/experimental", session: "disk-sess-owner" },
+          }),
+        (err) => err.code === "SESSION_NOT_SHARED" && err.statusCode === 403
+      );
+      assert.deepEqual(
+        openedFiles,
+        [],
+        "events.jsonl must never be opened when get_transcript is denied for an unauthorized flock"
+      );
+
+      const allowedDiskTx = await handleRpcAction(diskHostCfg, {
+        action: "get_transcript",
+        flockId: "owner/experimental",
+        params: { flock: "owner/experimental", session: "disk-sess-exp" },
+      });
+      assert.equal(allowedDiskTx.messages[0].content, "DISK_EXP_AUTHORIZED_TRANSCRIPT_BODY");
+      assert.equal(openedFiles.length, 1);
+      assert.match(openedFiles[0], /disk-sess-exp[\\/]events\.jsonl$/);
+    } finally {
+      fs.promises.open = origPromisesOpen;
+    }
+  } finally {
+    if (prevCopilotHome === undefined) delete process.env.COPILOT_HOME;
+    else process.env.COPILOT_HOME = prevCopilotHome;
+    fs.rmSync(tempRoot, { recursive: true, force: true });
+  }
+});
+
+test("TODO #9: broker-free two-flock list_remote_sessions and get_remote_session_transcript propagate args.flock end-to-end, isolate per-flock session IDs, and reject invalid/non-member selectors fail-closed", async () => {
+  const { AzureTransport, azureEndpoints } = await import("../flock-azure.mjs");
+  const { BrokerFreeRuntime } = await import("../flock-broker-free.mjs");
+  const { ownerFingerprint } = await import("../flock-protocol.mjs");
+  const { atomicJson } = await import("../flock-lifecycle.mjs");
+
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "flock-todo9-bf34-"));
+  const prevCopilotHome = process.env.COPILOT_HOME;
+  const ownerCopilotHome = path.join(root, "owner-copilot-home");
+  process.env.COPILOT_HOME = ownerCopilotHome;
+
+  let ownerDaemon = null;
+  try {
+    const endpoints = azureEndpoints(
+      "https://fixture.service.signalr.net",
+      "https://fixture.servicebus.windows.net"
+    );
+    const credentials = {
+      connectionString: "Endpoint=https://fixture.service.signalr.net;AccessKey=signalr-fixture",
+      manageConnectionString:
+        "Endpoint=sb://fixture.servicebus.windows.net/;SharedAccessKeyName=RootManageSharedAccessKey;SharedAccessKey=manage-fixture",
+      sendConnectionString:
+        "Endpoint=sb://fixture.servicebus.windows.net/;SharedAccessKeyName=FlockSendRule;SharedAccessKey=send-fixture",
+      listenConnectionString:
+        "Endpoint=sb://fixture.servicebus.windows.net/;SharedAccessKeyName=FlockListenRule;SharedAccessKey=listen-fixture",
+    };
+
+    const subscribers = new Map();
+    const sockets = new Set();
+    const fetchImpl = async (url, options) => {
+      const parsed = new URL(url);
+      const peer = parsed.pathname.match(/\/subscriptions\/(sub-[a-f0-9]{46})/)?.[1];
+      if (options.method === "PUT" && peer && !parsed.pathname.includes("/messages/")) {
+        if (!subscribers.has(peer)) subscribers.set(peer, []);
+        return new Response("", { status: 201 });
+      }
+      if (options.method === "DELETE" && peer && !parsed.pathname.includes("/messages/")) {
+        subscribers.delete(peer);
+        return new Response(null, { status: 204 });
+      }
+      if (parsed.hostname.endsWith(".signalr.net")) {
+        const { target, arguments: args } = JSON.parse(options.body);
+        for (const socket of sockets) {
+          if (!socket.ws.closed) socket.callback(target, structuredClone(args));
+        }
+        return new Response("", { status: 202 });
+      }
+      if (options.method === "POST" && parsed.pathname.endsWith("/messages") && !peer) {
+        for (const queue of subscribers.values()) queue.push(JSON.parse(options.body));
+        return new Response("", { status: 201 });
+      }
+      if (options.method === "POST" && parsed.pathname.endsWith("/messages/head")) {
+        const queue = subscribers.get(peer);
+        if (!queue?.length) return new Response(null, { status: 204 });
+        return new Response(JSON.stringify(queue[0]), {
+          status: 201,
+          headers: {
+            Location: `${endpoints.serviceBusEndpoint}/copilot-bridge-offline/subscriptions/${peer}/messages/lock`,
+          },
+        });
+      }
+      if (options.method === "DELETE" && parsed.pathname.endsWith("/messages/lock")) {
+        subscribers.get(peer)?.shift();
+        return new Response(null, { status: 204 });
+      }
+      if (options.method === "PUT" && parsed.pathname.endsWith("/messages/lock")) {
+        return new Response(null, { status: 204 });
+      }
+      throw new Error(`Unexpected synthetic transport operation: ${options.method} ${parsed.pathname}`);
+    };
+    const connect = async (_cfg, { onInvocation }) => {
+      const socket = {
+        ws: { closed: false },
+        callback: onInvocation,
+        close() {
+          this.ws.closed = true;
+          sockets.delete(this);
+        },
+      };
+      sockets.add(socket);
+      return socket;
+    };
+    const transportFactory = (config, opts) => new AzureTransport(config, { ...opts, fetchImpl });
+
+    const ownerFlockDir = path.join(ownerCopilotHome, "flock");
+    const peerFlockDir = path.join(root, "peer-flock");
+    fs.mkdirSync(ownerFlockDir, { recursive: true });
+    fs.mkdirSync(peerFlockDir, { recursive: true });
+
+    const ownerHostCfg = { protocol: "broker-free-v34", machineId: "OWNER-HOST", scope: "work" };
+    const ownerRuntime = new BrokerFreeRuntime(ownerFlockDir, {
+      connect,
+      transportFactory,
+      log: () => {},
+      dispatch: (req) => dispatchBrokerFreeRpc(ownerHostCfg, req),
+    });
+    const peerRuntime = new BrokerFreeRuntime(peerFlockDir, {
+      connect,
+      transportFactory,
+      log: () => {},
+    });
+
+    await ownerRuntime.initializeOwner({
+      flockId: "demo/flock-a",
+      machineId: "OWNER-HOST",
+      scope: "work",
+      ...credentials,
+    });
+    await ownerRuntime.initializeOwner({
+      flockId: "demo/flock-b",
+      machineId: "OWNER-HOST",
+      scope: "work",
+      ...credentials,
+    });
+
+    const joinA = await peerRuntime.joinRequest({
+      machineId: "PEER-CLIENT",
+      scope: "work",
+      flockId: "demo/flock-a",
+    });
+    const ticketA = await ownerRuntime.approve({
+      flockId: "demo/flock-a",
+      code: joinA,
+      expectedEd25519Fingerprint: joinA.body.peerId,
+      role: "collaborator",
+      sessionIds: ["sess-bf-a", "sess-bf-both"],
+      membershipExpiresAt: Date.now() + 3600000,
+    });
+    await peerRuntime.accept(
+      ticketA,
+      ownerFingerprint(ownerRuntime.record("demo/flock-a").ownerPublicKey)
+    );
+
+    const joinB = await peerRuntime.joinRequest({
+      machineId: "PEER-CLIENT",
+      scope: "work",
+      flockId: "demo/flock-b",
+    });
+    const ticketB = await ownerRuntime.approve({
+      flockId: "demo/flock-b",
+      code: joinB,
+      expectedEd25519Fingerprint: joinB.body.peerId,
+      role: "collaborator",
+      sessionIds: ["sess-bf-b", "sess-bf-both"],
+      membershipExpiresAt: Date.now() + 3600000,
+    });
+    await peerRuntime.accept(
+      ticketB,
+      ownerFingerprint(ownerRuntime.record("demo/flock-b").ownerPublicKey)
+    );
+
+    // Configure owner's local flocks.json with distinct shared sessions per flock + a foreign-bound session
+    atomicJson(path.join(ownerFlockDir, "flocks.json"), {
+      flocks: {
+        "demo/flock-a": {
+          sharedSessionIds: ["sess-bf-a", "sess-bf-both", "sess-bf-foreign"],
+          sharedSnapshots: {
+            "sess-bf-a": {
+              title: "Flock A Thread",
+              summarySnapshot: "Approved summary A",
+              sharedAt: "2026-11-12T01:00:00.000Z",
+            },
+            "sess-bf-both": {
+              title: "Shared AB Thread",
+              summarySnapshot: "Approved summary AB (A view)",
+              sharedAt: "2026-11-12T01:00:00.000Z",
+            },
+            "sess-bf-foreign": {
+              title: "Foreign Bound Thread",
+              summarySnapshot: "MUST_NOT_LEAK_FOREIGN",
+              sharedAt: "2026-11-12T01:00:00.000Z",
+            },
+          },
+        },
+        "demo/flock-b": {
+          sharedSessionIds: ["sess-bf-b", "sess-bf-both"],
+          sharedSnapshots: {
+            "sess-bf-b": {
+              title: "Flock B Thread",
+              summarySnapshot: "Approved summary B",
+              sharedAt: "2026-11-12T01:05:00.000Z",
+            },
+            "sess-bf-both": {
+              title: "Shared AB Thread",
+              summarySnapshot: "Approved summary AB (B view)",
+              sharedAt: "2026-11-12T01:05:00.000Z",
+            },
+          },
+        },
+      },
+      threadBindings: {
+        "sess-bf-foreign": "demo/external-other",
+      },
+    });
+
+    ownerDaemon = await ownerRuntime.start();
+
+    const peerCfg = {
+      protocol: "broker-free-v34",
+      machineId: "PEER-CLIENT",
+      scope: "work",
+      hub: "copilotbridge",
+      skipDaemonEnsure: true,
+      brokerFreeOptions: {
+        root: peerFlockDir,
+        connect,
+        transportFactory,
+        log: () => {},
+      },
+    };
+
+    const listA = await executeMcpTool(peerCfg, "list_remote_sessions", {
+      flock: "demo/flock-a",
+      machine: "OWNER-HOST",
+    });
+    assert.equal(listA.flockId, "demo/flock-a");
+    assert.deepEqual(
+      listA.sessions.map((s) => s.session_id).sort(),
+      ["sess-bf-a", "sess-bf-both"]
+    );
+
+    const listB = await executeMcpTool(peerCfg, "list_remote_sessions", {
+      flock: "demo/flock-b",
+      machine: "OWNER-HOST",
+    });
+    assert.equal(listB.flockId, "demo/flock-b");
+    assert.deepEqual(
+      listB.sessions.map((s) => s.session_id).sort(),
+      ["sess-bf-b", "sess-bf-both"]
+    );
+
+    const txA = await executeMcpTool(peerCfg, "get_remote_session_transcript", {
+      flock: "demo/flock-a",
+      to_machine: "OWNER-HOST",
+      session: "sess-bf-a",
+    });
+    assert.equal(txA.messages[0].content, "Approved summary A");
+
+    // Pre-body transcript denial across flocks & unshared/foreign sessions
+    for (const deniedSess of ["sess-bf-b", "sess-bf-foreign", "unshared-local-only", "latest"]) {
+      await assert.rejects(
+        () =>
+          executeMcpTool(peerCfg, "get_remote_session_transcript", {
+            flock: "demo/flock-a",
+            to_machine: "OWNER-HOST",
+            session: deniedSess,
+          }),
+        /forbids|not explicitly shared/i
+      );
+    }
+
+    // Omitted selector with 2 broker-free memberships fails closed as ambiguous
+    await assert.rejects(
+      () => executeMcpTool(peerCfg, "list_remote_sessions", { machine: "OWNER-HOST" }),
+      /ambiguous/i
+    );
+
+    // Explicit empty/invalid/non-member selectors fail closed even if cfg.flockId has a default
+    const singleDefaultPeerCfg = { ...peerCfg, flockId: "demo/flock-a" };
+    await assert.rejects(
+      () => executeMcpTool(singleDefaultPeerCfg, "list_remote_sessions", { flock: "", machine: "OWNER-HOST" }),
+      (err) => err.code === "INVALID_FLOCK_SELECTOR"
+    );
+    await assert.rejects(
+      () =>
+        executeMcpTool(singleDefaultPeerCfg, "get_remote_session_transcript", {
+          flock: "demo/non-member",
+          to_machine: "OWNER-HOST",
+          session: "sess-bf-a",
+        }),
+      /Not an active broker-free flock/i
+    );
+  } finally {
+    if (ownerDaemon) ownerDaemon.close();
+    if (prevCopilotHome === undefined) delete process.env.COPILOT_HOME;
+    else process.env.COPILOT_HOME = prevCopilotHome;
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+

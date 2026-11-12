@@ -111,6 +111,8 @@ Enrolling `CLOUD-DEV-VM` or `LINUX-GPU-HOST` into `erjadi/studio-team` never exp
   > *"Share this thread with `erjadi/studio-team`."* (Calls MCP tool `share_thread`, exporting a static, read-only `approved-snapshot` summary rather than raw `events.jsonl` tool logs. Always review the summary text to ensure no sensitive strings are included.)
 - **Collaborate in an isolated team thread (`boundFlockId`)**:
   > Collaborators in `erjadi/studio-team` can interact with sessions explicitly created for `boundFlockId = "erjadi/studio-team"` without ever listing, reading, or pivoting into your `personal` or `work` threads.
+- **Flock-scoped `list_remote_sessions` and `get_remote_session_transcript` enforcement**:
+  > Passing an explicit `flock` selector (e.g. `flock: "erjadi/studio-team"`) propagates and enforces that exact flock end-to-end: responders return only sessions authorized/shared for that flock and reject unauthorized transcript reads pre-body before reading `events.jsonl`. Invalid, non-member, or unauthorized explicit `flock` selectors fail closed without falling back to the default owner route, while omitting `flock` on legacy installations preserves the same-owner default route.
 - **Audit what you are sharing right now**:
   > *"What threads am I sharing right now?"* (Calls MCP tool `list_shared_threads` and lists every opted-in thread and which flock can see it.)
 - **Stop sharing a thread immediately**:

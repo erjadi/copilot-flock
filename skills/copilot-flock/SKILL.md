@@ -59,3 +59,6 @@ version or this skill alone does not establish production authorization.
    - `<owner>/<flock>/<machineId>` — Specific machine or single-PC time-bound guest pass (e.g. `erjadi/work/CLOUD-DEV-VM`).
 4. **4 Anti-Leakage Hard Walls (`Shared machines ≠ shared threads`)**:
    - Joining an external/collaborator flock or issuing a guest pass never exposes existing local threads. External callers can only access threads explicitly opted in via `share_thread` (with `approved-snapshot` transcript redaction) or new threads created for that `boundFlockId`.
+5. **Explicit `flock` Selector Enforcement (`list_remote_sessions` & `get_remote_session_transcript`)**:
+   - Both legacy and broker-free `list_remote_sessions` and `get_remote_session_transcript` propagate `flock` end-to-end, return only sessions authorized/shared for that exact flock, and deny transcript reads pre-body when a session is not authorized for that flock.
+   - Invalid, non-member, or unauthorized explicit `flock` selectors fail closed without falling back to the default owner route. On legacy installations, omitting `flock` preserves the same-owner default route (cross-user callers must supply an authorized explicit `flock`); on broker-free installations with multiple enrolled flocks, an explicit `flock` is always required.
