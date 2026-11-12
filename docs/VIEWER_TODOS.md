@@ -128,6 +128,31 @@ editorial rank ascending, then stable ID in code-point order. Sorting does
 not change the visible editorial rank labels or the source data. Search,
 status and kind filters continue to work; acceptance criteria are searchable.
 
+### Optional implementation tracking
+
+`implementationStatus` remains the required human-readable string, now also
+shown on the card summary next to the existing status badge. Optional
+`implementationDetails` adds `stage`, `workerSessionId`, `model`, `branch`,
+`commitSha`, `changedFiles`, `testSummary`, `mergedIn35Candidate` and
+`flockReviewStatus`. When supplied, the entire block is validated: text fields
+must be nonempty strings, `changedFiles` an array of nonempty strings, and
+`mergedIn35Candidate` a boolean. `commitSha` and `testSummary` may be `null`
+to explicitly represent unavailable evidence. Unknown keys are not projected.
+An absent block stays absent for older snapshots.
+
+The expanded card renders these fields as tracker-reported progress, with
+missing commit/test/file evidence labeled "Not supplied". Progress text,
+worker, branch, commit, file and test metadata are searchable. Neither a done
+status nor a recorded commit/candidate merge implies passing tests, flock
+approval or deployment. The tracker controls status changes; the viewer
+does not infer them.
+
+Older installed viewers project only `implementationStatus` and `details`,
+not this optional block. Publish only that explicitly agreed text projection
+until compatible code is deployed; retain the structured canonical tracker
+data. Adding the block to an already published revision requires a new
+revision rather than bypassing same-revision conflict protection.
+
 ## Verification and release
 
 Focused checks: `node --test test/viewer-todos.test.mjs`, then viewer

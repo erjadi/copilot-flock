@@ -63,6 +63,20 @@ export function validateTodoSnapshot(value) {
       if (!Array.isArray(item.acceptanceCriteria)) invalid();
       issue.acceptanceCriteria = item.acceptanceCriteria.map(text);
     }
+    if (Object.hasOwn(item, "implementationDetails")) {
+      const progress = item.implementationDetails;
+      if (!progress || typeof progress !== "object" || Array.isArray(progress) ||
+          !Array.isArray(progress.changedFiles) || typeof progress.mergedIn35Candidate !== "boolean") invalid();
+      issue.implementationDetails = {
+        stage: text(progress.stage), workerSessionId: text(progress.workerSessionId),
+        model: text(progress.model), branch: text(progress.branch),
+        commitSha: progress.commitSha === null ? null : text(progress.commitSha),
+        changedFiles: progress.changedFiles.map(text),
+        testSummary: progress.testSummary === null ? null : text(progress.testSummary),
+        mergedIn35Candidate: progress.mergedIn35Candidate,
+        flockReviewStatus: text(progress.flockReviewStatus),
+      };
+    }
     if (ids.has(issue.todoId) || numbers.has(issue.number) || ranks.has(issue.rank)) invalid();
     ids.add(issue.todoId); numbers.add(issue.number); ranks.add(issue.rank);
     return issue;

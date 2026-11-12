@@ -40,7 +40,11 @@ export function TodosView() {
   const filtered = useMemo(() => sortTodoIssues(items.filter((item) =>
     (status === "all" || item.status === status) &&
     (kind === "all" || item.type === kind) &&
-    [item.title, item.todoId, `Local #${item.number}`, item.rankingExplanation, item.evidence, item.nextStep, ...item.details, ...(item.acceptanceCriteria ?? [])]
+    [item.title, item.todoId, `Local #${item.number}`, item.rankingExplanation, item.evidence, item.nextStep, item.implementationStatus,
+      ...item.details, ...(item.acceptanceCriteria ?? []),
+      ...(item.implementationDetails ? [item.implementationDetails.stage, item.implementationDetails.workerSessionId,
+        item.implementationDetails.model, item.implementationDetails.branch, item.implementationDetails.commitSha ?? "",
+        item.implementationDetails.testSummary ?? "", item.implementationDetails.flockReviewStatus, ...item.implementationDetails.changedFiles] : [])]
       .join(" ").toLowerCase().includes(query.trim().toLowerCase())
   ), sortKey, direction), [items, status, kind, query, sortKey, direction]);
   const clearFilters = () => { setQuery(""); setStatus("all"); setKind("all"); };
@@ -101,9 +105,31 @@ export function TodosView() {
                 <div className="flex flex-wrap items-center gap-2"><span className="font-mono text-[10px] text-muted-foreground">Local #{item.number} · {item.todoId}</span><Pill>{item.type}</Pill><Pill tone={item.status === "done" ? "online" : item.status === "blocked" ? "destructive" : "gpu"}>{statusLabels[item.status]}</Pill></div>
                 <h2 className="mt-2 break-words text-base font-medium sm:text-lg">{item.title}</h2>
                 <p className="mt-2 text-sm leading-6 text-muted-foreground">{item.rankingExplanation}</p>
+                <p className="mt-2 whitespace-pre-wrap break-words text-xs leading-5 text-muted-foreground"><span className="font-medium text-foreground">Implementation: </span>{item.implementationStatus}</p>
                 <dl className="mt-3 grid grid-cols-2 gap-3 sm:grid-cols-3">
                   {TODO_DIMENSIONS.map(({ key, label, meaning }) => <div key={key} title={meaning}><dt className="text-[10px] text-muted-foreground">{label}</dt><dd className="mt-1 font-mono text-xs">{item.scores ? `${item.scores[key]}/5` : "Unscored"}</dd></div>)}
                 </dl>
+                {item.implementationDetails && <div className="mt-5 border-t border-border/50 pt-4">
+                  <h3 className="text-[10px] uppercase tracking-widest text-muted-foreground">Implementation tracking</h3>
+                  <dl className="mt-3 grid gap-4 text-sm sm:grid-cols-2">
+                    {[
+                      ["Stage", item.implementationDetails.stage],
+                      ["Worker session", item.implementationDetails.workerSessionId],
+                      ["Model", item.implementationDetails.model],
+                      ["Branch", item.implementationDetails.branch],
+                      ["Commit SHA", item.implementationDetails.commitSha ?? "Not supplied"],
+                      ["Test results", item.implementationDetails.testSummary ?? "Not supplied"],
+                      ["Merged in 3.5 candidate", item.implementationDetails.mergedIn35Candidate ? "Reported merged" : "Not reported merged"],
+                      ["Flock review", item.implementationDetails.flockReviewStatus],
+                    ].map(([label, value]) => <div key={label}><dt className="text-[10px] uppercase tracking-widest text-muted-foreground">{label}</dt><dd className="mt-1 whitespace-pre-wrap break-words leading-6">{value}</dd></div>)}
+                    <div className="sm:col-span-2"><dt className="text-[10px] uppercase tracking-widest text-muted-foreground">Changed files</dt>
+                      <dd className="mt-1">{item.implementationDetails.changedFiles.length
+                        ? <ul className="list-disc pl-4">{item.implementationDetails.changedFiles.map((file, index) => <li key={index} className="break-words">{file}</li>)}</ul>
+                        : "Not supplied"}</dd>
+                    </div>
+                  </dl>
+                  <p className="mt-3 text-xs text-muted-foreground">Tracker-reported progress, not independent verification. A done status, commit or candidate merge does not imply passing tests, release approval or deployment.</p>
+                </div>}
                 <p className="mt-3 text-xs text-muted-foreground">Evidence confidence: <span className="text-foreground">{item.evidenceConfidence ? confidenceLabels[item.evidenceConfidence] : "Unknown"}</span></p>
               </div>
               <ChevronDown aria-hidden="true" className="mt-1 h-4 w-4 shrink-0 text-muted-foreground transition-transform group-open/todo:rotate-180" />

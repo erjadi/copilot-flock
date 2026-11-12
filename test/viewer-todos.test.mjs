@@ -21,6 +21,36 @@ const snapshot = () => ({
   source: "Synthetic test tracker", issues: [issue(2), issue(1)],
 });
 const scores = (value) => Object.fromEntries(TODO_DIMENSIONS.map(({ key }) => [key, value]));
+const progress = () => ({
+  stage: "in_progress", workerSessionId: "synthetic-worker", model: "synthetic-model",
+  branch: "synthetic-feature", commitSha: null, changedFiles: [], testSummary: null,
+  mergedIn35Candidate: false, flockReviewStatus: "pending",
+});
+
+test("optional implementation tracking preserves unknown and reported outcomes without inferring completion", () => {
+  assert.equal(Object.hasOwn(validateTodoSnapshot(snapshot()).issues[0], "implementationDetails"), false);
+  const value = snapshot();
+  value.issues[0].implementationDetails = { ...progress(), secret: "not projected" };
+  assert.deepEqual(validateTodoSnapshot(value).issues[1].implementationDetails, progress());
+  value.issues[0].status = "done";
+  value.issues[0].implementationDetails = {
+    ...progress(), stage: "implemented", commitSha: "a".repeat(40), changedFiles: ["viewer/synthetic.ts"],
+    testSummary: "Reported: 2 passed; deployment not verified", mergedIn35Candidate: true, flockReviewStatus: "pending",
+  };
+  const projected = validateTodoSnapshot(value).issues[1];
+  assert.deepEqual(projected.implementationDetails, value.issues[0].implementationDetails);
+  assert.equal(projected.implementationDetails.flockReviewStatus, "pending");
+  for (const change of [
+    () => null, () => [], () => ({}), p => ({ ...p, stage: "" }),
+    p => ({ ...p, workerSessionId: null }), p => ({ ...p, model: "" }), p => ({ ...p, branch: false }),
+    p => ({ ...p, commitSha: 42 }), p => ({ ...p, changedFiles: "file.ts" }),
+    p => ({ ...p, changedFiles: [" "] }), p => ({ ...p, testSummary: {} }),
+    p => ({ ...p, mergedIn35Candidate: "false" }), p => ({ ...p, flockReviewStatus: null }),
+  ]) {
+    const invalid = snapshot(); invalid.issues[0].implementationDetails = change(progress());
+    assert.throws(() => validateTodoSnapshot(invalid), /Invalid TODO snapshot/);
+  }
+});
 
 test("optional scoring contract preserves old snapshots and rejects partial or invalid supplied metadata", () => {
   const legacy = validateTodoSnapshot(snapshot()).issues[0];
@@ -115,12 +145,13 @@ test("TODO endpoint is opt-in, read-only, same-origin and reloads durable data w
   assert.equal((await fetch(`${base}/api/todos`, { headers: { Origin: "https://other.invalid" } })).status, 403);
   assert.equal((await fetch(`${base}/api/todos`, { headers: { "Sec-Fetch-Site": "cross-site" } })).status, 403);
   const updated = { ...snapshot(), revision: 2 };
-  Object.assign(updated.issues[0], { scores: scores(4), evidenceConfidence: "reproduced", acceptanceCriteria: ["Verify result"] });
+  Object.assign(updated.issues[0], { scores: scores(4), evidenceConfidence: "reproduced", acceptanceCriteria: ["Verify result"], implementationDetails: progress() });
   await writeFile(file, JSON.stringify(updated));
   const scored = await (await fetch(`${base}/api/todos`)).json();
   assert.equal(scored.revision, 2);
   assert.deepEqual(scored.issues[1].scores, scores(4));
   assert.equal(scored.issues[1].evidenceConfidence, "reproduced");
+  assert.deepEqual(scored.issues[1].implementationDetails, progress());
   await writeFile(file, "{broken");
   const failed = await fetch(`${base}/api/todos`);
   assert.equal(failed.status, 503);
@@ -140,11 +171,12 @@ test("TODO publication is private, atomic and refuses stale/conflicting updates"
   if (process.platform !== "win32") assert.equal((await stat(destination)).mode & 0o777, 0o600);
   await publishTodos(source, destination);
   const newer = { ...snapshot(), revision: 2, updatedAt: "2026-11-11T18:00:00Z" };
-  Object.assign(newer.issues[0], { scores: scores(5), evidenceConfidence: "reported", acceptanceCriteria: ["Scoped acceptance"] });
+  Object.assign(newer.issues[0], { scores: scores(5), evidenceConfidence: "reported", acceptanceCriteria: ["Scoped acceptance"], implementationDetails: progress() });
   await writeFile(source, JSON.stringify(newer));
   await publishTodos(source, destination);
   const published = JSON.parse(await readFile(destination, "utf8"));
   assert.deepEqual(published.issues[1].scores, scores(5));
+  assert.deepEqual(published.issues[1].implementationDetails, progress());
   assert.deepEqual(published.issues[1].acceptanceCriteria, ["Scoped acceptance"]);
   await writeFile(source, JSON.stringify(snapshot()));
   await assert.rejects(publishTodos(source, destination), /older TODO revision/);
