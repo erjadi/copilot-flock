@@ -4,7 +4,14 @@ Licensed under [Apache-2.0](./LICENSE). Copyright 2026 Eric Jadi.
 Viewer preview data, hostnames, network addresses and governance examples are
 synthetic, not captured conversations or real signed release evidence.
 
-**3.4.1 candidate, not yet released:** Linux uninstall now fails closed when
+**3.4.1 candidate, not yet released:** Linux `systemd --user` activation generates
+`KillMode=process` units, supervises daemon-spawned children in outside-cgroup
+transient scopes when available, signals only the creation-pinned daemon PID
+while restoring original unit policy on success or failure, and refuses
+disruptive restarts without explicit maintenance consent when child preservation
+is unproven (reboot and power-loss boundaries remain separate; see
+[broker-free Linux boundaries](./docs/BROKER_FREE_V34.md#linux-systemd-session-preserving-activation-reboot-and-power-loss-boundaries)).
+Linux uninstall also fails closed when
 service/cgroup child preservation is unproven and no longer uses systemd
 `disable --now`. Published 3.4.0 retains that known Linux safety limitation;
 do not remove an active shared Flock service using that release. See

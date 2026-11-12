@@ -4,11 +4,13 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import crypto from "node:crypto";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { lifecyclePaths, atomicJson, recordInstalledArtifact, uninstallFlock as runUninstall, stopPinnedDaemon,
   assertNoLinks, inspectProcess, findRuntimeClients, assertLinuxUnitsQuiescent,
-  assertLinuxDaemonCgroupSafe, disablePersistence } from "../flock-lifecycle.mjs";
+  assertLinuxDaemonCgroupSafe, disablePersistence, buildLinuxSystemdUnit,
+  configureLinuxSystemdPersistence, activateLinuxSystemdDaemon, readLinuxCgroupPids,
+  prepareOutsideLinuxServiceCgroupSpawn, spawnSessionSafeProcess } from "../flock-lifecycle.mjs";
 import { matchesMember, signLeave, verifyLeave } from "../flock-membership.mjs";
 import { leaveV3Device, kickV3FlockMember, planV3DeviceLeave } from "../bootstrap-server.mjs";
 
@@ -823,3 +825,536 @@ await runMcpServer({});
     assert.ok(messages.find((message) => message.id === 2).result.tools.some((tool) => tool.name === "unenroll_flock"));
   } finally { f.close(); }
 });
+
+test("Linux systemd unit generation sets KillMode=process and persistence avoids disable --now", () => {
+  const f = fixture("linux");
+  try {
+    const script = path.join(f.root, "flock.mjs");
+    const unitText = buildLinuxSystemdUnit({ home: f.home, targetScript: script, execPath: "/opt/node/bin/node" });
+    assert.match(unitText, /\nKillMode=process\n/);
+    assert.match(unitText, /\nRestart=always\n/);
+    assert.match(unitText, /ExecStart="\/opt\/node\/bin\/node" /);
+
+    const legacyPath = f.paths.persistence[1];
+    fs.mkdirSync(path.dirname(legacyPath), { recursive: true });
+    fs.writeFileSync(legacyPath, "legacy-unit", "utf8");
+    const commands = [];
+    let legacyActive = true;
+    const query = (args) => {
+      commands.push(args);
+      if (args[0] === "show" && args[1] === "copilot-signalr-bridge.service") {
+        return [
+          "Id=copilot-signalr-bridge.service",
+          "LoadState=loaded",
+          `FragmentPath=${legacyPath}`,
+          `ActiveState=${legacyActive ? "active" : "inactive"}`,
+          `MainPID=${legacyActive ? "4100" : "0"}`,
+          `ControlGroup=${legacyActive ? "/user.slice/user-1000.slice/user@1000.service/app.slice/copilot-signalr-bridge.service" : ""}`,
+        ].join("\n") + "\n";
+      }
+      return "";
+    };
+    const activeMigration = configureLinuxSystemdPersistence(script, f.paths, {
+      strict: true,
+      execPath: process.execPath,
+      query,
+      checkLinger: () => "yes\n",
+      username: () => "demo",
+    });
+    assert.equal(activeMigration.killMode, "process");
+    assert.equal(activeMigration.systemdReady, true);
+    assert.match(fs.readFileSync(f.paths.persistence[0], "utf8"), /\nKillMode=process\n/);
+    assert.equal(commands.some((args) => args.includes("--now")), false, "Must never run disable --now on active legacy unit");
+    assert.equal(fs.existsSync(legacyPath), true, "Active legacy unit remains on disk until guarded activation handoff");
+
+    legacyActive = false;
+    configureLinuxSystemdPersistence(script, f.paths, {
+      strict: true,
+      execPath: process.execPath,
+      query,
+      checkLinger: () => "yes\n",
+      username: () => "demo",
+    });
+    assert.equal(fs.existsSync(legacyPath), false, "Quiescent legacy unit is cleaned up after disable without --now");
+  } finally { f.close(); }
+});
+
+test("outside-cgroup child supervision wraps Linux service children in transient user scopes", () => {
+  const serviceCgroup = "0::/user.slice/user-1000.slice/user@1000.service/app.slice/copilot-flock.service\n";
+  const scopeCgroup = "0::/user.slice/user-1000.slice/user@1000.service/app.slice/terminal.scope\n";
+
+  const wrapped = prepareOutsideLinuxServiceCgroupSpawn("/usr/bin/copilot", ["-p", "hello"], {
+    platform: "linux",
+    pid: 2000,
+    uid: 1000,
+    read: () => serviceCgroup,
+    probeScope: () => true,
+    unitPrefix: "copilot-flock-session",
+    unitId: "req-42",
+  });
+  assert.equal(wrapped.supervisedOutsideCgroup, true);
+  assert.equal(wrapped.mode, "systemd-transient-scope");
+  assert.equal(wrapped.scopeUnit, "copilot-flock-session-req-42.scope");
+  assert.equal(wrapped.command, "systemd-run");
+  assert.deepEqual(wrapped.args, [
+    "--user", "--scope", "--collect", "--quiet", "--unit=copilot-flock-session-req-42",
+    "--", "/usr/bin/copilot", "-p", "hello",
+  ]);
+
+  let spawnedCall = null;
+  const child = spawnSessionSafeProcess("/usr/bin/copilot", ["-p", "hello"], { cwd: "/tmp" }, {
+    platform: "linux",
+    pid: 2000,
+    uid: 1000,
+    read: () => serviceCgroup,
+    probeScope: () => true,
+    unitId: "abc",
+    spawnImpl: (cmd, args, opts) => {
+      spawnedCall = { cmd, args, opts };
+      return { pid: 9999 };
+    },
+  });
+  assert.equal(spawnedCall.cmd, "systemd-run");
+  assert.equal(child.outsideCgroupSupervision.mode, "systemd-transient-scope");
+
+  const alreadyOutside = prepareOutsideLinuxServiceCgroupSpawn("/usr/bin/copilot", ["-p", "hello"], {
+    platform: "linux",
+    pid: 2000,
+    uid: 1000,
+    read: () => scopeCgroup,
+    probeScope: () => { throw new Error("Should not probe systemd-run when already outside .service cgroup"); },
+  });
+  assert.equal(alreadyOutside.supervisedOutsideCgroup, true);
+  assert.equal(alreadyOutside.mode, "already-outside-service-cgroup");
+  assert.equal(alreadyOutside.command, "/usr/bin/copilot");
+
+  assert.throws(() => prepareOutsideLinuxServiceCgroupSpawn("/usr/bin/copilot", [], {
+    platform: "linux",
+    pid: 2000,
+    uid: 1000,
+    read: () => serviceCgroup,
+    probeScope: () => false,
+    requireOutsideCgroup: true,
+    unitId: "strict-1",
+  }), /outside-cgroup transient scope supervision is unavailable/);
+
+  const fallback = prepareOutsideLinuxServiceCgroupSpawn("/usr/bin/copilot", ["-s"], {
+    platform: "linux",
+    pid: 2000,
+    uid: 1000,
+    read: () => serviceCgroup,
+    probeScope: () => false,
+    unitId: "fallback-1",
+  });
+  assert.equal(fallback.supervisedOutsideCgroup, false);
+  assert.equal(fallback.mode, "service-cgroup-fallback");
+});
+
+test("Linux activation preserves real active child PID/start-time, signals only pinned daemon, and restores policy on success or failure", async (t) => {
+  const f = fixture("linux");
+  const liveChild = spawn(process.execPath, ["-e", "setInterval(() => {}, 60000)"], { stdio: "ignore", windowsHide: true });
+  t.after(() => {
+    try { liveChild.kill(); } catch {}
+    f.close();
+  });
+  await new Promise((resolve, reject) => {
+    liveChild.once("spawn", resolve);
+    liveChild.once("error", reject);
+  });
+  const initialChildIdentity = inspectProcess(liveChild.pid);
+  assert.ok(initialChildIdentity?.start, "Expected real OS process identity for active child");
+
+  const script = path.join(f.root, "flock.mjs");
+  const unitPath = f.paths.persistence[0];
+  const dropInPath = `${unitPath}.d${path.sep}90-flock-session-handoff.conf`;
+  fs.mkdirSync(path.dirname(unitPath), { recursive: true });
+  fs.writeFileSync(unitPath, buildLinuxSystemdUnit({ home: f.home, targetScript: script }), "utf8");
+
+  // Also verify recursive cgroup.procs enumeration with nested sub-cgroups
+  const cgroupRoot = path.join(f.home, "fake-cgroup");
+  const controlGroup = "/user.slice/user-1000.slice/user@1000.service/app.slice/copilot-flock.service";
+  const nestedCgroupDir = path.join(cgroupRoot, ...controlGroup.split("/").filter(Boolean), "child-subscope");
+  fs.mkdirSync(nestedCgroupDir, { recursive: true });
+  const daemonPid = 424242;
+  const newDaemonPid = 434343;
+  fs.writeFileSync(path.join(path.dirname(nestedCgroupDir), "cgroup.procs"), `${daemonPid}\n`, "utf8");
+  fs.writeFileSync(path.join(nestedCgroupDir, "cgroup.procs"), `${liveChild.pid}\n`, "utf8");
+  assert.deepEqual(readLinuxCgroupPids(controlGroup, { cgroupRoot }).sort((a, b) => a - b),
+    [liveChild.pid, daemonPid].sort((a, b) => a - b));
+
+  const daemonLive = {
+    pid: daemonPid,
+    start: "boot:daemon-v1",
+    executable: process.execPath,
+    argv: [process.execPath, script, "daemon"],
+  };
+  const newDaemonLive = {
+    pid: newDaemonPid,
+    start: "boot:daemon-v2",
+    executable: process.execPath,
+    argv: [process.execPath, script, "daemon"],
+  };
+  fs.writeFileSync(path.join(f.root, "daemon.pid"), String(daemonPid), "utf8");
+  atomicJson(path.join(f.root, "daemon-identity.json"), { ...daemonLive, script });
+
+  const state = {
+    activeState: "active",
+    mainPid: String(daemonPid),
+    killMode: "process",
+    restart: "always",
+    forceIgnoreDropIn: false,
+    failStart: false,
+    daemonRunning: true,
+    reloads: 0,
+    commands: [],
+  };
+  const readEffectivePolicy = () => {
+    if (!state.forceIgnoreDropIn && fs.existsSync(dropInPath)) {
+      const content = fs.readFileSync(dropInPath, "utf8");
+      return {
+        killMode: /KillMode=(\S+)/.exec(content)?.[1] || state.killMode,
+        restart: /Restart=(\S+)/.exec(content)?.[1] || state.restart,
+      };
+    }
+    return { killMode: state.killMode, restart: state.restart };
+  };
+  const query = (args) => {
+    state.commands.push(args);
+    if (args[0] === "list-units") return JSON.stringify([{ unit: "copilot-flock.service" }]);
+    if (args[0] === "daemon-reload") { state.reloads++; return ""; }
+    if (args[0] === "show" && args[1] === "copilot-flock.service") {
+      const eff = readEffectivePolicy();
+      return [
+        "Id=copilot-flock.service",
+        "LoadState=loaded",
+        `FragmentPath=${unitPath}`,
+        `ActiveState=${state.activeState}`,
+        `MainPID=${state.mainPid}`,
+        `ControlGroup=${controlGroup}`,
+        `KillMode=${eff.killMode}`,
+        `Restart=${eff.restart}`,
+      ].join("\n") + "\n";
+    }
+    if (args[0] === "start" && args[1] === "copilot-flock.service") {
+      assert.equal(fs.existsSync(dropInPath), false, "Handoff drop-in must be removed before starting new daemon");
+      if (state.failStart) throw new Error("simulated systemd start failure");
+      state.activeState = "active";
+      state.mainPid = String(newDaemonPid);
+      return "";
+    }
+    throw new Error(`Unexpected systemctl command: ${args.join(" ")}`);
+  };
+  const inspect = (pid) => {
+    if (pid === liveChild.pid) {
+      try {
+        process.kill(liveChild.pid, 0);
+        return { pid: liveChild.pid, start: initialChildIdentity.start, executable: initialChildIdentity.executable, argv: [initialChildIdentity.executable] };
+      } catch {
+        return null;
+      }
+    }
+    if (pid === daemonPid) return state.daemonRunning ? daemonLive : null;
+    if (pid === newDaemonPid) return state.mainPid === String(newDaemonPid) ? newDaemonLive : null;
+    return null;
+  };
+
+  // 1. Failure path: if higher-precedence override blocks handoff policy, refuse with 0 signals and restore drop-in
+  state.forceIgnoreDropIn = true;
+  const refusedSignals = [];
+  await assert.rejects(activateLinuxSystemdDaemon({
+    root: f.root,
+    paths: f.paths,
+    uid: 1000,
+    query,
+    inspect,
+    readCgroup: () => `0::${controlGroup}\n`,
+    readCgroupProcs: (cg) => readLinuxCgroupPids(cg, { cgroupRoot }),
+    kill: (pid) => refusedSignals.push(pid),
+    delay: async () => {},
+  }), /did not adopt session-preserving handoff policy/);
+  assert.deepEqual(refusedSignals, []);
+  assert.equal(fs.existsSync(dropInPath), false, "Temporary handoff drop-in must be cleaned up on refusal");
+  assert.equal(fs.existsSync(`${unitPath}.d`), false, "Created .service.d directory must be cleaned up on refusal");
+
+  // 2. Failure path: start fails after pinned daemon stop -> original policy is still restored and active child survives
+  state.forceIgnoreDropIn = false;
+  state.failStart = true;
+  const failedStartSignals = [];
+  await assert.rejects(activateLinuxSystemdDaemon({
+    root: f.root,
+    paths: f.paths,
+    uid: 1000,
+    query,
+    inspect,
+    readCgroup: () => `0::${controlGroup}\n`,
+    readCgroupProcs: (cg) => readLinuxCgroupPids(cg, { cgroupRoot }),
+    kill: (pid) => {
+      failedStartSignals.push(pid);
+      // Confirm KillMode=process and Restart=no are active at the exact moment the daemon is signaled
+      assert.deepEqual(readEffectivePolicy(), { killMode: "process", restart: "no" });
+      state.daemonRunning = false;
+      state.activeState = "inactive";
+      state.mainPid = "0";
+    },
+    delay: async () => {},
+  }), /simulated systemd start failure/);
+  assert.deepEqual(failedStartSignals, [daemonPid]);
+  assert.equal(fs.existsSync(dropInPath), false, "Original policy must be restored when start fails");
+  assert.deepEqual(readEffectivePolicy(), { killMode: "process", restart: "always" });
+  assert.equal(inspectProcess(liveChild.pid)?.start, initialChildIdentity.start, "Active child must survive failed start");
+
+  // 3. Happy path: active daemon restarts cleanly, signaling ONLY pinned daemon, restoring policy, preserving live child PID + start time
+  state.failStart = false;
+  state.daemonRunning = true;
+  state.activeState = "active";
+  state.mainPid = String(daemonPid);
+  state.commands.length = 0;
+  const signals = [];
+  const activated = await activateLinuxSystemdDaemon({
+    root: f.root,
+    paths: f.paths,
+    uid: 1000,
+    query,
+    inspect,
+    readCgroup: () => `0::${controlGroup}\n`,
+    readCgroupProcs: (cg) => readLinuxCgroupPids(cg, { cgroupRoot }),
+    kill: (pid) => {
+      signals.push(pid);
+      assert.deepEqual(readEffectivePolicy(), { killMode: "process", restart: "no" });
+      state.daemonRunning = false;
+      state.activeState = "inactive";
+      state.mainPid = "0";
+    },
+    delay: async () => {},
+  });
+  assert.equal(activated.activated, true);
+  assert.equal(activated.mode, "restarted-session-preserving");
+  assert.equal(activated.pid, newDaemonPid);
+  assert.equal(activated.policyRestored, true);
+  assert.deepEqual(signals, [daemonPid], "Only the pinned daemon process may be signaled");
+  assert.equal(state.commands.some((args) => args[0] === "restart" || args[0] === "stop"), false);
+  assert.equal(fs.existsSync(dropInPath), false);
+  const afterChildIdentity = inspectProcess(liveChild.pid);
+  assert.ok(afterChildIdentity, "Real child process must still be alive after daemon restart");
+  assert.equal(afterChildIdentity.pid, initialChildIdentity.pid);
+  assert.equal(afterChildIdentity.start, initialChildIdentity.start);
+  assert.deepEqual(activated.preservedChildren, [{ pid: liveChild.pid, start: initialChildIdentity.start }]);
+});
+
+test("Linux activation refuses unproven child-preservation paths before signalling unless explicit maintenance consent is supplied", async () => {
+  const f = fixture("linux");
+  try {
+    const script = path.join(f.root, "flock.mjs");
+    const unitPath = f.paths.persistence[0];
+    fs.mkdirSync(path.dirname(unitPath), { recursive: true });
+    fs.writeFileSync(unitPath, buildLinuxSystemdUnit({ home: f.home, targetScript: script }), "utf8");
+    const controlGroup = "/user.slice/user-1000.slice/user@1000.service/app.slice/copilot-flock.service";
+    const daemonPid = 515151;
+    const daemonLive = {
+      pid: daemonPid,
+      start: "boot:pinned",
+      executable: process.execPath,
+      argv: [process.execPath, script, "daemon"],
+    };
+
+    const makeScenario = (overrides = {}) => {
+      const commands = [];
+      const signals = [];
+      let restarted = false;
+      const props = {
+        Id: "copilot-flock.service",
+        LoadState: "loaded",
+        FragmentPath: unitPath,
+        ActiveState: "active",
+        MainPID: String(daemonPid),
+        ControlGroup: controlGroup,
+        KillMode: "process",
+        Restart: "always",
+        ...overrides.props,
+      };
+      const query = (args) => {
+        commands.push(args);
+        if (args[0] === "list-units") return JSON.stringify([{ unit: "copilot-flock.service" }]);
+        if (args[0] === "show") {
+          return Object.entries({
+            ...props,
+            ...(restarted ? { ActiveState: "active", MainPID: "626262" } : {}),
+          }).map(([k, v]) => `${k}=${v}`).join("\n") + "\n";
+        }
+        if (args[0] === "restart") { restarted = true; return ""; }
+        return "";
+      };
+      return { commands, signals, query };
+    };
+
+    // Case A: Missing daemon-identity.json pin -> refuses with 0 signals and 0 systemctl restart/stop
+    fs.writeFileSync(path.join(f.root, "daemon.pid"), String(daemonPid), "utf8");
+    const unpinned = makeScenario();
+    await assert.rejects(activateLinuxSystemdDaemon({
+      root: f.root,
+      paths: f.paths,
+      uid: 1000,
+      query: unpinned.query,
+      inspect: (pid) => pid === daemonPid ? daemonLive : null,
+      readCgroup: () => `0::${controlGroup}\n`,
+      readCgroupProcs: () => [daemonPid, 7777],
+      kill: (pid) => unpinned.signals.push(pid),
+      delay: async () => {},
+    }), /without explicit maintenance consent/);
+    assert.deepEqual(unpinned.signals, []);
+    assert.equal(unpinned.commands.some((args) => args[0] === "restart" || args[0] === "stop"), false);
+
+    // Case B: Pinned daemon, but target unit KillMode=control-group -> refuses with 0 signals
+    atomicJson(path.join(f.root, "daemon-identity.json"), { ...daemonLive, script });
+    const controlGroupKillMode = makeScenario({ props: { KillMode: "control-group" } });
+    await assert.rejects(activateLinuxSystemdDaemon({
+      root: f.root,
+      paths: f.paths,
+      uid: 1000,
+      query: controlGroupKillMode.query,
+      inspect: (pid) => pid === daemonPid ? daemonLive : null,
+      readCgroup: () => `0::${controlGroup}\n`,
+      readCgroupProcs: () => [daemonPid],
+      kill: (pid) => controlGroupKillMode.signals.push(pid),
+      delay: async () => {},
+    }), /KillMode=control-group.*without explicit maintenance consent/);
+    assert.deepEqual(controlGroupKillMode.signals, []);
+    assert.equal(controlGroupKillMode.commands.some((args) => args[0] === "restart" || args[0] === "stop"), false);
+
+    // Case C: Unreadable cgroup.procs -> refuses with 0 signals
+    const unreadableProcs = makeScenario();
+    await assert.rejects(activateLinuxSystemdDaemon({
+      root: f.root,
+      paths: f.paths,
+      uid: 1000,
+      query: unreadableProcs.query,
+      inspect: (pid) => pid === daemonPid ? daemonLive : null,
+      readCgroup: () => `0::${controlGroup}\n`,
+      readCgroupProcs: () => { throw Object.assign(new Error("permission denied"), { code: "EACCES" }); },
+      kill: (pid) => unreadableProcs.signals.push(pid),
+      delay: async () => {},
+    }), /Cannot inspect cgroup processes.*without explicit maintenance consent/);
+    assert.deepEqual(unreadableProcs.signals, []);
+
+    // Case D: Explicit maintenance consent permits managed restart when KillMode/pin was unproven
+    const consented = makeScenario({ props: { KillMode: "control-group" } });
+    const consentedRes = await activateLinuxSystemdDaemon({
+      root: f.root,
+      paths: f.paths,
+      uid: 1000,
+      maintenanceConsent: true,
+      query: consented.query,
+      inspect: (pid) => pid === daemonPid ? daemonLive : pid === 626262 ? { ...daemonLive, pid: 626262, start: "boot:new" } : null,
+      readCgroup: () => `0::${controlGroup}\n`,
+      readCgroupProcs: () => [daemonPid],
+      kill: (pid) => consented.signals.push(pid),
+      delay: async () => {},
+    });
+    assert.equal(consentedRes.activated, true);
+    assert.equal(consentedRes.mode, "maintenance-restart");
+    assert.equal(consentedRes.maintenanceConsentUsed, true);
+    assert.equal(consentedRes.pid, 626262);
+
+    // Case E: Unowned third-party/system service cgroup is refused EVEN WITH maintenance consent
+    const thirdParty = makeScenario();
+    await assert.rejects(activateLinuxSystemdDaemon({
+      root: f.root,
+      paths: f.paths,
+      uid: 1000,
+      maintenanceConsent: true,
+      query: thirdParty.query,
+      inspect: (pid) => pid === daemonPid ? daemonLive : null,
+      readCgroup: () => "0::/system.slice/third-party-worker.service\n",
+      readCgroupProcs: () => [daemonPid],
+      kill: (pid) => thirdParty.signals.push(pid),
+      delay: async () => {},
+    }), /unowned service cgroup/);
+    assert.deepEqual(thirdParty.signals, []);
+    assert.equal(thirdParty.commands.some((args) => args[0] === "restart" || args[0] === "stop"), false);
+
+    // Case F: Active legacy copilot-signalr-bridge.service (KillMode=control-group) hands off to copilot-flock.service preserving children
+    const legacyRoot = f.paths.roots[1];
+    fs.mkdirSync(legacyRoot, { recursive: true });
+    const legacyScript = path.join(legacyRoot, "bridge.mjs");
+    fs.writeFileSync(legacyScript, 'export const BRIDGE_VERSION = "test";\nexport async function runDaemon() {}', "utf8");
+    const legacyUnitPath = f.paths.persistence[1];
+    fs.writeFileSync(legacyUnitPath, "legacy-control-group-unit", "utf8");
+    fs.unlinkSync(path.join(f.root, "daemon.pid"));
+    fs.unlinkSync(path.join(f.root, "daemon-identity.json"));
+    const legacyDaemon = {
+      pid: 717171,
+      start: "boot:legacy-daemon",
+      executable: process.execPath,
+      argv: [process.execPath, legacyScript, "daemon"],
+    };
+    const survivingChild = { pid: 818181, start: "boot:active-copilot-child", executable: process.execPath, argv: ["copilot"] };
+    fs.writeFileSync(path.join(legacyRoot, "daemon.pid"), String(legacyDaemon.pid), "utf8");
+    atomicJson(path.join(legacyRoot, "daemon-identity.json"), { ...legacyDaemon, script: legacyScript });
+    const legacyCg = "/user.slice/user-1000.slice/user@1000.service/app.slice/copilot-signalr-bridge.service";
+    const legacyDropIn = `${legacyUnitPath}.d${path.sep}90-flock-session-handoff.conf`;
+    let legacyRunning = true;
+    let newStarted = false;
+    const legacySignals = [];
+    const legacyCommands = [];
+    const legacyQuery = (args) => {
+      legacyCommands.push(args);
+      if (args[0] === "list-units") {
+        return JSON.stringify([{ unit: "copilot-flock.service" }, { unit: "copilot-signalr-bridge.service" }]);
+      }
+      if (args[0] === "show" && args[1] === "copilot-signalr-bridge.service") {
+        const dropInActive = fs.existsSync(legacyDropIn);
+        return [
+          "Id=copilot-signalr-bridge.service",
+          "LoadState=loaded",
+          `FragmentPath=${legacyUnitPath}`,
+          `ActiveState=${legacyRunning ? "active" : "inactive"}`,
+          `MainPID=${legacyRunning ? String(legacyDaemon.pid) : "0"}`,
+          `ControlGroup=${legacyCg}`,
+          `KillMode=${dropInActive ? "process" : "control-group"}`,
+          `Restart=${dropInActive ? "no" : "always"}`,
+        ].join("\n") + "\n";
+      }
+      if (args[0] === "show" && args[1] === "copilot-flock.service") {
+        return [
+          "Id=copilot-flock.service",
+          "LoadState=loaded",
+          `FragmentPath=${unitPath}`,
+          `ActiveState=${newStarted ? "active" : "inactive"}`,
+          `MainPID=${newStarted ? "919191" : "0"}`,
+          "ControlGroup=",
+          "KillMode=process",
+          "Restart=always",
+        ].join("\n") + "\n";
+      }
+      if (args[0] === "start" && args[1] === "copilot-flock.service") { newStarted = true; return ""; }
+      return "";
+    };
+    const handoff = await activateLinuxSystemdDaemon({
+      root: f.root,
+      paths: f.paths,
+      uid: 1000,
+      query: legacyQuery,
+      inspect: (pid) => {
+        if (pid === legacyDaemon.pid) return legacyRunning ? legacyDaemon : null;
+        if (pid === survivingChild.pid) return survivingChild;
+        if (pid === 919191) return newStarted ? { ...daemonLive, pid: 919191, start: "boot:new-flock" } : null;
+        return null;
+      },
+      readCgroup: () => `0::${legacyCg}\n`,
+      readCgroupProcs: () => legacyRunning ? [legacyDaemon.pid, survivingChild.pid] : [survivingChild.pid],
+      kill: (pid) => {
+        assert.equal(fs.existsSync(legacyDropIn), true, "Legacy KillMode=control-group unit must have KillMode=process drop-in active before signal");
+        legacySignals.push(pid);
+        legacyRunning = false;
+      },
+      delay: async () => {},
+    });
+    assert.deepEqual(legacySignals, [legacyDaemon.pid]);
+    assert.equal(handoff.pid, 919191);
+    assert.equal(fs.existsSync(legacyDropIn), false, "Temporary handoff drop-in on legacy unit must be restored");
+    assert.equal(fs.existsSync(legacyUnitPath), true, "Legacy unit with surviving child cgroup remains disabled without deletion");
+    assert.equal(legacyCommands.some((args) => args.includes("--now") || args[0] === "stop"), false);
+    assert.deepEqual(handoff.preservedChildren, [{ pid: survivingChild.pid, start: survivingChild.start }]);
+  } finally { f.close(); }
+});
+
