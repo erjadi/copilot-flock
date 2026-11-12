@@ -6624,6 +6624,18 @@ test("release voter extracts complete modular dependency closure into isolated f
   const prevCopilotHome = process.env.COPILOT_HOME;
   process.env.COPILOT_HOME = env.tempRoot;
 
+  const inheritedReviewOverrides = {
+    COPILOT_BRIDGE_MACHINE_ID: "HOST-OVERRIDE-MUST-NOT-LEAK",
+    COPILOT_BRIDGE_SCOPE: "work",
+    COPILOT_FLOCK_BOOTSTRAP_URL: "https://host-fixture.example.invalid",
+    SIGNALR_CONNECTION_STRING: "synthetic-host-credential",
+    SERVICEBUS_CONNECTION_STRING: "synthetic-host-credential",
+    BRIDGE_FAST_VOTE_TEST: "1",
+  };
+  const previousReviewOverrides = Object.fromEntries(
+    Object.keys(inheritedReviewOverrides).map((name) => [name, process.env[name]])
+  );
+
   const gitRun = (cwd, args) =>
     execFileSync("git", args, {
       cwd,
@@ -6663,7 +6675,16 @@ test("release voter extracts complete modular dependency closure into isolated f
       "utf8"
     );
 
+    const identityPath = path.join(hostFlockDir, "identity.json");
+    const legacyIdentityPath = path.join(env.tempRoot, "signalr-bridge", "identity.json");
+    fs.writeFileSync(legacyIdentityPath, "unregistered legacy identity must not migrate");
+    await assert.rejects(reviewReleaseCandidate({ machineId: "VOTER-WIN-PC" }, { branch: "main" }),
+      /existing registered machine identity/);
+    assert.equal(fs.existsSync(identityPath), false);
+    assert.equal(fs.readFileSync(legacyIdentityPath, "utf8"), "unregistered legacy identity must not migrate");
+    fs.unlinkSync(legacyIdentityPath);
     const voterKey = ensureMachineIdentityKeypair();
+    const registeredIdentityBytes = fs.readFileSync(identityPath);
     const voterCfg = {
       machineId: "VOTER-WIN-PC",
       scope: "personal",
@@ -6710,6 +6731,7 @@ test("release voter extracts complete modular dependency closure into isolated f
         '  assert.equal(BOOTSTRAP_READY, "deep:modular-v35");',
         '  assert.notEqual(path.resolve(process.env.COPILOT_HOME || ""), path.resolve(hostTempRoot));',
         '  assert.equal(fs.existsSync(path.join(os.homedir(), ".copilot", "flock", "config.json")), false);',
+        `  for (const name of ${JSON.stringify(Object.keys(inheritedReviewOverrides))}) assert.equal(process.env[name], undefined, name);`,
         '  console.log("modular-candidate-stdout-ok");',
         '});',
       ].join("\n"),
@@ -6741,11 +6763,23 @@ test("release voter extracts complete modular dependency closure into isolated f
     gitRun(originWorkDir, ["commit", "-m", "add extra nested module"]);
     const passCommit = gitRun(originWorkDir, ["rev-parse", "HEAD"]);
 
-    const passBallot = await reviewReleaseCandidate(
-      voterCfg,
-      { branch: "rc-modular-pass" },
-      { repoDir: voterCloneDir }
-    );
+    let passBallot;
+    try {
+      Object.assign(process.env, inheritedReviewOverrides);
+      passBallot = await reviewReleaseCandidate(
+        voterCfg,
+        { branch: "rc-modular-pass" },
+        { repoDir: voterCloneDir }
+      );
+      for (const [name, value] of Object.entries(inheritedReviewOverrides)) {
+        assert.equal(process.env[name], value, "Review must not mutate the host environment");
+      }
+    } finally {
+      for (const [name, value] of Object.entries(previousReviewOverrides)) {
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      }
+    }
     assert.equal(passBallot.vote, "ACCEPT");
     assert.equal(passBallot.failureCategory, "passed");
     assert.equal(passBallot.candidateCommit, passCommit);
@@ -6758,8 +6792,11 @@ test("release voter extracts complete modular dependency closure into isolated f
     assert.equal(passBallot.checks.fixtureExtractedOk, true);
     assert.equal(passBallot.checks.dependencyClosureOk, true);
     assert.equal(passBallot.checks.unitTestsOk, true);
+    assert.ok(Number.isFinite(Date.parse(passBallot.reviewStartedAt)));
     assert.ok(passBallot.stdout.includes("modular-candidate-stdout-ok"));
     assert.equal(verifyVoteBallotSignature(passBallot, voterKey.publicKey), true);
+    assert.deepEqual(fs.readFileSync(identityPath), registeredIdentityBytes,
+      "Release review must use, not replace, the existing registered identity");
 
     // Tampering with any signed v2 ballot metadata field must invalidate verifyVoteBallotSignature
     for (const tampered of [
@@ -6771,6 +6808,7 @@ test("release voter extracts complete modular dependency closure into isolated f
       { ...passBallot, voterVersion: "0.0.0-forged" },
       { ...passBallot, fixtureVerificationLevel: "three_file_legacy" },
       { ...passBallot, keyFingerprint: "0".repeat(32) },
+      { ...passBallot, reviewStartedAt: "2000-01-01T00:00:00.000Z" },
       { ...passBallot, ballotSignature: undefined },
     ]) {
       assert.equal(verifyVoteBallotSignature(tampered, voterKey.publicKey), false);
@@ -6808,6 +6846,7 @@ test("release voter extracts complete modular dependency closure into isolated f
     writeTreeFiles(originWorkDir, {
       ...baseModularCandidate,
       "test/flock.test.mjs": [
+        'process.stdout.write("HEAD-STDOUT-αβγ🚀-" + "ω".repeat(900) + "\\n");',
         'process.stderr.write("HEAD-STDERR-δεζ❌-" + "λ".repeat(900) + "-TAIL-STDERR-END\\n");',
         'import test from "node:test";',
         'import assert from "node:assert/strict";',

@@ -14533,10 +14533,12 @@ export function buildCanonicalVoteBallotPayload(ballot) {
     timedOut: Boolean(ballot?.timedOut),
     stdout: String(ballot?.stdout ?? ""),
     stderr: String(ballot?.stderr ?? ""),
+    ...(ballot?.reviewStartedAt !== undefined ? { reviewStartedAt: String(ballot.reviewStartedAt) } : {}),
   });
 }
 
 export async function reviewReleaseCandidate(cfg, params = {}, internalOptions = {}) {
+  const reviewStartedAt = new Date().toISOString();
   const branch = String(params?.branch || "main").trim();
   if (!/^[A-Za-z0-9._/-]+$/.test(branch) || branch.includes("..")) {
     throw new Error(`Invalid branch name for review_release: ${branch}`);
@@ -14549,11 +14551,14 @@ export async function reviewReleaseCandidate(cfg, params = {}, internalOptions =
   const checkTimeoutMs =
     Number(internalOptions.checkTimeoutMs) > 0 ? Number(internalOptions.checkTimeoutMs) : 15000;
   const testTimeoutMs =
-    Number(internalOptions.testTimeoutMs) > 0 ? Number(internalOptions.testTimeoutMs) : 45000;
+    Number(internalOptions.testTimeoutMs) > 0 ? Number(internalOptions.testTimeoutMs) : 300000;
   const fetchTimeoutMs =
     Number(internalOptions.fetchTimeoutMs) > 0 ? Number(internalOptions.fetchTimeoutMs) : 20000;
 
-  const idKey = ensureMachineIdentityKeypair();
+  const idKey = readMachineIdentityKeypairPassive();
+  if (!idKey) {
+    throw new Error("Release review requires an existing registered machine identity; refusing to create or migrate one");
+  }
   let candidateCommit = null;
   let candidateSha = null;
   let diffStat = "";
@@ -14779,7 +14784,12 @@ export async function reviewReleaseCandidate(cfg, params = {}, internalOptions =
     delete isolatedEnv.NODE_PATH;
     delete isolatedEnv.NODE_OPTIONS;
     for (const envKey of Object.keys(isolatedEnv)) {
-      if (envKey.startsWith("NODE_TEST_")) {
+      if (envKey.startsWith("NODE_TEST_") ||
+          envKey.startsWith("COPILOT_FLOCK_") ||
+          envKey.startsWith("COPILOT_BRIDGE_") ||
+          envKey === "SIGNALR_CONNECTION_STRING" ||
+          envKey.startsWith("SERVICEBUS_") ||
+          envKey === "BRIDGE_FAST_VOTE_TEST") {
         delete isolatedEnv[envKey];
       }
     }
@@ -14792,7 +14802,6 @@ export async function reviewReleaseCandidate(cfg, params = {}, internalOptions =
     isolatedEnv.XDG_DATA_HOME = path.join(isolatedHome, ".local", "share");
     isolatedEnv.APPDATA = path.join(isolatedHome, "AppData", "Roaming");
     isolatedEnv.LOCALAPPDATA = path.join(isolatedHome, "AppData", "Local");
-    isolatedEnv.BRIDGE_FAST_VOTE_TEST = "1";
 
     const entrypointsToVerify = [];
     if (hasFlockMjs) entrypointsToVerify.push("flock.mjs");
@@ -14863,7 +14872,7 @@ export async function reviewReleaseCandidate(cfg, params = {}, internalOptions =
       checks.bootstrapSyntaxOk = true;
       checks.verifiedEntrypoints = entrypointsToVerify;
 
-      const testArgs = ["--import", pathToFileURL(guardScriptPath).href, "--test"];
+      const testArgs = ["--import", pathToFileURL(guardScriptPath).href, "--test", "--test-reporter=tap"];
       if (process.allowedNodeEnvironmentFlags?.has?.("--test-isolation")) {
         testArgs.push("--test-isolation=none");
       } else if (process.allowedNodeEnvironmentFlags?.has?.("--experimental-test-isolation")) {
@@ -14942,6 +14951,7 @@ export async function reviewReleaseCandidate(cfg, params = {}, internalOptions =
     .toString("base64");
 
   const ballotBase = {
+    reviewStartedAt,
     machineId: cfg.machineId,
     voterVersion: BRIDGE_VERSION,
     scope: cfg.scope,
@@ -15097,7 +15107,7 @@ export async function voteReleaseAcrossFlock(
   }));
 
   const outcomes =
-    batchItems.length > 0 ? await rpcBatchFn(cfg, batchItems, 75000) : [];
+    batchItems.length > 0 ? await rpcBatchFn(cfg, batchItems, 360000) : [];
 
   const votes = outcomes.map((o) => {
     const mId = o.item.target.machineId;

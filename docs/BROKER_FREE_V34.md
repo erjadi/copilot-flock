@@ -326,3 +326,13 @@ restart the entire Copilot app, deploy a broker or delete production hosting.
 Changing an existing flock's protocol/authority requires a separate explicit
 migration decision. A source release alone does not demonstrate that every
 host has upgraded or that an old loaded MCP process has reloaded.
+
+Release review uses an existing machine identity read-only; it refuses to
+create or migrate an identity. Its isolated candidate-test child removes host
+Flock configuration/credential overrides and fast-vote flags, so required
+tests are not skipped. The default complete-suite subprocess deadline is five
+minutes, with a six-minute batch reply budget; test assertions keep their own
+unchanged performance limits. An explicit TAP reporter preserves executed-test
+counts in the signed stdout across supported Node.js defaults.
+New ballots also bind `reviewStartedAt` in their signed payload, allowing a
+collector to reject reviews older than its requested freshness boundary.
