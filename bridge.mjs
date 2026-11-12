@@ -1055,6 +1055,7 @@ export function loadConfig({ autoFetchAz = true, refreshSpecs = false } = {}) {
   if (cfg.protocol === "broker-free-v34") {
     const activeFlocks = Object.values(brokerFreeRuntime(cfg).read().flocks).filter((record) => !record.departed);
     return { ...cfg, flockId: activeFlocks.length === 1 ? activeFlocks[0].flockId : undefined,
+      autoFlockId: activeFlocks.length === 1 && !cfg.explicitFlock,
       hub: DEFAULT_HUB, bootstrapUrl: null, connectionString: null,
       installedScriptPath: path.join(getBridgeHome(), "flock.mjs") };
   }
@@ -4527,11 +4528,12 @@ export async function invokeRemoteRpc(
     params = {},
     timeoutMs = 8000,
     collectAll = false,
-    flockId = cfg.flockId,
+    flockId = cfg.protocol === "broker-free-v34" && cfg.autoFlockId && !cfg.explicitFlock ? undefined : cfg.flockId,
+    allowLoopback = false,
   }
 ) {
   if (cfg.protocol === "broker-free-v34") {
-    return brokerFreeRuntime(cfg).invoke({ flockId, toMachine, action, params, timeoutMs, collectAll });
+    return brokerFreeRuntime(cfg).invoke({ flockId, toMachine, action, params, timeoutMs, collectAll, allowLoopback });
   }
   const requestId = crypto.randomUUID();
   const replyUserId = `rpc-${requestId}`;
@@ -7426,14 +7428,22 @@ const MCP_TOOLS = [
 ];
 
 for (const tool of MCP_TOOLS) {
-  tool.inputSchema.properties.flock ||= { type: "string", description: "Explicit <owner>/<flock> membership. Required when more than one broker-free flock is enrolled." };
+  tool.inputSchema.properties.flock ||= {
+    type: "string",
+    description:
+      "Explicit <owner>/<flock> membership selector (validated first when supplied). Required for multi-flock broker-free calls unless an explicit to_machine has a single active, non-expired authorized route.",
+  };
 }
 Object.assign(MCP_TOOLS.find((tool) => tool.name === "kick_flock_member").inputSchema.properties, {
   peer_id: { type: "string", description: "Exact signed device fingerprint; conjunctive with machine_id when both are supplied." },
   operation_id: { type: "string", description: "Stable operation ID for retrying an interrupted owner rotation." },
 });
 
-async function executeMcpTool(cfg, name, args = {}) {
+export async function executeMcpTool(cfg, name, args = {}, options = {}) {
+  const ensureDaemon = options.ensureDaemon || ensureDaemonStarted;
+  if (options.runtimeOptions) {
+    cfg = { ...cfg, _brokerFreeOptions: { ...(cfg?._brokerFreeOptions || {}), ...options.runtimeOptions } };
+  }
   if (name === "unenroll_flock") {
     if (args.traceless !== true) throw new Error("Specify traceless=true to remove this installation");
     return uninstallBridge();
@@ -7443,7 +7453,8 @@ async function executeMcpTool(cfg, name, args = {}) {
     return brokerFreeRuntime(cfg).joinRequest({ machineId: cfg.machineId, scope: cfg.scope, flockId: args.flock });
   }
   if (cfg.protocol === "broker-free-v34") {
-    cfg = { ...cfg, flockId: args.flock || cfg.flockId };
+    const hasExplicitFlock = Object.prototype.hasOwnProperty.call(args, "flock") && args.flock !== undefined;
+    const explicitFlock = hasExplicitFlock ? args.flock : (cfg.explicitFlock ? cfg.flockId : undefined);
     const runtime = brokerFreeRuntime(cfg);
     if (name === "approve_join") return runtime.approve({
       flockId: args.flock, code: args.join_code, role: args.role || "collaborator",
@@ -7452,10 +7463,10 @@ async function executeMcpTool(cfg, name, args = {}) {
     });
     if (name === "accept_welcome") return installBridge({ welcomeTicketArg: args.welcome_ticket,
       ownerFingerprintArg: args.owner_fingerprint, protocolArg: "broker-free-v34" });
-    if (name === "renew_membership") return runtime.renewMembership(runtime.select(args.flock).flockId);
+    if (name === "renew_membership") return runtime.renewMembership(runtime.select(explicitFlock).flockId);
     if (name === "list_flocks") return brokerFreeFlockSummaries(runtime);
     if (name === "kick_flock_member") {
-      const record = runtime.assertOwner(runtime.select(args.flock));
+      const record = runtime.assertOwner(runtime.select(explicitFlock));
       if (args.github_user) throw new Error("Broker-free identities are device-key bound; a GitHub label is not a member selector");
       const candidates = Object.entries(record.members).filter(([id, entry]) => !entry.removed &&
         (!args.peer_id || id === args.peer_id) && (!args.machine_id || entry.cert.body.machineId === args.machine_id));
@@ -7466,9 +7477,50 @@ async function executeMcpTool(cfg, name, args = {}) {
       "get_remote_session_transcript", "send_remote_session_message", "broadcast_remote_session_message",
       "share_thread", "unshare_thread", "list_shared_threads"]);
     if (!supported.has(name)) throw new Error(`Tool ${name} is not a broker-free operation; legacy broker fallback is forbidden`);
+
+    const rpcRouteSpec = {
+      flock_status: { toMachine: "*", action: "ping", params: {} },
+      bridge_status: { toMachine: "*", action: "ping", params: {} },
+      list_remote_machines: { toMachine: "*", action: "ping", params: {} },
+      broadcast_remote_session_message: {
+        toMachine: "*",
+        action: args.new_session ? "create_session" : "send_message",
+        params: { targetSession: args.to_session || "latest", newSession: Boolean(args.new_session) },
+      },
+      list_remote_sessions: { toMachine: args.machine ?? args.to_machine ?? "*", action: "list_sessions", params: {} },
+      get_remote_session_transcript: {
+        toMachine: args.to_machine,
+        action: "get_transcript",
+        params: { session: args.session || "latest" },
+      },
+      send_remote_session_message: {
+        toMachine: args.to_machine,
+        action: "send_message",
+        params: { targetSession: args.to_session, delegate: Boolean(args.delegate) },
+      },
+    }[name];
+    if (rpcRouteSpec) {
+      const resolved = runtime.resolveRoute({
+        flockId: explicitFlock,
+        toMachine: rpcRouteSpec.toMachine,
+        action: rpcRouteSpec.action,
+        params: rpcRouteSpec.params,
+        allowLoopback: Boolean(args.allow_loopback),
+        localMachineId: cfg.machineId,
+      });
+      if (args.from_session) {
+        let senderId = args.from_session;
+        try { senderId = resolveLocalSession(args.from_session).session_id; } catch {}
+        const boundFlock = loadLocalFlocksConfig(cfg).threadBindings?.[senderId];
+        if (boundFlock && boundFlock !== resolved.record.flockId) {
+          throw new Error(`Thread is bound to another flock (${boundFlock})`);
+        }
+      }
+      cfg = { ...cfg, flockId: resolved.record.flockId, explicitFlock: true, autoFlockId: false };
+    }
   }
   if (name === "flock_status" || name === "bridge_status") {
-    const daemonStatus = await ensureDaemonStarted(cfg);
+    const daemonStatus = await ensureDaemon(cfg);
     const machines = await discoverMachines(cfg, { includeSelf: true, timeoutMs: 2200 });
     return {
       localMachineId: cfg.machineId,
@@ -7485,7 +7537,7 @@ async function executeMcpTool(cfg, name, args = {}) {
   }
 
   if (name === "list_remote_machines") {
-    await ensureDaemonStarted(cfg);
+    await ensureDaemon(cfg);
     return await discoverMachines(cfg, {
       includeSelf: args.include_self !== false,
       scope: args.scope || null,
@@ -7498,8 +7550,8 @@ async function executeMcpTool(cfg, name, args = {}) {
   }
 
   if (name === "list_remote_sessions") {
-    await ensureDaemonStarted(cfg);
-    const machineArg = args.machine || "*";
+    await ensureDaemon(cfg);
+    const machineArg = args.machine ?? args.to_machine ?? "*";
     const scopeFilter =
       args.scope && String(args.scope).toLowerCase() !== "all" && String(args.scope).trim() !== "*"
         ? normalizeScope(args.scope, "")
@@ -7526,7 +7578,10 @@ async function executeMcpTool(cfg, name, args = {}) {
         })
         .filter((item) => !scopeFilter || item.scope === scopeFilter);
     } else {
-      const targetMachine = await resolveTargetMachine(cfg, machineArg, { scope: scopeFilter || null });
+      const targetMachine = await resolveTargetMachine(cfg, machineArg, {
+        allowLoopback: Boolean(args.allow_loopback),
+        scope: scopeFilter || null,
+      });
       const res = await invokeRemoteRpc(cfg, {
         toMachine: targetMachine,
         action: "list_sessions",
@@ -7536,6 +7591,7 @@ async function executeMcpTool(cfg, name, args = {}) {
           runningOnly: Boolean(args.running_only),
         },
         timeoutMs: 8000,
+        allowLoopback: Boolean(args.allow_loopback),
       });
       return {
         ...res.result,
@@ -7545,7 +7601,7 @@ async function executeMcpTool(cfg, name, args = {}) {
   }
 
   if (name === "get_remote_session_transcript") {
-    await ensureDaemonStarted(cfg);
+    await ensureDaemon(cfg);
     const targetMachine = await resolveTargetMachine(cfg, args.to_machine, {
       allowLoopback: Boolean(args.allow_loopback),
     });
@@ -7557,14 +7613,16 @@ async function executeMcpTool(cfg, name, args = {}) {
         limit: args.limit || 10,
       },
       timeoutMs: 10000,
+      allowLoopback: Boolean(args.allow_loopback),
     });
     return res.result;
   }
 
   if (name === "send_remote_session_message") {
-    await ensureDaemonStarted(cfg);
+    await ensureDaemon(cfg);
     const targetMachine = await resolveTargetMachine(cfg, args.to_machine, {
       allowLoopback: Boolean(args.allow_loopback),
+      scope: args.scope || null,
     });
     let senderSessionId = args.from_session || "latest";
     let senderSessionName = null;
@@ -7607,6 +7665,7 @@ async function executeMcpTool(cfg, name, args = {}) {
         action: "send_message",
         params: rpcParams,
         timeoutMs: rpcTimeoutMs,
+        allowLoopback: Boolean(args.allow_loopback),
       });
     } catch (err) {
       const allowOfflineQueue = args.offline_queue !== false && !waitForReply;
@@ -7734,7 +7793,7 @@ async function executeMcpTool(cfg, name, args = {}) {
   }
 
   if (name === "broadcast_remote_session_message") {
-    await ensureDaemonStarted(cfg);
+    await ensureDaemon(cfg);
     const includeSelf = Boolean(args.include_self);
     const scopeFilter =
       args.scope && String(args.scope).toLowerCase() !== "all" && String(args.scope).trim() !== "*"
@@ -10891,11 +10950,12 @@ export async function installBridge({
 }
 
 export function brokerFreeRuntime(cfg = {}, options = {}) {
-  return new BrokerFreeRuntime(options.root || getBridgeHome(), {
+  const merged = { ...(cfg?._brokerFreeOptions || {}), ...options };
+  return new BrokerFreeRuntime(merged.root || getBridgeHome(), {
     connect: connectSignalRClient,
     dispatch: (request) => dispatchBrokerFreeRpc(cfg, request),
     log: (message) => logDaemon(message),
-    ...options,
+    ...merged,
   });
 }
 
@@ -11379,10 +11439,14 @@ Usage:
   }
 
   const cfg = loadConfig({ autoFetchAz: true, refreshSpecs: Boolean(flags.refresh) });
-  if (flags.flock) cfg.flockId = flags.flock;
+  if (flags.flock !== undefined) {
+    cfg.flockId = flags.flock;
+    cfg.explicitFlock = true;
+    cfg.autoFlockId = false;
+  }
   if (cfg.protocol === "broker-free-v34") {
     if (["members", "enrolled", "flock"].includes(command)) {
-      const record = brokerFreeRuntime(cfg).select(cfg.flockId);
+      const record = brokerFreeRuntime(cfg).select(cfg.explicitFlock ? cfg.flockId : undefined);
       console.log(JSON.stringify({ flockId: record.flockId, members: Object.entries(record.members)
         .map(([peerId, entry]) => ({ peerId, machineId: entry.cert.body.machineId, role: entry.cert.body.role,
           expiresAt: entry.cert.body.expiresAt, removed: entry.removed === true })) }, null, 2));
@@ -11974,15 +12038,6 @@ Usage:
       console.log(JSON.stringify(out, null, 2));
       return;
     }
-    await ensureDaemonStarted(cfg);
-    const toMachine = await resolveTargetMachine(
-      cfg,
-      flags["to-machine"] || flags.machine || "auto",
-      {
-        allowLoopback: Boolean(flags["allow-loopback"]),
-        scope: flags.scope || flags.profile || null,
-      }
-    );
     const toSession = flags["to-session"] || flags.session || "latest";
     const message = resolveCliMessage(flags, positional);
     if (!message) {
@@ -12006,7 +12061,8 @@ Usage:
 
     if (!flags["dry-run"]) {
       const out = await executeMcpTool(cfg, "send_remote_session_message", {
-        to_machine: toMachine,
+        to_machine: rawMachineArg,
+        scope: flags.scope || flags.profile || null,
         to_session: toSession,
         message,
         from_session: fromSessionId,
@@ -12024,6 +12080,29 @@ Usage:
       console.log(JSON.stringify(out, null, 2));
       return;
     }
+
+    if (cfg.protocol === "broker-free-v34") {
+      const resolved = brokerFreeRuntime(cfg).resolveRoute({
+        flockId: cfg.explicitFlock ? cfg.flockId : undefined,
+        toMachine: rawMachineArg,
+        action: "send_message",
+        params: { targetSession: toSession, delegate: Boolean(flags.delegate) },
+        allowLoopback: Boolean(flags["allow-loopback"]),
+        localMachineId: cfg.machineId,
+      });
+      cfg.flockId = resolved.record.flockId;
+      cfg.explicitFlock = true;
+      cfg.autoFlockId = false;
+    }
+    await ensureDaemonStarted(cfg);
+    const toMachine = await resolveTargetMachine(
+      cfg,
+      rawMachineArg,
+      {
+        allowLoopback: Boolean(flags["allow-loopback"]),
+        scope: flags.scope || flags.profile || null,
+      }
+    );
 
     const res = await invokeRemoteRpc(cfg, {
       toMachine,
@@ -12047,6 +12126,7 @@ Usage:
         dryRun: true,
       },
       timeoutMs: dispatchTimeoutMs + 7000,
+      allowLoopback: Boolean(flags["allow-loopback"]),
     });
     console.log(JSON.stringify(res.result, null, 2));
     return;
@@ -12060,6 +12140,7 @@ Usage:
       action: "list_sessions",
       params: { limit: 5 },
       timeoutMs: 6000,
+      allowLoopback: true,
     });
     const drySendResp = await invokeRemoteRpc(cfg, {
       toMachine: cfg.machineId,
@@ -12074,6 +12155,7 @@ Usage:
         dryRun: true,
       },
       timeoutMs: 6000,
+      allowLoopback: true,
     });
     console.log(
       JSON.stringify(

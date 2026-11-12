@@ -35,11 +35,25 @@ Agent entrypoints (Copilot executes them, not the human):
 | Renew | `renew-membership --flock owner/team` | `renew_membership` |
 | Remove local installation | `uninstall` or `unenroll --traceless` | `unenroll_flock` |
 
-Use an explicit flock selector when multiple memberships exist, including
-replies. Ambiguous dispatch fails. A legacy installation requires a separately
-configured Copilot home for broker-free enrollment; no silent replacement or
-hosted-broker fallback occurs. Canonical and legacy script entrypoints use
-the same protocol selection.
+When multiple memberships exist, preserve incoming `from_flock` explicitly on
+replies and pass an explicit `flock` selector (`--flock` or MCP `flock`) for
+discovery, wildcard, and broadcast operations. An explicit `flock` selector is
+always validated first against local active enrollment, non-expired certificate
+and transport authority, action/session scope, and target membership; an
+invalid, departed, expired, or unauthorized explicit `flock` is rejected
+immediately without replacing it via inference. When `flock` is omitted and an
+explicit single target (`to_machine`, or single-machine `list_remote_sessions`
+`machine`) is provided, the runtime resolves the route automatically **only**
+if **exactly one** active, non-expired, authorized enrolled flock contains that
+target machine with fresh, cryptographically valid, non-revoked `MemberCert`
+membership evidence. If two or more enrolled flocks can reach the target
+machine, dispatch fails closed with an actionable ambiguity error listing the
+eligible `owner/flock` choices without sending any message. If zero authorized
+routes reach the target, or membership/transport evidence is stale, expired, or
+revoked, dispatch fails closed clearly without broadcasting or falling back. A
+legacy installation requires a separately configured Copilot home for
+broker-free enrollment; no silent replacement or hosted-broker fallback occurs.
+Canonical and legacy script entrypoints use the same protocol selection.
 
 ## Active transport and authorization
 

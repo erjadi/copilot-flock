@@ -57,7 +57,11 @@ import {
   validatePinnedBootstrapOrigin,
   recordSandboxManifestResource,
   teardownLocalSandbox,
+  executeMcpTool,
 } from "../bridge.mjs";
+import { AzureTransport, azureEndpoints } from "../flock-azure.mjs";
+import { BrokerFreeRuntime } from "../flock-broker-free.mjs";
+import { ownerFingerprint } from "../flock-protocol.mjs";
 
 import {
   verifyGitHubRepoAccess,
@@ -2305,3 +2309,69 @@ test("v3.0.0 multi-flock platform: universal <owner>/<flock>[/<machineId>] addre
     env.cleanup();
   }
 });
+
+test(
+  "broker-free MCP unique route inference and fail-closed rejection parity on bridge.mjs",
+  { skip: process.env.BRIDGE_FAST_VOTE_TEST === "1" },
+  async (t) => {
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-route-inference-"));
+  const prevCopilotHome = process.env.COPILOT_HOME;
+  process.env.COPILOT_HOME = path.join(tempRoot, "copilot-home");
+  t.after(() => {
+    if (prevCopilotHome === undefined) delete process.env.COPILOT_HOME;
+    else process.env.COPILOT_HOME = prevCopilotHome;
+    fs.rmSync(tempRoot, { recursive: true, force: true });
+  });
+  let now = Date.now();
+  const clock = () => now;
+  const credentials = {
+    connectionString: "Endpoint=https://fixture.service.signalr.net;AccessKey=signalr-fixture",
+    manageConnectionString: "Endpoint=sb://fixture.servicebus.windows.net/;SharedAccessKeyName=RootManageSharedAccessKey;SharedAccessKey=manage-fixture",
+    sendConnectionString: "Endpoint=sb://fixture.servicebus.windows.net/;SharedAccessKeyName=FlockSendRule;SharedAccessKey=send-fixture",
+    listenConnectionString: "Endpoint=sb://fixture.servicebus.windows.net/;SharedAccessKeyName=FlockListenRule;SharedAccessKey=listen-fixture",
+  };
+  const sockets = new Set();
+  const fetchImpl = async (url, options) => {
+    const parsed = new URL(url);
+    if (options.method === "PUT") return new Response("", { status: 201 });
+    if (options.method === "DELETE") return new Response(null, { status: 204 });
+    if (parsed.hostname.endsWith(".signalr.net")) {
+      const { target, arguments: args } = JSON.parse(options.body);
+      for (const s of sockets) if (!s.ws.closed) s.callback(target, structuredClone(args));
+      return new Response("", { status: 202 });
+    }
+    if (options.method === "POST" && parsed.pathname.endsWith("/messages/head")) return new Response(null, { status: 204 });
+    if (options.method === "POST" && parsed.pathname.endsWith("/messages")) return new Response("", { status: 201 });
+    throw new Error(`Unexpected fetch: ${options.method} ${parsed.pathname}`);
+  };
+  const connect = async (_cfg, { onInvocation }) => {
+    const socket = { ws: { closed: false }, callback: onInvocation, close() { this.ws.closed = true; sockets.delete(this); } };
+    sockets.add(socket);
+    return socket;
+  };
+  const makeOpts = (machineId) => ({
+    clock, connect, log: () => {},
+    dispatch: async ({ flockId, assertAuthorized }) => { assertAuthorized(); return { ok: true, flockId, machineId }; },
+    transportFactory: (config, opts) => new AzureTransport(config, { ...opts, fetchImpl }),
+  });
+  const callerRoot = path.join(tempRoot, "caller");
+  const caller = new BrokerFreeRuntime(callerRoot, makeOpts("CALLER-PC"));
+  const peerB = new BrokerFreeRuntime(path.join(tempRoot, "peer-b"), makeOpts("PEER-B"));
+  await caller.initializeOwner({ flockId: "demo/alpha", machineId: "CALLER-PC", scope: "personal", ...credentials });
+  await caller.initializeOwner({ flockId: "demo/beta", machineId: "CALLER-PC", scope: "personal", ...credentials });
+  const code = await peerB.joinRequest({ machineId: "PEER-B", scope: "personal", flockId: "demo/beta" });
+  const ticket = await caller.approve({ flockId: "demo/beta", code, expectedEd25519Fingerprint: code.body.peerId, role: "collaborator", sessionIds: ["s1"], membershipExpiresAt: now + 600000 });
+  await peerB.accept(ticket, ownerFingerprint(caller.record("demo/beta").ownerPublicKey));
+  const daemon = await peerB.start();
+  t.after(() => daemon.close());
+
+  const cfg = { protocol: "broker-free-v34", machineId: "CALLER-PC", scope: "personal", hub: "copilotbridge" };
+  const opts = { ensureDaemon: async () => ({ running: true, pid: process.pid }), runtimeOptions: { ...makeOpts("CALLER-PC"), root: callerRoot } };
+  const inferred = await executeMcpTool(cfg, "send_remote_session_message", { to_machine: "PEER-B", to_session: "s1", message: "hi" }, opts);
+  assert.equal(inferred.flockId, "demo/beta");
+  await assert.rejects(executeMcpTool(cfg, "send_remote_session_message", { flock: "demo/alpha", to_machine: "PEER-B", to_session: "s1", message: "hi" }, opts), /Explicit flock "demo\/alpha"/);
+  await assert.rejects(executeMcpTool(cfg, "send_remote_session_message", { to_machine: "MISSING", to_session: "s1", message: "hi" }, opts), /No active, non-expired authorized broker-free route/);
+  now += 660000;
+  await assert.rejects(executeMcpTool(cfg, "send_remote_session_message", { to_machine: "PEER-B", to_session: "s1", message: "hi" }, opts), /expired/);
+});
+

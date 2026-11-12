@@ -57,7 +57,11 @@ import {
   validatePinnedBootstrapOrigin,
   recordSandboxManifestResource,
   teardownLocalSandbox,
+  executeMcpTool,
 } from "../flock.mjs";
+import { AzureTransport, azureEndpoints } from "../flock-azure.mjs";
+import { BrokerFreeRuntime } from "../flock-broker-free.mjs";
+import { ownerFingerprint } from "../flock-protocol.mjs";
 
 import {
   verifyGitHubRepoAccess,
@@ -2341,3 +2345,301 @@ test("v3.0.0 multi-flock platform: universal <owner>/<flock>[/<machineId>] addre
     env.cleanup();
   }
 });
+
+test("broker-free MCP unique route inference, ambiguity fail-closed, zero/expired/revoked route rejection, and explicit invalid flock rejection", async (t) => {
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "flock-route-inference-"));
+  const prevCopilotHome = process.env.COPILOT_HOME;
+  const copilotHome = path.join(tempRoot, "copilot-home");
+  process.env.COPILOT_HOME = copilotHome;
+  t.after(() => {
+    if (prevCopilotHome === undefined) delete process.env.COPILOT_HOME;
+    else process.env.COPILOT_HOME = prevCopilotHome;
+    fs.rmSync(tempRoot, { recursive: true, force: true });
+  });
+
+  let now = Date.now();
+  const clock = () => now;
+  const endpoints = azureEndpoints("https://fixture.service.signalr.net", "https://fixture.servicebus.windows.net");
+  const credentials = {
+    connectionString: "Endpoint=https://fixture.service.signalr.net;AccessKey=signalr-fixture",
+    manageConnectionString: "Endpoint=sb://fixture.servicebus.windows.net/;SharedAccessKeyName=RootManageSharedAccessKey;SharedAccessKey=manage-fixture",
+    sendConnectionString: "Endpoint=sb://fixture.servicebus.windows.net/;SharedAccessKeyName=FlockSendRule;SharedAccessKey=send-fixture",
+    listenConnectionString: "Endpoint=sb://fixture.servicebus.windows.net/;SharedAccessKeyName=FlockListenRule;SharedAccessKey=listen-fixture",
+  };
+
+  const subscribers = new Map();
+  const sockets = new Set();
+  const publishedMessages = [];
+  let connectCount = 0;
+
+  const fetchImpl = async (url, options) => {
+    const parsed = new URL(url);
+    const peer = parsed.pathname.match(/\/subscriptions\/(sub-[a-f0-9]{46})/)?.[1];
+    if (options.method === "PUT" && peer && !parsed.pathname.includes("/messages/")) {
+      if (!subscribers.has(peer)) subscribers.set(peer, []);
+      return new Response("", { status: 201 });
+    }
+    if (options.method === "DELETE" && peer && !parsed.pathname.includes("/messages/")) {
+      subscribers.delete(peer);
+      return new Response(null, { status: 204 });
+    }
+    if (parsed.hostname.endsWith(".signalr.net")) {
+      const { target, arguments: args } = JSON.parse(options.body);
+      for (const socket of sockets) {
+        if (!socket.ws.closed) socket.callback(target, structuredClone(args));
+      }
+      return new Response("", { status: 202 });
+    }
+    if (options.method === "POST" && parsed.pathname.endsWith("/messages") && !peer) {
+      const body = JSON.parse(options.body);
+      publishedMessages.push(body);
+      for (const queue of subscribers.values()) queue.push(body);
+      return new Response("", { status: 201 });
+    }
+    if (options.method === "POST" && parsed.pathname.endsWith("/messages/head")) {
+      const queue = subscribers.get(peer);
+      if (!queue?.length) return new Response(null, { status: 204 });
+      return new Response(JSON.stringify(queue[0]), {
+        status: 201,
+        headers: { Location: `${endpoints.serviceBusEndpoint}/copilot-bridge-offline/subscriptions/${peer}/messages/lock` },
+      });
+    }
+    if (options.method === "DELETE" && parsed.pathname.endsWith("/messages/lock")) {
+      subscribers.get(peer)?.shift();
+      return new Response(null, { status: 204 });
+    }
+    if (options.method === "PUT" && parsed.pathname.endsWith("/messages/lock")) {
+      return new Response(null, { status: 204 });
+    }
+    throw new Error(`Unexpected synthetic transport call: ${options.method} ${parsed.pathname}`);
+  };
+
+  const connect = async (_cfg, { onInvocation }) => {
+    connectCount += 1;
+    const socket = {
+      ws: { closed: false },
+      callback: onInvocation,
+      close() {
+        this.ws.closed = true;
+        sockets.delete(this);
+      },
+    };
+    sockets.add(socket);
+    return socket;
+  };
+
+  const dispatched = [];
+  const makeRuntimeOptions = (machineId, extra = {}) => ({
+    clock,
+    connect,
+    log: () => {},
+    dispatch: async ({ action, payload, flockId, assertAuthorized }) => {
+      assertAuthorized();
+      dispatched.push({ machineId, flockId, action, params: payload.params });
+      if (action === "list_sessions") {
+        return { machineId, scope: "personal", count: 1, sessions: [{ session_id: `sess-${machineId.toLowerCase()}`, title: `${machineId} shared` }] };
+      }
+      if (action === "get_transcript") {
+        return { session: { session_id: payload.params.session, mode: "approved-snapshot" }, messages: [{ role: "assistant", content: `snapshot from ${machineId} via ${flockId}` }] };
+      }
+      return { delivered: true, targetMachine: machineId, flockId, targetSession: payload.params.targetSession };
+    },
+    transportFactory: (config, opts) => new AzureTransport(config, { ...opts, fetchImpl }),
+    ...extra,
+  });
+
+  const callerRoot = path.join(copilotHome, "flock");
+  fs.mkdirSync(callerRoot, { recursive: true });
+  const caller = new BrokerFreeRuntime(callerRoot, makeRuntimeOptions("CALLER-PC"));
+  const peerAlpha = new BrokerFreeRuntime(path.join(tempRoot, "peer-alpha"), makeRuntimeOptions("PEER-ALPHA"));
+  const peerBeta = new BrokerFreeRuntime(path.join(tempRoot, "peer-beta"), makeRuntimeOptions("PEER-BETA"));
+  const sharedPeer = new BrokerFreeRuntime(path.join(tempRoot, "shared-peer"), makeRuntimeOptions("SHARED-PEER"));
+  const expiringPeer = new BrokerFreeRuntime(path.join(tempRoot, "expiring-peer"), makeRuntimeOptions("EXPIRING-PEER"));
+
+  await caller.initializeOwner({ flockId: "demo/alpha", machineId: "CALLER-PC", scope: "personal", ...credentials });
+  await caller.initializeOwner({ flockId: "demo/beta", machineId: "CALLER-PC", scope: "personal", ...credentials });
+  await caller.initializeOwner({ flockId: "demo/expiring", machineId: "CALLER-PC", scope: "personal", ...credentials });
+
+  const enrollPeer = async (peerRuntime, machineId, flockId, expiresAt = now + 3600000, sessionIds = ["shared-sess"]) => {
+    const code = await peerRuntime.joinRequest({ machineId, scope: "personal", flockId });
+    const ticket = await caller.approve({
+      flockId,
+      code,
+      expectedEd25519Fingerprint: code.body.peerId,
+      role: "collaborator",
+      sessionIds,
+      membershipExpiresAt: expiresAt,
+    });
+    await peerRuntime.accept(ticket, ownerFingerprint(caller.record(flockId).ownerPublicKey));
+    return code.body.peerId;
+  };
+
+  const alphaPeerId = await enrollPeer(peerAlpha, "PEER-ALPHA", "demo/alpha");
+  const betaPeerId = await enrollPeer(peerBeta, "PEER-BETA", "demo/beta");
+  const sharedAlphaPeerId = await enrollPeer(sharedPeer, "SHARED-PEER", "demo/alpha");
+  await enrollPeer(sharedPeer, "SHARED-PEER", "demo/beta");
+  await enrollPeer(expiringPeer, "EXPIRING-PEER", "demo/expiring", now + 600000);
+
+  const daemons = await Promise.all([peerAlpha.start(), peerBeta.start(), sharedPeer.start(), expiringPeer.start()]);
+  t.after(async () => {
+    await Promise.all(daemons.map((d) => d.close()));
+  });
+
+  const cfg = { protocol: "broker-free-v34", machineId: "CALLER-PC", scope: "personal", hub: "copilotbridge" };
+  const mcpOpts = {
+    ensureDaemon: async () => ({ running: true, pid: process.pid }),
+    runtimeOptions: { ...makeRuntimeOptions("CALLER-PC"), root: callerRoot },
+  };
+
+  // 1. Unique route inference: omitted flock + explicit to_machine resolves to the sole active authorized flock
+  publishedMessages.length = 0;
+  dispatched.length = 0;
+  const sendBeta = await executeMcpTool(
+    cfg,
+    "send_remote_session_message",
+    { to_machine: "PEER-BETA", to_session: "shared-sess", message: "hello inferred beta" },
+    mcpOpts
+  );
+  assert.equal(sendBeta.delivered, true);
+  assert.equal(sendBeta.flockId, "demo/beta");
+  assert.equal(dispatched.length, 1);
+  assert.equal(dispatched[0].flockId, "demo/beta");
+  assert.equal(dispatched[0].machineId, "PEER-BETA");
+  const outboundBetaEnvelope = publishedMessages.find((m) => m.type === "envelope" && m.envelope?.header?.action === "send_message");
+  assert.ok(outboundBetaEnvelope);
+  assert.equal(outboundBetaEnvelope.flockId, "demo/beta");
+  assert.equal(outboundBetaEnvelope.envelope.header.targetPeerId, betaPeerId);
+
+  // Case-insensitive to_machine and transcript/session listing inference
+  const transcriptAlpha = await executeMcpTool(
+    cfg,
+    "get_remote_session_transcript",
+    { to_machine: "peer-alpha", session: "shared-sess" },
+    mcpOpts
+  );
+  assert.equal(transcriptAlpha.messages[0].content, "snapshot from PEER-ALPHA via demo/alpha");
+  const sessionsAlpha = await executeMcpTool(
+    cfg,
+    "list_remote_sessions",
+    { machine: "PEER-ALPHA" },
+    mcpOpts
+  );
+  assert.equal(sessionsAlpha.machineId, "PEER-ALPHA");
+
+  // 2. Multi-route ambiguity rejection: >= 2 active flocks reach SHARED-PEER -> fail closed listing eligible owner/flock choices, 0 messages sent
+  const publishedBeforeAmbiguous = publishedMessages.length;
+  const connectsBeforeAmbiguous = connectCount;
+  await assert.rejects(
+    executeMcpTool(
+      cfg,
+      "send_remote_session_message",
+      { to_machine: "SHARED-PEER", to_session: "shared-sess", message: "must not send" },
+      mcpOpts
+    ),
+    /Ambiguous broker-free route to target machine "SHARED-PEER"[\s\S]*demo\/alpha, demo\/beta/
+  );
+  assert.equal(publishedMessages.length, publishedBeforeAmbiguous, "Ambiguous route must send zero messages");
+  assert.equal(connectCount, connectsBeforeAmbiguous, "Ambiguous route must open zero sockets");
+
+  // Wildcard / auto / broadcast without explicit flock must also fail closed without broadcasting
+  await assert.rejects(
+    executeMcpTool(cfg, "broadcast_remote_session_message", { message: "must not broadcast" }, mcpOpts),
+    /Select an explicit --flock \(demo\/alpha, demo\/beta, demo\/expiring\); broker-free dispatch is ambiguous/
+  );
+  await assert.rejects(
+    executeMcpTool(cfg, "send_remote_session_message", { to_machine: "auto", to_session: "shared-sess", message: "no auto" }, mcpOpts),
+    /Select an explicit --flock \(demo\/alpha, demo\/beta, demo\/expiring\); broker-free dispatch is ambiguous/
+  );
+  assert.equal(publishedMessages.length, publishedBeforeAmbiguous);
+
+  // 3. Zero-route & revoked-route rejection: fail closed without broadcasting or falling back
+  const publishedBeforeZero = publishedMessages.length;
+  const connectsBeforeZero = connectCount;
+  await assert.rejects(
+    executeMcpTool(
+      cfg,
+      "send_remote_session_message",
+      { to_machine: "UNKNOWN-MACHINE", to_session: "shared-sess", message: "must not broadcast" },
+      mcpOpts
+    ),
+    /No active, non-expired authorized broker-free route reaches target machine "UNKNOWN-MACHINE"; refusing broadcast or fallback/
+  );
+  assert.equal(publishedMessages.length, publishedBeforeZero);
+  assert.equal(connectCount, connectsBeforeZero);
+
+  // Revoking PEER-ALPHA removes its sole route -> fail closed with revoked evidence; revoking SHARED-PEER from demo/alpha leaves unique route demo/beta
+  await caller.removePeer({ flockId: "demo/alpha", peerId: alphaPeerId });
+  await caller.removePeer({ flockId: "demo/alpha", peerId: sharedAlphaPeerId });
+  const publishedAfterRevoke = publishedMessages.length;
+  await assert.rejects(
+    executeMcpTool(
+      cfg,
+      "send_remote_session_message",
+      { to_machine: "PEER-ALPHA", to_session: "shared-sess", message: "revoked peer" },
+      mcpOpts
+    ),
+    /No active, non-expired authorized broker-free route reaches target machine "PEER-ALPHA"[\s\S]*revoked/
+  );
+  assert.equal(publishedMessages.length, publishedAfterRevoke, "Revoked peer must not trigger broadcast or fallback");
+
+  const resolvedSharedAfterKick = await executeMcpTool(
+    cfg,
+    "send_remote_session_message",
+    { to_machine: "SHARED-PEER", to_session: "shared-sess", message: "now unique on beta" },
+    mcpOpts
+  );
+  assert.equal(resolvedSharedAfterKick.flockId, "demo/beta");
+
+  // 4. Expired-route rejection: advance clock past EXPIRING-PEER membership expiry -> fail closed without sending
+  now += 660000;
+  const publishedBeforeExpired = publishedMessages.length;
+  const connectsBeforeExpired = connectCount;
+  await assert.rejects(
+    executeMcpTool(
+      cfg,
+      "send_remote_session_message",
+      { to_machine: "EXPIRING-PEER", to_session: "shared-sess", message: "expired peer" },
+      mcpOpts
+    ),
+    /No active, non-expired authorized broker-free route reaches target machine "EXPIRING-PEER"[\s\S]*expired/
+  );
+  assert.equal(publishedMessages.length, publishedBeforeExpired, "Expired route must send zero messages");
+  assert.equal(connectCount, connectsBeforeExpired, "Expired route must open zero sockets");
+
+  // 5. Explicit invalid or unauthorized flock rejection: never replaced via inference even when demo/beta is valid for PEER-BETA
+  const publishedBeforeExplicitInvalid = publishedMessages.length;
+  const connectsBeforeExplicitInvalid = connectCount;
+  for (const [badFlock, expectedPattern] of [
+    ["demo/nonexistent", /Not an active broker-free flock/],
+    ["", /Invalid explicit broker-free flock selector/],
+    ["Invalid/Flock", /Invalid explicit broker-free flock selector/],
+    ["demo/alpha", /Explicit flock "demo\/alpha" has no active, non-expired authorized route to target machine "PEER-BETA"/],
+  ]) {
+    await assert.rejects(
+      executeMcpTool(
+        cfg,
+        "send_remote_session_message",
+        { flock: badFlock, to_machine: "PEER-BETA", to_session: "shared-sess", message: "must not infer beta" },
+        mcpOpts
+      ),
+      expectedPattern
+    );
+  }
+  // Guest peer with restricted session scope must also reject unauthorized session on explicit or inferred route without sending
+  const peerBetaMcpOpts = {
+    ensureDaemon: async () => ({ running: true, pid: process.pid }),
+    runtimeOptions: { ...makeRuntimeOptions("PEER-BETA"), root: path.join(tempRoot, "peer-beta") },
+  };
+  await assert.rejects(
+    executeMcpTool(
+      { protocol: "broker-free-v34", machineId: "PEER-BETA", scope: "personal", hub: "copilotbridge" },
+      "send_remote_session_message",
+      { flock: "demo/beta", to_machine: "CALLER-PC", to_session: "unapproved-private-session", message: "forbidden" },
+      peerBetaMcpOpts
+    ),
+    /forbids/
+  );
+  assert.equal(publishedMessages.length, publishedBeforeExplicitInvalid, "Explicit invalid/unauthorized flock must send zero messages");
+  assert.equal(connectCount, connectsBeforeExplicitInvalid, "Explicit invalid/unauthorized flock must open zero sockets");
+});
+
