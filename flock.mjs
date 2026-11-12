@@ -1477,49 +1477,78 @@ function round1(num) {
   return Math.round((Number(num) || 0) * 10) / 10;
 }
 
-let lastNvidiaLiveProbeAt = 0;
 let lastNvidiaLiveMetrics = [];
+const nvidiaAsyncQueries = new Map();
+
+function readAsyncNvidiaQuery(binary, args, timeoutMs, ttlMs, negativeTtlMs, cacheStore = null, forceRefresh = false) {
+  const key = JSON.stringify([binary, args]);
+  const previous = nvidiaAsyncQueries.get(key);
+  const reuseUntilMs = previous
+    ? Math.min(previous.expiresAtMs, previous.sampledAtMs + (previous.error ? negativeTtlMs : ttlMs))
+    : 0;
+  if (previous && (previous.pending || (!forceRefresh && Date.now() < reuseUntilMs))) {
+    if (previous.pending && cacheStore) previous.cacheStores.add(cacheStore);
+    return previous;
+  }
+  const state = {
+    pending: true, stdout: null, error: null, sampledAtMs: null, expiresAtMs: 0,
+    cacheStores: new Set(cacheStore ? [cacheStore] : []),
+  };
+  nvidiaAsyncQueries.set(key, state);
+  const finish = (error, stdout) => {
+    if (nvidiaAsyncQueries.get(key) !== state) return;
+    state.pending = false;
+    state.error = error;
+    state.stdout = error ? null : String(stdout || "");
+    state.sampledAtMs = Date.now();
+    state.expiresAtMs = state.sampledAtMs + (error ? negativeTtlMs : ttlMs);
+    for (const store of state.cacheStores) store.entry = null;
+    state.cacheStores.clear();
+    defaultThermalTelemetryCache = null;
+    defaultLiveSpecsCache = null;
+  };
+  try {
+    const child = execFile(binary, args, {
+      encoding: "utf8", timeout: timeoutMs, maxBuffer: 64 * 1024, windowsHide: true,
+    }, finish);
+    child.unref?.();
+  } catch (error) {
+    finish(error, "");
+  }
+  return state;
+}
 
 function probeLiveNvidiaGpuMetrics(timeoutMs = 90) {
-  const now = Date.now();
-  if (now - lastNvidiaLiveProbeAt < 5000) {
-    return lastNvidiaLiveMetrics;
+  const state = readAsyncNvidiaQuery(
+    resolveNvidiaSmiBinary("nvidia-smi"),
+    [
+      "--query-gpu=name,memory.total,memory.free,utilization.gpu",
+      "--format=csv,noheader,nounits",
+    ],
+    Math.max(15, Math.min(180, Number(timeoutMs) || 90)),
+    5000,
+    5000
+  );
+  const nvOut = state.stdout?.trim();
+  if (!nvOut) return lastNvidiaLiveMetrics;
+  const parsed = [];
+  for (const line of nvOut.split(/\r?\n/)) {
+    const parts = line.split(",").map((s) => s.trim());
+    if (parts[0]) {
+      const totalMib = Number(parts[1]) || 0;
+      const freeMib = Number.isFinite(Number(parts[2])) ? Number(parts[2]) : null;
+      const utilPct = Number.isFinite(Number(parts[3])) ? Math.round(Number(parts[3])) : null;
+      parsed.push({
+        name: parts[0],
+        vramGb: totalMib > 0 ? round1(totalMib / 1024) : null,
+        vramFreeGb: freeMib !== null && totalMib > 0 ? round1(freeMib / 1024) : null,
+        utilizationPct: utilPct,
+      });
+    }
   }
-  lastNvidiaLiveProbeAt = now;
-  try {
-    const nvOut = execFileSync(
-      resolveNvidiaSmiBinary("nvidia-smi"),
-      [
-        "--query-gpu=name,memory.total,memory.free,utilization.gpu",
-        "--format=csv,noheader,nounits",
-      ],
-      {
-        encoding: "utf8",
-        stdio: ["ignore", "pipe", "ignore"],
-        timeout: Math.max(15, Math.min(180, Number(timeoutMs) || 90)),
-        windowsHide: true,
-      }
-    ).trim();
-    if (!nvOut) return lastNvidiaLiveMetrics;
-    const parsed = [];
-    for (const line of nvOut.split(/\r?\n/)) {
-      const parts = line.split(",").map((s) => s.trim());
-      if (parts[0]) {
-        const totalMib = Number(parts[1]) || 0;
-        const freeMib = Number.isFinite(Number(parts[2])) ? Number(parts[2]) : null;
-        const utilPct = Number.isFinite(Number(parts[3])) ? Math.round(Number(parts[3])) : null;
-        parsed.push({
-          name: parts[0],
-          vramGb: totalMib > 0 ? round1(totalMib / 1024) : null,
-          vramFreeGb: freeMib !== null && totalMib > 0 ? round1(freeMib / 1024) : null,
-          utilizationPct: utilPct,
-        });
-      }
-    }
-    if (parsed.length > 0) {
-      lastNvidiaLiveMetrics = parsed;
-    }
-  } catch {}
+  if (parsed.length > 0) {
+    lastNvidiaLiveMetrics = parsed;
+  }
   return lastNvidiaLiveMetrics;
 }
 
@@ -1533,10 +1562,14 @@ let defaultThermalTelemetryCache = null;
 let defaultLiveSpecsCache = null;
 let win32ThermalScriptSeq = 0;
 let win32AsyncProbeInFlight = false;
+let thermalCacheGeneration = 0;
 
 export function resetThermalTelemetryCache() {
   defaultThermalTelemetryCache = null;
   defaultLiveSpecsCache = null;
+  nvidiaAsyncQueries.clear();
+  lastNvidiaLiveMetrics = [];
+  thermalCacheGeneration++;
 }
 
 const WIN32_THERMAL_JSCRIPT_SOURCE = [
@@ -1556,6 +1589,8 @@ function buildThermalTelemetrySample({
   hadMalformedOutput,
   hadUnreportedSensors,
   asyncRefreshPending = false,
+  asyncRefreshProvider = "win32-thermal-counter",
+  providerFailure = null,
   platform,
   sampledAt,
   nowMs,
@@ -1620,14 +1655,18 @@ function buildThermalTelemetrySample({
     provider =
       boundedReadings[0]?.provider ||
       timedOutProvider ||
-      (asyncRefreshPending ? "win32-thermal-counter" : "none");
+      providerFailure ||
+      (asyncRefreshPending ? asyncRefreshProvider : "none");
     sensorType = boundedReadings[0]?.sensorType || "unknown";
     if (!enabled) {
       unavailableReason = "disabled_by_configuration";
     } else if (asyncRefreshPending) {
-      unavailableReason = "windows_async_refresh_pending";
+      unavailableReason = asyncRefreshProvider === "nvidia-smi"
+        ? "nvidia_async_refresh_pending" : "windows_async_refresh_pending";
     } else if (timedOut) {
       unavailableReason = "probe_timeout";
+    } else if (providerFailure) {
+      unavailableReason = "provider_error";
     } else if (boundedReadings.some((r) => r.unavailableReason)) {
       unavailableReason = boundedReadings[0].unavailableReason;
     } else if (hadMalformedOutput) {
@@ -1681,6 +1720,7 @@ function triggerWin32AsyncThermalRefresh({
 }) {
   if (win32AsyncProbeInFlight || ttlMs <= 0) return;
   win32AsyncProbeInFlight = true;
+  const generation = thermalCacheGeneration;
   const tempScriptPath = path.join(
     os.tmpdir(),
     `copilot-flock-tz-async-${process.pid}-${++win32ThermalScriptSeq}.js`
@@ -1717,10 +1757,13 @@ function triggerWin32AsyncThermalRefresh({
       (err, stdout) => {
         cleanup();
         win32AsyncProbeInFlight = false;
+        if (generation !== thermalCacheGeneration) return;
         const doneMs = Date.now();
         const doneIso = new Date(doneMs).toISOString();
         const durationMs = Math.max(0, Math.round(performance.now() - startedPerf));
-        const combined = Array.isArray(seedReadings) ? seedReadings.map((r) => ({ ...r })) : [];
+        const combined = Array.isArray(seedReadings)
+          ? seedReadings.filter((r) => Date.parse(r.sampledAt) + ttlMs > doneMs).map((r) => ({ ...r }))
+          : [];
         let hadMalformed = false;
         let hadUnreported = false;
         const timedOut = isExecTimeoutError(err);
@@ -1740,7 +1783,8 @@ function triggerWin32AsyncThermalRefresh({
           platform: "win32",
           sampledAt: doneIso,
           nowMs: doneMs,
-          ttlMs,
+          ttlMs: Math.max(0, Math.min(ttlMs,
+            ...combined.map((r) => Date.parse(r.sampledAt) + ttlMs - doneMs))),
           negativeTtlMs,
           budgetMs,
           probeDurationMs: durationMs,
@@ -2397,6 +2441,11 @@ export function probeThermalTelemetry(options = {}) {
   let hadMalformedOutput = false;
   let hadUnreportedSensors = false;
   let asyncRefreshPending = false;
+  let asyncRefreshProvider = "win32-thermal-counter";
+  let nativeNvidiaPending = false;
+  let nativeNvidiaSampledAt = sampledAt;
+  let nativeNvidiaExpiresAtMs = null;
+  let providerFailure = null;
 
   if (enabled) {
     const baseGpus = Array.isArray(options.baseSpecs?.gpus) ? options.baseSpecs.gpus : null;
@@ -2435,13 +2484,27 @@ export function probeThermalTelemetry(options = {}) {
         timedOut = true;
         timedOutProvider = "nvidia-smi";
       } else {
-        const queryNvidia = (throttleField) =>
-          runExec(
+        const queryNvidia = (throttleField) => {
+          const args = [
+            `--query-gpu=index,name,temperature.gpu,power.draw,power.limit,${throttleField}`,
+            "--format=csv,noheader,nounits",
+          ];
+          if (!customExecFn) {
+            const state = readAsyncNvidiaQuery(nvBinary, args, nvTimeoutMs, ttlMs, negativeTtlMs, options.cacheStore, forceRefresh);
+            if (state.pending) {
+              nativeNvidiaPending = true;
+              asyncRefreshPending = true;
+              asyncRefreshProvider = "nvidia-smi";
+              return null;
+            }
+            if (state.error) throw state.error;
+            nativeNvidiaSampledAt = new Date(state.sampledAtMs).toISOString();
+            nativeNvidiaExpiresAtMs = Math.min(state.expiresAtMs, state.sampledAtMs + ttlMs);
+            return state.stdout;
+          }
+          return runExec(
             nvBinary,
-            [
-              `--query-gpu=index,name,temperature.gpu,power.draw,power.limit,${throttleField}`,
-              "--format=csv,noheader,nounits",
-            ],
+            args,
             {
               encoding: "utf8",
               stdio: ["ignore", "pipe", "pipe"],
@@ -2449,6 +2512,7 @@ export function probeThermalTelemetry(options = {}) {
               windowsHide: true,
             }
           );
+        };
 
         let nvRaw = null;
         try {
@@ -2458,6 +2522,7 @@ export function probeThermalTelemetry(options = {}) {
             timedOutProvider = "nvidia-smi";
           }
         } catch (err) {
+          if (!customExecFn) providerFailure = "nvidia-smi";
           if (isExecTimeoutError(err) || isOverBudget()) {
             timedOut = true;
             timedOutProvider = "nvidia-smi";
@@ -2483,7 +2548,7 @@ export function probeThermalTelemetry(options = {}) {
         }
 
         if (nvRaw !== null && (!timedOut || String(nvRaw).trim().length > 0)) {
-          const parsedNv = parseNvidiaSmiThermalOutput(nvRaw, sampledAt);
+          const parsedNv = parseNvidiaSmiThermalOutput(nvRaw, nativeNvidiaSampledAt);
           if (parsedNv.hadMalformed) hadMalformedOutput = true;
           allReadings.push(...parsedNv.readings);
         }
@@ -2509,7 +2574,7 @@ export function probeThermalTelemetry(options = {}) {
         }
         allReadings.push(...linuxRes.readings);
       }
-    } else if (platform === "win32" && !timedOut) {
+    } else if (platform === "win32" && !timedOut && !nativeNvidiaPending) {
       if (!customExecFn && !forceRefresh) {
         triggerWin32AsyncThermalRefresh({
           cacheKey,
@@ -2595,10 +2660,13 @@ export function probeThermalTelemetry(options = {}) {
     hadMalformedOutput,
     hadUnreportedSensors,
     asyncRefreshPending,
+    asyncRefreshProvider,
+    providerFailure,
     platform,
     sampledAt,
     nowMs,
-    ttlMs,
+    ttlMs: nativeNvidiaExpiresAtMs === null ? ttlMs
+      : Math.min(ttlMs, Math.max(0, nativeNvidiaExpiresAtMs - nowMs)),
     negativeTtlMs,
     budgetMs,
     probeDurationMs,

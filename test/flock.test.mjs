@@ -8555,6 +8555,158 @@ test("thermal telemetry: missing/unsupported sensors return null + unavailableRe
 });
 
 test("thermal telemetry: strict <= 250ms hard timeout budget, freshness cache window, and flock specs-sharing boundaries", async () => {
+  const asyncEnv = setupTempCopilotEnv();
+  try {
+    const script = path.join(asyncEnv.tempRoot, "native-gpu-cache.mjs");
+    fs.writeFileSync(script, `
+import assert from "node:assert/strict";
+import childProcess from "node:child_process";
+import { syncBuiltinESMExports } from "node:module";
+let synchronousGpuCalls = 0;
+const pending = [];
+const windowsPending = [];
+childProcess.execFileSync = () => {
+  synchronousGpuCalls++;
+  throw new Error("Native GPU sampling must never synchronously wait on the caller");
+};
+childProcess.execFile = (command, args, options, callback) => {
+  if (command === "cscript.exe") {
+    assert.equal(options.windowsHide, true);
+    windowsPending.push(callback);
+    return { unref() {} };
+  }
+  assert.equal(command, "synthetic-nvidia");
+  assert.equal(options.windowsHide, true);
+  assert.ok(options.timeout > 0 && options.timeout <= 90);
+  pending.push({ args, callback });
+  return { unref() {} };
+};
+syncBuiltinESMExports();
+const api = await import(${JSON.stringify(new URL("../flock.mjs", import.meta.url).href)});
+let now = Date.now();
+Date.now = () => now;
+const base = {
+  gpus: [{ name: "NVIDIA RTX 4090", vramGb: 24 }],
+  disks: [{ mount: process.env.COPILOT_HOME, type: "fixed" }],
+};
+let cacheStore = { entry: null };
+const read = () => api.refreshLiveSpecs(base, {
+  thermalOptions: { platform: "linux", sysfsRoot: process.env.COPILOT_HOME, cacheStore },
+});
+api.resetThermalTelemetryCache();
+const started = performance.now();
+const cold = read();
+assert.ok(performance.now() - started <= 250);
+assert.equal(cold.thermal.available, false);
+assert.equal(cold.thermal.unavailableReason, "nvidia_async_refresh_pending");
+for (let i = 0; i < 10; i++) read();
+assert.equal(pending.length, 2, "Concurrent cold reads must share each native query");
+assert.equal(synchronousGpuCalls, 0);
+for (const query of pending.splice(0)) query.callback(null,
+  query.args[0].includes("temperature.gpu")
+    ? "0, NVIDIA RTX 4090, 62, 150, 450, 0x0\\n"
+    : "NVIDIA RTX 4090, 24576, 16384, 25\\n");
+const warm = read();
+assert.equal(warm.gpus[0].vramFreeGb, 16);
+assert.equal(warm.gpus[0].utilizationPct, 25);
+assert.equal(warm.thermal.temperatureC, 62);
+assert.equal(warm.thermal.unavailableReason, null);
+assert.equal(pending.length, 0);
+assert.equal(read().thermal.cached, true);
+const gpuFreshUntil = warm.thermal.freshUntil;
+const gpuSampledAt = warm.thermal.readings[0].sampledAt;
+now += 5000;
+cacheStore.entry = null;
+const rebuilt = read().thermal;
+assert.equal(rebuilt.freshUntil, gpuFreshUntil, "Rebuilding composite cache must not extend GPU freshness");
+assert.equal(rebuilt.readings[0].sampledAt, gpuSampledAt);
+const narrower = api.probeThermalTelemetry({
+  platform: "linux", sysfsRoot: process.env.COPILOT_HOME, baseSpecs: base, ttlMs: 6000, cacheStore: { entry: null },
+});
+assert.equal(Date.parse(narrower.freshUntil), Date.parse(gpuSampledAt) + 6000);
+now += 5001;
+assert.equal(read().thermal.unavailableReason, "nvidia_async_refresh_pending");
+assert.equal(pending.length, 2, "Expired samples require a single fresh query per kind");
+for (const query of pending.splice(0)) query.callback(
+  Object.assign(new Error("GPU driver did not respond"), { code: "ETIMEDOUT" }), "");
+const failed = read();
+assert.equal(failed.thermal.available, false);
+assert.equal(failed.thermal.temperatureC, null);
+assert.equal(failed.thermal.unavailableReason, "probe_timeout");
+read();
+assert.equal(pending.length, 0, "Negative cache must avoid a timeout retry storm");
+api.resetThermalTelemetryCache();
+cacheStore = { entry: null };
+read();
+const obsolete = pending.splice(0);
+api.resetThermalTelemetryCache();
+cacheStore = { entry: null };
+read();
+for (const query of obsolete) query.callback(null, "0, NVIDIA RTX 4090, 99, 150, 450, 0x0\\n");
+assert.equal(read().thermal.unavailableReason, "nvidia_async_refresh_pending");
+assert.equal(pending.length, 2, "An obsolete completion cannot replace the new generation");
+assert.equal(synchronousGpuCalls, 0);
+for (const query of pending.splice(0)) query.callback(
+  Object.assign(new Error("GPU executable unavailable"), { code: "ENOENT" }), "");
+assert.equal(read().thermal.unavailableReason, "provider_error");
+const forced = api.probeThermalTelemetry({
+  platform: "linux", sysfsRoot: process.env.COPILOT_HOME, baseSpecs: base, cacheStore, forceRefresh: true,
+});
+assert.equal(forced.unavailableReason, "nvidia_async_refresh_pending");
+assert.equal(pending.length, 1, "Explicit refresh must bypass a completed negative GPU cache");
+pending.shift().callback(null, "0, NVIDIA RTX 4090, 66, 150, 450, 0x0\\n");
+assert.equal(read().thermal.temperatureC, 66);
+assert.equal(synchronousGpuCalls, 0);
+api.resetThermalTelemetryCache();
+const nativeOptions = { platform: "linux", sysfsRoot: process.env.COPILOT_HOME, baseSpecs: base };
+const expire = () => pending.shift().callback(
+  Object.assign(new Error("GPU timeout"), { code: "ETIMEDOUT" }), "");
+api.probeThermalTelemetry({ ...nativeOptions, cacheStore: { entry: null } });
+expire();
+const noNegativeCache = { ...nativeOptions, negativeTtlMs: 0, cacheStore: { entry: null } };
+api.probeThermalTelemetry(noNegativeCache);
+assert.equal(pending.length, 1, "Consumer negativeTtlMs:0 must bypass a longer cached native error");
+expire();
+api.probeThermalTelemetry(noNegativeCache);
+assert.equal(pending.length, 1, "Completed errors must not be cached with negativeTtlMs:0");
+expire();
+const shortCache = { ...nativeOptions, ttlMs: 20, cacheStore: { entry: null } };
+api.probeThermalTelemetry(shortCache);
+expire();
+assert.equal(api.probeThermalTelemetry(shortCache).unavailableReason, "probe_timeout");
+assert.equal(pending.length, 0);
+now += 21;
+api.probeThermalTelemetry(shortCache);
+assert.equal(pending.length, 1, "Default negative TTL must not exceed the consumer's 20ms TTL");
+expire();
+const noCache = { ...nativeOptions, ttlMs: 0, cacheStore: { entry: null } };
+api.probeThermalTelemetry(noCache);
+assert.equal(pending.length, 1);
+expire();
+api.probeThermalTelemetry(noCache);
+assert.equal(pending.length, 1, "ttlMs:0 must disable completed native-error reuse");
+expire();
+delete process.env.COPILOT_FLOCK_NVIDIA_SMI;
+api.resetThermalTelemetryCache();
+const windowsStore = { entry: null };
+api.probeThermalTelemetry({
+  platform: "win32", baseSpecs: { gpus: [{ name: "Intel" }] },
+  fsImpl: { existsSync: () => false }, cacheStore: windowsStore,
+});
+assert.equal(windowsPending.length, 1);
+api.resetThermalTelemetryCache();
+const replacement = { marker: "new-generation" };
+windowsStore.entry = replacement;
+windowsPending.shift()(null, "[]");
+assert.equal(windowsStore.entry, replacement, "Old WMI completion must not publish stale seeded GPU readings");
+`);
+    execFileSync(process.execPath, [script], {
+      encoding: "utf8", windowsHide: true, timeout: 10000,
+      env: { ...process.env, COPILOT_HOME: asyncEnv.tempRoot, COPILOT_FLOCK_NVIDIA_SMI: "synthetic-nvidia" },
+    });
+  } finally {
+    asyncEnv.cleanup();
+  }
   resetThermalTelemetryCache();
 
   // 1. Real hanging subprocess is killed within strict <= 250ms budget

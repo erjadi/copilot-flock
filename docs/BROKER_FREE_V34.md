@@ -336,3 +336,14 @@ unchanged performance limits. An explicit TAP reporter preserves executed-test
 counts in the signed stdout across supported Node.js defaults.
 New ballots also bind `reviewStartedAt` in their signed payload, allowing a
 collector to reject reviews older than its requested freshness boundary.
+
+Native NVIDIA live metrics and thermal queries run asynchronously with
+single-flight positive/negative caching; they never synchronously wait for a
+GPU driver on the specs caller. A cold thermal result remains unavailable with
+`nvidia_async_refresh_pending` until sampling completes. Timeouts and provider
+errors remain explicit, with no fabricated temperature or power readings.
+Completion invalidates composite caches, and cached GPU timestamps/expiry are
+preserved when those caches are rebuilt. Explicit refresh schedules a fresh
+native query without making the caller wait; injected synchronous providers
+retain their existing budget checks. Native-cache reuse honors the caller's
+positive and negative TTLs, including zero. The caller's 250 ms limit is unchanged.
