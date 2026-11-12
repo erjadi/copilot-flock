@@ -36,7 +36,7 @@
     },
     "flock-lifecycle.mjs": {
       "role": "companion",
-      "sha256": "23b12ff899d154304b16b3ec5b88ad8b509cd632e70213b95cc6e0ef9baf6b51",
+      "sha256": "864795e569c37e94309b21d37e271efd6cbae5559521b6237c4f17eb0b22f423",
       "imports": [
         "./flock-membership.mjs"
       ]
@@ -67,5 +67,5 @@
       ]
     }
   },
-  "manifestDigest": "f5e166201233c1530db2b37dec3448600035618a9ccb1c049a163b6c8457eea0"
+  "manifestDigest": "a32a8c7bc847119d109e16de300ada8de121a1382c8515dac45efe232a830af1"
 }

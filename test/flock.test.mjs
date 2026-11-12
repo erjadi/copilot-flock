@@ -5991,6 +5991,29 @@ test("pinned RUNTIME_MODULE_MANIFEST covers complete runtime closure and matches
   }
 });
 
+test("runtime manifest without an external manifest matches the pinned closure, including embedded fallback", async () => {
+  const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+  const expected = computeRuntimeManifest(repoRoot, { version: BRIDGE_VERSION });
+  for (const useEmbeddedFallback of [false, true]) {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "flock-embedded-manifest-"));
+    try {
+      for (const name of REQUIRED_RUNTIME_MODULES) {
+        if (useEmbeddedFallback && name === "flock-azure.mjs") continue;
+        fs.copyFileSync(path.join(repoRoot, name), path.join(root, name));
+      }
+      assert.equal(fs.existsSync(path.join(root, RUNTIME_MANIFEST_FILENAME)), false);
+      const { RUNTIME_MODULE_MANIFEST: actual } = await import(
+        pathToFileURL(path.join(root, "flock-lifecycle.mjs")).href
+      );
+      validateRuntimeManifest(actual, { expectedVersion: BRIDGE_VERSION });
+      assert.deepEqual(actual, expected,
+        useEmbeddedFallback ? "Embedded fallback must pin this exact generation" : "Complete closure must be recomputed");
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  }
+});
+
 test("fleet runtime staging rejects omitted modules, partial copies, interrupted staging/cutover, and hash mismatches while preserving active generation and protected state", async () => {
   const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
   const scratchRoot = fs.mkdtempSync(path.join(os.tmpdir(), "flock-manifest-gate-"));
