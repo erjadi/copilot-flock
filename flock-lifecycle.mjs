@@ -1767,7 +1767,7 @@ const EMBEDDED_RUNTIME_MANIFEST_FALLBACK = (() => {
       },
       "flock-azure.mjs": {
         role: "companion",
-        sha256: "73fd4f9945554c6765898359439a35470c7e3104b5f4d959f8d1d4bd31769458",
+        sha256: "6dd60ee4f5f10a7e6d6438d650d71063514a5b8c3675ddb6c15eced6165effab",
         imports: ["./flock-protocol.mjs"],
       },
       "flock-broker-free.mjs": {
@@ -1787,7 +1787,7 @@ const EMBEDDED_RUNTIME_MANIFEST_FALLBACK = (() => {
       },
       "flock-membership.mjs": {
         role: "companion",
-        sha256: "3c180a66b7ac4455c98ff115ac276020d6b63180114c2f390cee7756d681941d",
+        sha256: "5ccd409530a2dcbbd1c8025e6f6f2af7da9ae0a4a79b70d1384f1c46fbd4c77c",
         imports: [
           "./flock-lifecycle.mjs",
           "./flock-protocol.mjs",
@@ -2204,9 +2204,29 @@ export function recoverInterruptedRuntimeCutover(targetDir, { force = false } = 
     journal.previousFileHashes && typeof journal.previousFileHashes === "object"
       ? journal.previousFileHashes
       : {};
+  const rollbackPriority = [
+    "flock.mjs",
+    "bridge.mjs",
+    "installation.json",
+    "runtime-manifest.json",
+    "flock-registry.mjs",
+    "flock-broker-free.mjs",
+    "flock-protocol.mjs",
+    "flock-lifecycle.mjs",
+    "flock-membership.mjs",
+    "flock-azure.mjs",
+  ];
+  const orderedNames = [...managedNames].sort((a, b) => {
+    const ia = rollbackPriority.indexOf(a);
+    const ib = rollbackPriority.indexOf(b);
+    if (ia !== -1 && ib !== -1) return ia - ib;
+    if (ia !== -1) return -1;
+    if (ib !== -1) return 1;
+    return a.localeCompare(b);
+  });
   const restoreErrors = [];
 
-  for (const name of managedNames) {
+  for (const name of orderedNames) {
     const activeFile = path.join(resolvedTarget, name);
     const backupFile = backupDir ? path.join(backupDir, name) : null;
     const expectedPrevHash =
@@ -2223,25 +2243,29 @@ export function recoverInterruptedRuntimeCutover(targetDir, { force = false } = 
         }
         if (!backedUpFiles.has(name) || !backupFile || !fs.existsSync(backupFile)) {
           restoreErrors.push(`${name}: missing rollback backup file`);
-          continue;
+          break;
         }
         atomicReplaceFile(backupFile, activeFile);
         if (!fs.existsSync(activeFile)) {
           restoreErrors.push(`${name}: restored file missing after rename`);
+          break;
         } else if (
           expectedPrevHash &&
           hashRuntimeModule(fs.readFileSync(activeFile)) !== expectedPrevHash
         ) {
           restoreErrors.push(`${name}: restored file digest mismatch`);
+          break;
         }
       } else if (fs.existsSync(activeFile)) {
         fs.unlinkSync(activeFile);
         if (fs.existsSync(activeFile)) {
           restoreErrors.push(`${name}: failed to remove newly added file`);
+          break;
         }
       }
     } catch (err) {
       restoreErrors.push(`${name}: ${err?.code || err?.message || String(err)}`);
+      break;
     }
   }
 
@@ -3161,7 +3185,7 @@ export function activateStagedRuntime({
     // Only roll back target files if cutover actually started; backup failures must never delete or mutate preexisting files
     const rollbackErrors = [];
     if (cutoverStarted) {
-      for (const name of touchedDuringCutover) {
+      for (const name of [...touchedDuringCutover].reverse()) {
         const activeFile = path.join(resolvedTarget, name);
         const backupFile = path.join(backupDir, name);
         const expectedPrevHash = previousFileHashes[name] || null;
@@ -3177,7 +3201,7 @@ export function activateStagedRuntime({
             }
             if (!backedUpFiles.has(name) || !fs.existsSync(backupFile)) {
               rollbackErrors.push(`${name}: missing rollback backup file`);
-              continue;
+              break;
             }
             atomicReplaceFile(backupFile, activeFile);
             if (
@@ -3185,12 +3209,14 @@ export function activateStagedRuntime({
               (expectedPrevHash && hashRuntimeModule(fs.readFileSync(activeFile)) !== expectedPrevHash)
             ) {
               rollbackErrors.push(`${name}: post-rollback digest mismatch`);
+              break;
             }
           } else if (fs.existsSync(activeFile)) {
             fs.unlinkSync(activeFile);
           }
         } catch (rbErr) {
           rollbackErrors.push(`${name}: ${rbErr?.code || rbErr?.message || String(rbErr)}`);
+          break;
         }
       }
     }

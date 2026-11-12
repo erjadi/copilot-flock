@@ -39,9 +39,29 @@ import { validateCert, peerSubscription } from "./flock-protocol.mjs";
     journal.previousFileHashes && typeof journal.previousFileHashes === "object"
       ? journal.previousFileHashes
       : {};
+  const rollbackPriority = [
+    "flock.mjs",
+    "bridge.mjs",
+    "installation.json",
+    "runtime-manifest.json",
+    "flock-registry.mjs",
+    "flock-broker-free.mjs",
+    "flock-protocol.mjs",
+    "flock-lifecycle.mjs",
+    "flock-membership.mjs",
+    "flock-azure.mjs",
+  ];
+  const orderedNames = [...managedNames].sort((a, b) => {
+    const ia = rollbackPriority.indexOf(a);
+    const ib = rollbackPriority.indexOf(b);
+    if (ia !== -1 && ib !== -1) return ia - ib;
+    if (ia !== -1) return -1;
+    if (ib !== -1) return 1;
+    return a.localeCompare(b);
+  });
   const restoreErrors = [];
 
-  for (const name of managedNames) {
+  for (const name of orderedNames) {
     const activeFile = path.join(dir, name);
     const backupFile = backupDir ? path.join(backupDir, name) : null;
     const expectedPrevHash =
@@ -57,25 +77,29 @@ import { validateCert, peerSubscription } from "./flock-protocol.mjs";
         }
         if (!backedUpFiles.has(name) || !backupFile || !fs.existsSync(backupFile)) {
           restoreErrors.push(`${name}: missing rollback backup file`);
-          continue;
+          break;
         }
         fs.renameSync(backupFile, activeFile);
         if (!fs.existsSync(activeFile)) {
           restoreErrors.push(`${name}: restored file missing after rename`);
+          break;
         } else if (
           expectedPrevHash &&
           hashNormalized(fs.readFileSync(activeFile)) !== expectedPrevHash
         ) {
           restoreErrors.push(`${name}: restored file digest mismatch`);
+          break;
         }
       } else if (fs.existsSync(activeFile)) {
         fs.unlinkSync(activeFile);
         if (fs.existsSync(activeFile)) {
           restoreErrors.push(`${name}: failed to remove newly added file`);
+          break;
         }
       }
     } catch (err) {
       restoreErrors.push(`${name}: ${err?.code || err?.message || String(err)}`);
+      break;
     }
   }
 

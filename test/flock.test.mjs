@@ -9130,6 +9130,73 @@ test("NEXUS-V2 regressions: live cutover inspection safety, fs.renameSync post-C
       const actualSha = hashRuntimeModule(fs.readFileSync(path.join(crossTarget, fName)));
       assert.equal(actualSha, fEntry.sha256, `Restored ${fName} must match old generation SHA-256`);
     }
+
+    // 4d. Restore failure retry matrix at callback 8 (after flock.mjs is promoted):
+    // Injecting EACCES on restoring flock.mjs (or flock-membership.mjs) during boot #1 must NOT leave
+    // new flock.mjs paired with old flock-membership.mjs, so boot #2 links ESM imports and recovers 100%!
+    for (const lockedFile of ["flock.mjs", "flock-membership.mjs"]) {
+      const crashAt8 = spawnSync(
+        process.execPath,
+        [
+          "--input-type=module",
+          "-e",
+          `import { stageAndActivateRuntime } from ${JSON.stringify(
+            pathToFileURL(path.join(repoRoot, "flock-lifecycle.mjs")).href
+          )};
+          stageAndActivateRuntime({
+            sourceDir: ${JSON.stringify(v2Source)},
+            targetDir: ${JSON.stringify(crossTarget)},
+            verifyImports: false,
+            onDuringCutover: ({ index }) => { if (index === 8) process.exit(77); },
+          });`,
+        ],
+        { encoding: "utf8", timeout: 15000 }
+      );
+      assert.equal(crashAt8.status, 77, `Expected exit 77 at callback 8 for ${lockedFile}`);
+
+      const preloadPath = path.join(scratchRoot, `inject-eacces-${lockedFile}.mjs`);
+      fs.writeFileSync(
+        preloadPath,
+        `import fs from "node:fs";
+        const orig = fs.renameSync;
+        fs.renameSync = function(a, b) {
+          if (String(b).endsWith(${JSON.stringify(path.sep + lockedFile)}) || String(b).endsWith(${JSON.stringify("/" + lockedFile)})) {
+            const e = new Error("EACCES: simulated sharing lock on " + b);
+            e.code = "EACCES";
+            throw e;
+          }
+          return orig.call(fs, a, b);
+        };`,
+        "utf8"
+      );
+
+      // Boot #1 with EACCES on lockedFile fails closed with RUNTIME_CUTOVER_RECOVERY_FAILED
+      const boot1 = spawnSync(
+        process.execPath,
+        ["--import", pathToFileURL(preloadPath).href, path.join(crossTarget, "flock.mjs"), "--version"],
+        { encoding: "utf8", timeout: 15000, env: { ...process.env, COPILOT_HOME: scratchRoot } }
+      );
+      assert.notEqual(boot1.status, 0);
+      assert.match(boot1.stderr, /RUNTIME_CUTOVER_RECOVERY_FAILED/);
+      assert.equal(fs.existsSync(journalPath), true, `Journal must remain after EACCES on ${lockedFile}`);
+
+      // Boot #2 with EACCES cleared links all static ESM imports cleanly and finishes rollback to 3.4.8!
+      const boot2 = spawnSync(
+        process.execPath,
+        [path.join(crossTarget, "flock.mjs"), "--version"],
+        { encoding: "utf8", timeout: 15000, env: { ...process.env, COPILOT_HOME: scratchRoot } }
+      );
+      assert.equal(
+        boot2.status,
+        0,
+        `Boot #2 after EACCES on ${lockedFile} at callback 8 must link & recover cleanly, got ${boot2.status}: ${boot2.stderr}`
+      );
+      assert.equal(fs.existsSync(journalPath), false);
+      for (const [fName, fEntry] of Object.entries(oldManifest.files)) {
+        const actualSha = hashRuntimeModule(fs.readFileSync(path.join(crossTarget, fName)));
+        assert.equal(actualSha, fEntry.sha256, `After retry for ${lockedFile}, ${fName} must match old digest`);
+      }
+    }
   } finally {
     fs.rmSync(scratchRoot, { recursive: true, force: true });
   }
