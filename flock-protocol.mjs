@@ -91,6 +91,23 @@ export function validateCert(cert, ownerPublicKey, now = Date.now()) {
       body.sessionIds.length > 100) throw new Error("Invalid or expired MemberCert");
   return body;
 }
+export function verifyRosterMemberCert(cert, ownerPublicKey, expectedFlockId = null, now = Date.now()) {
+  if (!cert || typeof cert !== "object" || !cert.body) throw new Error("Missing MemberCert");
+  verify("member-cert", cert.body, cert.signature, ownerPublicKey);
+  const body = cert.body;
+  publicDevice(body);
+  if (body.type !== "copilot-flock-member-v1" ||
+      !["owner", "collaborator", "guest"].includes(body.role) ||
+      !["personal", "work"].includes(body.scope) ||
+      !Number.isSafeInteger(body.issuedAt) || !Number.isSafeInteger(body.expiresAt) ||
+      body.issuedAt > now + 30000 ||
+      body.expiresAt - body.issuedAt > DAY || body.expiresAt <= body.issuedAt ||
+      typeof body.flockId !== "string" || !/^[a-z0-9-]+\/[a-z0-9-]+$/.test(body.flockId) || body.flockId.length > 128 ||
+      (expectedFlockId && body.flockId !== expectedFlockId) ||
+      !Array.isArray(body.sessionIds) || body.sessionIds.some((id) => typeof id !== "string" || !id || id.length > 128) ||
+      body.sessionIds.length > 100) throw new Error("Invalid MemberCert");
+  return { ...body, credentialExpired: body.expiresAt <= now };
+}
 function sharedKey(privateKey, publicKey, salt, info) {
   if (crypto.createPublicKey(publicKey).asymmetricKeyType !== "x25519") throw new Error("Expected X25519 recipient");
   const secret = crypto.diffieHellman({ privateKey: crypto.createPrivateKey(privateKey), publicKey: crypto.createPublicKey(publicKey) });
@@ -188,6 +205,7 @@ function authorize(header, cert, state, now) {
 export function authorizeAction(member, action, payload) {
   if (typeof action !== "string" || action.length > 64) throw new Error("Invalid action");
   if (member.role === "owner") return;
+  if (action === "list_roster" && member.role === "collaborator") return;
   if (["ping", "list_shared_threads", "list_sessions", "rpc_response", "leave", "renew"].includes(action)) return;
   if ((action === "send_message" || action === "get_transcript") &&
       member.sessionIds.includes(payload?.params?.targetSession || payload?.params?.session) &&

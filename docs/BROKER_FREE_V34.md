@@ -79,13 +79,18 @@ This uses a 184-bit hash output rather than aliasing peers by
 a shared fingerprint prefix. Known mapped-name collisions
 with local retained or pending memberships are rejected before provisioning.
 
-The active broker-free RPC surface supports ping, certificate-filtered
-session listings, approved-snapshot transcript access, guarded messaging to
-explicitly shared sessions, renewal and leave. Local sharing and signed
-session IDs both apply; even owner certificates do not expose all local
-threads by default. Cross-flock thread bindings are enforced. Snapshots and
-returned replies use credential redaction; the user must still approve a
-secret-free snapshot rather than relying on redaction alone.
+The active broker-free RPC surface supports ping, owner-signed collaborator
+roster snapshots (`list_roster`; forbidden to guests and omitting session IDs),
+certificate-filtered session listings, approved-snapshot transcript access,
+guarded messaging to explicitly shared sessions, renewal and leave. `flock_status`
+and `list_flocks` keep observed live presence (`onlineMachines`) distinct from
+authenticated roster membership (`knownMembers`, `offlineMembers`, `roster`
+`source`, `freshness`, and explicit refresh status) without presenting missing
+heartbeats as member removal. Local sharing and signed session IDs both apply;
+even owner certificates do not expose all local threads by default. Cross-flock
+thread bindings are enforced. Snapshots and returned replies use credential
+redaction; the user must still approve a secret-free snapshot rather than
+relying on redaction alone.
 
 Legacy remote session creation, delegation, file operations and broader
 administrative RPC are not enabled in this mode. Unsupported calls fail
