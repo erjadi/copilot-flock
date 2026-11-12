@@ -17,6 +17,13 @@ import {
   sanitizeTodoText,
   sortTodoIssues,
   summarizeTodosForFlock,
+  MAX_TODO_STALE_AFTER_MINUTES,
+  beginTodoRefresh,
+  createTodoRefreshState,
+  describeTodoTimings,
+  formatTodoElapsedAge,
+  parseTodoStaleAfterMinutes,
+  refreshTodoState,
   validateTodoSnapshot,
 } from "../viewer/todo-snapshot.mjs";
 import { publishTodos } from "../viewer/publish-todos.mjs";
@@ -270,6 +277,32 @@ const receipt = (overrides = {}) => ({
   confidence: "independently_verified",
   verificationTier: "unit_synthetic",
   ...overrides,
+});
+
+test("merged implementation, readiness and freshness metadata survives publication and repeated refresh together", async (t) => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "flock-unified-todos-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const source = path.join(dir, "incoming.json"), destination = path.join(dir, "runtime.json");
+  const raw = { ...snapshot(), staleAfterMinutes: 60 };
+  Object.assign(raw.issues[0], {
+    implementationDetails: { ...progress(), stage: "implemented", commitSha: receipt().candidateSha },
+    candidateSha: receipt().candidateSha, verificationTier: "unit_synthetic",
+    readinessEvidence: [receipt()],
+  });
+  await writeFile(source, JSON.stringify(raw));
+  await publishTodos(source, destination);
+  const load = async () => JSON.parse(await readFile(destination, "utf8"));
+  let state = await refreshTodoState(createTodoRefreshState(), load, { now: Date.parse("2026-11-12T10:00:00Z") });
+  state = await refreshTodoState(state, load, { now: Date.parse("2026-11-12T10:05:00Z") });
+  const item = state.snapshot.issues.find(i => i.number === 2);
+  assert.deepEqual(item.implementationDetails, raw.issues[0].implementationDetails);
+  assert.equal(resolveTodoReadiness(item).effectiveVerificationTier, "unit_synthetic");
+  assert.equal(state.unchangedRevision, true);
+  assert.equal(state.lastSuccessfulFetchAt, "2026-11-12T10:05:00.000Z");
+  assert.equal(describeTodoTimings(state, { now: Date.parse("2026-11-12T10:05:00Z") }).freshnessState, "stale");
+  const summary = summarizeTodosForFlock(state.snapshot, { format: "json" });
+  assert.equal(summary.issues.find(i => i.number === 2).verificationTier, "unit_synthetic");
+  assert.equal(state.snapshot.updatedAt, raw.updatedAt);
 });
 
 test("readiness evidence schema is backward-compatible, projects approved fields and rejects malformed receipts", () => {
@@ -606,4 +639,244 @@ test("remote Flock summary helper filters by effective tier, redacts secrets/pat
   assert.match(uiSource, /aria-label="TODO verification tier"/);
   assert.match(uiSource, /Copy verification prompt/);
   assert.match(uiSource, /navigator\.clipboard\.writeText/);
+});
+test("controlled clock distinguishes source updatedAt age from lastSuccessfulFetchAt across unchanged and updated revisions", async () => {
+  let clockMs = Date.parse("2026-11-12T10:00:00Z");
+  const now = () => clockMs;
+  const rev4 = { ...snapshot(), revision: 4, updatedAt: "2026-11-12T08:00:00Z" };
+
+  let state = await refreshTodoState(createTodoRefreshState(), async () => rev4, { now });
+  assert.equal(state.error, null);
+  assert.equal(state.unchangedRevision, false);
+  assert.equal(state.snapshot.revision, 4);
+  assert.equal(state.snapshot.updatedAt, "2026-11-12T08:00:00Z");
+  assert.equal(state.lastSuccessfulFetchAt, "2026-11-12T10:00:00.000Z");
+
+  let timings = describeTodoTimings(state, { now });
+  assert.equal(timings.revision, 4);
+  assert.equal(timings.sourceUpdatedAt, "2026-11-12T08:00:00Z");
+  assert.equal(timings.sourceAgeLabel, "2h ago");
+  assert.equal(timings.lastSuccessfulFetchAt, "2026-11-12T10:00:00.000Z");
+  assert.equal(timings.fetchAgeLabel, "0s ago");
+  assert.equal(timings.freshnessState, "age_only");
+  assert.equal(timings.isStale, null);
+  assert.equal(timings.machinePresenceInferred, false);
+
+  // Advance clock 15m 30s without refreshing: both ages advance independently.
+  clockMs = Date.parse("2026-11-12T10:15:30Z");
+  timings = describeTodoTimings(state, { now });
+  assert.equal(timings.sourceAgeLabel, "2h 15m ago");
+  assert.equal(timings.fetchAgeLabel, "15m 30s ago");
+
+  // Refreshing an unchanged revision advances lastSuccessfulFetchAt without making source data appear newly authored.
+  state = await refreshTodoState(state, async () => ({ ...rev4 }), { now });
+  assert.equal(state.unchangedRevision, true);
+  assert.equal(state.snapshot.revision, 4);
+  assert.equal(state.snapshot.updatedAt, "2026-11-12T08:00:00Z");
+  assert.equal(state.lastSuccessfulFetchAt, "2026-11-12T10:15:30.000Z");
+  timings = describeTodoTimings(state, { now });
+  assert.equal(timings.sourceAgeLabel, "2h 15m ago");
+  assert.equal(timings.fetchAgeLabel, "0s ago");
+  assert.equal(timings.unchangedRevision, true);
+
+  // Refreshing a newly authored revision updates updatedAt, revision, and clears unchangedRevision.
+  clockMs = Date.parse("2026-11-12T10:20:00Z");
+  const rev5 = { ...snapshot(), revision: 5, updatedAt: "2026-11-12T10:18:00Z" };
+  state = await refreshTodoState(state, async () => rev5, { now });
+  assert.equal(state.unchangedRevision, false);
+  assert.equal(state.snapshot.revision, 5);
+  timings = describeTodoTimings(state, { now });
+  assert.equal(timings.sourceAgeLabel, "2m ago");
+  assert.equal(timings.fetchAgeLabel, "0s ago");
+
+  // Clock skew where updatedAt is slightly ahead of the local clock is explicit and non-negative.
+  assert.equal(formatTodoElapsedAge("2026-11-12T10:20:05Z", clockMs), "0s ago (ahead of local clock)");
+  const skewedState = await refreshTodoState(createTodoRefreshState(), async () => ({
+    ...snapshot(), revision: 6, updatedAt: "2026-11-12T10:20:05Z",
+  }), { now });
+  const skewedTimings = describeTodoTimings(skewedState, { now });
+  assert.equal(skewedTimings.sourceAheadOfClock, true);
+  assert.equal(skewedTimings.sourceElapsedMs, 0);
+  assert.equal(skewedTimings.sourceAgeLabel, "0s ago (ahead of local clock)");
+});
+
+test("optional freshness threshold policy evaluates source age only and never infers machine online/offline state", async (t) => {
+  assert.equal(parseTodoStaleAfterMinutes(undefined), null);
+  assert.equal(parseTodoStaleAfterMinutes(""), null);
+  assert.equal(parseTodoStaleAfterMinutes(60), 60);
+  assert.equal(parseTodoStaleAfterMinutes("120"), 120);
+  for (const invalid of [0, -1, 1.5, MAX_TODO_STALE_AFTER_MINUTES + 1, "0", "-5", "060", "60m", false, {}]) {
+    assert.throws(() => parseTodoStaleAfterMinutes(invalid), /Invalid TODO freshness threshold/);
+  }
+  for (const badField of [null, 0, -5, 2.5, "60", MAX_TODO_STALE_AFTER_MINUTES + 1]) {
+    assert.throws(() => validateTodoSnapshot({ ...snapshot(), staleAfterMinutes: badField }), /Invalid TODO snapshot/);
+  }
+  assert.equal(Object.hasOwn(validateTodoSnapshot(snapshot()), "staleAfterMinutes"), false);
+  assert.equal(validateTodoSnapshot({ ...snapshot(), staleAfterMinutes: 90 }).staleAfterMinutes, 90);
+
+  let clockMs = Date.parse("2026-11-12T09:00:00Z");
+  const now = () => clockMs;
+  const policySnapshot = { ...snapshot(), revision: 7, updatedAt: "2026-11-12T08:00:00Z", staleAfterMinutes: 60 };
+  let state = await refreshTodoState(createTodoRefreshState(), async () => policySnapshot, { now });
+
+  // Exact 60m boundary is still fresh.
+  let timings = describeTodoTimings(state, { now });
+  assert.equal(timings.staleAfterMinutes, 60);
+  assert.equal(timings.freshnessState, "fresh");
+  assert.equal(timings.isStale, false);
+  assert.equal(timings.machinePresenceInferred, false);
+
+  // 1s past the 60m source threshold becomes stale, and refreshing the unchanged revision does not clear staleness.
+  clockMs = Date.parse("2026-11-12T09:00:01Z");
+  state = await refreshTodoState(state, async () => policySnapshot, { now });
+  timings = describeTodoTimings(state, { now });
+  assert.equal(timings.fetchAgeLabel, "0s ago");
+  assert.equal(timings.sourceAgeLabel, "1h ago");
+  assert.equal(timings.freshnessState, "stale");
+  assert.equal(timings.isStale, true);
+  assert.equal(timings.machinePresenceInferred, false);
+  assert.doesNotMatch(timings.freshnessSummary, /online|offline/i);
+
+  // Explicit null override reverts to age-only presentation.
+  const ageOnly = describeTodoTimings(state, { now, staleAfterMinutes: null });
+  assert.equal(ageOnly.freshnessState, "age_only");
+  assert.equal(ageOnly.isStale, null);
+
+  // Server-level VIEWER_TODOS_STALE_AFTER_MINUTES applies valid policy and fails closed with 503 when malformed.
+  const dir = await mkdtemp(path.join(os.tmpdir(), "flock-todos-policy-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const file = path.join(dir, "snapshot.json");
+  await writeFile(file, JSON.stringify(snapshot()));
+  const callApi = async (staleAfterMinutes) => {
+    let status, body;
+    await handleTodoRequest({
+      url: "/api/todos", method: "GET", socket: { remoteAddress: "127.0.0.1" }, headers: { host: "localhost" },
+    }, {
+      writeHead(code) { status = code; }, end(payload) { body = JSON.parse(payload); },
+    }, { snapshotPath: file, staleAfterMinutes, log() {} });
+    return { status, body };
+  };
+  const unconfigured = await callApi("");
+  assert.equal(unconfigured.status, 200);
+  assert.equal(Object.hasOwn(unconfigured.body, "staleAfterMinutes"), false);
+  const configured = await callApi("45");
+  assert.equal(configured.status, 200);
+  assert.equal(configured.body.staleAfterMinutes, 45);
+  for (const invalidPolicy of ["0", "-10", "abc", "1.5"]) {
+    const rejected = await callApi(invalidPolicy);
+    assert.equal(rejected.status, 503, invalidPolicy);
+    assert.match(rejected.body.error, /freshness policy configuration is invalid/);
+  }
+});
+
+test("failed or invalid refreshes retain explicit errors without substituting stale rankings or advancing lastSuccessfulFetchAt", async () => {
+  let clockMs = Date.parse("2026-11-12T11:00:00Z");
+  const now = () => clockMs;
+
+  // Initial failure leaves snapshot and lastSuccessfulFetchAt null.
+  const initialDenied = await refreshTodoState(createTodoRefreshState(), async () => { throw new Error("403"); }, { now });
+  assert.equal(initialDenied.snapshot, null);
+  assert.equal(initialDenied.lastSuccessfulFetchAt, null);
+  assert.match(initialDenied.error, /configured home LAN or an authenticated SSH connection/);
+
+  // Succeed at 11:05:00Z.
+  clockMs = Date.parse("2026-11-12T11:05:00Z");
+  const good = await refreshTodoState(initialDenied, async () => snapshot(), { now });
+  assert.equal(good.error, null);
+  assert.equal(good.snapshot.issues.length, 2);
+  assert.equal(good.lastSuccessfulFetchAt, "2026-11-12T11:05:00.000Z");
+
+  // Starting a refresh clears active rankings immediately without advancing lastSuccessfulFetchAt.
+  clockMs = Date.parse("2026-11-12T11:25:00Z");
+  const inFlight = beginTodoRefresh(good);
+  assert.equal(inFlight.snapshot, null);
+  assert.equal(inFlight.error, null);
+  assert.equal(inFlight.lastSuccessfulFetchAt, "2026-11-12T11:05:00.000Z");
+
+  // HTTP failure, network failure, and invalid snapshot payloads all clear rankings and preserve the 11:05:00Z fetch timestamp.
+  for (const failingLoader of [
+    async () => { throw new Error("503"); },
+    async () => { throw new Error("403"); },
+    async () => ({ ...snapshot(), updatedAt: "not-a-timestamp" }),
+    async () => ({ schemaVersion: 1, revision: 2 }),
+    async () => null,
+  ]) {
+    const failed = await refreshTodoState(good, failingLoader, { now });
+    assert.equal(failed.snapshot, null);
+    assert.equal(failed.lastSuccessfulFetchAt, "2026-11-12T11:05:00.000Z");
+    assert.ok(failed.error);
+    const timings = describeTodoTimings(failed, { now });
+    assert.equal(timings.sourceUpdatedAt, null);
+    assert.equal(timings.lastSuccessfulFetchAt, "2026-11-12T11:05:00.000Z");
+    assert.equal(timings.fetchAgeLabel, "20m ago");
+  }
+});
+
+test("end-to-end /api/todos refresh lifecycle with controlled clock separates fetch freshness from snapshot authoring and preserves failure invariants", async (t) => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "flock-todos-e2e-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const file = path.join(dir, "runtime.json");
+  await writeFile(file, JSON.stringify({ ...snapshot(), revision: 10, updatedAt: "2026-11-12T06:00:00Z" }));
+
+  let stalePolicy = "180";
+  const server = http.createServer(async (req, res) => {
+    if (!await handleTodoRequest(req, res, { snapshotPath: file, staleAfterMinutes: stalePolicy, log() {} })) {
+      res.writeHead(404);
+      res.end();
+    }
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+  const url = `http://127.0.0.1:${server.address().port}/api/todos`;
+  const fetchTodos = async () => {
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(String(res.status));
+    return res.json();
+  };
+
+  let clockMs = Date.parse("2026-11-12T08:30:00Z");
+  const now = () => clockMs;
+
+  // Initial fetch at 08:30Z: source is 2h 30m old (within 180m threshold), fetch is 0s old.
+  let state = await refreshTodoState(createTodoRefreshState(), fetchTodos, { now });
+  let timings = describeTodoTimings(state, { now });
+  assert.equal(timings.revision, 10);
+  assert.equal(timings.sourceAgeLabel, "2h 30m ago");
+  assert.equal(timings.fetchAgeLabel, "0s ago");
+  assert.equal(timings.freshnessState, "fresh");
+
+  // Refresh same file at 09:10Z: fetch advances to 09:10Z (0s ago), source stays 06:00Z (3h 10m ago -> stale > 180m).
+  clockMs = Date.parse("2026-11-12T09:10:00Z");
+  state = await refreshTodoState(state, fetchTodos, { now });
+  timings = describeTodoTimings(state, { now });
+  assert.equal(state.unchangedRevision, true);
+  assert.equal(timings.lastSuccessfulFetchAt, "2026-11-12T09:10:00.000Z");
+  assert.equal(timings.fetchAgeLabel, "0s ago");
+  assert.equal(timings.sourceUpdatedAt, "2026-11-12T06:00:00Z");
+  assert.equal(timings.sourceAgeLabel, "3h 10m ago");
+  assert.equal(timings.freshnessState, "stale");
+  assert.equal(timings.machinePresenceInferred, false);
+
+  // Corrupt runtime file and refresh at 09:25Z: 503 hides rankings and keeps lastSuccessfulFetchAt at 09:10Z.
+  await writeFile(file, "{corrupt");
+  clockMs = Date.parse("2026-11-12T09:25:00Z");
+  state = await refreshTodoState(state, fetchTodos, { now });
+  timings = describeTodoTimings(state, { now });
+  assert.equal(state.snapshot, null);
+  assert.match(state.error, /503/);
+  assert.equal(state.lastSuccessfulFetchAt, "2026-11-12T09:10:00.000Z");
+  assert.equal(timings.fetchAgeLabel, "15m ago");
+
+  // Restore valid file without threshold policy at 09:30Z -> recovers cleanly in age-only mode.
+  stalePolicy = "";
+  await writeFile(file, JSON.stringify({ ...snapshot(), revision: 11, updatedAt: "2026-11-12T09:28:00Z" }));
+  clockMs = Date.parse("2026-11-12T09:30:00Z");
+  state = await refreshTodoState(state, fetchTodos, { now });
+  timings = describeTodoTimings(state, { now });
+  assert.equal(state.error, null);
+  assert.equal(state.unchangedRevision, false);
+  assert.equal(timings.revision, 11);
+  assert.equal(timings.sourceAgeLabel, "2m ago");
+  assert.equal(timings.fetchAgeLabel, "0s ago");
+  assert.equal(timings.freshnessState, "age_only");
 });
