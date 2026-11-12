@@ -18,9 +18,59 @@ import https from "node:https";
 import crypto from "node:crypto";
 import { spawn, execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { uninstallFlock, lifecyclePaths, recordInstalledArtifact, pinDaemonIdentity, atomicJson, assertNoLinks, stopPinnedDaemon, inspectProcess } from "./flock-lifecycle.mjs";
+import {
+  uninstallFlock,
+  lifecyclePaths,
+  recordInstalledArtifact,
+  pinDaemonIdentity,
+  atomicJson,
+  assertNoLinks,
+  stopPinnedDaemon,
+  inspectProcess,
+  RUNTIME_MANIFEST_FILENAME,
+  RUNTIME_STATE_FILENAME,
+  REQUIRED_RUNTIME_ENTRYPOINTS,
+  REQUIRED_COMPANION_MODULES,
+  REQUIRED_RUNTIME_MODULES,
+  RUNTIME_MODULE_MANIFEST,
+  hashRuntimeModule,
+  extractRelativeModuleImports,
+  computeManifestDigest,
+  computeRuntimeManifest,
+  validateRuntimeManifest,
+  loadRuntimeManifest,
+  verifyStagedRuntimeClosure,
+  readRuntimeState,
+  inspectRuntimeGenerations,
+  inspectRuntimeGenerationsAsync,
+  stageRuntimeRelease,
+  activateStagedRuntime,
+  stageAndActivateRuntime,
+} from "./flock-lifecycle.mjs";
 import { BrokerFreeRuntime } from "./flock-broker-free.mjs";
 import { authorizeAction, ownerFingerprint } from "./flock-protocol.mjs";
+
+export {
+  RUNTIME_MANIFEST_FILENAME,
+  RUNTIME_STATE_FILENAME,
+  REQUIRED_RUNTIME_ENTRYPOINTS,
+  REQUIRED_COMPANION_MODULES,
+  REQUIRED_RUNTIME_MODULES,
+  RUNTIME_MODULE_MANIFEST,
+  hashRuntimeModule,
+  extractRelativeModuleImports,
+  computeManifestDigest,
+  computeRuntimeManifest,
+  validateRuntimeManifest,
+  loadRuntimeManifest,
+  verifyStagedRuntimeClosure,
+  readRuntimeState,
+  inspectRuntimeGenerations,
+  inspectRuntimeGenerationsAsync,
+  stageRuntimeRelease,
+  activateStagedRuntime,
+  stageAndActivateRuntime,
+};
 
 if (typeof dns.setDefaultResultOrder === "function") {
   try {
@@ -76,20 +126,94 @@ function ipv4Lookup(hostname, options, callback) {
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-
-function copyRuntimeModules(sourceDirectory, destinationDirectory, installedEntrypoints) {
-  for (const module of ["flock-lifecycle.mjs", "flock-membership.mjs", "flock-protocol.mjs", "flock-azure.mjs", "flock-broker-free.mjs"]) {
-    const source = path.join(sourceDirectory, module);
-    const destination = assertNoLinks(path.join(destinationDirectory, module));
-    if (path.resolve(source) !== path.resolve(destination)) fs.copyFileSync(source, destination);
-    recordInstalledArtifact(destinationDirectory, destination);
-  }
-  for (const name of installedEntrypoints) {
-    recordInstalledArtifact(destinationDirectory, path.join(destinationDirectory, name));
-  }
-}
+const PROCESS_STARTED_AT = new Date().toISOString();
 
 export const BRIDGE_VERSION = "3.4.1";
+
+function buildInProcessResidentRuntime() {
+  const digest = RUNTIME_MODULE_MANIFEST?.manifestDigest || null;
+  return {
+    status: "running",
+    running: true,
+    pid: process.pid,
+    version: BRIDGE_VERSION,
+    digest,
+    manifestDigest: digest,
+    startedAt: PROCESS_STARTED_AT,
+  };
+}
+
+function resolveResidentDaemonRuntime({ daemonStatus = null, inDaemonProcess = false, statePath = null } = {}) {
+  if (inDaemonProcess) {
+    return buildInProcessResidentRuntime();
+  }
+  const status = daemonStatus || isLocalDaemonRunning();
+  if (!status?.running || !status?.pid) {
+    return {
+      status: "stopped",
+      running: false,
+      pid: null,
+      version: null,
+      digest: null,
+      manifestDigest: null,
+      startedAt: null,
+    };
+  }
+  const resolvedStatePath = statePath || getStatePath();
+  if (fs.existsSync(resolvedStatePath)) {
+    try {
+      const st = JSON.parse(fs.readFileSync(resolvedStatePath, "utf8"));
+      if (!st.pid || st.pid === status.pid) {
+        const res = st.residentRuntime || null;
+        const digest = res?.manifestDigest || res?.digest || st.manifestDigest || null;
+        return {
+          status: "running",
+          running: true,
+          pid: status.pid,
+          version: res?.version || st.version || null,
+          digest,
+          manifestDigest: digest,
+          startedAt: res?.startedAt || st.updatedAt || null,
+        };
+      }
+    } catch {}
+  }
+  return {
+    status: "running",
+    running: true,
+    pid: status.pid,
+    version: null,
+    digest: null,
+    manifestDigest: null,
+    startedAt: null,
+  };
+}
+
+export function getLocalRuntimeStates({
+  targetDir = getBridgeHome(),
+  daemonStatus = null,
+  inDaemonProcess = false,
+  residentOverride = null,
+  statePath = null,
+} = {}) {
+  const resident =
+    residentOverride ||
+    resolveResidentDaemonRuntime({ daemonStatus, inDaemonProcess, statePath });
+  return inspectRuntimeGenerations(targetDir, { resident });
+}
+
+export async function getLocalRuntimeStatesAsync({
+  targetDir = getBridgeHome(),
+  daemonStatus = null,
+  inDaemonProcess = false,
+  residentOverride = null,
+  statePath = null,
+} = {}) {
+  const resident =
+    residentOverride ||
+    resolveResidentDaemonRuntime({ daemonStatus, inDaemonProcess, statePath });
+  return await inspectRuntimeGenerationsAsync(targetDir, { resident });
+}
 
 const DEFAULT_AZURE_SUBSCRIPTION = process.env.COPILOT_FLOCK_SUBSCRIPTION || "";
 const DEFAULT_AZURE_RESOURCE_GROUP = process.env.COPILOT_FLOCK_RESOURCE_GROUP || "";
@@ -5317,10 +5441,17 @@ export async function handleRpcAction(cfg, req) {
         .filter((d) => d.type !== "network")
         .map((d) => ({ mount: d.mount, type: "fixed", totalGb: d.totalGb, freeGb: d.freeGb }));
     }
+    const runtimeStates = await getLocalRuntimeStatesAsync({ inDaemonProcess: true });
     const out = {
       machineId: cfg.machineId,
       canonicalAddress: `${(githubUser || "unknown").toLowerCase()}/${normalizeScope(cfg.scope, "work")}/${cfg.machineId}`,
       version: BRIDGE_VERSION,
+      manifestDigest: RUNTIME_MODULE_MANIFEST?.manifestDigest || null,
+      runtimeStates,
+      staged: runtimeStates.staged,
+      installed: runtimeStates.installed,
+      resident: runtimeStates.resident,
+      verified: runtimeStates.verified,
       scope: normalizeScope(cfg.scope, "work"),
       githubUser,
       specs,
@@ -5692,65 +5823,7 @@ export async function handleRpcAction(cfg, req) {
   }
 
   if (action === "self_update") {
-    const repoDir = resolveOrFindBridgeGitRepo();
-    if (!repoDir) {
-      throw new Error(`Could not locate or clone copilot-signalr-bridge git repo on ${cfg.machineId}`);
-    }
-    execFileSync("git", ["-C", repoDir, "fetch", "origin", "main"], {
-      stdio: ["ignore", "pipe", "pipe"],
-      timeout: 20000,
-      windowsHide: true,
-    });
-    execFileSync("git", ["-C", repoDir, "reset", "--hard", "origin/main"], {
-      stdio: ["ignore", "pipe", "pipe"],
-      timeout: 10000,
-      windowsHide: true,
-    });
-    const newCommit = execFileSync("git", ["-C", repoDir, "rev-parse", "--short", "HEAD"], {
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "ignore"],
-      timeout: 5000,
-      windowsHide: true,
-    }).trim();
-    const updatedRepoScript = fs.existsSync(path.join(repoDir, "flock.mjs"))
-      ? path.join(repoDir, "flock.mjs")
-      : path.join(repoDir, "bridge.mjs");
-    ensureBridgeDir();
-    const targetScript = path.join(getBridgeHome(), "flock.mjs");
-    const compatScript = path.join(getBridgeHome(), "bridge.mjs");
-    fs.copyFileSync(updatedRepoScript, targetScript);
-    fs.copyFileSync(updatedRepoScript, compatScript);
-    copyRuntimeModules(path.dirname(updatedRepoScript), getBridgeHome(), ["flock.mjs", "bridge.mjs"]);
-
-    // Spawn `node flock.mjs install` detached after 300ms so the RPC reply returns first
-    setTimeout(() => {
-      try {
-        const child = spawn(
-          process.execPath,
-          [
-            targetScript,
-            "install",
-            "--scope",
-            cfg.scope || "work",
-            ...(cfg.githubUser ? ["--github-user", cfg.githubUser] : []),
-          ],
-          {
-            detached: true,
-            stdio: "ignore",
-            windowsHide: true,
-          }
-        );
-        child.unref();
-      } catch {}
-    }, 300);
-
-    return {
-      status: "updating",
-      machineId: cfg.machineId,
-      previousVersion: BRIDGE_VERSION,
-      repoDir,
-      targetCommit: newCommit,
-    };
+    return await performLocalSelfUpdate(cfg);
   }
 
   if (action === "diagnose") {
@@ -5955,11 +6028,20 @@ export async function handleRpcAction(cfg, req) {
     }
 
     try {
-      for (const module of ["flock-lifecycle.mjs", "flock-membership.mjs", "flock-protocol.mjs", "flock-azure.mjs", "flock-broker-free.mjs"]) {
-        const content = execFileSync("git", ["-C", repoDir, "show", `${candidateCommit}:${module}`], {
-          encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: 5000,
-        });
-        fs.writeFileSync(path.join(tmpDir, module), content, "utf8");
+      for (const module of ["flock.mjs", "flock-lifecycle.mjs", "flock-membership.mjs", "flock-protocol.mjs", "flock-azure.mjs", "flock-broker-free.mjs", RUNTIME_MANIFEST_FILENAME]) {
+        try {
+          const content = execFileSync("git", ["-C", repoDir, "show", `${candidateCommit}:${module}`], {
+            encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: 5000,
+          });
+          fs.writeFileSync(path.join(tmpDir, module), content, "utf8");
+        } catch (showErr) {
+          if (module !== "flock.mjs" && module !== RUNTIME_MANIFEST_FILENAME) throw showErr;
+        }
+      }
+      if (fs.existsSync(path.join(tmpDir, RUNTIME_MANIFEST_FILENAME))) {
+        const candidateManifest = loadRuntimeManifest(tmpDir);
+        verifyStagedRuntimeClosure(tmpDir, candidateManifest);
+        checks.runtimeManifestOk = true;
       }
       const candidateTest = execFileSync(
         "git",
@@ -6375,8 +6457,16 @@ export async function runDaemon(cfg) {
   fs.writeFileSync(pidPath, String(process.pid), "utf8");
   if (cfg.protocol === "broker-free-v34") {
     const daemon = await brokerFreeRuntime(cfg).start();
-    atomicJson(statePath, { status: "connected", protocol: cfg.protocol, machineId: cfg.machineId,
-      pid: process.pid, updatedAt: new Date().toISOString() });
+    atomicJson(statePath, {
+      status: "connected",
+      protocol: cfg.protocol,
+      machineId: cfg.machineId,
+      version: BRIDGE_VERSION,
+      manifestDigest: RUNTIME_MODULE_MANIFEST?.manifestDigest || null,
+      residentRuntime: buildInProcessResidentRuntime(),
+      pid: process.pid,
+      updatedAt: new Date().toISOString(),
+    });
     await new Promise((resolve) => {
       const shutdown = () => { daemon.close().then(resolve, (error) => { logDaemon(error.message); process.exitCode = 1; resolve(); }); };
       process.once("SIGTERM", shutdown);
@@ -6395,6 +6485,9 @@ export async function runDaemon(cfg) {
             status,
             machineId: cfg.machineId,
             scope: cfg.scope,
+            version: BRIDGE_VERSION,
+            manifestDigest: RUNTIME_MODULE_MANIFEST?.manifestDigest || null,
+            residentRuntime: buildInProcessResidentRuntime(),
             endpoint: cfg.endpoint,
             hub: cfg.hub,
             pid: process.pid,
@@ -7433,7 +7526,7 @@ Object.assign(MCP_TOOLS.find((tool) => tool.name === "kick_flock_member").inputS
   operation_id: { type: "string", description: "Stable operation ID for retrying an interrupted owner rotation." },
 });
 
-async function executeMcpTool(cfg, name, args = {}) {
+export async function executeMcpTool(cfg, name, args = {}) {
   if (name === "unenroll_flock") {
     if (args.traceless !== true) throw new Error("Specify traceless=true to remove this installation");
     return uninstallBridge();
@@ -7470,9 +7563,22 @@ async function executeMcpTool(cfg, name, args = {}) {
   if (name === "flock_status" || name === "bridge_status") {
     const daemonStatus = await ensureDaemonStarted(cfg);
     const machines = await discoverMachines(cfg, { includeSelf: true, timeoutMs: 2200 });
+    const selfPing = machines.find(
+      (m) => String(m.machineId || "").toLowerCase() === String(cfg.machineId || "").toLowerCase()
+    );
+    const runtimeStates = await getLocalRuntimeStatesAsync({
+      daemonStatus,
+      residentOverride: selfPing?.resident || null,
+    });
     return {
       localMachineId: cfg.machineId,
       version: BRIDGE_VERSION,
+      manifestDigest: RUNTIME_MODULE_MANIFEST?.manifestDigest || null,
+      runtimeStates,
+      staged: runtimeStates.staged,
+      installed: runtimeStates.installed,
+      resident: runtimeStates.resident,
+      verified: runtimeStates.verified,
       scope: cfg.scope,
       githubUser: cfg.githubUser || null,
       specs: refreshLiveSpecs(cfg.specs),
@@ -9159,11 +9265,136 @@ export function reapOrphanedMcpProcesses() {
   return reapedPids;
 }
 
+export async function performLocalSelfUpdate(
+  cfg,
+  {
+    sourceDir = null,
+    targetDir = null,
+    legacyDir = null,
+    gitSync = true,
+    spawnInstall = true,
+    verifyImports = true,
+    runImportCheck = null,
+    onBeforeStageFile = null,
+    onAfterStageFile = null,
+    onDuringCutover = null,
+  } = {}
+) {
+  if (cfg?.protocol === "broker-free-v34") {
+    const err = new Error("Remote self_update is not permitted in broker-free-v34 mode; existing protocol and credentials retained");
+    err.code = "BROKER_FREE_MUTATION_FORBIDDEN";
+    throw err;
+  }
+  const resolvedTargetDir = targetDir ? path.resolve(targetDir) : getBridgeHome();
+  const resolvedLegacyDir = legacyDir !== undefined
+    ? (legacyDir ? path.resolve(legacyDir) : null)
+    : getLegacyBridgeHome();
+
+  const repoDir = sourceDir ? path.resolve(sourceDir) : resolveOrFindBridgeGitRepo();
+  if (!repoDir) {
+    throw new Error(`Could not locate or clone copilot-signalr-bridge git repo on ${cfg.machineId}`);
+  }
+
+  let newCommit = null;
+  if (!sourceDir && gitSync) {
+    execFileSync("git", ["-C", repoDir, "fetch", "origin", "main"], {
+      stdio: ["ignore", "pipe", "pipe"],
+      timeout: 20000,
+      windowsHide: true,
+    });
+    execFileSync("git", ["-C", repoDir, "reset", "--hard", "origin/main"], {
+      stdio: ["ignore", "pipe", "pipe"],
+      timeout: 10000,
+      windowsHide: true,
+    });
+    newCommit = execFileSync("git", ["-C", repoDir, "rev-parse", "--short", "HEAD"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+      timeout: 5000,
+      windowsHide: true,
+    }).trim();
+  }
+
+  if (!targetDir) ensureBridgeDir();
+  const residentNow = buildInProcessResidentRuntime();
+  const activated = stageAndActivateRuntime({
+    sourceDir: repoDir,
+    targetDir: resolvedTargetDir,
+    verifyImports,
+    ...(runImportCheck ? { runImportCheck } : {}),
+    onBeforeStageFile,
+    onAfterStageFile,
+    onDuringCutover,
+    resident: residentNow,
+  });
+
+  if (resolvedLegacyDir && fs.existsSync(resolvedLegacyDir) && path.resolve(resolvedLegacyDir) !== path.resolve(resolvedTargetDir)) {
+    try {
+      stageAndActivateRuntime({
+        sourceDir: resolvedTargetDir,
+        targetDir: resolvedLegacyDir,
+        verifyImports: false,
+      });
+    } catch {}
+  }
+
+  const targetScript = path.join(resolvedTargetDir, "flock.mjs");
+  if (spawnInstall) {
+    // Spawn `node flock.mjs install` detached after 300ms so the RPC reply returns first
+    setTimeout(() => {
+      try {
+        const child = spawn(
+          process.execPath,
+          [
+            targetScript,
+            "install",
+            "--scope",
+            cfg.scope || "work",
+            ...(cfg.githubUser ? ["--github-user", cfg.githubUser] : []),
+          ],
+          {
+            detached: true,
+            stdio: "ignore",
+            windowsHide: true,
+          }
+        );
+        child.unref();
+      } catch {}
+    }, 300);
+  }
+
+  return {
+    status: "updating",
+    machineId: cfg.machineId,
+    previousVersion: BRIDGE_VERSION,
+    previousDigest: RUNTIME_MODULE_MANIFEST?.manifestDigest || null,
+    repoDir,
+    targetCommit: newCommit,
+    runtimeStates: activated.runtimeStates,
+    staged: activated.staged,
+    installed: activated.installed,
+    resident: activated.resident,
+    verified: activated.verified,
+  };
+}
+
 export async function updateFleetMachines(
   cfg,
-  { machines = "*", scope = null, includeSelf = true } = {}
+  {
+    machines = "*",
+    scope = null,
+    includeSelf = true,
+    sourceDir = null,
+    gitSync = true,
+    verifyImports = true,
+    runImportCheck = null,
+    discoverFn = discoverMachines,
+    invokeBatchFn = invokeRemoteRpcBatch,
+    localInstallFn = installBridge,
+    postUpdateWaitMs = 4500,
+  } = {}
 ) {
-  const discovered = await discoverMachines(cfg, { includeSelf: true, timeoutMs: 2500 });
+  const discovered = await discoverFn(cfg, { includeSelf: true, timeoutMs: 2500 });
   const remoteTargets = filterBroadcastTargets(discovered, {
     localMachineId: cfg.machineId,
     includeSelf: false,
@@ -9178,13 +9409,13 @@ export async function updateFleetMachines(
     params: {},
   }));
   const batchOutcomes =
-    batchItems.length > 0 ? await invokeRemoteRpcBatch(cfg, batchItems, 25000) : [];
+    batchItems.length > 0 ? await invokeBatchFn(cfg, batchItems, 25000) : [];
 
   let localUpdate = null;
   if (includeSelf && matchesSelectorList(cfg.machineId, machines)) {
-    const repoDir = resolveOrFindBridgeGitRepo();
-    if (repoDir) {
-      try {
+    const repoDir = sourceDir ? path.resolve(sourceDir) : resolveOrFindBridgeGitRepo();
+    try {
+      if (repoDir && !sourceDir && gitSync) {
         execFileSync("git", ["-C", repoDir, "fetch", "origin", "main"], {
           stdio: ["ignore", "pipe", "pipe"],
           timeout: 20000,
@@ -9195,39 +9426,172 @@ export async function updateFleetMachines(
           timeout: 10000,
           windowsHide: true,
         });
-        fs.copyFileSync(path.join(repoDir, "bridge.mjs"), path.join(getBridgeHome(), "bridge.mjs"));
-        copyRuntimeModules(repoDir, getBridgeHome(), ["bridge.mjs"]);
-      } catch {}
+      }
+      const candidateSource = repoDir || __dirname;
+      ensureBridgeDir();
+      stageAndActivateRuntime({
+        sourceDir: candidateSource,
+        targetDir: getBridgeHome(),
+        verifyImports,
+        ...(runImportCheck ? { runImportCheck } : {}),
+      });
+      const installRes = await localInstallFn({
+        scopeArg: cfg.scope,
+        githubUserArg: cfg.githubUser,
+        sourceDirArg: getBridgeHome(),
+        verifyImportsArg: false,
+      });
+      const states = installRes?.runtimeStates || getLocalRuntimeStates();
+      localUpdate = {
+        machineId: cfg.machineId,
+        ok: true,
+        error: null,
+        version: states.installed?.version || installRes?.version || BRIDGE_VERSION,
+        daemonPid: installRes?.daemonPid ?? states.resident?.pid ?? null,
+        runtimeStates: states,
+        staged: states.staged,
+        installed: states.installed,
+        resident: states.resident,
+        verified: states.verified,
+      };
+    } catch (err) {
+      const states = getLocalRuntimeStates();
+      localUpdate = {
+        machineId: cfg.machineId,
+        ok: false,
+        error: formatErrorDetail(err),
+        code: err.code || "RUNTIME_UPDATE_FAILED",
+        version: states.installed?.version || null,
+        daemonPid: states.resident?.pid || null,
+        runtimeStates: states,
+        staged: states.staged,
+        installed: states.installed,
+        resident: states.resident,
+        verified: states.verified,
+      };
     }
-    localUpdate = await installBridge({
-      scopeArg: cfg.scope,
-      githubUserArg: cfg.githubUser,
-    });
   }
 
-  if (batchItems.length > 0) {
-    await new Promise((r) => setTimeout(r, 4500));
+  if (batchItems.length > 0 && postUpdateWaitMs > 0) {
+    await new Promise((r) => setTimeout(r, postUpdateWaitMs));
   }
-  const verifiedOnline = await discoverMachines(cfg, { includeSelf: true, timeoutMs: 3000 });
+  const verifiedOnline = await discoverFn(cfg, { includeSelf: true, timeoutMs: 3000 });
   const verifiedMap = new Map(verifiedOnline.map((m) => [m.machineId, m]));
 
+  const remoteUpdates = batchOutcomes.map((o) => {
+    const mId = o.item.target.machineId;
+    const beforeTarget = o.item.target;
+    const rpcRes = o.ok ? o.response?.result : null;
+    const after = verifiedMap.get(mId);
+
+    const stagedState = after?.staged || rpcRes?.staged || {
+      status: o.ok ? "promoted" : "failed",
+      version: rpcRes?.installed?.version || null,
+      digest: rpcRes?.installed?.manifestDigest || null,
+      manifestDigest: rpcRes?.installed?.manifestDigest || null,
+      closureVerified: Boolean(rpcRes?.staged?.closureVerified),
+      importVerified: Boolean(rpcRes?.staged?.importVerified),
+      error: o.ok ? null : o.error,
+      code: null,
+      updatedAt: new Date().toISOString(),
+    };
+
+    const installedState = after?.installed || rpcRes?.installed || beforeTarget?.installed || {
+      status: "unknown",
+      complete: false,
+      version: after?.version || beforeTarget?.version || null,
+      digest: after?.manifestDigest || beforeTarget?.manifestDigest || null,
+      manifestDigest: after?.manifestDigest || beforeTarget?.manifestDigest || null,
+    };
+
+    const residentDigest = after?.resident?.manifestDigest || after?.manifestDigest || null;
+    const residentState = after
+      ? (after.resident || {
+          status: "running",
+          running: true,
+          pid: after.pid || null,
+          version: after.version || null,
+          digest: residentDigest,
+          manifestDigest: residentDigest,
+          startedAt: after.timestamp || null,
+        })
+      : {
+          status: "stopped",
+          running: false,
+          pid: null,
+          version: null,
+          digest: null,
+          manifestDigest: null,
+          startedAt: null,
+        };
+
+    const closureOk = Boolean(after?.verified?.closureVerified ?? rpcRes?.verified?.closureVerified);
+    const importOk = Boolean(after?.verified?.importVerified ?? rpcRes?.verified?.importVerified);
+    const residentMatches =
+      Boolean(residentState.running) &&
+      Boolean(installedState.manifestDigest) &&
+      residentState.manifestDigest === installedState.manifestDigest &&
+      residentState.version === installedState.version;
+
+    const verifiedDigest = closureOk && importOk ? installedState.manifestDigest : null;
+    const verifiedState = after?.verified || {
+      status: !closureOk || !importOk
+        ? "unverified"
+        : residentState.running && !residentMatches
+        ? "pending_daemon_restart"
+        : residentMatches
+        ? "verified"
+        : "unverified",
+      closureVerified: closureOk,
+      importVerified: importOk,
+      residentMatchesInstalled: residentMatches,
+      fullyActive: Boolean(closureOk && importOk && residentMatches),
+      version: closureOk && importOk ? installedState.version : null,
+      digest: verifiedDigest,
+      manifestDigest: verifiedDigest,
+      verifiedAt: rpcRes?.verified?.verifiedAt || null,
+    };
+
+    const activationVerified = Boolean(
+      o.ok &&
+      installedState.complete !== false &&
+      closureOk &&
+      importOk &&
+      residentMatches
+    );
+
+    return {
+      machineId: mId,
+      ok: Boolean(o.ok),
+      activationVerified,
+      updateResult: rpcRes,
+      error: o.ok ? null : o.error,
+      verifiedOnlineVersion: after?.version || null,
+      verifiedDaemonPid: after?.pid || null,
+      runtimeStates: {
+        staged: stagedState,
+        installed: installedState,
+        resident: residentState,
+        verified: verifiedState,
+      },
+      staged: stagedState,
+      installed: installedState,
+      resident: residentState,
+      verified: verifiedState,
+    };
+  });
+
+  const topRuntimeStates = localUpdate?.runtimeStates || getLocalRuntimeStates();
   return {
     updatedAt: new Date().toISOString(),
-    localUpdate: localUpdate
-      ? { machineId: cfg.machineId, version: localUpdate.version, daemonPid: localUpdate.daemonPid }
-      : null,
-    remoteUpdates: batchOutcomes.map((o) => {
-      const mId = o.item.target.machineId;
-      const after = verifiedMap.get(mId);
-      return {
-        machineId: mId,
-        ok: o.ok,
-        updateResult: o.ok ? o.response.result : null,
-        error: o.ok ? null : o.error,
-        verifiedOnlineVersion: after?.version || null,
-        verifiedDaemonPid: after?.pid || null,
-      };
-    }),
+    ok: (localUpdate ? localUpdate.ok !== false : true) && remoteUpdates.every((r) => r.ok),
+    runtimeStates: topRuntimeStates,
+    staged: topRuntimeStates.staged,
+    installed: topRuntimeStates.installed,
+    resident: topRuntimeStates.resident,
+    verified: topRuntimeStates.verified,
+    localUpdate,
+    remoteUpdates,
   };
 }
 
@@ -9403,16 +9767,112 @@ export async function deleteOldBridgeSessions(wsInfo) {
   return removed;
 }
 
-export async function reprovisionLocalBridge(cfg, { syncInstall = false } = {}) {
-  ensureBridgeDir();
-  const wsInfo = getLocalWsConnectionInfo();
-  const reapedMcpPids = reapOrphanedMcpProcesses();
+export async function reprovisionLocalBridge(
+  cfg,
+  {
+    syncInstall = false,
+    sourceDir = null,
+    gitSync = true,
+    verifyImports = true,
+    runImportCheck = null,
+    onBeforeStageFile = null,
+    onAfterStageFile = null,
+    onDuringCutover = null,
+    installFn = installBridge,
+    reapFn = reapOrphanedMcpProcesses,
+    spawnDetachedInstall = true,
+  } = {}
+) {
+  const existingCfgPath = getConfigPath();
+  if (cfg?.protocol === "broker-free-v34") {
+    const err = new Error("Reprovision is not permitted in broker-free-v34 mode; existing protocol and credentials retained");
+    err.code = "BROKER_FREE_MUTATION_FORBIDDEN";
+    throw err;
+  }
+  if (fs.existsSync(existingCfgPath)) {
+    try {
+      const onDiskCfg = JSON.parse(fs.readFileSync(existingCfgPath, "utf8"));
+      if (onDiskCfg?.protocol === "broker-free-v34") {
+        const err = new Error("Reprovision is not permitted in broker-free-v34 mode; existing protocol and credentials retained");
+        err.code = "BROKER_FREE_MUTATION_FORBIDDEN";
+        throw err;
+      }
+    } catch (err) {
+      if (err.code === "BROKER_FREE_MUTATION_FORBIDDEN") throw err;
+    }
+  }
 
-  // 1. Abort and delete all old bridge sessions (Coordinator, Thread Tracker, Upgrade bridge v1.7.0, etc.)
+  ensureBridgeDir();
+  const bridgeHome = getBridgeHome();
+
+  // 1. Pull/locate candidate runtime and verify complete staged dependency closure BEFORE mutating sessions or identity/credential state
+  const managedRepoClone = path.join(bridgeHome, "repo");
+  let activeRepoDir = sourceDir ? path.resolve(sourceDir) : null;
+  let targetCommit = null;
+
+  if (!activeRepoDir) {
+    const repoDir = resolveOrFindBridgeGitRepo() || managedRepoClone;
+    if (repoDir && gitSync) {
+      try {
+        execFileSync("git", ["-C", repoDir, "fetch", "origin", "main"], {
+          stdio: ["ignore", "pipe", "pipe"],
+          timeout: 20000,
+          windowsHide: true,
+        });
+        execFileSync("git", ["-C", repoDir, "reset", "--hard", "origin/main"], {
+          stdio: ["ignore", "pipe", "pipe"],
+          timeout: 10000,
+          windowsHide: true,
+        });
+      } catch {
+        try {
+          if (fs.existsSync(managedRepoClone)) {
+            fs.rmSync(managedRepoClone, { recursive: true, force: true });
+          }
+          execFileSync(
+            "git",
+            ["clone", "https://github.com/erjadi/copilot-signalr-bridge.git", managedRepoClone],
+            { stdio: ["ignore", "pipe", "pipe"], timeout: 25000, windowsHide: true }
+          );
+        } catch {}
+      }
+    }
+    const candidateRepo = fs.existsSync(path.join(repoDir, "flock.mjs")) || fs.existsSync(path.join(repoDir, "bridge.mjs"))
+      ? repoDir
+      : fs.existsSync(path.join(managedRepoClone, "flock.mjs")) || fs.existsSync(path.join(managedRepoClone, "bridge.mjs"))
+      ? managedRepoClone
+      : __dirname;
+    activeRepoDir = candidateRepo;
+    if (fs.existsSync(path.join(activeRepoDir, ".git")) && gitSync) {
+      try {
+        targetCommit = execFileSync("git", ["-C", activeRepoDir, "rev-parse", "--short", "HEAD"], {
+          encoding: "utf8",
+          stdio: ["ignore", "pipe", "ignore"],
+          timeout: 5000,
+          windowsHide: true,
+        }).trim();
+      } catch {}
+    }
+  }
+
+  // Stage and verify complete dependency closure + atomic cutover BEFORE removing identity or sessions
+  const activated = stageAndActivateRuntime({
+    sourceDir: activeRepoDir,
+    targetDir: bridgeHome,
+    verifyImports,
+    ...(runImportCheck ? { runImportCheck } : {}),
+    onBeforeStageFile,
+    onAfterStageFile,
+    onDuringCutover,
+  });
+
+  const wsInfo = getLocalWsConnectionInfo();
+  const reapedMcpPids = reapFn();
+
+  // 2. Abort and delete all old bridge sessions (Coordinator, Thread Tracker, Upgrade bridge v1.7.0, etc.)
   const removedSessions = await deleteOldBridgeSessions(wsInfo);
 
-  // 2. Remove old bridge state, logs, caches, identity key, locks, transfers, and skill folders
-  const bridgeHome = getBridgeHome();
+  // 3. Remove old bridge state, logs, caches, identity key, locks, transfers, and skill folders
   const filesToRemove = [
     path.join(bridgeHome, "state.json"),
     path.join(bridgeHome, "inbox.jsonl"),
@@ -9440,49 +9900,6 @@ export async function reprovisionLocalBridge(cfg, { syncInstall = false } = {}) 
   }
   cachedIdentityKeypair = null;
   cachedIdentityKeyPath = null;
-
-  // 3. Pull or clone a fresh repo checkout from origin/main
-  const managedRepoClone = path.join(bridgeHome, "repo");
-  const repoDir = resolveOrFindBridgeGitRepo() || managedRepoClone;
-  let targetCommit = null;
-  if (repoDir) {
-    try {
-      execFileSync("git", ["-C", repoDir, "fetch", "origin", "main"], {
-        stdio: ["ignore", "pipe", "pipe"],
-        timeout: 20000,
-        windowsHide: true,
-      });
-      execFileSync("git", ["-C", repoDir, "reset", "--hard", "origin/main"], {
-        stdio: ["ignore", "pipe", "pipe"],
-        timeout: 10000,
-        windowsHide: true,
-      });
-    } catch {
-      try {
-        if (fs.existsSync(managedRepoClone)) {
-          fs.rmSync(managedRepoClone, { recursive: true, force: true });
-        }
-        execFileSync(
-          "git",
-          ["clone", "https://github.com/erjadi/copilot-signalr-bridge.git", managedRepoClone],
-          { stdio: ["ignore", "pipe", "pipe"], timeout: 25000, windowsHide: true }
-        );
-      } catch {}
-    }
-    const activeRepoDir = fs.existsSync(path.join(repoDir, "bridge.mjs"))
-      ? repoDir
-      : managedRepoClone;
-    if (fs.existsSync(path.join(activeRepoDir, "bridge.mjs"))) {
-      targetCommit = execFileSync("git", ["-C", activeRepoDir, "rev-parse", "--short", "HEAD"], {
-        encoding: "utf8",
-        stdio: ["ignore", "pipe", "ignore"],
-        timeout: 5000,
-        windowsHide: true,
-      }).trim();
-      fs.copyFileSync(path.join(activeRepoDir, "bridge.mjs"), path.join(bridgeHome, "bridge.mjs"));
-      copyRuntimeModules(activeRepoDir, bridgeHome, ["bridge.mjs"]);
-    }
-  }
 
   // 4. Create brand-new, clean, idle Coordinator and Thread Tracker sessions (no initial LLM turn)
   let newCoordinatorSessionId = null;
@@ -9526,12 +9943,15 @@ export async function reprovisionLocalBridge(cfg, { syncInstall = false } = {}) 
 
   // 5. Generate fresh Ed25519 keypair and run install (synchronously when called from local CLI, or detached after 300ms when called via RPC)
   const freshKey = ensureMachineIdentityKeypair();
-  const targetScript = path.join(bridgeHome, "bridge.mjs");
+  const targetScript = path.join(bridgeHome, "flock.mjs");
   if (syncInstall) {
-    const installRes = await installBridge({
+    const installRes = await installFn({
       scopeArg: cfg.scope || "work",
       githubUserArg: cfg.githubUser || null,
+      sourceDirArg: bridgeHome,
+      verifyImportsArg: false,
     });
+    const finalStates = installRes?.runtimeStates || getLocalRuntimeStates({ targetDir: bridgeHome });
     return {
       status: "reprovisioned",
       machineId: cfg.machineId,
@@ -9542,29 +9962,36 @@ export async function reprovisionLocalBridge(cfg, { syncInstall = false } = {}) 
       newThreadTrackerSessionId,
       newKeyFingerprint: freshKey.fingerprint,
       installResult: installRes,
+      runtimeStates: finalStates,
+      staged: finalStates.staged,
+      installed: finalStates.installed,
+      resident: finalStates.resident,
+      verified: finalStates.verified,
     };
   }
 
-  setTimeout(() => {
-    try {
-      const child = spawn(
-        process.execPath,
-        [
-          targetScript,
-          "install",
-          "--scope",
-          cfg.scope || "work",
-          ...(cfg.githubUser ? ["--github-user", cfg.githubUser] : []),
-        ],
-        {
-          detached: true,
-          stdio: "ignore",
-          windowsHide: true,
-        }
-      );
-      child.unref();
-    } catch {}
-  }, 300);
+  if (spawnDetachedInstall) {
+    setTimeout(() => {
+      try {
+        const child = spawn(
+          process.execPath,
+          [
+            targetScript,
+            "install",
+            "--scope",
+            cfg.scope || "work",
+            ...(cfg.githubUser ? ["--github-user", cfg.githubUser] : []),
+          ],
+          {
+            detached: true,
+            stdio: "ignore",
+            windowsHide: true,
+          }
+        );
+        child.unref();
+      } catch {}
+    }, 300);
+  }
 
   return {
     status: "reprovisioning",
@@ -9575,6 +10002,11 @@ export async function reprovisionLocalBridge(cfg, { syncInstall = false } = {}) 
     newCoordinatorSessionId,
     newThreadTrackerSessionId,
     newKeyFingerprint: freshKey.fingerprint,
+    runtimeStates: activated.runtimeStates,
+    staged: activated.staged,
+    installed: activated.installed,
+    resident: activated.resident,
+    verified: activated.verified,
   };
 }
 
@@ -9687,10 +10119,28 @@ export async function reprovisionFleetMachines(cfg, { machines = "*" } = {}) {
   }
 
   const diag = await diagnoseFleetMachines(cfg, { machines, fix: anyOnlineSucceeded });
+  const diagByMachine = new Map(
+    (diag.members || []).map((m) => [String(m.machineId || "").toLowerCase(), m])
+  );
+  for (const item of reprovisionResults) {
+    const memberDiag = diagByMachine.get(String(item.machineId || "").toLowerCase());
+    const states = memberDiag?.runtimeStates || item.result?.runtimeStates || null;
+    item.runtimeStates = states;
+    item.staged = states?.staged || null;
+    item.installed = states?.installed || null;
+    item.resident = states?.resident || null;
+    item.verified = states?.verified || null;
+  }
+  const localStates = getLocalRuntimeStates();
 
   return {
     reprovisionedAt: new Date().toISOString(),
     machinesTargeted: targets.map((t) => t.machineId),
+    runtimeStates: localStates,
+    staged: localStates.staged,
+    installed: localStates.installed,
+    resident: localStates.resident,
+    verified: localStates.verified,
     reprovisionResults,
     postReprovisionDiagnosis: diag,
   };
@@ -10001,10 +10451,32 @@ export async function diagnoseLocalBridgeState(cfg, { fix = false } = {}) {
 
   const liveSpecs = refreshLiveSpecs(cfg.specs);
   const idKey = ensureMachineIdentityKeypair();
+  const runtimeStates = await getLocalRuntimeStatesAsync({ daemonStatus: daemonState, inDaemonProcess: true });
+  if (runtimeStates.installed.status !== "not_installed" && !runtimeStates.installed.complete) {
+    issues.push(
+      `Installed runtime closure incomplete or mismatched (status=${runtimeStates.installed.status}, missing=${runtimeStates.installed.missingFiles.join(",") || "none"}, mismatched=${runtimeStates.installed.mismatchedFiles.join(",") || "none"})`
+    );
+  }
+  if (
+    runtimeStates.installed.complete &&
+    runtimeStates.resident.running &&
+    runtimeStates.resident.manifestDigest &&
+    runtimeStates.resident.manifestDigest !== runtimeStates.installed.manifestDigest
+  ) {
+    issues.push(
+      `Resident daemon manifestDigest (${runtimeStates.resident.manifestDigest.slice(0, 12)}) differs from installed runtime (${runtimeStates.installed.manifestDigest.slice(0, 12)})`
+    );
+  }
 
   return {
     machineId: cfg.machineId,
     version: BRIDGE_VERSION,
+    manifestDigest: RUNTIME_MODULE_MANIFEST?.manifestDigest || null,
+    runtimeStates,
+    staged: runtimeStates.staged,
+    installed: runtimeStates.installed,
+    resident: runtimeStates.resident,
+    verified: runtimeStates.verified,
     scope: cfg.scope,
     githubUser: cfg.githubUser || null,
     identity: {
@@ -10187,6 +10659,11 @@ export async function diagnoseFleetMachines(
       version: runningVersion,
       expectedVersion: BRIDGE_VERSION,
       versionMatch,
+      runtimeStates: diag?.runtimeStates || livePings[0].runtimeStates || null,
+      staged: diag?.staged || livePings[0].staged || null,
+      installed: diag?.installed || livePings[0].installed || null,
+      resident: diag?.resident || livePings[0].resident || null,
+      verified: diag?.verified || livePings[0].verified || null,
       daemonInstanceCount,
       daemonPid: diag?.daemon?.pid || livePings[0].pid || null,
       runtime: diag?.runtime || null,
@@ -10498,89 +10975,111 @@ export async function installBridge({
   hubArg,
   protocolArg, welcomeTicketArg, ownerFingerprintArg, flockIdArg,
   serviceBusSendConnectionStringArg, serviceBusListenConnectionStringArg,
+  sourceDirArg, verifyImportsArg = true, runImportCheckArg = null,
+  onBeforeStageFileArg = null, onAfterStageFileArg = null, onDuringCutoverArg = null,
 } = {}) {
+  const candidateSourceDir = sourceDirArg ? path.resolve(sourceDirArg) : __dirname;
+  const stagedRelease = stageRuntimeRelease({
+    sourceDir: candidateSourceDir,
+    targetDir: getBridgeHome(),
+    verifyImports: verifyImportsArg,
+    ...(runImportCheckArg ? { runImportCheck: runImportCheckArg } : {}),
+    onBeforeStageFile: onBeforeStageFileArg,
+    onAfterStageFile: onAfterStageFileArg,
+  });
+
   ensureBridgeDir();
   const activeConfigPath = getConfigPath();
   const sandboxMode = isSandboxV3Mode();
 
-  // Save overrides before loading config
   let existing = {};
-  if (fs.existsSync(activeConfigPath)) {
-    try {
-      existing = JSON.parse(fs.readFileSync(activeConfigPath, "utf8"));
-    } catch {}
-  } else if (sandboxMode && fs.existsSync(CONFIG_PATH)) {
-    try {
-      existing = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf8"));
-    } catch {}
-  }
-  if (protocolArg === "broker-free-v34" || welcomeTicketArg ||
-      (!Object.keys(existing).length && !bootstrapUrlArg && !enrollmentJsonArg)) {
-    if (bootstrapUrlArg || enrollmentJsonArg) throw new Error("Broker-free mode cannot silently enroll through a legacy broker invite");
-    if (Object.keys(existing).length && existing.protocol !== "broker-free-v34") {
-      throw new Error("Existing legacy installation remains unchanged; broker-free migration requires explicit separate enrollment");
-    }
-    const runtime = brokerFreeRuntime(existing);
-    let enrollment;
-    if (welcomeTicketArg) {
-      enrollment = await runtime.accept(welcomeTicketArg, ownerFingerprintArg);
-    } else if (!Object.keys(runtime.read().flocks).length || (flockIdArg && !runtime.read().flocks[flockIdArg])) {
-      enrollment = await runtime.initializeOwner({ flockId: flockIdArg || `${githubUserArg || resolveLocalGitHubUser()}/${scopeArg}`, machineId: machineIdArg || os.hostname(),
-        scope: scopeArg, connectionString: connectionStringArg, manageConnectionString: serviceBusConnectionStringArg,
-        sendConnectionString: serviceBusSendConnectionStringArg, listenConnectionString: serviceBusListenConnectionStringArg });
-    } else {
-      const record = runtime.select(flockIdArg);
-      if (!record.transport && record.ownerSecrets) await runtime.renewOwn(record.flockId);
-      enrollment = { enrolled: true, flockId: record.flockId };
-    }
-    return installBrokerFreeLocal({ ...existing, protocol: "broker-free-v34", machineId: runtime.select(enrollment.flockId).cert.body.machineId,
-      scope: scopeArg || runtime.select(enrollment.flockId).cert.body.scope, flockId: enrollment.flockId }, enrollment);
-  }
-
   let parsedEnrollmentJson = null;
-  if (enrollmentJsonArg) {
-    parsedEnrollmentJson =
-      typeof enrollmentJsonArg === "string" ? JSON.parse(enrollmentJsonArg) : enrollmentJsonArg;
-    if (parsedEnrollmentJson?.bootstrapUrl) {
-      const origin = validatePinnedBootstrapOrigin(
-        parsedEnrollmentJson.bootstrapUrl,
-        existing.bootstrapUrl || null
+  let cfg;
+  try {
+    // Save overrides before loading config
+    if (fs.existsSync(activeConfigPath)) {
+      try {
+        existing = JSON.parse(fs.readFileSync(activeConfigPath, "utf8"));
+      } catch {}
+    } else if (sandboxMode && fs.existsSync(CONFIG_PATH)) {
+      try {
+        existing = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf8"));
+      } catch {}
+    }
+    if (protocolArg === "broker-free-v34" || welcomeTicketArg ||
+        (!Object.keys(existing).length && !bootstrapUrlArg && !enrollmentJsonArg)) {
+      if (bootstrapUrlArg || enrollmentJsonArg) throw new Error("Broker-free mode cannot silently enroll through a legacy broker invite");
+      if (Object.keys(existing).length && existing.protocol !== "broker-free-v34") {
+        throw new Error("Existing legacy installation remains unchanged; broker-free migration requires explicit separate enrollment");
+      }
+      const runtime = brokerFreeRuntime(existing);
+      let enrollment;
+      if (welcomeTicketArg) {
+        enrollment = await runtime.accept(welcomeTicketArg, ownerFingerprintArg);
+      } else if (!Object.keys(runtime.read().flocks).length || (flockIdArg && !runtime.read().flocks[flockIdArg])) {
+        enrollment = await runtime.initializeOwner({ flockId: flockIdArg || `${githubUserArg || resolveLocalGitHubUser()}/${scopeArg}`, machineId: machineIdArg || os.hostname(),
+          scope: scopeArg, connectionString: connectionStringArg, manageConnectionString: serviceBusConnectionStringArg,
+          sendConnectionString: serviceBusSendConnectionStringArg, listenConnectionString: serviceBusListenConnectionStringArg });
+      } else {
+        const record = runtime.select(flockIdArg);
+        if (!record.transport && record.ownerSecrets) await runtime.renewOwn(record.flockId);
+        enrollment = { enrolled: true, flockId: record.flockId };
+      }
+      return await installBrokerFreeLocal(
+        { ...existing, protocol: "broker-free-v34", machineId: runtime.select(enrollment.flockId).cert.body.machineId,
+          scope: scopeArg || runtime.select(enrollment.flockId).cert.body.scope, flockId: enrollment.flockId },
+        enrollment,
+        { stagedRelease, onDuringCutover: onDuringCutoverArg }
       );
+    }
+
+    if (enrollmentJsonArg) {
+      parsedEnrollmentJson =
+        typeof enrollmentJsonArg === "string" ? JSON.parse(enrollmentJsonArg) : enrollmentJsonArg;
+      if (parsedEnrollmentJson?.bootstrapUrl) {
+        const origin = validatePinnedBootstrapOrigin(
+          parsedEnrollmentJson.bootstrapUrl,
+          existing.bootstrapUrl || null
+        );
+        existing.bootstrapUrl = `${origin}/api/bootstrap`;
+      }
+    }
+    if (bootstrapUrlArg) {
+      const origin = validatePinnedBootstrapOrigin(bootstrapUrlArg, null);
       existing.bootstrapUrl = `${origin}/api/bootstrap`;
     }
-  }
-  if (bootstrapUrlArg) {
-    const origin = validatePinnedBootstrapOrigin(bootstrapUrlArg, null);
-    existing.bootstrapUrl = `${origin}/api/bootstrap`;
-  }
-  if (subscriptionArg) existing.subscription = subscriptionArg;
-  if (resourceGroupArg) existing.resourceGroup = resourceGroupArg;
-  if (signalrNameArg) existing.signalrName = signalrNameArg;
-  if (connectionStringArg) existing.connectionString = connectionStringArg;
-  if (serviceBusConnectionStringArg) {
-    existing.serviceBusConnectionString = serviceBusConnectionStringArg;
-  }
-  if (machineIdArg) existing.machineId = machineIdArg;
-  if (scopeArg) {
-    existing.scope = normalizeScope(scopeArg, existing.scope || "work");
-  } else if (existing.scope) {
-    existing.scope = normalizeScope(existing.scope, "work");
-  } else {
-    const detected = detectMachineScopeRecommendation(existing.specs);
-    existing.scope = detected.recommendedScope;
-  }
-  if (githubUserArg) existing.githubUser = normalizeGitHubUser(githubUserArg);
-  if (hubArg) existing.hub = hubArg;
-  else if (sandboxMode && !existing.hub?.startsWith("v3_preview")) {
-    existing.hub = `v3_preview_flock_${(existing.githubUser || "erjadi").toLowerCase()}_${existing.scope}`;
-  }
+    if (subscriptionArg) existing.subscription = subscriptionArg;
+    if (resourceGroupArg) existing.resourceGroup = resourceGroupArg;
+    if (signalrNameArg) existing.signalrName = signalrNameArg;
+    if (connectionStringArg) existing.connectionString = connectionStringArg;
+    if (serviceBusConnectionStringArg) {
+      existing.serviceBusConnectionString = serviceBusConnectionStringArg;
+    }
+    if (machineIdArg) existing.machineId = machineIdArg;
+    if (scopeArg) {
+      existing.scope = normalizeScope(scopeArg, existing.scope || "work");
+    } else if (existing.scope) {
+      existing.scope = normalizeScope(existing.scope, "work");
+    } else {
+      const detected = detectMachineScopeRecommendation(existing.specs);
+      existing.scope = detected.recommendedScope;
+    }
+    if (githubUserArg) existing.githubUser = normalizeGitHubUser(githubUserArg);
+    if (hubArg) existing.hub = hubArg;
+    else if (sandboxMode && !existing.hub?.startsWith("v3_preview")) {
+      existing.hub = `v3_preview_flock_${(existing.githubUser || "erjadi").toLowerCase()}_${existing.scope}`;
+    }
 
-  if (Object.keys(existing).length > 0) {
-    writeConfigFileSecure(existing, activeConfigPath);
-  }
+    if (Object.keys(existing).length > 0) {
+      writeConfigFileSecure(existing, activeConfigPath);
+    }
 
-  const cfg = loadConfig({ autoFetchAz: true, refreshSpecs: true });
-  loadLocalFlocksConfig(cfg);
+    cfg = loadConfig({ autoFetchAz: true, refreshSpecs: true });
+    loadLocalFlocksConfig(cfg);
+  } catch (err) {
+    stagedRelease.cleanup();
+    throw err;
+  }
 
   // Register member metadata (machineId, githubUser, scope, version, specs) with bootstrap server
   let memberRegistration = null;
@@ -10622,24 +11121,24 @@ export async function installBridge({
 
   // 1. Copy flock.mjs and bridge.mjs into active home (`~/.copilot/flock/flock.mjs` and `bridge.mjs`)
   const targetScript = path.join(getBridgeHome(), "flock.mjs");
-  const compatScript = path.join(getBridgeHome(), "bridge.mjs");
-  if (path.resolve(__filename) !== path.resolve(targetScript)) {
-    fs.copyFileSync(__filename, targetScript);
-  }
-  if (path.resolve(__filename) !== path.resolve(compatScript)) {
-    fs.copyFileSync(__filename, compatScript);
-  }
-  copyRuntimeModules(__dirname, getBridgeHome(), ["flock.mjs", "bridge.mjs"]);
-  // Also update legacy ~/.copilot/signalr-bridge/bridge.mjs if that directory exists so running sessions stay in sync
-  const legacyScript = path.join(getLegacyBridgeHome(), "bridge.mjs");
-  if (fs.existsSync(getLegacyBridgeHome()) && path.resolve(__filename) !== path.resolve(legacyScript)) {
+  activateStagedRuntime({
+    stageDir: stagedRelease.stageDir,
+    targetDir: getBridgeHome(),
+    manifest: stagedRelease.manifest,
+    onDuringCutover: onDuringCutoverArg,
+  });
+  // Also update legacy ~/.copilot/signalr-bridge if that directory exists so running sessions stay in sync
+  if (fs.existsSync(getLegacyBridgeHome()) && path.resolve(getLegacyBridgeHome()) !== path.resolve(getBridgeHome())) {
     try {
-      fs.copyFileSync(__filename, legacyScript);
-      copyRuntimeModules(__dirname, getLegacyBridgeHome(), ["bridge.mjs"]);
+      stageAndActivateRuntime({
+        sourceDir: getBridgeHome(),
+        targetDir: getLegacyBridgeHome(),
+        verifyImports: false,
+      });
     } catch {}
   }
 
-  const mcpConfigPath = path.join(COPILOT_DIR, "mcp-config.json");
+  const mcpConfigPath = path.join(getCopilotDir(), "mcp-config.json");
   let bootPersistence = null;
   let threadTracker = null;
 
@@ -10867,8 +11366,20 @@ export async function installBridge({
     });
   }
 
+  const finalRuntimeStates = getLocalRuntimeStates({
+    targetDir: getBridgeHome(),
+    daemonStatus: daemonInfo,
+    residentOverride: pingReply?.result?.resident || null,
+  });
+
   return {
     version: BRIDGE_VERSION,
+    manifestDigest: stagedRelease.manifest.manifestDigest,
+    runtimeStates: finalRuntimeStates,
+    staged: finalRuntimeStates.staged,
+    installed: finalRuntimeStates.installed,
+    resident: finalRuntimeStates.resident,
+    verified: finalRuntimeStates.verified,
     sandbox: sandboxMode ? "v3" : null,
     installedScript: targetScript,
     configPath: activeConfigPath,
@@ -10933,8 +11444,22 @@ export async function dispatchBrokerFreeRpc(cfg, { member, payload, action, asse
     if (bindings[id] && bindings[id] !== flockId) throw new Error("Thread is bound to another flock");
     return { id, ...entry[1] };
   };
-  if (action === "ping") return { machineId: cfg.machineId, scope: cfg.scope, version: BRIDGE_VERSION,
-    platform: process.platform, activeSessionCount: shared().length };
+  if (action === "ping") {
+    const runtimeStates = await getLocalRuntimeStatesAsync({ inDaemonProcess: true });
+    return {
+      machineId: cfg.machineId,
+      scope: cfg.scope,
+      version: BRIDGE_VERSION,
+      manifestDigest: RUNTIME_MODULE_MANIFEST?.manifestDigest || null,
+      runtimeStates,
+      staged: runtimeStates.staged,
+      installed: runtimeStates.installed,
+      resident: runtimeStates.resident,
+      verified: runtimeStates.verified,
+      platform: process.platform,
+      activeSessionCount: shared().length,
+    };
+  }
   if (action === "list_sessions" || action === "list_shared_threads") {
     const sessions = shared().slice(0, Math.min(100, Math.max(1, Number(params.limit) || 30)))
       .map(([id, entry]) => ({ session_id: id, title: entry.title, session_type: "approved-snapshot",
@@ -10963,25 +11488,33 @@ export async function dispatchBrokerFreeRpc(cfg, { member, payload, action, asse
   throw new Error(`Unsupported broker-free RPC action: ${action}; no legacy dispatch fallback`);
 }
 
-async function installBrokerFreeLocal(config, enrollment) {
+async function installBrokerFreeLocal(config, enrollment, { stagedRelease = null, onDuringCutover = null } = {}) {
   const root = assertNoLinks(getBridgeHome());
   if (fs.existsSync(path.join(root, ".git"))) throw new Error("Refusing to overwrite a source checkout");
   fs.mkdirSync(root, { recursive: true });
   const paths = lifecyclePaths();
   const manifestPath = path.join(root, "installation.json");
   const manifest = fs.existsSync(manifestPath) ? JSON.parse(fs.readFileSync(assertNoLinks(manifestPath), "utf8")) : { artifacts: {} };
-  for (const artifact of [...paths.persistence, ...paths.skills]) {
-    assertNoLinks(artifact);
-    if (fs.existsSync(artifact) && manifest.artifacts[artifact] !== crypto.createHash("sha256").update(fs.readFileSync(artifact)).digest("hex")) {
-      throw new Error(`Unowned/modified installation artifact retained: ${artifact}`);
+  const preparedStage = stagedRelease || stageRuntimeRelease({ sourceDir: __dirname, targetDir: root });
+  let activatedStage = false;
+  try {
+    for (const artifact of [...paths.persistence, ...paths.skills]) {
+      assertNoLinks(artifact);
+      if (fs.existsSync(artifact) && manifest.artifacts[artifact] !== crypto.createHash("sha256").update(fs.readFileSync(artifact)).digest("hex")) {
+        throw new Error(`Unowned/modified installation artifact retained: ${artifact}`);
+      }
     }
+    await stopPinnedDaemon(root, paths);
+    activateStagedRuntime({
+      stageDir: preparedStage.stageDir,
+      targetDir: root,
+      manifest: preparedStage.manifest,
+      onDuringCutover,
+    });
+    activatedStage = true;
+  } finally {
+    if (!activatedStage) preparedStage.cleanup();
   }
-  await stopPinnedDaemon(root, paths);
-  for (const name of ["flock.mjs", "bridge.mjs"]) {
-    const target = assertNoLinks(path.join(root, name));
-    if (path.resolve(__filename) !== target) fs.copyFileSync(__filename, target);
-  }
-  copyRuntimeModules(__dirname, root, ["flock.mjs", "bridge.mjs"]);
   atomicJson(getConfigPath(), config);
   const mcpPath = path.join(getCopilotDir(), "mcp-config.json");
   assertNoLinks(mcpPath);
@@ -11021,8 +11554,19 @@ Owner removal ends that owner's renewal service; it does not delegate authority 
   recordInstalledArtifact(root, persistence.path, paths);
   const daemon = await ensureDaemonStarted(config);
   if (!daemon.state || daemon.state.status !== "connected") throw new Error("Broker-free daemon readiness unconfirmed; enrollment retained for retry");
-  return { protocol: config.protocol, enrollment, installedScript: targetScript, daemonPid: daemon.pid,
-    liveAzureScopeGates: "NOT RUN: disposable-namespace positive/negative JWT and SAS isolation tests required before merge/release" };
+  const runtimeStates = getLocalRuntimeStates({ targetDir: root, daemonStatus: daemon });
+  return {
+    protocol: config.protocol,
+    enrollment,
+    installedScript: targetScript,
+    daemonPid: daemon.pid,
+    runtimeStates,
+    staged: runtimeStates.staged,
+    installed: runtimeStates.installed,
+    resident: runtimeStates.resident,
+    verified: runtimeStates.verified,
+    liveAzureScopeGates: "NOT RUN: disposable-namespace positive/negative JWT and SAS isolation tests required before merge/release",
+  };
 }
 
 export async function uninstallBridge(options = {}) {
