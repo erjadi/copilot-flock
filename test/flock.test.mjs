@@ -79,6 +79,24 @@ import {
   syncFlockMemberships,
   signV3MembershipSyncRequest,
   hasVerifiedOwnerAuthority,
+  RUNTIME_MANIFEST_FILENAME,
+  REQUIRED_RUNTIME_MODULES,
+  RUNTIME_MODULE_MANIFEST,
+  hashRuntimeModule,
+  computeRuntimeManifest,
+  validateRuntimeManifest,
+  loadRuntimeManifest,
+  verifyStagedRuntimeClosure,
+  inspectRuntimeGenerations,
+  stageRuntimeRelease,
+  activateStagedRuntime,
+  stageAndActivateRuntime,
+  getLocalRuntimeStates,
+  performLocalSelfUpdate,
+  updateFleetMachines,
+  reprovisionLocalBridge,
+  installBridge,
+  diagnoseLocalBridgeState,
 } from "../flock.mjs";
 import {
   verifyGitHubRepoAccess,
@@ -5798,5 +5816,567 @@ test("reconcileAuthoritativeFlockMemberships heals downgraded owner roles, enfor
     server.closeAllConnections();
     await new Promise((resolve) => server.close(resolve));
     fs.rmSync(tempRoot, { recursive: true, force: true });
+  }
+});
+
+function buildSyntheticRuntimeSource(baseDir, repoRoot, { version = null, mutate = null, writeManifest = true } = {}) {
+  fs.mkdirSync(baseDir, { recursive: true });
+  const entrypointFallback = fs.existsSync(path.join(repoRoot, "flock.mjs"))
+    ? path.join(repoRoot, "flock.mjs")
+    : path.join(repoRoot, "bridge.mjs");
+  for (const modName of REQUIRED_RUNTIME_MODULES) {
+    const srcPath = fs.existsSync(path.join(repoRoot, modName))
+      ? path.join(repoRoot, modName)
+      : entrypointFallback;
+    let content = fs.readFileSync(srcPath, "utf8");
+    if (version && (modName === "flock.mjs" || modName === "bridge.mjs")) {
+      content = content.replace(
+        /export const BRIDGE_VERSION = "[^"]+";/,
+        `export const BRIDGE_VERSION = ${JSON.stringify(version)};`
+      );
+    }
+    fs.writeFileSync(path.join(baseDir, modName), content, "utf8");
+  }
+  if (typeof mutate === "function") {
+    mutate(baseDir);
+  }
+  let manifest = null;
+  if (writeManifest) {
+    manifest = computeRuntimeManifest(baseDir, version ? { version } : {});
+    fs.writeFileSync(
+      path.join(baseDir, RUNTIME_MANIFEST_FILENAME),
+      JSON.stringify(manifest, null, 2) + "\n",
+      "utf8"
+    );
+  }
+  return manifest;
+}
+
+test("pinned RUNTIME_MODULE_MANIFEST covers complete runtime closure and matches repository SHA-256 digests", () => {
+  assert.ok(RUNTIME_MODULE_MANIFEST, "RUNTIME_MODULE_MANIFEST must be defined");
+  assert.equal(Object.isFrozen(RUNTIME_MODULE_MANIFEST), true);
+  assert.equal(Object.isFrozen(RUNTIME_MODULE_MANIFEST.files), true);
+  assert.equal(RUNTIME_MODULE_MANIFEST.type, "copilot-flock-runtime-manifest-v1");
+  assert.equal(RUNTIME_MODULE_MANIFEST.version, BRIDGE_VERSION);
+  for (const required of REQUIRED_RUNTIME_MODULES) {
+    assert.ok(
+      RUNTIME_MODULE_MANIFEST.files[required]?.sha256,
+      `Missing required runtime module in manifest: ${required}`
+    );
+    assert.match(RUNTIME_MODULE_MANIFEST.files[required].sha256, /^[a-f0-9]{64}$/);
+  }
+  validateRuntimeManifest(RUNTIME_MODULE_MANIFEST, { expectedVersion: BRIDGE_VERSION });
+
+  const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+  if (process.env.BRIDGE_FAST_VOTE_TEST === "1" && !fs.existsSync(path.join(repoRoot, RUNTIME_MANIFEST_FILENAME))) {
+    return;
+  }
+  const loaded = loadRuntimeManifest(repoRoot, { expectedVersion: BRIDGE_VERSION });
+  const recomputed = computeRuntimeManifest(repoRoot, { version: BRIDGE_VERSION });
+  assert.equal(loaded.manifestDigest, recomputed.manifestDigest);
+  assert.deepEqual(loaded.files, recomputed.files);
+  const closure = verifyStagedRuntimeClosure(repoRoot, loaded);
+  assert.equal(closure.ok, true);
+  assert.equal(closure.closureVerified, true);
+  assert.equal(closure.importVerified, true);
+
+  // Verify cross-OS LF vs CRLF Git checkout invariance (Linux/macOS LF vs Windows autocrlf CRLF)
+  const lfCheckoutDir = fs.mkdtempSync(path.join(os.tmpdir(), "flock-lf-checkout-"));
+  try {
+    for (const modName of REQUIRED_RUNTIME_MODULES) {
+      const lfText = fs.readFileSync(path.join(repoRoot, modName), "utf8").replace(/\r\n/g, "\n");
+      fs.writeFileSync(path.join(lfCheckoutDir, modName), lfText, "utf8");
+    }
+    fs.copyFileSync(path.join(repoRoot, RUNTIME_MANIFEST_FILENAME), path.join(lfCheckoutDir, RUNTIME_MANIFEST_FILENAME));
+    const lfManifest = computeRuntimeManifest(lfCheckoutDir, { version: BRIDGE_VERSION });
+    assert.equal(lfManifest.manifestDigest, loaded.manifestDigest, "LF and CRLF checkouts must produce identical manifestDigest");
+    assert.equal(verifyStagedRuntimeClosure(lfCheckoutDir, loaded, { verifyImports: false }).ok, true);
+  } finally {
+    fs.rmSync(lfCheckoutDir, { recursive: true, force: true });
+  }
+});
+
+test("fleet runtime staging rejects omitted modules, partial copies, interrupted staging/cutover, and hash mismatches while preserving active generation and protected state", async () => {
+  const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+  const scratchRoot = fs.mkdtempSync(path.join(os.tmpdir(), "flock-manifest-gate-"));
+  const prevCopilotHome = process.env.COPILOT_HOME;
+  const copilotHome = path.join(scratchRoot, ".copilot");
+  const targetDir = path.join(copilotHome, "flock");
+  process.env.COPILOT_HOME = copilotHome;
+
+  try {
+    // 1. Seed a verified working v1 ("3.4.1") installation + protected identity, protocol, and credential state
+    const v1Source = path.join(scratchRoot, "source-v1");
+    const v1Manifest = buildSyntheticRuntimeSource(v1Source, repoRoot, { version: "3.4.1" });
+    const initialActivation = stageAndActivateRuntime({
+      sourceDir: v1Source,
+      targetDir,
+      resident: {
+        running: true,
+        pid: process.pid,
+        version: "3.4.1",
+        manifestDigest: v1Manifest.manifestDigest,
+        startedAt: "2026-11-12T00:00:00.000Z",
+      },
+    });
+    assert.equal(initialActivation.ok, true);
+    assert.equal(initialActivation.installed.status, "installed");
+    assert.equal(initialActivation.installed.version, "3.4.1");
+    assert.equal(initialActivation.installed.digest, v1Manifest.manifestDigest);
+    assert.equal(initialActivation.verified.status, "verified");
+    assert.equal(initialActivation.verified.fullyActive, true);
+
+    // Populate protected identity, credential, protocol, and resident state files
+    const protectedFiles = {
+      "config.json": JSON.stringify({
+        machineId: "TEST-RIG-1",
+        scope: "personal",
+        githubUser: "erjadi",
+        bootstrapUrl: "https://your-flock-bootstrap.azurewebsites.net/api/bootstrap",
+        connectionString: "Endpoint=https://demo.service.signalr.net;AccessKey=synthetic-key-do-not-mutate;Version=1.0;",
+      }, null, 2),
+      "identity.json": JSON.stringify({
+        algorithm: "ed25519",
+        fingerprint: "protected-fp-v1",
+        publicKey: "-----BEGIN PUBLIC KEY-----\nPROTECTED\n-----END PUBLIC KEY-----",
+        privateKey: "-----BEGIN PRIVATE KEY-----\nPROTECTED\n-----END PRIVATE KEY-----",
+      }, null, 2),
+      "flocks.json": JSON.stringify({
+        flocks: { "erjadi/personal": { trustTier: "owner", rosterEpoch: 4 } },
+      }, null, 2),
+      "broker-free.json": JSON.stringify({
+        schema: 34,
+        flocks: { "erjadi/personal": { flockId: "erjadi/personal", epoch: 2 } },
+        pendingJoins: {},
+      }, null, 2),
+      "daemon.pid": String(process.pid),
+      "state.json": JSON.stringify({
+        status: "connected",
+        pid: process.pid,
+        version: "3.4.1",
+        manifestDigest: v1Manifest.manifestDigest,
+        residentRuntime: {
+          status: "running",
+          running: true,
+          pid: process.pid,
+          version: "3.4.1",
+          digest: v1Manifest.manifestDigest,
+          manifestDigest: v1Manifest.manifestDigest,
+          startedAt: "2026-11-12T00:00:00.000Z",
+        },
+        updatedAt: new Date().toISOString(),
+      }, null, 2),
+    };
+    for (const [name, content] of Object.entries(protectedFiles)) {
+      fs.writeFileSync(path.join(targetDir, name), content, "utf8");
+    }
+
+    const snapshotBaseline = () => {
+      const snap = {};
+      for (const name of [...REQUIRED_RUNTIME_MODULES, RUNTIME_MANIFEST_FILENAME, "installation.json", ...Object.keys(protectedFiles)]) {
+        snap[name] = fs.readFileSync(path.join(targetDir, name));
+      }
+      return snap;
+    };
+    const baselineBytes = snapshotBaseline();
+
+    const assertBaselinePreserved = (label) => {
+      for (const [name, expectedBuf] of Object.entries(baselineBytes)) {
+        const actualBuf = fs.readFileSync(path.join(targetDir, name));
+        assert.equal(actualBuf.equals(expectedBuf), true, `${label}: mutated protected or active file ${name}`);
+      }
+      const leftoverStage = fs.readdirSync(targetDir).filter((n) => n.startsWith(".runtime-stage-") || n.startsWith(".runtime-backup-"));
+      assert.deepEqual(leftoverStage, [], `${label}: left temporary staging/backup directories behind`);
+      const states = getLocalRuntimeStates({ targetDir });
+      assert.equal(states.staged.status, "failed", `${label}: staged status should be 'failed'`);
+      assert.equal(states.installed.status, "installed", `${label}: installed status must remain 'installed'`);
+      assert.equal(states.installed.complete, true, `${label}: installed closure must remain complete`);
+      assert.equal(states.installed.version, "3.4.1");
+      assert.equal(states.installed.digest, v1Manifest.manifestDigest);
+      assert.equal(states.resident.running, true);
+      assert.equal(states.resident.version, "3.4.1");
+      assert.equal(states.resident.digest, v1Manifest.manifestDigest);
+      assert.equal(states.verified.status, "verified");
+      assert.equal(states.verified.fullyActive, true);
+      assert.equal(states.verified.digest, v1Manifest.manifestDigest);
+    };
+
+    // 2a. Omitted companion module on disk (historical bug: copying flock.mjs/bridge.mjs without flock-lifecycle.mjs)
+    const omittedDiskDir = path.join(scratchRoot, "bad-omitted-module");
+    buildSyntheticRuntimeSource(omittedDiskDir, repoRoot, { version: "3.5.0-omitted" });
+    fs.unlinkSync(path.join(omittedDiskDir, "flock-lifecycle.mjs"));
+    assert.throws(
+      () => stageAndActivateRuntime({ sourceDir: omittedDiskDir, targetDir }),
+      (err) => err.code === "RUNTIME_MODULE_MISSING" && /flock-lifecycle\.mjs/.test(err.message)
+    );
+    assertBaselinePreserved("omitted companion module on disk");
+
+    // 2b. Manifest omits required companion module
+    const omittedManifestDir = path.join(scratchRoot, "bad-manifest-omitted");
+    const fullV2 = buildSyntheticRuntimeSource(omittedManifestDir, repoRoot, { version: "3.5.0-manifest-omit" });
+    const incompleteManifest = {
+      ...fullV2,
+      files: Object.fromEntries(Object.entries(fullV2.files).filter(([k]) => k !== "flock-protocol.mjs")),
+    };
+    fs.writeFileSync(path.join(omittedManifestDir, RUNTIME_MANIFEST_FILENAME), JSON.stringify(incompleteManifest, null, 2));
+    assert.throws(
+      () => stageAndActivateRuntime({ sourceDir: omittedManifestDir, targetDir }),
+      (err) => err.code === "RUNTIME_MODULE_MISSING" && /flock-protocol\.mjs/.test(err.message)
+    );
+    assertBaselinePreserved("manifest omits required module");
+
+    // 2c. Entrypoint imports unpinned companion module missing from manifest
+    const unpinnedDir = path.join(scratchRoot, "bad-unpinned-import");
+    buildSyntheticRuntimeSource(unpinnedDir, repoRoot, { version: "3.5.0-unpinned" });
+    const unpinnedManifest = JSON.parse(fs.readFileSync(path.join(unpinnedDir, RUNTIME_MANIFEST_FILENAME), "utf8"));
+    fs.writeFileSync(path.join(unpinnedDir, "extra-helper.mjs"), "export const EXTRA = 1;\n", "utf8");
+    const mutatedFlock = `import { EXTRA } from "./extra-helper.mjs";\n` + fs.readFileSync(path.join(unpinnedDir, "flock.mjs"), "utf8");
+    fs.writeFileSync(path.join(unpinnedDir, "flock.mjs"), mutatedFlock, "utf8");
+    unpinnedManifest.files["flock.mjs"] = {
+      role: "entrypoint",
+      sha256: hashRuntimeModule(mutatedFlock),
+      imports: ["./extra-helper.mjs", "./flock-broker-free.mjs", "./flock-lifecycle.mjs", "./flock-protocol.mjs"],
+    };
+    const sortedEntries = Object.keys(unpinnedManifest.files).sort().map((n) => [
+      n, unpinnedManifest.files[n].role, unpinnedManifest.files[n].sha256, [...unpinnedManifest.files[n].imports].sort(),
+    ]);
+    unpinnedManifest.manifestDigest = crypto.createHash("sha256").update(JSON.stringify([
+      "copilot-flock-runtime-manifest-v1", unpinnedManifest.version, [...unpinnedManifest.entrypoints].sort(), sortedEntries,
+    ])).digest("hex");
+    assert.throws(
+      () => stageAndActivateRuntime({ sourceDir: unpinnedDir, targetDir, manifest: unpinnedManifest }),
+      (err) => err.code === "RUNTIME_UNPINNED_IMPORT" && /extra-helper\.mjs/.test(err.message)
+    );
+    assertBaselinePreserved("unpinned relative import");
+
+    // 3a. Partial copy (truncated companion module)
+    const partialCopyDir = path.join(scratchRoot, "bad-partial-copy");
+    buildSyntheticRuntimeSource(partialCopyDir, repoRoot, { version: "3.5.0-partial" });
+    const origBrokerFree = fs.readFileSync(path.join(partialCopyDir, "flock-broker-free.mjs"));
+    fs.writeFileSync(path.join(partialCopyDir, "flock-broker-free.mjs"), origBrokerFree.subarray(0, 128));
+    assert.throws(
+      () => stageAndActivateRuntime({ sourceDir: partialCopyDir, targetDir }),
+      (err) => err.code === "RUNTIME_HASH_MISMATCH" && /flock-broker-free\.mjs/.test(err.message)
+    );
+    assertBaselinePreserved("partial/truncated module copy");
+
+    // 3b. Broken ESM export / syntax error even when manifest SHA-256 digests match the broken source
+    const brokenImportDir = path.join(scratchRoot, "bad-esm-export");
+    buildSyntheticRuntimeSource(brokenImportDir, repoRoot, {
+      version: "3.5.0-broken-export",
+      mutate: (dir) => {
+        const src = fs.readFileSync(path.join(dir, "flock-azure.mjs"), "utf8");
+        fs.writeFileSync(
+          path.join(dir, "flock-azure.mjs"),
+          `import { nonExistentSymbolFromProtocol } from "./flock-protocol.mjs";\n` + src,
+          "utf8"
+        );
+      },
+    });
+    assert.throws(
+      () => stageAndActivateRuntime({ sourceDir: brokenImportDir, targetDir }),
+      (err) => err.code === "RUNTIME_IMPORT_VERIFICATION_FAILED" && /nonExistentSymbolFromProtocol/.test(err.message)
+    );
+    assertBaselinePreserved("broken ESM named export caught in staged import check");
+
+    // 3c. Interrupted staging mid-copy
+    const validV2Dir = path.join(scratchRoot, "valid-v2");
+    const v2Manifest = buildSyntheticRuntimeSource(validV2Dir, repoRoot, { version: "3.5.0-rc1" });
+    let stagedFilesCount = 0;
+    assert.throws(
+      () =>
+        stageAndActivateRuntime({
+          sourceDir: validV2Dir,
+          targetDir,
+          onAfterStageFile: () => {
+            stagedFilesCount++;
+            if (stagedFilesCount === 3) {
+              const err = new Error("Simulated power/network interruption during staging");
+              err.code = "SIMULATED_STAGE_INTERRUPT";
+              throw err;
+            }
+          },
+        }),
+      (err) => err.code === "SIMULATED_STAGE_INTERRUPT"
+    );
+    assertBaselinePreserved("interrupted staging mid-copy");
+
+    // 3d. Interrupted cutover mid-activation -> automatic rollback restores exact previous working generation
+    assert.throws(
+      () =>
+        stageAndActivateRuntime({
+          sourceDir: validV2Dir,
+          targetDir,
+          onDuringCutover: ({ index }) => {
+            if (index === 3) {
+              const err = new Error("Simulated mid-cutover failure");
+              err.code = "SIMULATED_CUTOVER_FAILURE";
+              throw err;
+            }
+          },
+        }),
+      (err) => err.code === "SIMULATED_CUTOVER_FAILURE"
+    );
+    assertBaselinePreserved("interrupted cutover rolled back cleanly");
+
+    // 4. Hash mismatch on valid-syntax tampered module & across install / self_update / reprovision / updateFleetMachines
+    const hashMismatchDir = path.join(scratchRoot, "bad-hash-mismatch");
+    buildSyntheticRuntimeSource(hashMismatchDir, repoRoot, { version: "3.5.0-tampered" });
+    fs.appendFileSync(path.join(hashMismatchDir, "flock-membership.mjs"), "\n// unauthorized modification\n", "utf8");
+
+    const testCfg = JSON.parse(protectedFiles["config.json"]);
+    await assert.rejects(
+      () => installBridge({ sourceDirArg: hashMismatchDir, scopeArg: "personal", githubUserArg: "erjadi" }),
+      (err) => err.code === "RUNTIME_HASH_MISMATCH"
+    );
+    assertBaselinePreserved("installBridge rejects hash mismatch before mutating config/identity");
+
+    await assert.rejects(
+      () => performLocalSelfUpdate(testCfg, { sourceDir: hashMismatchDir, gitSync: false, spawnInstall: false }),
+      (err) => err.code === "RUNTIME_HASH_MISMATCH"
+    );
+    assertBaselinePreserved("performLocalSelfUpdate rejects hash mismatch before mutating active runtime");
+
+    await assert.rejects(
+      () => reprovisionLocalBridge(testCfg, { sourceDir: omittedDiskDir, gitSync: false, spawnDetachedInstall: false }),
+      (err) => err.code === "RUNTIME_MODULE_MISSING"
+    );
+    assertBaselinePreserved("reprovisionLocalBridge rejects omitted module before deleting identity.json or sessions");
+
+    // Broker-free protocol guard on reprovision & self_update preserves protected protocol/credentials
+    await assert.rejects(
+      () => reprovisionLocalBridge({ ...testCfg, protocol: "broker-free-v34" }, { sourceDir: validV2Dir, gitSync: false }),
+      (err) => err.code === "BROKER_FREE_MUTATION_FORBIDDEN"
+    );
+    await assert.rejects(
+      () => performLocalSelfUpdate({ ...testCfg, protocol: "broker-free-v34" }, { sourceDir: validV2Dir, gitSync: false, spawnInstall: false }),
+      (err) => err.code === "BROKER_FREE_MUTATION_FORBIDDEN"
+    );
+
+    const failedFleetLocal = await updateFleetMachines(testCfg, {
+      machines: "TEST-RIG-1",
+      includeSelf: true,
+      sourceDir: hashMismatchDir,
+      gitSync: false,
+      discoverFn: async () => [],
+      invokeBatchFn: async () => [],
+      postUpdateWaitMs: 0,
+    });
+    assert.equal(failedFleetLocal.ok, false);
+    assert.equal(failedFleetLocal.localUpdate.ok, false);
+    assert.equal(failedFleetLocal.localUpdate.code, "RUNTIME_HASH_MISMATCH");
+    assertBaselinePreserved("updateFleetMachines retains previous generation on hash mismatch");
+
+    // 5. Stage-only vs activated vs resident states exposed independently across update and status responses
+    const stagedOnly = stageAndActivateRuntime({
+      sourceDir: validV2Dir,
+      targetDir,
+      activate: false,
+      resident: {
+        running: true,
+        pid: process.pid,
+        version: "3.4.1",
+        manifestDigest: v1Manifest.manifestDigest,
+      },
+    });
+    assert.equal(stagedOnly.activated, false);
+    assert.equal(stagedOnly.staged.status, "staged");
+    assert.equal(stagedOnly.staged.version, "3.5.0-rc1");
+    assert.equal(stagedOnly.staged.digest, v2Manifest.manifestDigest);
+    assert.equal(stagedOnly.installed.status, "installed");
+    assert.equal(stagedOnly.installed.version, "3.4.1");
+    assert.equal(stagedOnly.installed.digest, v1Manifest.manifestDigest);
+    assert.equal(stagedOnly.resident.version, "3.4.1");
+    assert.equal(stagedOnly.resident.digest, v1Manifest.manifestDigest);
+    assert.equal(stagedOnly.verified.status, "verified");
+    assert.equal(stagedOnly.verified.version, "3.4.1");
+    assert.equal(stagedOnly.verified.digest, v1Manifest.manifestDigest);
+    stagedOnly.cleanup();
+
+    // Perform self_update atomic cutover to v2 while v1 daemon is still resident in memory
+    const selfUpdateRes = await performLocalSelfUpdate(testCfg, {
+      sourceDir: validV2Dir,
+      gitSync: false,
+      spawnInstall: false,
+    });
+    assert.equal(selfUpdateRes.status, "updating");
+    assert.equal(selfUpdateRes.staged.status, "promoted");
+    assert.equal(selfUpdateRes.staged.version, "3.5.0-rc1");
+    assert.equal(selfUpdateRes.staged.digest, v2Manifest.manifestDigest);
+    assert.equal(selfUpdateRes.installed.status, "installed");
+    assert.equal(selfUpdateRes.installed.complete, true);
+    assert.equal(selfUpdateRes.installed.version, "3.5.0-rc1");
+    assert.equal(selfUpdateRes.installed.digest, v2Manifest.manifestDigest);
+    // Resident daemon is still running in-process version (BRIDGE_VERSION = 3.4.1) before restart!
+    assert.equal(selfUpdateRes.resident.running, true);
+    assert.equal(selfUpdateRes.resident.version, BRIDGE_VERSION);
+    assert.equal(selfUpdateRes.verified.closureVerified, true);
+    assert.equal(selfUpdateRes.verified.importVerified, true);
+    assert.equal(selfUpdateRes.verified.residentMatchesInstalled, false);
+    assert.equal(selfUpdateRes.verified.status, "pending_daemon_restart");
+    assert.equal(selfUpdateRes.verified.version, "3.5.0-rc1");
+    assert.equal(selfUpdateRes.verified.digest, v2Manifest.manifestDigest);
+
+    // Protected credentials and flocks remain untouched by self_update
+    for (const key of ["config.json", "identity.json", "flocks.json", "broker-free.json"]) {
+      assert.equal(fs.readFileSync(path.join(targetDir, key)).equals(baselineBytes[key]), true);
+    }
+
+    // Diagnose surfaces pending resident restart when resident digest != installed digest
+    const diagBeforeRestart = await diagnoseLocalBridgeState(testCfg, { fix: false });
+    assert.equal(diagBeforeRestart.installed.version, "3.5.0-rc1");
+    assert.equal(diagBeforeRestart.resident.version, BRIDGE_VERSION);
+    assert.equal(diagBeforeRestart.verified.status, "pending_daemon_restart");
+    assert.ok(diagBeforeRestart.issues.some((msg) => /manifestDigest .* differs from installed runtime/.test(msg)));
+
+    // Simulate daemon restart completing onto v2 in state.json and verify fleet update + status responses
+    fs.writeFileSync(
+      path.join(targetDir, "state.json"),
+      JSON.stringify({
+        status: "connected",
+        pid: process.pid,
+        version: "3.5.0-rc1",
+        manifestDigest: v2Manifest.manifestDigest,
+        residentRuntime: {
+          status: "running",
+          running: true,
+          pid: process.pid,
+          version: "3.5.0-rc1",
+          digest: v2Manifest.manifestDigest,
+          manifestDigest: v2Manifest.manifestDigest,
+          startedAt: "2026-11-12T00:05:00.000Z",
+        },
+        updatedAt: new Date().toISOString(),
+      }, null, 2),
+      "utf8"
+    );
+
+    const postRestartStates = getLocalRuntimeStates({ targetDir });
+    assert.equal(postRestartStates.installed.version, "3.5.0-rc1");
+    assert.equal(postRestartStates.resident.version, "3.5.0-rc1");
+    assert.equal(postRestartStates.resident.digest, v2Manifest.manifestDigest);
+    assert.equal(postRestartStates.verified.status, "verified");
+    assert.equal(postRestartStates.verified.residentMatchesInstalled, true);
+    assert.equal(postRestartStates.verified.fullyActive, true);
+
+    const pingStatus = await handleRpcAction(testCfg, { action: "ping", params: {} });
+    assert.equal(pingStatus.staged.version, "3.5.0-rc1");
+    assert.equal(pingStatus.staged.digest, v2Manifest.manifestDigest);
+    assert.equal(pingStatus.installed.version, "3.5.0-rc1");
+    assert.equal(pingStatus.installed.digest, v2Manifest.manifestDigest);
+    assert.equal(pingStatus.resident.running, true);
+    assert.equal(pingStatus.resident.version, BRIDGE_VERSION);
+    assert.equal(pingStatus.verified.closureVerified, true);
+    assert.equal(pingStatus.verified.importVerified, true);
+
+    // Verify updateFleetMachines (`update_remote_machines`) exposes staged/installed/resident/verified for remote peers too
+    let discoverCall = 0;
+    const fleetRes = await updateFleetMachines(testCfg, {
+      machines: "*",
+      includeSelf: true,
+      sourceDir: validV2Dir,
+      gitSync: false,
+      postUpdateWaitMs: 0,
+      localInstallFn: async () => ({
+        version: "3.5.0-rc1",
+        daemonPid: process.pid,
+        runtimeStates: getLocalRuntimeStates({ targetDir }),
+      }),
+      discoverFn: async () => {
+        discoverCall++;
+        if (discoverCall === 1) {
+          return [
+            { machineId: "TEST-RIG-1", scope: "personal", version: "3.4.1" },
+            { machineId: "REMOTE-OK", scope: "personal", version: "3.4.1" },
+            { machineId: "REMOTE-LAGGING-DAEMON", scope: "personal", version: "3.4.1" },
+          ];
+        }
+        return [
+          {
+            machineId: "REMOTE-OK",
+            scope: "personal",
+            pid: 4100,
+            version: "3.5.0-rc1",
+            manifestDigest: v2Manifest.manifestDigest,
+            staged: { status: "promoted", version: "3.5.0-rc1", digest: v2Manifest.manifestDigest, manifestDigest: v2Manifest.manifestDigest, closureVerified: true, importVerified: true },
+            installed: { status: "installed", complete: true, version: "3.5.0-rc1", digest: v2Manifest.manifestDigest, manifestDigest: v2Manifest.manifestDigest },
+            resident: { status: "running", running: true, pid: 4100, version: "3.5.0-rc1", digest: v2Manifest.manifestDigest, manifestDigest: v2Manifest.manifestDigest },
+            verified: { status: "verified", closureVerified: true, importVerified: true, residentMatchesInstalled: true, fullyActive: true, version: "3.5.0-rc1", digest: v2Manifest.manifestDigest, manifestDigest: v2Manifest.manifestDigest },
+          },
+          {
+            machineId: "REMOTE-LAGGING-DAEMON",
+            scope: "personal",
+            pid: 4200,
+            version: "3.4.1",
+            manifestDigest: v1Manifest.manifestDigest,
+            staged: { status: "promoted", version: "3.5.0-rc1", digest: v2Manifest.manifestDigest, manifestDigest: v2Manifest.manifestDigest, closureVerified: true, importVerified: true },
+            installed: { status: "installed", complete: true, version: "3.5.0-rc1", digest: v2Manifest.manifestDigest, manifestDigest: v2Manifest.manifestDigest },
+            resident: { status: "running", running: true, pid: 4200, version: "3.4.1", digest: v1Manifest.manifestDigest, manifestDigest: v1Manifest.manifestDigest },
+          },
+        ];
+      },
+      invokeBatchFn: async (_cfg, items) =>
+        items.map((item) => ({
+          item,
+          ok: true,
+          response: {
+            result: {
+              status: "updating",
+              machineId: item.toMachine,
+              staged: { status: "promoted", version: "3.5.0-rc1", digest: v2Manifest.manifestDigest, manifestDigest: v2Manifest.manifestDigest, closureVerified: true, importVerified: true },
+              installed: { status: "installed", complete: true, version: "3.5.0-rc1", digest: v2Manifest.manifestDigest, manifestDigest: v2Manifest.manifestDigest },
+              resident: { status: "running", running: true, pid: 4000, version: "3.4.1", digest: v1Manifest.manifestDigest, manifestDigest: v1Manifest.manifestDigest },
+              verified: { status: "pending_daemon_restart", closureVerified: true, importVerified: true, residentMatchesInstalled: false, version: "3.5.0-rc1", digest: v2Manifest.manifestDigest, manifestDigest: v2Manifest.manifestDigest },
+            },
+          },
+        })),
+    });
+
+    assert.equal(fleetRes.ok, true);
+    assert.equal(fleetRes.localUpdate.ok, true);
+    assert.equal(fleetRes.installed.version, "3.5.0-rc1");
+    assert.equal(fleetRes.resident.version, "3.5.0-rc1");
+    assert.equal(fleetRes.verified.fullyActive, true);
+
+    const remoteOk = fleetRes.remoteUpdates.find((r) => r.machineId === "REMOTE-OK");
+    const remoteLag = fleetRes.remoteUpdates.find((r) => r.machineId === "REMOTE-LAGGING-DAEMON");
+    assert.equal(remoteOk.activationVerified, true);
+    assert.equal(remoteOk.installed.digest, v2Manifest.manifestDigest);
+    assert.equal(remoteOk.resident.digest, v2Manifest.manifestDigest);
+    assert.equal(remoteOk.verified.status, "verified");
+
+    assert.equal(remoteLag.activationVerified, false);
+    assert.equal(remoteLag.installed.version, "3.5.0-rc1");
+    assert.equal(remoteLag.installed.digest, v2Manifest.manifestDigest);
+    assert.equal(remoteLag.resident.version, "3.4.1");
+    assert.equal(remoteLag.resident.digest, v1Manifest.manifestDigest);
+    assert.equal(remoteLag.verified.status, "pending_daemon_restart");
+
+    // Also verify reprovisionLocalBridge happy path activates both flock.mjs & bridge.mjs + companion closure
+    const reprovCfg = { machineId: "TEST-RIG-1", scope: "personal", githubUser: "erjadi" };
+    fs.writeFileSync(path.join(targetDir, "config.json"), JSON.stringify(reprovCfg, null, 2), "utf8");
+    const reprovRes = await reprovisionLocalBridge(reprovCfg, {
+      sourceDir: validV2Dir,
+      gitSync: false,
+      syncInstall: true,
+      reapFn: () => [],
+      installFn: async () => ({
+        version: "3.5.0-rc1",
+        daemonPid: process.pid,
+        runtimeStates: getLocalRuntimeStates({ targetDir }),
+      }),
+    });
+    assert.equal(reprovRes.status, "reprovisioned");
+    assert.equal(reprovRes.installed.complete, true);
+    assert.equal(reprovRes.installed.version, "3.5.0-rc1");
+    assert.equal(reprovRes.installed.digest, v2Manifest.manifestDigest);
+    for (const modName of REQUIRED_RUNTIME_MODULES) {
+      const diskSha = hashRuntimeModule(fs.readFileSync(path.join(targetDir, modName)));
+      assert.equal(diskSha, v2Manifest.files[modName].sha256, `Reprovisioned ${modName} digest mismatch`);
+    }
+  } finally {
+    if (prevCopilotHome === undefined) delete process.env.COPILOT_HOME;
+    else process.env.COPILOT_HOME = prevCopilotHome;
+    fs.rmSync(scratchRoot, { recursive: true, force: true });
   }
 });

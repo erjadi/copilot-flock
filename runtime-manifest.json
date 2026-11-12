@@ -1,0 +1,78 @@
+{
+  "type": "copilot-flock-runtime-manifest-v1",
+  "schema": 1,
+  "version": "3.4.1",
+  "entrypoints": [
+    "flock.mjs",
+    "bridge.mjs"
+  ],
+  "files": {
+    "bridge.mjs": {
+      "role": "entrypoint",
+      "sha256": "20be79c87ca9a877671da2f38c914a3f3f3991e5c40bcda4787755bee73c47e4",
+      "imports": [
+        "./flock-broker-free.mjs",
+        "./flock-lifecycle.mjs",
+        "./flock-membership.mjs",
+        "./flock-protocol.mjs",
+        "./flock-registry.mjs"
+      ]
+    },
+    "flock-azure.mjs": {
+      "role": "companion",
+      "sha256": "10cb6cc02c0be5cff5ff9a2849ee0bc96b3113dd3ff19381771ec791fac1ec33",
+      "imports": [
+        "./flock-protocol.mjs"
+      ]
+    },
+    "flock-broker-free.mjs": {
+      "role": "companion",
+      "sha256": "afc86e643e4d35248ff485f32027f7858c8867ca25de5fee2f2dd11ab5b7aedf",
+      "imports": [
+        "./flock-azure.mjs",
+        "./flock-lifecycle.mjs",
+        "./flock-protocol.mjs",
+        "./flock-registry.mjs"
+      ]
+    },
+    "flock-lifecycle.mjs": {
+      "role": "companion",
+      "sha256": "81c9fd8c51a60155b603643f78e9ccdce332eefa69d681000405c8b5435b8295",
+      "imports": [
+        "./flock-membership.mjs"
+      ]
+    },
+    "flock-membership.mjs": {
+      "role": "companion",
+      "sha256": "7e9fd66a15094ab2d7d67cdd62814d92a2c8ab817c237a25488014a8067c7107",
+      "imports": []
+    },
+    "flock-protocol.mjs": {
+      "role": "companion",
+      "sha256": "4292997940c5b36d6873a00b9ad6aa248ae58e897df98cffd937aeb34a44c8f3",
+      "imports": [
+        "./flock-lifecycle.mjs"
+      ]
+    },
+    "flock-registry.mjs": {
+      "role": "companion",
+      "sha256": "2f2d3d0ca9e45545a87dbcfaffe202b019f6871f5e6af965de88beca1c7fe1f4",
+      "imports": [
+        "./flock-lifecycle.mjs",
+        "./flock-protocol.mjs"
+      ]
+    },
+    "flock.mjs": {
+      "role": "entrypoint",
+      "sha256": "20be79c87ca9a877671da2f38c914a3f3f3991e5c40bcda4787755bee73c47e4",
+      "imports": [
+        "./flock-broker-free.mjs",
+        "./flock-lifecycle.mjs",
+        "./flock-membership.mjs",
+        "./flock-protocol.mjs",
+        "./flock-registry.mjs"
+      ]
+    }
+  },
+  "manifestDigest": "50e2e0521c97fae6bc44196c149f7ee7c39d8ef9cab607baebc689d8a20eff87"
+}

@@ -76,6 +76,13 @@ import {
   syncFlockMemberships,
   signV3MembershipSyncRequest,
   hasVerifiedOwnerAuthority,
+  RUNTIME_MANIFEST_FILENAME,
+  REQUIRED_RUNTIME_MODULES,
+  RUNTIME_MODULE_MANIFEST,
+  computeRuntimeManifest,
+  validateRuntimeManifest,
+  loadRuntimeManifest,
+  verifyStagedRuntimeClosure,
 } from "../bridge.mjs";
 import {
   verifyGitHubRepoAccess,
@@ -2607,4 +2614,21 @@ test("bridge entrypoint reconciles authenticated owner/collaborator/guest roles,
   } finally {
     fs.rmSync(tempRoot, { recursive: true, force: true });
   }
+});
+
+test("bridge.mjs compatibility entrypoint exposes pinned RUNTIME_MODULE_MANIFEST matching repository closure", () => {
+  assert.ok(RUNTIME_MODULE_MANIFEST);
+  assert.equal(RUNTIME_MODULE_MANIFEST.type, "copilot-flock-runtime-manifest-v1");
+  assert.equal(RUNTIME_MODULE_MANIFEST.version, BRIDGE_VERSION);
+  validateRuntimeManifest(RUNTIME_MODULE_MANIFEST, { expectedVersion: BRIDGE_VERSION });
+  for (const required of REQUIRED_RUNTIME_MODULES) {
+    assert.match(RUNTIME_MODULE_MANIFEST.files[required]?.sha256 || "", /^[a-f0-9]{64}$/);
+  }
+  const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+  if (process.env.BRIDGE_FAST_VOTE_TEST === "1" && !fs.existsSync(path.join(repoRoot, RUNTIME_MANIFEST_FILENAME))) {
+    return;
+  }
+  const loaded = loadRuntimeManifest(repoRoot, { expectedVersion: BRIDGE_VERSION });
+  assert.equal(loaded.manifestDigest, computeRuntimeManifest(repoRoot, { version: BRIDGE_VERSION }).manifestDigest);
+  assert.equal(verifyStagedRuntimeClosure(repoRoot, loaded).ok, true);
 });
