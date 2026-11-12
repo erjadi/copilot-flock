@@ -1,41 +1,76 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { ChevronDown, RefreshCw, Search } from "lucide-react";
 import { req } from "@/lib/fleet/api";
-import { TODO_DIMENSIONS, sortTodoIssues, validateTodoSnapshot, type TodoSnapshot, type TodoSortKey } from "../../../todo-snapshot.mjs";
+import {
+  TODO_DIMENSIONS,
+  applyTodoRefreshFailure,
+  applyTodoRefreshSuccess,
+  beginTodoRefresh,
+  createTodoRefreshState,
+  describeTodoTimings,
+  sortTodoIssues,
+  validateTodoSnapshot,
+  type TodoRefreshState,
+  type TodoSortKey,
+} from "../../../todo-snapshot.mjs";
 import { Btn, Input, Panel, Pill, Select } from "./ui";
 
 const statusLabels = { pending: "Pending", in_progress: "In progress", blocked: "Blocked", done: "Done" };
 const confidenceLabels = { reported: "Reported", reproduced: "Reproduced", independently_verified: "Independently verified" };
 
-export function TodosView() {
-  const [snapshot, setSnapshot] = useState<TodoSnapshot | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [loading, setLoading] = useState(true);
+export interface TodosViewProps {
+  now?: () => number;
+  staleAfterMinutes?: number | null;
+  initialState?: TodoRefreshState;
+}
+
+export function TodosView({ now, staleAfterMinutes, initialState }: TodosViewProps = {}) {
+  const [state, setState] = useState<TodoRefreshState>(() => initialState ?? createTodoRefreshState());
+  const [loading, setLoading] = useState(() => !initialState);
   const [refresh, setRefresh] = useState(0);
+  const [, setAgeTick] = useState(0);
   const [query, setQuery] = useState("");
   const [status, setStatus] = useState("all");
   const [kind, setKind] = useState("all");
   const [sortKey, setSortKey] = useState<TodoSortKey>("editorial");
   const [direction, setDirection] = useState<"asc" | "desc">("asc");
+  const nowRef = useRef(now);
+  nowRef.current = now;
+  const skipInitialFetchRef = useRef(Boolean(initialState));
 
   useEffect(() => {
+    if (skipInitialFetchRef.current && refresh === 0) return;
     let active = true;
     setLoading(true);
-    setError(null);
-    setSnapshot(null);
+    setState((prev) => beginTodoRefresh(prev));
     // Private tracker data always comes from this viewer, never a connection override.
     req<unknown>("", "/api/todos")
       .then(validateTodoSnapshot)
-      .then((value) => { if (active) setSnapshot(value); })
+      .then((value) => {
+        const fetchedAtMs = (nowRef.current ?? Date.now)();
+        if (!Number.isFinite(fetchedAtMs)) throw new Error("Invalid TODO clock value");
+        if (active) setState((prev) => applyTodoRefreshSuccess(prev, value, { now: fetchedAtMs }));
+      })
       .catch((cause: unknown) => {
-        if (active) setError(cause instanceof Error && cause.message === "403"
-          ? "Access is restricted to the configured home LAN or an authenticated SSH connection. Other networks are not permitted."
-          : `Could not load the tracker snapshot (${cause instanceof Error ? cause.message : "request failed"}). Check viewer configuration and retry.`);
+        if (active) setState((prev) => applyTodoRefreshFailure(prev, cause));
       })
       .finally(() => { if (active) setLoading(false); });
     return () => { active = false; };
   }, [refresh]);
 
+  useEffect(() => {
+    if (now || (!state.snapshot && !state.lastSuccessfulFetchAt)) return;
+    // Advance displayed elapsed ages locally without polling /api/todos.
+    const timer = setInterval(() => setAgeTick((value) => value + 1), 15000);
+    return () => clearInterval(timer);
+  }, [now, state.snapshot, state.lastSuccessfulFetchAt]);
+
+  const snapshot = state.snapshot;
+  const error = state.error;
+  const timings = describeTodoTimings(state, {
+    now: now ?? Date.now,
+    ...(staleAfterMinutes !== undefined ? { staleAfterMinutes } : {}),
+  });
   const items = snapshot?.issues ?? [];
   const filtered = useMemo(() => sortTodoIssues(items.filter((item) =>
     (status === "all" || item.status === status) &&
@@ -55,12 +90,44 @@ export function TodosView() {
       <span>Viewer-wide tracker; not filtered by the active flock.</span>
       <Btn variant="outline" onClick={() => setRefresh((value) => value + 1)} disabled={loading}><RefreshCw className={`h-3.5 w-3.5 ${loading ? "animate-spin" : ""}`} />Refresh TODOs</Btn>
     </div>
-    {snapshot && <p className="mt-3 break-words font-mono text-[11px] leading-5 text-muted-foreground">Source: {snapshot.source} · revision {snapshot.revision}<br />Snapshot updated: <time dateTime={snapshot.updatedAt}>{new Date(snapshot.updatedAt).toLocaleString()}</time> · Not a live feed; refresh to load a newer export.</p>}
+    {snapshot && state.lastSuccessfulFetchAt && <Panel className="mt-4 p-3.5 sm:p-4" aria-label="Snapshot and refresh timestamps">
+      <div className="flex flex-wrap items-center gap-2 font-mono text-[11px] leading-5 text-muted-foreground">
+        <span>Source: <span className="text-foreground">{snapshot.source}</span></span>
+        <span>·</span>
+        <span>revision <span className="text-foreground">{snapshot.revision}</span></span>
+        {timings.unchangedRevision && <Pill tone="muted">Unchanged revision on last refresh</Pill>}
+        <Pill tone={timings.freshnessState === "stale" ? "busy" : timings.freshnessState === "fresh" ? "info" : "muted"}>{timings.freshnessSummary}</Pill>
+      </div>
+      <dl className="mt-3 grid gap-3 border-t border-border/50 pt-3 font-mono text-[11px] leading-5 sm:grid-cols-2">
+        <div>
+          <dt className="text-[10px] uppercase tracking-widest text-muted-foreground">Source snapshot updated</dt>
+          <dd className="mt-1 text-foreground">
+            <time dateTime={snapshot.updatedAt}>{new Date(snapshot.updatedAt).toLocaleString()}</time>
+            <span className="ml-1.5 text-muted-foreground">({timings.sourceAgeLabel})</span>
+          </dd>
+          <p className="mt-0.5 font-sans text-[11px] text-muted-foreground">Tracker authoring timestamp (<code className="font-mono text-[10px]">updatedAt</code>) for revision {snapshot.revision}.</p>
+        </div>
+        <div>
+          <dt className="text-[10px] uppercase tracking-widest text-muted-foreground">Last successful refresh</dt>
+          <dd className="mt-1 text-foreground">
+            <time dateTime={state.lastSuccessfulFetchAt}>{new Date(state.lastSuccessfulFetchAt).toLocaleString()}</time>
+            <span className="ml-1.5 text-muted-foreground">({timings.fetchAgeLabel})</span>
+          </dd>
+          <p className="mt-0.5 font-sans text-[11px] text-muted-foreground">Last validated viewer fetch (<code className="font-mono text-[10px]">lastSuccessfulFetchAt</code>){timings.unchangedRevision ? "; content was not re-authored." : "."}</p>
+        </div>
+      </dl>
+      <p className="mt-3 border-t border-border/50 pt-2.5 text-[11px] leading-5 text-muted-foreground">Not a live feed; refresh to check for a newer export. Snapshot age reflects tracker export authoring time only and never indicates machine online or offline state.</p>
+    </Panel>}
 
     {error && <div role="alert" className="mt-6 rounded-xl border border-destructive/50 bg-destructive/10 p-4">
       <h2 className="font-medium text-destructive">Refresh failed - no ranking shown</h2>
       <p className="mt-2 text-sm">{error}</p>
       <p className="mt-1 text-xs text-muted-foreground">No cached ranking or synthetic examples are substituted.</p>
+      <p className="mt-2 font-mono text-[11px] text-muted-foreground">
+        {state.lastSuccessfulFetchAt
+          ? <>Last successful refresh (<code className="text-[10px]">lastSuccessfulFetchAt</code>): <time dateTime={state.lastSuccessfulFetchAt}>{new Date(state.lastSuccessfulFetchAt).toLocaleString()}</time> ({timings.fetchAgeLabel}) · Failed refresh did not advance this timestamp.</>
+          : <>Last successful refresh (<code className="text-[10px]">lastSuccessfulFetchAt</code>): none in this view.</>}
+      </p>
     </div>}
     {loading && <p role="status" className="mt-6 text-sm text-muted-foreground">Loading tracker snapshot...</p>}
 

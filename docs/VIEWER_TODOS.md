@@ -67,10 +67,49 @@ Windows directory ACLs must be verified separately. A broken existing runtime
 file is an explicit failure, not silently overwritten.
 Data-only updates need no service restart once the endpoint is configured.
 
+## Snapshot age vs. refresh freshness policy
+
+The companion page distinguishes **when the tracker authored the snapshot** from
+**when the viewer last refreshed `/api/todos`**, while retaining `revision`:
+
+- **Source snapshot updated (`updatedAt`)**: the ISO timestamp exported by the
+  tracker for that `revision`, displayed alongside its elapsed source age.
+- **Last successful refresh (`lastSuccessfulFetchAt`)**: the ISO timestamp when
+  this browser view last received and validated `/api/todos`, displayed
+  alongside its elapsed fetch age.
+
+Refreshing an unchanged revision advances `lastSuccessfulFetchAt` (and resets
+elapsed fetch age) while preserving `revision` and `updatedAt` (whose elapsed
+source age continues to advance), explicitly noting that the revision did not
+change rather than making old content appear newly authored.
+
+Failed or invalid refreshes (`403`, `503`, network errors, or invalid snapshot
+payloads) retain explicit error presentation, clear active rankings so stale or
+cached rankings are never substituted, and never advance `lastSuccessfulFetchAt`.
+
+### Optional freshness / staleness threshold policy
+
+- **Default (`age_only`)**: When neither the snapshot nor the viewer configures
+  a threshold, the UI shows elapsed source age and elapsed fetch age with
+  `Age only (no staleness threshold configured)` and makes no fresh/stale claim.
+- **Explicit threshold (`staleAfterMinutes` / `VIEWER_TODOS_STALE_AFTER_MINUTES`)**:
+  An optional positive integer from `1` to `525600` minutes (up to 365 days) may
+  be set on the snapshot (`staleAfterMinutes`) or on the viewer server via
+  `VIEWER_TODOS_STALE_AFTER_MINUTES` (which overrides when set; malformed viewer
+  values fail closed with HTTP 503).
+- **Evaluation**: Threshold comparison uses elapsed **source `updatedAt`** age
+  (`sourceElapsedMs <= staleAfterMinutes * 60_000` is within threshold; strictly
+  greater is marked stale). Refreshing an unchanged old snapshot never clears
+  staleness.
+- **Presence non-inference**: Snapshot age and staleness reflect tracker export
+  authoring time only and **never infer or indicate machine online/offline
+  status**.
+
 ## Snapshot contract (version 1)
 
 Top-level fields: `schemaVersion: 1`, positive integer `revision`, ISO
-timestamp `updatedAt`, nonempty `source`, and `issues: []`.
+timestamp `updatedAt`, nonempty `source`, `issues: []`, and optional positive
+integer `staleAfterMinutes` (`1..525600`).
 Every issue has:
 
 | Field | Contract |
