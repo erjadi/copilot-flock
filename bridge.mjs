@@ -1874,16 +1874,57 @@ export function registerWithBootstrapServer({
   return null;
 }
 
-export function fetchBootstrapMembers({ bootstrapUrl = DEFAULT_BOOTSTRAP_URL } = {}) {
+export function fetchBootstrapMembersStatus({ bootstrapUrl = DEFAULT_BOOTSTRAP_URL } = {}) {
+  if (!bootstrapUrl) {
+    return {
+      attempted: false,
+      ok: false,
+      status: "skipped",
+      statusCode: null,
+      fetchedAt: null,
+      error: "Bootstrap URL not configured",
+      members: [],
+    };
+  }
+  let pinnedOrigin;
+  try {
+    pinnedOrigin = validatePinnedBootstrapOrigin(bootstrapUrl, bootstrapUrl);
+  } catch (err) {
+    return {
+      attempted: false,
+      ok: false,
+      status: "failed",
+      statusCode: err.statusCode || 403,
+      fetchedAt: null,
+      error: err.message,
+      members: [],
+    };
+  }
   const ghToken = resolveLocalGitHubToken();
-  if (!ghToken || !bootstrapUrl) return [];
+  if (!ghToken) {
+    return {
+      attempted: false,
+      ok: false,
+      status: "skipped",
+      statusCode: null,
+      fetchedAt: null,
+      error: "Missing local GitHub token",
+      members: [],
+    };
+  }
 
   try {
-    const membersUrl = new URL(bootstrapUrl);
+    const membersUrl = new URL(bootstrapUrl, pinnedOrigin);
     membersUrl.pathname = membersUrl.pathname.replace(/\/api\/bootstrap\/?$/, "/api/members");
     const inlineScript = `
       const https = require("node:https");
       const url = new URL(process.env.MEMBERS_URL);
+      let completed = false;
+      function finish(payload) {
+        if (completed) return;
+        completed = true;
+        process.stdout.write(JSON.stringify(payload));
+      }
       const req = https.request(url, {
         method: "GET",
         headers: {
@@ -1894,13 +1935,28 @@ export function fetchBootstrapMembers({ bootstrapUrl = DEFAULT_BOOTSTRAP_URL } =
         timeout: 8000
       }, (res) => {
         let data = "";
-        res.on("data", (c) => data += c);
+        res.on("data", (c) => { data += c; });
         res.on("end", () => {
-          if (res.statusCode === 200) process.stdout.write(data);
+          let parsed = null;
+          try { parsed = data ? JSON.parse(data) : null; } catch {}
+          if (res.statusCode === 200 && Array.isArray(parsed?.members)) {
+            finish({ ok: true, statusCode: 200, members: parsed.members });
+          } else {
+            finish({
+              ok: false,
+              statusCode: res.statusCode || 500,
+              error: parsed?.error || ("Bootstrap /api/members returned HTTP " + (res.statusCode || 500)),
+              members: []
+            });
+          }
         });
+        res.on("error", (err) => finish({ ok: false, statusCode: res.statusCode || 500, error: err.message, members: [] }));
       });
-      req.on("error", () => {});
-      req.on("timeout", () => req.destroy());
+      req.on("error", (err) => finish({ ok: false, statusCode: null, error: err.message, members: [] }));
+      req.on("timeout", () => {
+        req.destroy();
+        finish({ ok: false, statusCode: 504, error: "Bootstrap /api/members request timed out", members: [] });
+      });
       req.end();
     `;
     const out = execFileSync(process.execPath, ["-e", inlineScript], {
@@ -1916,10 +1972,52 @@ export function fetchBootstrapMembers({ bootstrapUrl = DEFAULT_BOOTSTRAP_URL } =
     }).trim();
     if (out) {
       const parsed = JSON.parse(out);
-      if (Array.isArray(parsed?.members)) return parsed.members;
+      if (parsed?.ok && Array.isArray(parsed.members)) {
+        return {
+          attempted: true,
+          ok: true,
+          status: "ok",
+          statusCode: 200,
+          fetchedAt: new Date().toISOString(),
+          error: null,
+          members: parsed.members,
+        };
+      }
+      const statusCode = parsed?.statusCode ?? null;
+      return {
+        attempted: true,
+        ok: false,
+        status: statusCode === 401 || statusCode === 403 ? "unauthorized" : "failed",
+        statusCode,
+        fetchedAt: null,
+        error: redactFlockSnapshot(parsed?.error || "Failed to fetch /api/members"),
+        members: [],
+      };
     }
-  } catch {}
-  return [];
+    return {
+      attempted: true,
+      ok: false,
+      status: "failed",
+      statusCode: null,
+      fetchedAt: null,
+      error: "Empty response from /api/members",
+      members: [],
+    };
+  } catch (err) {
+    return {
+      attempted: true,
+      ok: false,
+      status: "failed",
+      statusCode: null,
+      fetchedAt: null,
+      error: redactFlockSnapshot(err.message || "Failed to fetch /api/members"),
+      members: [],
+    };
+  }
+}
+
+export function fetchBootstrapMembers({ bootstrapUrl = DEFAULT_BOOTSTRAP_URL } = {}) {
+  return fetchBootstrapMembersStatus({ bootstrapUrl }).members;
 }
 
 export function callBootstrapQueueApi({
@@ -6664,19 +6762,31 @@ const MCP_TOOLS = [
   {
     name: "flock_status",
     description:
-      "Check local Copilot Flock daemon status, machine ID, local WebSocket status, and online remote Copilot machines.",
+      "Check local Copilot Flock daemon status, machine ID, local WebSocket status, live online machines, and authenticated flock roster (including offline shared-flock/collaborator machines).",
     inputSchema: {
       type: "object",
-      properties: {},
+      properties: {
+        flock: {
+          type: "string",
+          description:
+            "Optional flock address (<owner>/<flock>) to scope status and roster without cross-flock disclosure; required in broker-free mode when enrolled in multiple flocks.",
+        },
+      },
     },
   },
   {
     name: "bridge_status",
     description:
-      "Alias for flock_status: check local Copilot Flock daemon status and online remote Copilot machines.",
+      "Alias for flock_status: check local Copilot Flock daemon status, live online machines, and authenticated flock roster.",
     inputSchema: {
       type: "object",
-      properties: {},
+      properties: {
+        flock: {
+          type: "string",
+          description:
+            "Optional flock address (<owner>/<flock>) to scope status and roster without cross-flock disclosure; required in broker-free mode when enrolled in multiple flocks.",
+        },
+      },
     },
   },
   {
@@ -7270,10 +7380,21 @@ const MCP_TOOLS = [
   {
     name: "list_flocks",
     description:
-      "List all v3 flocks this user owns or this machine is enrolled in (including built-in <owner>, <owner>/personal, <owner>/work, and shared/custom flocks).",
+      "List all v3 or broker-free flocks this user owns or this machine is enrolled in, with authenticated roster membership, epoch freshness, and refresh status.",
     inputSchema: {
       type: "object",
-      properties: {},
+      properties: {
+        flock: {
+          type: "string",
+          description:
+            "Optional flock address (<owner>/<flock>) to inspect a single authorized flock without cross-flock metadata disclosure.",
+        },
+        probe_presence: {
+          type: "boolean",
+          description:
+            "Optionally probe live SignalR presence alongside authenticated roster lookup (default: false).",
+        },
+      },
     },
   },
   {
@@ -7433,18 +7554,21 @@ Object.assign(MCP_TOOLS.find((tool) => tool.name === "kick_flock_member").inputS
   operation_id: { type: "string", description: "Stable operation ID for retrying an interrupted owner rotation." },
 });
 
-async function executeMcpTool(cfg, name, args = {}) {
+export async function executeMcpTool(cfg, name, args = {}, options = {}) {
+  const ensureDaemon = options.ensureDaemon || ensureDaemonStarted;
+  const discoverOnlineMachines = options.discoverOnlineMachines || discoverMachines;
   if (name === "unenroll_flock") {
     if (args.traceless !== true) throw new Error("Specify traceless=true to remove this installation");
     return uninstallBridge();
   }
   if (name === "join_request") {
     if (cfg.protocol !== "broker-free-v34") throw new Error("Legacy enrollment is unchanged; generate broker-free Join Codes in a separately configured installation");
-    return brokerFreeRuntime(cfg).joinRequest({ machineId: cfg.machineId, scope: cfg.scope, flockId: args.flock });
+    return (options.brokerFreeRuntimeFactory || brokerFreeRuntime)(cfg, options.runtimeOptions || {})
+      .joinRequest({ machineId: cfg.machineId, scope: cfg.scope, flockId: args.flock });
   }
   if (cfg.protocol === "broker-free-v34") {
     cfg = { ...cfg, flockId: args.flock || cfg.flockId };
-    const runtime = brokerFreeRuntime(cfg);
+    const runtime = (options.brokerFreeRuntimeFactory || brokerFreeRuntime)(cfg, options.runtimeOptions || {});
     if (name === "approve_join") return runtime.approve({
       flockId: args.flock, code: args.join_code, role: args.role || "collaborator",
       sessionIds: args.session_ids || [], membershipExpiresAt: args.membership_expires_at,
@@ -7453,7 +7577,44 @@ async function executeMcpTool(cfg, name, args = {}) {
     if (name === "accept_welcome") return installBridge({ welcomeTicketArg: args.welcome_ticket,
       ownerFingerprintArg: args.owner_fingerprint, protocolArg: "broker-free-v34" });
     if (name === "renew_membership") return runtime.renewMembership(runtime.select(args.flock).flockId);
-    if (name === "list_flocks") return brokerFreeFlockSummaries(runtime);
+    if (name === "list_flocks") {
+      let onlineMachines = null;
+      let liveSignalRSource = null;
+      if (args.probe_presence === true) {
+        const selected = runtime.select(cfg.flockId || null);
+        await ensureDaemon(cfg);
+        try {
+          onlineMachines = await discoverOnlineMachines(
+            { ...cfg, flockId: selected.flockId },
+            { includeSelf: true, timeoutMs: 2200 }
+          );
+          liveSignalRSource = {
+            attempted: true,
+            ok: true,
+            status: "ok",
+            fetchedAt: new Date().toISOString(),
+            error: null,
+          };
+        } catch (err) {
+          onlineMachines = [];
+          liveSignalRSource = {
+            attempted: true,
+            ok: false,
+            status: "failed",
+            fetchedAt: null,
+            error: redactFlockSnapshot(err.message),
+          };
+        }
+      }
+      return resolveBrokerFreeFlockRoster(cfg, {
+        ...options,
+        runtime,
+        targetFlock: args.flock || cfg.flockId || null,
+        allowMultipleLocalOverview: !args.flock && !cfg.flockId,
+        onlineMachines,
+        liveSignalRSource,
+      });
+    }
     if (name === "kick_flock_member") {
       const record = runtime.assertOwner(runtime.select(args.flock));
       if (args.github_user) throw new Error("Broker-free identities are device-key bound; a GitHub label is not a member selector");
@@ -7466,21 +7627,132 @@ async function executeMcpTool(cfg, name, args = {}) {
       "get_remote_session_transcript", "send_remote_session_message", "broadcast_remote_session_message",
       "share_thread", "unshare_thread", "list_shared_threads"]);
     if (!supported.has(name)) throw new Error(`Tool ${name} is not a broker-free operation; legacy broker fallback is forbidden`);
+
+    if (name === "flock_status" || name === "bridge_status") {
+      const selected = runtime.select(cfg.flockId || null);
+      const scopedCfg = { ...cfg, flockId: selected.flockId };
+      const daemonStatus = await ensureDaemon(scopedCfg);
+      let machines = [];
+      let liveSignalRSource = null;
+      const [liveOutcome, rosterOut] = await Promise.all([
+        (async () => {
+          try {
+            const list = await discoverOnlineMachines(scopedCfg, { includeSelf: true, timeoutMs: 2200 });
+            return {
+              machines: list,
+              source: {
+                attempted: true,
+                ok: true,
+                status: "ok",
+                fetchedAt: new Date().toISOString(),
+                error: null,
+              },
+            };
+          } catch (err) {
+            return {
+              machines: [],
+              source: {
+                attempted: true,
+                ok: false,
+                status: "failed",
+                fetchedAt: null,
+                error: redactFlockSnapshot(err.message),
+              },
+            };
+          }
+        })(),
+        resolveBrokerFreeFlockRoster(scopedCfg, {
+          ...options,
+          runtime,
+          targetFlock: selected.flockId,
+          allowMultipleLocalOverview: false,
+          deferPresenceMerge: true,
+        }),
+      ]);
+      machines = liveOutcome.machines;
+      liveSignalRSource = liveOutcome.source;
+      const merged = applyLivePresenceToBrokerFreeRoster(rosterOut, machines, liveSignalRSource);
+      return {
+        localMachineId: scopedCfg.machineId,
+        protocol: "broker-free-v34",
+        flockId: selected.flockId,
+        version: BRIDGE_VERSION,
+        scope: scopedCfg.scope,
+        githubUser: null,
+        specs: options.skipSpecsRefresh ? (scopedCfg.specs || null) : refreshLiveSpecs(scopedCfg.specs),
+        hub: selected.endpoints?.signalrEndpoint ? "copilotbridge" : (scopedCfg.hub || "copilotbridge"),
+        endpoint: selected.endpoints?.signalrEndpoint || scopedCfg.endpoint || null,
+        daemon: daemonStatus,
+        localCopilotWs: getLocalWsConnectionInfo() ? "online" : "offline",
+        onlineMachines: merged.onlineMachines,
+        knownMembers: merged.knownMembers,
+        offlineMembers: merged.offlineMembers,
+        flocks: merged.flocks,
+        roster: merged.roster,
+      };
+    }
   }
   if (name === "flock_status" || name === "bridge_status") {
-    const daemonStatus = await ensureDaemonStarted(cfg);
-    const machines = await discoverMachines(cfg, { includeSelf: true, timeoutMs: 2200 });
+    const targetFlock = args.flock || cfg.boundFlockId || null;
+    if (targetFlock) {
+      parseFlockAddress(targetFlock, cfg.githubUser || "erjadi");
+    }
+    const daemonStatus = await ensureDaemon(cfg);
+    const [liveOutcome, legacyRoster] = await Promise.all([
+      (async () => {
+        try {
+          const list = await discoverOnlineMachines(cfg, { includeSelf: true, timeoutMs: 2200 });
+          return {
+            machines: list,
+            source: {
+              attempted: true,
+              ok: true,
+              status: "ok",
+              fetchedAt: new Date().toISOString(),
+              error: null,
+            },
+          };
+        } catch (err) {
+          return {
+            machines: [],
+            source: {
+              attempted: true,
+              ok: false,
+              status: "failed",
+              fetchedAt: null,
+              error: redactFlockSnapshot(err.message),
+            },
+          };
+        }
+      })(),
+      resolveLegacyFlockRoster(cfg, {
+        ...options,
+        targetFlock,
+        deferPresenceMerge: true,
+      }),
+    ]);
+    const merged = applyLivePresenceToLegacyRoster(
+      legacyRoster,
+      liveOutcome.machines,
+      liveOutcome.source
+    );
     return {
       localMachineId: cfg.machineId,
+      protocol: "legacy-v3",
+      ...(targetFlock ? { flockId: merged.flocks[0]?.flockId || targetFlock } : {}),
       version: BRIDGE_VERSION,
       scope: cfg.scope,
       githubUser: cfg.githubUser || null,
-      specs: refreshLiveSpecs(cfg.specs),
+      specs: options.skipSpecsRefresh ? (cfg.specs || null) : refreshLiveSpecs(cfg.specs),
       hub: cfg.hub,
       endpoint: cfg.endpoint,
       daemon: daemonStatus,
       localCopilotWs: getLocalWsConnectionInfo() ? "online" : "offline",
-      onlineMachines: machines,
+      onlineMachines: merged.onlineMachines,
+      knownMembers: merged.knownMembers,
+      offlineMembers: merged.offlineMembers,
+      flocks: merged.flocks,
+      roster: merged.roster,
     };
   }
 
@@ -8066,15 +8338,59 @@ async function executeMcpTool(cfg, name, args = {}) {
   }
 
   if (name === "list_flocks") {
-    const localFlocks = loadLocalFlocksConfig(cfg);
-    const remoteRes = callBootstrapV3Endpoint(cfg, "/my-flocks", { method: "GET" });
+    const targetFlock = args.flock || cfg.boundFlockId || null;
+    if (targetFlock) {
+      parseFlockAddress(targetFlock, cfg.githubUser || "erjadi");
+    }
+    let onlineMachines = null;
+    let liveSignalRSource = null;
+    if (args.probe_presence === true) {
+      await ensureDaemon(cfg);
+      try {
+        onlineMachines = await discoverOnlineMachines(cfg, { includeSelf: true, timeoutMs: 2200 });
+        liveSignalRSource = {
+          attempted: true,
+          ok: true,
+          status: "ok",
+          fetchedAt: new Date().toISOString(),
+          error: null,
+        };
+      } catch (err) {
+        onlineMachines = [];
+        liveSignalRSource = {
+          attempted: true,
+          ok: false,
+          status: "failed",
+          fetchedAt: null,
+          error: redactFlockSnapshot(err.message),
+        };
+      }
+    }
+    const legacyRoster = await resolveLegacyFlockRoster(cfg, {
+      ...options,
+      targetFlock,
+      deferPresenceMerge: true,
+    });
+    const resolved = onlineMachines !== null
+      ? applyLivePresenceToLegacyRoster(legacyRoster, onlineMachines, liveSignalRSource)
+      : applyLivePresenceToLegacyRoster(legacyRoster, null, null);
     return {
       machineId: cfg.machineId,
-      canonicalAddress: `${(cfg.githubUser || "unknown").toLowerCase()}/${normalizeScope(cfg.scope, "work")}/${cfg.machineId}`,
+      protocol: "legacy-v3",
+      canonicalAddress: `${(resolved.effectiveOwner || cfg.githubUser || "unknown").toLowerCase()}/${normalizeScope(cfg.scope, "work")}/${cfg.machineId}`,
       scope: normalizeScope(cfg.scope, "work"),
-      localFlocks: Object.values(localFlocks.flocks || {}),
-      remoteOwnedFlocks: remoteRes?.ownedFlocks || [],
-      remoteJoinedFlocks: remoteRes?.joinedFlocks || [],
+      localFlocks: resolved.localFlocks,
+      remoteOwnedFlocks: resolved.remoteOwnedFlocks,
+      remoteJoinedFlocks: resolved.remoteJoinedFlocks,
+      flocks: resolved.flocks,
+      knownMembers: resolved.knownMembers,
+      ...(onlineMachines !== null
+        ? {
+            onlineMachines: resolved.onlineMachines,
+            offlineMembers: resolved.offlineMembers,
+          }
+        : {}),
+      roster: resolved.roster,
     };
   }
 
@@ -10899,11 +11215,962 @@ export function brokerFreeRuntime(cfg = {}, options = {}) {
   });
 }
 
-function brokerFreeFlockSummaries(runtime) {
-  return Object.values(runtime.read().flocks).map((record) => ({ flockId: record.flockId,
-    peerId: record.localPeerId, role: record.cert.body.role, epoch: record.epoch,
-    ownerFingerprint: ownerFingerprint(record.ownerPublicKey), expiresAt: record.cert.body.expiresAt,
-    departed: record.departed === true, protocol: "broker-free-v34" }));
+const ROSTER_PRESENCE_NOTE =
+  "Authenticated roster membership is distinct from observed live SignalR presence; missing heartbeats indicate offline status, not member removal.";
+
+function isNonExpiredIsoOrMs(expiresAt, expiresAtMs, nowMs) {
+  if (expiresAtMs !== null && expiresAtMs !== undefined && Number.isFinite(Number(expiresAtMs))) {
+    return Number(expiresAtMs) > nowMs;
+  }
+  if (expiresAt !== null && expiresAt !== undefined && String(expiresAt).trim() !== "") {
+    const parsed = Date.parse(String(expiresAt));
+    if (Number.isFinite(parsed)) return parsed > nowMs;
+  }
+  return true;
+}
+
+export async function resolveLegacyFlockRoster(cfg, options = {}) {
+  if (cfg?.protocol === "broker-free-v34") {
+    throw new Error("Legacy broker roster query is forbidden in broker-free-v34 mode");
+  }
+  const nowMs = Number.isFinite(options.now) ? options.now : Date.now();
+  const nowIso = new Date(nowMs).toISOString();
+  const targetFlock = options.targetFlock || cfg?.boundFlockId || null;
+  const flocksConfigPath = options.flocksConfigPath || cfg?.flocksConfigPath || getFlocksConfigPath();
+  const fileExistedBefore = Boolean(flocksConfigPath && fs.existsSync(flocksConfigPath));
+
+  let rawStored = { flocks: {} };
+  if (fileExistedBefore) {
+    try {
+      rawStored = JSON.parse(fs.readFileSync(flocksConfigPath, "utf8")) || { flocks: {} };
+    } catch {}
+  }
+  const storedFlockIds = new Set(Object.keys(rawStored.flocks || {}));
+  const localFlocksCfg = loadLocalFlocksConfig(cfg, flocksConfigPath);
+  const configuredUser = normalizeGitHubUser(cfg?.githubUser)?.toLowerCase() || null;
+  const localScope = normalizeScope(cfg?.scope, "work");
+  const hasBootstrap = Boolean(cfg?.bootstrapUrl || DEFAULT_BOOTSTRAP_URL);
+
+  const [v3Raw, membersRaw] = await Promise.all([
+    (async () => {
+      if (options.fetchV3MyFlocks) return await options.fetchV3MyFlocks(cfg);
+      if (!hasBootstrap) return { __skipped: true, error: "Bootstrap URL not configured" };
+      if (!resolveLocalGitHubToken()) return { __skipped: true, error: "Missing local GitHub token" };
+      return callBootstrapV3Endpoint(cfg, "/my-flocks", { method: "GET" });
+    })(),
+    (async () => {
+      if (options.fetchLegacyMembers) return await options.fetchLegacyMembers(cfg);
+      if (!hasBootstrap) {
+        return {
+          attempted: false,
+          ok: false,
+          status: "skipped",
+          statusCode: null,
+          fetchedAt: null,
+          error: "Bootstrap URL not configured",
+          members: [],
+        };
+      }
+      return fetchBootstrapMembersStatus({ bootstrapUrl: cfg?.bootstrapUrl || DEFAULT_BOOTSTRAP_URL });
+    })(),
+  ]);
+
+  let v3Source;
+  let v3Res = null;
+  if (v3Raw?.__skipped) {
+    v3Source = {
+      attempted: false,
+      ok: false,
+      status: "skipped",
+      fetchedAt: null,
+      error: v3Raw.error,
+    };
+  } else if (v3Raw?.ok) {
+    const respUser = normalizeGitHubUser(v3Raw.githubUser)?.toLowerCase() || null;
+    if (configuredUser && configuredUser !== "unknown" && respUser && respUser !== configuredUser) {
+      v3Source = {
+        attempted: true,
+        ok: false,
+        status: "failed",
+        fetchedAt: null,
+        error: `Principal mismatch between local config "${configuredUser}" and /my-flocks response "${respUser}"`,
+      };
+    } else {
+      v3Res = v3Raw;
+      v3Source = {
+        attempted: true,
+        ok: true,
+        status: "ok",
+        fetchedAt: v3Raw.fetchedAt || nowIso,
+        error: null,
+      };
+    }
+  } else {
+    const errMsg = redactFlockSnapshot(v3Raw?.error || "Failed to refresh /api/v3/my-flocks");
+    v3Source = {
+      attempted: true,
+      ok: false,
+      status: /access denied|401|403|unauthorized/i.test(errMsg) ? "unauthorized" : "failed",
+      fetchedAt: null,
+      error: errMsg,
+    };
+  }
+
+  let membersSource;
+  if (Array.isArray(membersRaw)) {
+    membersSource = {
+      attempted: true,
+      ok: true,
+      status: "ok",
+      statusCode: 200,
+      fetchedAt: nowIso,
+      error: null,
+      members: membersRaw,
+    };
+  } else {
+    membersSource = {
+      attempted: Boolean(membersRaw?.attempted),
+      ok: Boolean(membersRaw?.ok),
+      status: membersRaw?.status || (membersRaw?.ok ? "ok" : "failed"),
+      statusCode: membersRaw?.statusCode ?? null,
+      fetchedAt: membersRaw?.ok ? (membersRaw.fetchedAt || nowIso) : null,
+      error: membersRaw?.ok ? null : redactFlockSnapshot(membersRaw?.error || "Failed to refresh /api/members"),
+      members: Array.isArray(membersRaw?.members) ? membersRaw.members : [],
+    };
+  }
+
+  const effectiveOwner =
+    normalizeGitHubUser((v3Source.ok && v3Res?.githubUser) || configuredUser || "erjadi")?.toLowerCase() ||
+    "erjadi";
+  const builtInRootId = effectiveOwner;
+  const builtInScopeId = `${effectiveOwner}/${localScope}`;
+  const errors = [];
+  const warnings = [];
+
+  if (v3Source.attempted && !v3Source.ok && v3Source.error) {
+    errors.push(v3Source.error);
+  }
+  if (!v3Source.attempted && v3Source.error) {
+    warnings.push(`/api/v3/my-flocks skipped: ${v3Source.error}`);
+  }
+  if (membersSource.attempted && !membersSource.ok) {
+    if (membersSource.status === "unauthorized" && v3Source.ok) {
+      warnings.push(
+        `Legacy /api/members returned HTTP ${membersSource.statusCode || 403} (restricted to repository maintainers/collaborators); v3 flock rosters were refreshed via /api/v3/my-flocks`
+      );
+    } else if (membersSource.error) {
+      errors.push(membersSource.error);
+    }
+  } else if (!membersSource.attempted && membersSource.error && !v3Source.ok) {
+    warnings.push(`/api/members skipped: ${membersSource.error}`);
+  }
+
+  const reconciledFlocksMap = new Map();
+  const revokedOwnerMachines = new Set();
+  const persistedFlocksOut = { ...(localFlocksCfg.flocks || {}) };
+
+  if (v3Source.ok) {
+    const ownedList = Array.isArray(v3Res?.ownedFlocks) ? v3Res.ownedFlocks : [];
+    const joinedList = Array.isArray(v3Res?.joinedFlocks) ? v3Res.joinedFlocks : [];
+    const remoteById = new Map();
+    for (const oflock of ownedList) {
+      if (!oflock?.flockId) continue;
+      remoteById.set(oflock.flockId, { ...oflock, __isOwned: true });
+      if (String(oflock.ownerGitHubUser || "").toLowerCase() === effectiveOwner) {
+        for (const rem of oflock.removedMachines || []) {
+          if (rem?.machineId) {
+            revokedOwnerMachines.add(
+              `${String(rem.githubUser || effectiveOwner).toLowerCase()}:${String(rem.machineId).toLowerCase()}`
+            );
+          }
+        }
+      }
+    }
+    for (const jflock of joinedList) {
+      if (!jflock?.flockId) continue;
+      const existing = remoteById.get(jflock.flockId);
+      remoteById.set(jflock.flockId, existing ? { ...existing, __isJoined: true } : { ...jflock, __isJoined: true });
+    }
+
+    for (const [flockId, rf] of remoteById.entries()) {
+      const localPrev = localFlocksCfg.flocks?.[flockId] || null;
+      const hadStoredMembers = storedFlockIds.has(flockId) && Array.isArray(localPrev?.members);
+      const remoteEpoch = Number(rf.rosterEpoch) || 1;
+      const localEpoch = hadStoredMembers ? (Number(localPrev.rosterEpoch) || 0) : 0;
+
+      const isBuiltInOwner =
+        String(rf.ownerGitHubUser || "").toLowerCase() === effectiveOwner &&
+        !rf.targetMachineId &&
+        (rf.flockType === "owner_root" || rf.flockType === "owner_scope");
+      const localMemberSelf = (rf.members || []).find(
+        (m) =>
+          String(m?.githubUser || "").toLowerCase() === effectiveOwner &&
+          (!cfg?.machineId || String(m?.machineId || "").toLowerCase() === String(cfg.machineId).toLowerCase())
+      );
+      const effectiveTrust = isBuiltInOwner
+        ? "owner"
+        : localMemberSelf?.trustTier === "guest" || localPrev?.trustTier === "guest" || rf.flockType === "guest_pass"
+        ? "guest"
+        : "collaborator";
+
+      let chosenMembers;
+      let chosenEpoch;
+      let flockSource;
+      let flockFetchedAt;
+      if (hadStoredMembers && remoteEpoch < localEpoch) {
+        warnings.push(
+          `Rejected roster epoch rollback for "${flockId}" (remote epoch ${remoteEpoch} < local epoch ${localEpoch})`
+        );
+        chosenMembers = (localPrev.members || []).filter(
+          (m) => m?.machineId && isNonExpiredIsoOrMs(m.membershipExpiresAt, m.membershipExpiresAtMs, nowMs)
+        );
+        chosenEpoch = localEpoch;
+        flockSource = "local_cache_higher_epoch";
+        flockFetchedAt = localPrev.rosterFetchedAt || null;
+      } else {
+        chosenMembers = (rf.members || []).filter(
+          (m) => m?.machineId && isNonExpiredIsoOrMs(m.membershipExpiresAt, m.membershipExpiresAtMs, nowMs)
+        );
+        chosenEpoch = remoteEpoch;
+        flockSource = "broker_v3_my_flocks";
+        flockFetchedAt = v3Source.fetchedAt;
+      }
+
+      const mergedEntry = {
+        ...(localPrev || {}),
+        flockId,
+        flockUuid: rf.flockUuid || localPrev?.flockUuid || null,
+        hubName: rf.hubName || localPrev?.hubName || null,
+        flockType: rf.flockType || localPrev?.flockType || "shared",
+        ownerGitHubUser: rf.ownerGitHubUser || localPrev?.ownerGitHubUser || effectiveOwner,
+        allowedScopes: rf.allowedScopes || localPrev?.allowedScopes || [localScope],
+        targetMachineId: rf.targetMachineId ?? localPrev?.targetMachineId ?? null,
+        trustTier: effectiveTrust,
+        sessionVisibility: isBuiltInOwner ? "all" : "explicit_opt_in_only",
+        shareSpecs: isBuiltInOwner ? "full" : "summary",
+        sharedSessionIds: Array.isArray(localPrev?.sharedSessionIds) ? localPrev.sharedSessionIds : [],
+        sharedSnapshots: localPrev?.sharedSnapshots || {},
+        rosterEpoch: chosenEpoch,
+        rosterFetchedAt: flockFetchedAt,
+        rosterSource: flockSource,
+        membershipStatus: "active",
+        members: chosenMembers,
+      };
+      reconciledFlocksMap.set(flockId, mergedEntry);
+      persistedFlocksOut[flockId] = mergedEntry;
+    }
+
+    for (const builtInId of [builtInRootId, builtInScopeId]) {
+      if (!reconciledFlocksMap.has(builtInId)) {
+        const base = localFlocksCfg.flocks[builtInId] || {
+          flockId: builtInId,
+          ownerGitHubUser: effectiveOwner,
+          flockType: builtInId === builtInRootId ? "owner_root" : "owner_scope",
+          trustTier: "owner",
+          allowedScopes: builtInId === builtInRootId ? ["personal", "work"] : [localScope],
+          sessionVisibility: "all",
+          shareSpecs: "full",
+          sharedSnapshots: {},
+          sharedSessionIds: [],
+          rosterEpoch: 1,
+        };
+        const entry = {
+          ...base,
+          members: [],
+          rosterFetchedAt: v3Source.fetchedAt,
+          rosterSource: "broker_v3_my_flocks",
+          membershipStatus: "active",
+        };
+        reconciledFlocksMap.set(builtInId, entry);
+        persistedFlocksOut[builtInId] = entry;
+      }
+    }
+
+    for (const [storedId, storedFlock] of Object.entries(rawStored.flocks || {})) {
+      if (reconciledFlocksMap.has(storedId)) continue;
+      const hadRemoteState =
+        Array.isArray(storedFlock?.members) ||
+        Boolean(storedFlock?.hubToken) ||
+        (storedFlock?.ownerGitHubUser &&
+          String(storedFlock.ownerGitHubUser).toLowerCase() !== effectiveOwner);
+      if (hadRemoteState) {
+        if (Array.isArray(storedFlock?.sharedSessionIds) && storedFlock.sharedSessionIds.length > 0) {
+          persistedFlocksOut[storedId] = {
+            ...storedFlock,
+            members: [],
+            membershipStatus: "revoked_or_expired",
+          };
+        } else {
+          delete persistedFlocksOut[storedId];
+        }
+      } else {
+        // Pure local share_thread policy stub created by this owner before broker creation
+        const stubEntry = {
+          ...storedFlock,
+          members: [],
+          rosterFetchedAt: null,
+          rosterSource: "local_policy_stub",
+          membershipStatus: "local_stub",
+        };
+        persistedFlocksOut[storedId] = stubEntry;
+        reconciledFlocksMap.set(storedId, stubEntry);
+      }
+    }
+
+    const shouldPersist =
+      options.persistFlocksCache !== undefined
+        ? Boolean(options.persistFlocksCache)
+        : fileExistedBefore && localFlocksCfg.ownerGitHubUser === effectiveOwner;
+    if (shouldPersist && flocksConfigPath) {
+      try {
+        saveLocalFlocksConfig(
+          {
+            ...localFlocksCfg,
+            ownerGitHubUser: effectiveOwner,
+            flocks: persistedFlocksOut,
+          },
+          flocksConfigPath
+        );
+      } catch {}
+    }
+  } else {
+    for (const [flockId, lf] of Object.entries(localFlocksCfg.flocks || {})) {
+      const isBuiltIn = flockId === builtInRootId || flockId === builtInScopeId;
+      if (!isBuiltIn && !storedFlockIds.has(flockId)) continue;
+      const activeCachedMembers = Array.isArray(lf.members)
+        ? lf.members.filter(
+            (m) => m?.machineId && isNonExpiredIsoOrMs(m.membershipExpiresAt, m.membershipExpiresAtMs, nowMs)
+          )
+        : [];
+      reconciledFlocksMap.set(flockId, {
+        ...lf,
+        members: activeCachedMembers,
+        rosterFetchedAt: lf.rosterFetchedAt || null,
+        rosterSource: storedFlockIds.has(flockId) && Array.isArray(lf.members) ? "local_cache" : "local_default",
+        membershipStatus: lf.membershipStatus || "cached",
+      });
+    }
+  }
+
+  // Merge authorized legacy `/api/members` owner-root registrations without cross-flock disclosure or stale resurrection
+  if (membersSource.ok) {
+    for (const bm of membersSource.members) {
+      if (!bm?.machineId) continue;
+      const bmUser = normalizeGitHubUser(bm.githubUser)?.toLowerCase() || null;
+      if (!bmUser || bmUser !== effectiveOwner) {
+        // Never admit another user's `/api/members` registration into this principal's roster
+        continue;
+      }
+      const bmMachineKey = `${bmUser}:${String(bm.machineId).toLowerCase()}`;
+      if (revokedOwnerMachines.has(bmMachineKey)) {
+        continue;
+      }
+      const bmScope = normalizeScope(bm.scope, "work");
+      const targetBuiltIns = [builtInRootId, `${effectiveOwner}/${bmScope}`];
+      for (const bFlockId of targetBuiltIns) {
+        let fEntry = reconciledFlocksMap.get(bFlockId);
+        if (!fEntry) {
+          fEntry = {
+            flockId: bFlockId,
+            flockUuid: `builtin-${bFlockId.replace("/", "-")}`,
+            hubName: `v3_flock_${bFlockId.replace(/[^a-z0-9]/g, "_")}`,
+            ownerGitHubUser: effectiveOwner,
+            flockType: bFlockId === builtInRootId ? "owner_root" : "owner_scope",
+            trustTier: "owner",
+            allowedScopes: bFlockId === builtInRootId ? ["personal", "work"] : [bmScope],
+            sessionVisibility: "all",
+            shareSpecs: "full",
+            sharedSnapshots: {},
+            sharedSessionIds: [],
+            rosterEpoch: 1,
+            rosterFetchedAt: membersSource.fetchedAt,
+            rosterSource: "bootstrap_members",
+            membershipStatus: "active",
+            members: [],
+          };
+          reconciledFlocksMap.set(bFlockId, fEntry);
+        }
+        const existingIdx = (fEntry.members || []).findIndex(
+          (m) =>
+            String(m?.githubUser || effectiveOwner).toLowerCase() === bmUser &&
+            String(m?.machineId || "").toLowerCase() === String(bm.machineId).toLowerCase()
+        );
+        if (existingIdx === -1) {
+          fEntry.members = [
+            ...(fEntry.members || []),
+            {
+              peerId: bm.keyFingerprint ? `${bmUser}:${bm.keyFingerprint}` : `${bmUser}:${bm.machineId}`,
+              githubUser: bmUser,
+              githubName: bm.githubName || null,
+              machineId: bm.machineId,
+              scope: bmScope,
+              trustTier: "owner",
+              publicKey: bm.publicKey || null,
+              keyFingerprint: bm.keyFingerprint || null,
+              specs: bm.specs || null,
+              registeredAt: bm.registeredAt || null,
+              lastSeenAt: bm.lastSeenAt || null,
+              membershipExpiresAt: null,
+              __source: "bootstrap_members",
+            },
+          ];
+          if (!v3Source.ok) {
+            fEntry.rosterFetchedAt = membersSource.fetchedAt;
+            fEntry.rosterSource = "bootstrap_members";
+          }
+        } else {
+          const cur = fEntry.members[existingIdx];
+          fEntry.members[existingIdx] = {
+            ...cur,
+            specs: cur.specs || bm.specs || null,
+            lastSeenAt: cur.lastSeenAt || bm.lastSeenAt || null,
+            registeredAt: cur.registeredAt || bm.registeredAt || null,
+          };
+        }
+      }
+    }
+  }
+
+  // Ensure local self machine is represented in its built-in owner flocks when unrevoked and not yet registered remotely
+  if (cfg?.machineId && !v3Source.ok && !membersSource.ok) {
+    const selfKey = `${effectiveOwner}:${String(cfg.machineId).toLowerCase()}`;
+    if (!revokedOwnerMachines.has(selfKey)) {
+      for (const bFlockId of [builtInRootId, builtInScopeId]) {
+        const fEntry = reconciledFlocksMap.get(bFlockId);
+        if (!fEntry) continue;
+        const hasSelf = (fEntry.members || []).some(
+          (m) => String(m?.machineId || "").toLowerCase() === String(cfg.machineId).toLowerCase()
+        );
+        if (!hasSelf) {
+          fEntry.members = [
+            ...(fEntry.members || []),
+            {
+              peerId: `${effectiveOwner}:${cfg.machineId}`,
+              githubUser: effectiveOwner,
+              machineId: cfg.machineId,
+              scope: localScope,
+              trustTier: "owner",
+              membershipExpiresAt: null,
+              __source: "local_config",
+            },
+          ];
+        }
+      }
+    }
+  }
+
+  let scopedFlocks;
+  let scopedTargetFlockId = null;
+  if (targetFlock) {
+    const parsedTarget = parseFlockAddress(targetFlock, effectiveOwner);
+    scopedTargetFlockId = parsedTarget.flockId;
+    const matched = reconciledFlocksMap.get(scopedTargetFlockId);
+    if (!matched || matched.membershipStatus === "revoked_or_expired") {
+      throw new Error(`Not an authorized member of flock "${scopedTargetFlockId}"`);
+    }
+    scopedFlocks = [matched];
+  } else {
+    scopedFlocks = [...reconciledFlocksMap.values()];
+  }
+
+  const localFlocksView = targetFlock
+    ? Object.values(persistedFlocksOut).filter((f) => f?.flockId === scopedTargetFlockId)
+    : Object.values(persistedFlocksOut);
+  const remoteOwnedView = v3Source.ok
+    ? (v3Res?.ownedFlocks || []).filter((f) => !scopedTargetFlockId || f?.flockId === scopedTargetFlockId)
+    : [];
+  const remoteJoinedView = v3Source.ok
+    ? (v3Res?.joinedFlocks || []).filter((f) => !scopedTargetFlockId || f?.flockId === scopedTargetFlockId)
+    : [];
+
+  const baseState = {
+    effectiveOwner,
+    scopedTargetFlockId,
+    scopedFlocks,
+    localFlocks: localFlocksView,
+    remoteOwnedFlocks: remoteOwnedView,
+    remoteJoinedFlocks: remoteJoinedView,
+    v3Source,
+    membersSource,
+    localCacheSource: {
+      attempted: true,
+      ok: fileExistedBefore,
+      status: fileExistedBefore ? "ok" : "empty",
+      fetchedAt: null,
+    },
+    errors,
+    warnings,
+    nowIso,
+  };
+
+  if (options.deferPresenceMerge) {
+    return baseState;
+  }
+  return applyLivePresenceToLegacyRoster(
+    baseState,
+    options.onlineMachines ?? null,
+    options.liveSignalRSource ?? null
+  );
+}
+
+function applyLivePresenceToLegacyRoster(baseState, onlineMachines, liveSignalRSource) {
+  const livePresenceProbed = Array.isArray(onlineMachines);
+  const errors = [...baseState.errors];
+  const warnings = [...baseState.warnings];
+  if (liveSignalRSource && liveSignalRSource.attempted && !liveSignalRSource.ok && liveSignalRSource.error) {
+    warnings.push(`Live SignalR presence probe failed: ${liveSignalRSource.error}`);
+  }
+
+  const liveByUserAndMachine = new Map();
+  const liveByMachineOnly = new Map();
+  if (livePresenceProbed) {
+    for (const lm of onlineMachines) {
+      if (!lm?.machineId) continue;
+      const mLower = String(lm.machineId).toLowerCase();
+      const uLower = normalizeGitHubUser(lm.githubUser)?.toLowerCase() || null;
+      if (uLower) liveByUserAndMachine.set(`${uLower}:${mLower}`, lm);
+      if (!liveByMachineOnly.has(mLower)) liveByMachineOnly.set(mLower, lm);
+      else liveByMachineOnly.set(mLower, null); // ambiguous machineId across users; require user match
+    }
+  }
+
+  const findLiveMatch = (githubUser, machineId) => {
+    if (!livePresenceProbed || !machineId) return null;
+    const mLower = String(machineId).toLowerCase();
+    const uLower = normalizeGitHubUser(githubUser)?.toLowerCase() || null;
+    if (uLower && liveByUserAndMachine.has(`${uLower}:${mLower}`)) {
+      return liveByUserAndMachine.get(`${uLower}:${mLower}`);
+    }
+    const fallback = liveByMachineOnly.get(mLower);
+    if (fallback && (!fallback.githubUser || !uLower)) return fallback;
+    return null;
+  };
+
+  const knownMap = new Map();
+  const allowedLiveKeys = new Set();
+  const allowedLiveMachines = new Set();
+
+  const flocksOut = baseState.scopedFlocks.map((f) => {
+    const callerHasOwnerSpecs = f.trustTier === "owner" && f.shareSpecs === "full";
+    const flockEpoch = Number(f.rosterEpoch) || 1;
+    const flockMembers = (f.members || []).map((m) => {
+      const mUser = normalizeGitHubUser(m.githubUser || f.ownerGitHubUser)?.toLowerCase() || "unknown";
+      const live = findLiveMatch(mUser, m.machineId);
+      const memberSource = m.__source || f.rosterSource || "local_cache";
+      const memberKey = `${mUser}:${String(m.machineId).toLowerCase()}`;
+      allowedLiveKeys.add(memberKey);
+      allowedLiveMachines.add(String(m.machineId).toLowerCase());
+
+      const prev = knownMap.get(memberKey);
+      const mergedFlocks = prev
+        ? Array.from(new Set([...prev.flocks, f.flockId]))
+        : [f.flockId];
+      const mergedEpoch = prev ? Math.max(prev.rosterEpoch || 1, flockEpoch) : flockEpoch;
+      const mergedOwnerAccess = Boolean(prev?.__ownerSpecs || callerHasOwnerSpecs);
+      const rankRole = (r) => (r === "owner" ? 3 : r === "collaborator" ? 2 : 1);
+      const mRole = m.trustTier || (mUser === f.ownerGitHubUser ? "owner" : "collaborator");
+      const bestRole = prev && rankRole(prev.trustTier) >= rankRole(mRole) ? prev.trustTier : mRole;
+
+      const entry = {
+        machineId: live?.machineId || m.machineId,
+        peerId: m.peerId || prev?.peerId || null,
+        githubUser: mUser,
+        scope: normalizeScope(live?.scope || m.scope, "work"),
+        role: bestRole,
+        trustTier: bestRole,
+        flocks: mergedFlocks,
+        membershipAuthenticated: true,
+        membershipStatus: "active",
+        membershipExpiresAt: m.membershipExpiresAt ?? prev?.membershipExpiresAt ?? null,
+        online: livePresenceProbed ? Boolean(live) : null,
+        presence: livePresenceProbed ? (live ? "online" : "offline") : "unprobed",
+        heartbeatObserved: livePresenceProbed ? Boolean(live) : false,
+        removed: false,
+        rosterSource: prev?.rosterSource === "broker_v3_my_flocks" ? "broker_v3_my_flocks" : memberSource,
+        rosterEpoch: mergedEpoch,
+        lastSeenAt: live?.respondedAt || live?.timestamp || m.lastSeenAt || prev?.lastSeenAt || null,
+        ...(mergedOwnerAccess ? { specs: live?.specs || m.specs || prev?.specs || null } : {}),
+        __ownerSpecs: mergedOwnerAccess,
+      };
+      knownMap.set(memberKey, entry);
+
+      return {
+        peerId: m.peerId || null,
+        githubUser: mUser,
+        machineId: live?.machineId || m.machineId,
+        scope: normalizeScope(live?.scope || m.scope, "work"),
+        trustTier: mRole,
+        membershipAuthenticated: true,
+        membershipStatus: "active",
+        membershipExpiresAt: m.membershipExpiresAt || null,
+        online: livePresenceProbed ? Boolean(live) : null,
+        presence: livePresenceProbed ? (live ? "online" : "offline") : "unprobed",
+        heartbeatObserved: livePresenceProbed ? Boolean(live) : false,
+        removed: false,
+        lastSeenAt: live?.respondedAt || live?.timestamp || m.lastSeenAt || null,
+      };
+    });
+
+    return {
+      flockId: f.flockId,
+      flockUuid: f.flockUuid || null,
+      hubName: f.hubName || null,
+      flockType: f.flockType || "shared",
+      ownerGitHubUser: f.ownerGitHubUser || baseState.effectiveOwner,
+      trustTier: f.trustTier || "collaborator",
+      rosterEpoch: flockEpoch,
+      source: f.rosterSource || "local_cache",
+      fetchedAt: f.rosterFetchedAt || null,
+      memberCount: flockMembers.length,
+      ...(livePresenceProbed
+        ? {
+            onlineCount: flockMembers.filter((m) => m.online === true).length,
+            offlineCount: flockMembers.filter((m) => m.online === false).length,
+          }
+        : {}),
+      members: flockMembers,
+    };
+  });
+
+  const knownMembers = [...knownMap.values()].map(({ __ownerSpecs, ...rest }) => rest);
+  const offlineMembers = livePresenceProbed ? knownMembers.filter((m) => m.online === false) : [];
+
+  let filteredOnlineMachines = onlineMachines;
+  if (livePresenceProbed) {
+    filteredOnlineMachines = onlineMachines.filter((lm) => {
+      if (!lm?.machineId) return false;
+      const mLower = String(lm.machineId).toLowerCase();
+      const uLower = normalizeGitHubUser(lm.githubUser)?.toLowerCase() || null;
+      if (baseState.scopedTargetFlockId) {
+        if (uLower) return allowedLiveKeys.has(`${uLower}:${mLower}`);
+        return allowedLiveMachines.has(mLower);
+      }
+      if (uLower && uLower !== baseState.effectiveOwner) {
+        return allowedLiveKeys.has(`${uLower}:${mLower}`);
+      }
+      return true;
+    });
+  }
+
+  const cachedTimestamps = flocksOut
+    .map((f) => f.fetchedAt)
+    .filter((ts) => ts && Number.isFinite(Date.parse(ts)))
+    .sort();
+  const latestCachedAt = cachedTimestamps.length ? cachedTimestamps[cachedTimestamps.length - 1] : null;
+  const authoritativeFetchedAt =
+    baseState.v3Source.fetchedAt || baseState.membersSource.fetchedAt || latestCachedAt || null;
+
+  const bothRemoteOk =
+    baseState.v3Source.ok &&
+    baseState.membersSource.ok &&
+    errors.length === 0 &&
+    warnings.length === 0 &&
+    (!liveSignalRSource || liveSignalRSource.ok);
+  const anyRemoteOk = baseState.v3Source.ok || baseState.membersSource.ok;
+  const remoteFailed =
+    ((baseState.v3Source.attempted && !baseState.v3Source.ok) &&
+      (!baseState.membersSource.attempted || !baseState.membersSource.ok)) ||
+    (errors.length > 0 && !anyRemoteOk);
+
+  const sourceLabel =
+    baseState.v3Source.ok && baseState.membersSource.ok && warnings.length === 0
+      ? "broker_live"
+      : anyRemoteOk
+      ? "broker_partial"
+      : "local_cache";
+
+  const refreshStatus = bothRemoteOk
+    ? "ok"
+    : remoteFailed
+    ? "failed"
+    : anyRemoteOk
+    ? "partial"
+    : "incomplete";
+
+  const epochsByFlock = Object.fromEntries(flocksOut.map((f) => [f.flockId, f.rosterEpoch]));
+  const summaryEpoch =
+    flocksOut.length === 1
+      ? flocksOut[0].rosterEpoch
+      : flocksOut.length > 0
+      ? Math.max(...flocksOut.map((f) => f.rosterEpoch))
+      : 1;
+
+  const sources = {
+    v3MyFlocks: baseState.v3Source,
+    bootstrapMembers: {
+      attempted: baseState.membersSource.attempted,
+      ok: baseState.membersSource.ok,
+      status: baseState.membersSource.status,
+      statusCode: baseState.membersSource.statusCode,
+      fetchedAt: baseState.membersSource.fetchedAt,
+      error: baseState.membersSource.error,
+    },
+    localFlocksCache: {
+      ...baseState.localCacheSource,
+      fetchedAt: latestCachedAt,
+    },
+    ...(liveSignalRSource ? { liveSignalR: liveSignalRSource } : {}),
+  };
+
+  const roster = {
+    protocol: "legacy-v3",
+    livePresenceProbed,
+    source: sourceLabel,
+    sources,
+    freshness: {
+      fetchedAt: authoritativeFetchedAt,
+      evaluatedAt: baseState.nowIso,
+      stale: !baseState.v3Source.ok,
+      rosterEpoch: summaryEpoch,
+      epochsByFlock,
+    },
+    refresh: {
+      status: refreshStatus,
+      complete: bothRemoteOk,
+      incomplete: !bothRemoteOk,
+      failed: remoteFailed,
+      errors,
+      warnings,
+    },
+    presenceNote: ROSTER_PRESENCE_NOTE,
+    flocks: flocksOut,
+    knownMembers,
+    ...(livePresenceProbed ? { offlineMembers } : {}),
+  };
+
+  return {
+    effectiveOwner: baseState.effectiveOwner,
+    localFlocks: baseState.localFlocks,
+    remoteOwnedFlocks: baseState.remoteOwnedFlocks,
+    remoteJoinedFlocks: baseState.remoteJoinedFlocks,
+    flocks: flocksOut,
+    knownMembers,
+    offlineMembers,
+    onlineMachines: filteredOnlineMachines,
+    roster,
+  };
+}
+
+export async function resolveBrokerFreeFlockRoster(cfg, options = {}) {
+  const runtime =
+    options.runtime ||
+    (options.brokerFreeRuntimeFactory || brokerFreeRuntime)(cfg, options.runtimeOptions || {});
+  const targetFlock = options.targetFlock || cfg?.flockId || null;
+  const stateData = runtime.read();
+  const allRecords = Object.values(stateData.flocks || {});
+  const activeRecords = allRecords.filter((r) => !r.departed);
+
+  let inspectedList = [];
+  let multiLocalWarning = null;
+  if (targetFlock || !options.allowMultipleLocalOverview || activeRecords.length === 1) {
+    const selected = runtime.select(targetFlock || null);
+    const inspected = await runtime.inspectRoster(selected.flockId, {
+      refresh: options.refresh !== false,
+      timeoutMs: options.rosterTimeoutMs || 2000,
+    });
+    inspectedList = [inspected];
+  } else if (activeRecords.length > 1) {
+    multiLocalWarning =
+      "Multiple broker-free flocks enrolled; pass an explicit flock selector to live-sync a specific flock roster";
+    for (const rec of activeRecords) {
+      inspectedList.push(await runtime.inspectRoster(rec.flockId, { refresh: false }));
+    }
+  }
+
+  const baseState = {
+    cfg,
+    targetFlock,
+    allRecords,
+    inspectedList,
+    multiLocalWarning,
+    evaluatedAt: new Date().toISOString(),
+  };
+
+  if (options.deferPresenceMerge) {
+    return baseState;
+  }
+  return applyLivePresenceToBrokerFreeRoster(
+    baseState,
+    options.onlineMachines ?? null,
+    options.liveSignalRSource ?? null
+  );
+}
+
+function applyLivePresenceToBrokerFreeRoster(baseState, onlineMachines, liveSignalRSource) {
+  const livePresenceProbed = Array.isArray(onlineMachines);
+  const liveByMachine = new Map();
+  if (livePresenceProbed) {
+    for (const lm of onlineMachines) {
+      if (lm?.machineId) liveByMachine.set(String(lm.machineId).toLowerCase(), lm);
+    }
+  }
+
+  const knownMembers = [];
+  const allowedMachines = new Set();
+  const flocks = [];
+  const errors = [];
+  const warnings = [];
+  if (baseState.multiLocalWarning) warnings.push(baseState.multiLocalWarning);
+  if (liveSignalRSource && liveSignalRSource.attempted && !liveSignalRSource.ok && liveSignalRSource.error) {
+    warnings.push(`Live SignalR presence probe failed: ${liveSignalRSource.error}`);
+  }
+
+  for (const inspected of baseState.inspectedList) {
+    errors.push(...(inspected.refresh?.errors || []));
+    warnings.push(...(inspected.refresh?.warnings || []));
+    const flockMembers = (inspected.members || []).map((m) => {
+      const live = livePresenceProbed ? liveByMachine.get(String(m.machineId).toLowerCase()) : null;
+      allowedMachines.add(String(m.machineId).toLowerCase());
+      const memberItem = {
+        machineId: live?.machineId || m.machineId,
+        peerId: m.peerId,
+        githubUser: null,
+        scope: m.scope,
+        role: m.role,
+        trustTier: m.role,
+        flocks: [inspected.flockId],
+        membershipAuthenticated: true,
+        membershipStatus: m.credentialExpired ? "active_credential_expired" : "active",
+        credentialExpired: Boolean(m.credentialExpired),
+        certExpiresAt: m.certExpiresAt ? new Date(m.certExpiresAt).toISOString() : null,
+        membershipExpiresAt: m.membershipExpiresAt ? new Date(m.membershipExpiresAt).toISOString() : null,
+        online: livePresenceProbed ? Boolean(live) : null,
+        presence: livePresenceProbed ? (live ? "online" : "offline") : "unprobed",
+        heartbeatObserved: livePresenceProbed ? Boolean(live) : false,
+        removed: false,
+        rosterSource: inspected.source,
+        rosterEpoch: inspected.freshness.rosterEpoch,
+      };
+      knownMembers.push(memberItem);
+      return memberItem;
+    });
+
+    flocks.push({
+      flockId: inspected.flockId,
+      peerId: inspected.localPeerId,
+      role: inspected.role,
+      epoch: inspected.freshness.rosterEpoch,
+      rosterEpoch: inspected.freshness.rosterEpoch,
+      rosterSeq: inspected.freshness.rosterSeq ?? null,
+      ownerFingerprint: inspected.ownerFingerprint,
+      departed: false,
+      protocol: "broker-free-v34",
+      source: inspected.source,
+      fetchedAt: inspected.freshness.fetchedAt,
+      memberCount: flockMembers.length,
+      ...(livePresenceProbed
+        ? {
+            onlineCount: flockMembers.filter((m) => m.online === true).length,
+            offlineCount: flockMembers.filter((m) => m.online === false).length,
+          }
+        : {}),
+      members: flockMembers,
+    });
+  }
+
+  // Include departed records in un-scoped list_flocks overview with empty active members (never resurrecting departed state)
+  if (!baseState.targetFlock && baseState.allRecords.some((r) => r.departed)) {
+    for (const dep of baseState.allRecords.filter((r) => r.departed)) {
+      flocks.push({
+        flockId: dep.flockId,
+        peerId: dep.localPeerId,
+        role: dep.cert.body.role,
+        epoch: dep.epoch,
+        rosterEpoch: dep.epoch,
+        ownerFingerprint: ownerFingerprint(dep.ownerPublicKey),
+        expiresAt: dep.cert.body.expiresAt,
+        departed: true,
+        protocol: "broker-free-v34",
+        source: "broker_free_departed",
+        fetchedAt: null,
+        memberCount: 0,
+        members: [],
+      });
+    }
+  }
+
+  const offlineMembers = livePresenceProbed ? knownMembers.filter((m) => m.online === false) : [];
+  const filteredOnlineMachines = livePresenceProbed
+    ? onlineMachines.filter((lm) => lm?.machineId && allowedMachines.has(String(lm.machineId).toLowerCase()))
+    : null;
+
+  const single = baseState.inspectedList.length === 1 ? baseState.inspectedList[0] : null;
+  const allComplete =
+    baseState.inspectedList.length > 0 &&
+    baseState.inspectedList.every((i) => i.refresh?.complete) &&
+    !baseState.multiLocalWarning &&
+    (!liveSignalRSource || liveSignalRSource.ok);
+  const anyFailed = baseState.inspectedList.some((i) => i.refresh?.failed);
+  const epochsByFlock = Object.fromEntries(
+    baseState.inspectedList.map((i) => [i.flockId, i.freshness.rosterEpoch])
+  );
+
+  const roster = {
+    protocol: "broker-free-v34",
+    livePresenceProbed,
+    source: single
+      ? single.source
+      : baseState.inspectedList.length > 1
+      ? "broker_free_multi_local"
+      : "broker_free_empty",
+    sources: {
+      ...(single
+        ? single.sources
+        : {
+            localBrokerFreeState: {
+              attempted: true,
+              ok: true,
+              status: baseState.multiLocalWarning ? "local_only" : "empty",
+              fetchedAt: null,
+              error: null,
+            },
+          }),
+      ...(liveSignalRSource ? { liveSignalR: liveSignalRSource } : {}),
+    },
+    freshness: {
+      fetchedAt: single ? single.freshness.fetchedAt : null,
+      evaluatedAt: baseState.evaluatedAt,
+      stale: single ? Boolean(single.freshness.stale) : Boolean(baseState.multiLocalWarning),
+      rosterEpoch: single
+        ? single.freshness.rosterEpoch
+        : baseState.inspectedList.length > 0
+        ? Math.max(...baseState.inspectedList.map((i) => i.freshness.rosterEpoch))
+        : 0,
+      rosterSeq: single ? (single.freshness.rosterSeq ?? null) : null,
+      epochsByFlock,
+    },
+    refresh: {
+      status: single
+        ? (!liveSignalRSource || liveSignalRSource.ok ? single.refresh.status : "partial")
+        : baseState.multiLocalWarning
+        ? "local_only"
+        : "ok",
+      complete: allComplete,
+      incomplete: !allComplete,
+      failed: anyFailed,
+      errors,
+      warnings,
+    },
+    presenceNote: ROSTER_PRESENCE_NOTE,
+    flocks,
+    knownMembers,
+    ...(livePresenceProbed ? { offlineMembers } : {}),
+  };
+
+  return {
+    protocol: "broker-free-v34",
+    machineId: baseState.cfg?.machineId || null,
+    scope: normalizeScope(baseState.cfg?.scope, "work"),
+    flocks,
+    knownMembers,
+    ...(livePresenceProbed
+      ? {
+          onlineMachines: filteredOnlineMachines,
+          offlineMembers,
+        }
+      : {}),
+    roster,
+  };
 }
 
 export function redactFlockSnapshot(text) {
@@ -11568,7 +12835,9 @@ Usage:
   }
 
   if (command === "status") {
-    const out = await executeMcpTool(cfg, "bridge_status", {});
+    const out = await executeMcpTool(cfg, "bridge_status", {
+      ...(flags.flock || positional[0] ? { flock: flags.flock || positional[0] } : {}),
+    });
     console.log(JSON.stringify(out, null, 2));
     return;
   }
@@ -11588,7 +12857,10 @@ Usage:
   }
 
   if (command === "my-flocks" || command === "flocks") {
-    const out = await executeMcpTool(cfg, "list_flocks", {});
+    const out = await executeMcpTool(cfg, "list_flocks", {
+      ...(flags.flock || positional[0] ? { flock: flags.flock || positional[0] } : {}),
+      ...(flags["probe-presence"] ? { probe_presence: true } : {}),
+    });
     console.log(JSON.stringify(out, null, 2));
     return;
   }

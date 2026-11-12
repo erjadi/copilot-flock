@@ -59,3 +59,5 @@ version or this skill alone does not establish production authorization.
    - `<owner>/<flock>/<machineId>` — Specific machine or single-PC time-bound guest pass (e.g. `erjadi/work/CLOUD-DEV-VM`).
 4. **4 Anti-Leakage Hard Walls (`Shared machines ≠ shared threads`)**:
    - Joining an external/collaborator flock or issuing a guest pass never exposes existing local threads. External callers can only access threads explicitly opted in via `share_thread` (with `approved-snapshot` transcript redaction) or new threads created for that `boundFlockId`.
+5. **Authenticated Roster vs. Live Presence (`flock_status` & `list_flocks`)**:
+   - `onlineMachines` reflects live SignalR heartbeats, while `knownMembers`, `offlineMembers`, and `roster` (`source`, `freshness`, `refresh`) reflect authenticated flock membership so sleeping/offline collaborator or owner-root PCs remain visible without being mistaken for removed members.

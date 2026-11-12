@@ -57,11 +57,15 @@ import {
   validatePinnedBootstrapOrigin,
   recordSandboxManifestResource,
   teardownLocalSandbox,
+  executeMcpTool,
+  resolveLegacyFlockRoster,
+  resolveBrokerFreeFlockRoster,
 } from "../flock.mjs";
 
 import {
   verifyGitHubRepoAccess,
   createBootstrapServer,
+  saveMemberRegistration,
   enqueueOfflineStoreItem,
   drainOfflineStoreItems,
   ackOfflineStoreItems,
@@ -72,6 +76,10 @@ import {
   kickV3FlockMember,
   listV3UserFlocks,
 } from "../bootstrap-server.mjs";
+
+import { AzureTransport, azureEndpoints } from "../flock-azure.mjs";
+import { BrokerFreeRuntime } from "../flock-broker-free.mjs";
+import { ownerFingerprint } from "../flock-protocol.mjs";
 
 test("reply and clarification shell examples strip unsafe remote identifiers", () => {
   const text = buildCrossSessionEnvelope({
@@ -2340,4 +2348,863 @@ test("v3.0.0 multi-flock platform: universal <owner>/<flock>[/<machineId>] addre
     else process.env.COPILOT_HOME = prevCopilotHome;
     env.cleanup();
   }
+});
+
+test("legacy flock_status and list_flocks surface offline shared-flock collaborators and owner-root machines while keeping membership distinct from live presence", async (t) => {
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "flock-status-legacy-"));
+  t.after(() => fs.rmSync(tempRoot, { recursive: true, force: true }));
+  const storePath = path.join(tempRoot, "v3-flocks.json");
+  const membersPath = path.join(tempRoot, "members.json");
+  const localFlocksPath = path.join(tempRoot, "local-flocks.json");
+  const testConnStr = "Endpoint=https://test-flock.service.signalr.net;AccessKey=MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=;Version=1.0;";
+
+  const genKey = () =>
+    crypto.generateKeyPairSync("ed25519", {
+      publicKeyEncoding: { type: "spki", format: "pem" },
+      privateKeyEncoding: { type: "pkcs8", format: "pem" },
+    });
+  const ownerKey1 = genKey();
+  const ownerKey2 = genKey();
+  const reneKey = genKey();
+
+  // 1. Owner @erjadi enrolls DESKTOP-2R3PAUG (personal) and CLOUD-DEV-VM (work)
+  await enrollV3Device(
+    {
+      githubUser: "erjadi",
+      githubUserId: 1001,
+      deviceId: "fp-owner-main",
+      machineId: "DESKTOP-2R3PAUG",
+      scope: "personal",
+      publicKey: ownerKey1.publicKey,
+      keyFingerprint: "fp-owner-main",
+    },
+    { storePath, connectionString: testConnStr }
+  );
+  await enrollV3Device(
+    {
+      githubUser: "erjadi",
+      githubUserId: 1001,
+      deviceId: "fp-owner-cloud",
+      machineId: "CLOUD-DEV-VM",
+      scope: "work",
+      publicKey: ownerKey2.publicKey,
+      keyFingerprint: "fp-owner-cloud",
+    },
+    { storePath, connectionString: testConnStr }
+  );
+
+  // Also register an offline legacy owner-root machine DESKTOP-UE3B1TD in /api/members
+  saveMemberRegistration(
+    {
+      machineId: "DESKTOP-UE3B1TD",
+      githubUser: "erjadi",
+      githubName: "Eric",
+      scope: "personal",
+      version: BRIDGE_VERSION,
+      specs: { cpu: { model: "Ryzen 9" }, memory: { totalGb: 64 } },
+    },
+    membersPath
+  );
+
+  // 2. Owner creates shared flock erjadi/experimental (initially epoch 1/2 before collaborator joins)
+  const expInvite = await createV3FlockInvite(
+    {
+      callerGitHubUser: "erjadi",
+      callerGitHubUserId: 1001,
+      targetAddress: "erjadi/experimental",
+      invitedUser: "renepajta",
+      invitedGitHubUserId: 2002,
+      allowedScopes: ["work"],
+    },
+    { storePath }
+  );
+  // Seed owner's local flocks.json at stale epoch 2 BEFORE @renepajta enrolls DESKTOP-PSCVM1T
+  writeConfigFileSecure(
+    {
+      ownerGitHubUser: "erjadi",
+      scope: "personal",
+      flocks: {
+        "erjadi/experimental": {
+          flockId: "erjadi/experimental",
+          flockUuid: expInvite.flockUuid,
+          hubName: "v3_flock_exp",
+          ownerGitHubUser: "erjadi",
+          flockType: "shared",
+          trustTier: "collaborator",
+          sessionVisibility: "explicit_opt_in_only",
+          shareSpecs: "summary",
+          sharedSessionIds: ["sess-exp-1"],
+          sharedSnapshots: {
+            "sess-exp-1": {
+              sessionId: "sess-exp-1",
+              title: "Experimental feature",
+              mode: "approved-snapshot",
+              summarySnapshot: "Approved summary",
+              sharedAt: "2026-11-10T00:00:00.000Z",
+            },
+          },
+          rosterEpoch: 2,
+          members: [
+            {
+              peerId: "1001:fp-owner-cloud",
+              githubUser: "erjadi",
+              machineId: "CLOUD-DEV-VM",
+              scope: "work",
+              trustTier: "collaborator",
+            },
+          ],
+        },
+      },
+    },
+    localFlocksPath
+  );
+
+  // 3. Collaborator @renepajta enrolls DESKTOP-PSCVM1T, and broker epoch advances to 5 while DESKTOP-PSCVM1T is offline
+  await enrollV3Device(
+    {
+      githubUser: "renepajta",
+      githubUserId: 2002,
+      deviceId: "fp-rene-pc",
+      machineId: "DESKTOP-PSCVM1T",
+      scope: "work",
+      publicKey: reneKey.publicKey,
+      keyFingerprint: "fp-rene-pc",
+      enrollmentJson: expInvite.enrollmentJson,
+    },
+    { storePath, connectionString: testConnStr }
+  );
+  const rawStore = JSON.parse(fs.readFileSync(storePath, "utf8"));
+  rawStore.flocks["erjadi/experimental"].rosterEpoch = 5;
+  fs.writeFileSync(storePath, JSON.stringify(rawStore, null, 2), "utf8");
+
+  const cfg = {
+    machineId: "DESKTOP-2R3PAUG",
+    githubUser: "erjadi",
+    scope: "personal",
+    hub: "copilotbridge",
+    endpoint: "https://test-flock.service.signalr.net",
+    bootstrapUrl: "https://your-flock-bootstrap.azurewebsites.net/api/bootstrap",
+    flocksConfigPath: localFlocksPath,
+  };
+  const deps = {
+    skipSpecsRefresh: true,
+    ensureDaemon: async () => ({ running: true, pid: 4242 }),
+    discoverOnlineMachines: async () => [
+      // ONLY DESKTOP-2R3PAUG is online on SignalR; CLOUD-DEV-VM, DESKTOP-UE3B1TD, and DESKTOP-PSCVM1T are all offline
+      { machineId: "DESKTOP-2R3PAUG", githubUser: "erjadi", scope: "personal", version: BRIDGE_VERSION },
+    ],
+    fetchV3MyFlocks: async () => listV3UserFlocks({ githubUser: "erjadi", githubUserId: 1001 }, { storePath }),
+    fetchLegacyMembers: async () => ({
+      attempted: true,
+      ok: true,
+      status: "ok",
+      statusCode: 200,
+      fetchedAt: new Date().toISOString(),
+      error: null,
+      members: Object.values(JSON.parse(fs.readFileSync(membersPath, "utf8"))),
+    }),
+  };
+
+  const statusOut = await executeMcpTool(cfg, "flock_status", {}, deps);
+  assert.equal(statusOut.onlineMachines.length, 1);
+  assert.equal(statusOut.onlineMachines[0].machineId, "DESKTOP-2R3PAUG");
+
+  // Known authenticated members include online self + offline owner-root + offline collaborator at epoch 5
+  const byMachine = new Map(statusOut.knownMembers.map((m) => [m.machineId, m]));
+  assert.equal(byMachine.get("DESKTOP-2R3PAUG")?.online, true);
+  assert.equal(byMachine.get("DESKTOP-2R3PAUG")?.presence, "online");
+  assert.equal(byMachine.get("DESKTOP-2R3PAUG")?.heartbeatObserved, true);
+
+  const rene = byMachine.get("DESKTOP-PSCVM1T");
+  assert.ok(rene, "Offline collaborator DESKTOP-PSCVM1T must be surfaced in knownMembers");
+  assert.equal(rene.githubUser, "renepajta");
+  assert.equal(rene.online, false);
+  assert.equal(rene.presence, "offline");
+  assert.equal(rene.heartbeatObserved, false);
+  assert.equal(rene.membershipAuthenticated, true);
+  assert.equal(rene.membershipStatus, "active");
+  assert.equal(rene.removed, false);
+  assert.deepEqual(rene.flocks, ["erjadi/experimental"]);
+  assert.equal(rene.rosterEpoch, 5);
+
+  const ue3 = byMachine.get("DESKTOP-UE3B1TD");
+  assert.ok(ue3, "Offline owner-root member DESKTOP-UE3B1TD from /api/members must be surfaced");
+  assert.equal(ue3.online, false);
+  assert.equal(ue3.removed, false);
+  assert.ok(ue3.flocks.includes("erjadi"));
+  assert.ok(ue3.flocks.includes("erjadi/personal"));
+
+  const offlineIds = statusOut.offlineMembers.map((m) => m.machineId).sort();
+  assert.deepEqual(offlineIds, ["CLOUD-DEV-VM", "DESKTOP-PSCVM1T", "DESKTOP-UE3B1TD"]);
+
+  // Roster metadata explicitly reports source, freshness, and complete refresh
+  assert.equal(statusOut.roster.source, "broker_live");
+  assert.equal(statusOut.roster.freshness.stale, false);
+  assert.equal(statusOut.roster.freshness.rosterEpoch, 5);
+  assert.equal(statusOut.roster.freshness.epochsByFlock["erjadi/experimental"], 5);
+  assert.ok(Number.isFinite(Date.parse(statusOut.roster.freshness.fetchedAt)));
+  assert.equal(statusOut.roster.refresh.status, "ok");
+  assert.equal(statusOut.roster.refresh.complete, true);
+  assert.equal(statusOut.roster.refresh.incomplete, false);
+  assert.equal(statusOut.roster.refresh.failed, false);
+
+  // Local flocks.json was reconciled to epoch 5 while preserving sharing walls and approved snapshots
+  const updatedDiskFlocks = JSON.parse(fs.readFileSync(localFlocksPath, "utf8"));
+  assert.equal(updatedDiskFlocks.flocks["erjadi/experimental"].rosterEpoch, 5);
+  assert.equal(updatedDiskFlocks.flocks["erjadi/experimental"].sessionVisibility, "explicit_opt_in_only");
+  assert.equal(updatedDiskFlocks.flocks["erjadi/experimental"].shareSpecs, "summary");
+  assert.deepEqual(updatedDiskFlocks.flocks["erjadi/experimental"].sharedSessionIds, ["sess-exp-1"]);
+
+  // list_flocks also surfaces epoch 5 and knownMembers without probing SignalR unless requested
+  const listOut = await executeMcpTool(cfg, "list_flocks", {}, deps);
+  assert.equal(listOut.roster.livePresenceProbed, false);
+  assert.equal(listOut.roster.freshness.epochsByFlock["erjadi/experimental"], 5);
+  const reneFromList = listOut.knownMembers.find((m) => m.machineId === "DESKTOP-PSCVM1T");
+  assert.ok(reneFromList);
+  assert.equal(reneFromList.presence, "unprobed");
+  assert.equal(reneFromList.online, null);
+  assert.equal(reneFromList.removed, false);
+});
+
+test("legacy flock_status and list_flocks prevent cross-flock metadata disclosure, prevent stale-member resurrection, and report partial or failed refresh states", async (t) => {
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "flock-status-walls-"));
+  t.after(() => fs.rmSync(tempRoot, { recursive: true, force: true }));
+  const storePath = path.join(tempRoot, "v3-flocks.json");
+  const membersPath = path.join(tempRoot, "members.json");
+  const ownerFlocksPath = path.join(tempRoot, "owner-flocks.json");
+  const bobFlocksPath = path.join(tempRoot, "bob-flocks.json");
+  const reneFlocksPath = path.join(tempRoot, "rene-flocks.json");
+  const testConnStr = "Endpoint=https://test-flock.service.signalr.net;AccessKey=MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=;Version=1.0;";
+
+  const genKey = () =>
+    crypto.generateKeyPairSync("ed25519", {
+      publicKeyEncoding: { type: "spki", format: "pem" },
+      privateKeyEncoding: { type: "pkcs8", format: "pem" },
+    });
+
+  // Enroll owner machines (including OLD-OWNER-LAPTOP which will be kicked)
+  await enrollV3Device(
+    { githubUser: "erjadi", githubUserId: 1001, deviceId: "fp-main", machineId: "DESKTOP-2R3PAUG", scope: "personal", publicKey: genKey().publicKey },
+    { storePath, connectionString: testConnStr }
+  );
+  await enrollV3Device(
+    { githubUser: "erjadi", githubUserId: 1001, deviceId: "fp-cloud", machineId: "CLOUD-DEV-VM", scope: "work", publicKey: genKey().publicKey, specs: { gpus: [{ name: "Private H100", vramGb: 80 }] } },
+    { storePath, connectionString: testConnStr }
+  );
+  await enrollV3Device(
+    { githubUser: "erjadi", githubUserId: 1001, deviceId: "fp-old", machineId: "OLD-OWNER-LAPTOP", scope: "work", publicKey: genKey().publicKey },
+    { storePath, connectionString: testConnStr }
+  );
+
+  // Create two separate shared flocks: erjadi/experimental (@renepajta + @bob) and erjadi/secret-project (@alice)
+  const expInviteRene = await createV3FlockInvite(
+    { callerGitHubUser: "erjadi", callerGitHubUserId: 1001, targetAddress: "erjadi/experimental", invitedUser: "renepajta", invitedGitHubUserId: 2002, allowedScopes: ["work"] },
+    { storePath }
+  );
+  const expInviteBob = await createV3FlockInvite(
+    { callerGitHubUser: "erjadi", callerGitHubUserId: 1001, targetAddress: "erjadi/experimental", invitedUser: "bob", invitedGitHubUserId: 3003, allowedScopes: ["work"] },
+    { storePath }
+  );
+  const secretInviteAlice = await createV3FlockInvite(
+    { callerGitHubUser: "erjadi", callerGitHubUserId: 1001, targetAddress: "erjadi/secret-project", invitedUser: "alice", invitedGitHubUserId: 4004, allowedScopes: ["work"] },
+    { storePath }
+  );
+  // Owner joins CLOUD-DEV-VM to both shared flocks
+  const expInviteOwner = await createV3FlockInvite(
+    { callerGitHubUser: "erjadi", callerGitHubUserId: 1001, targetAddress: "erjadi/experimental", invitedUser: "erjadi", invitedGitHubUserId: 1001, allowedScopes: ["work"] },
+    { storePath }
+  );
+  const secretInviteOwner = await createV3FlockInvite(
+    { callerGitHubUser: "erjadi", callerGitHubUserId: 1001, targetAddress: "erjadi/secret-project", invitedUser: "erjadi", invitedGitHubUserId: 1001, allowedScopes: ["work"] },
+    { storePath }
+  );
+  await enrollV3Device(
+    {
+      githubUser: "erjadi",
+      githubUserId: 1001,
+      deviceId: "fp-cloud",
+      machineId: "CLOUD-DEV-VM",
+      scope: "work",
+      publicKey: genKey().publicKey,
+      enrollmentJson: {
+        flocks: [...expInviteOwner.enrollmentJson.flocks, ...secretInviteOwner.enrollmentJson.flocks],
+      },
+    },
+    { storePath, connectionString: testConnStr }
+  );
+
+  await enrollV3Device(
+    { githubUser: "renepajta", githubUserId: 2002, deviceId: "fp-rene", machineId: "DESKTOP-PSCVM1T", scope: "work", publicKey: genKey().publicKey, enrollmentJson: expInviteRene.enrollmentJson },
+    { storePath, connectionString: testConnStr }
+  );
+  await enrollV3Device(
+    { githubUser: "bob", githubUserId: 3003, deviceId: "fp-bob", machineId: "BOB-PC", scope: "work", publicKey: genKey().publicKey, enrollmentJson: expInviteBob.enrollmentJson },
+    { storePath, connectionString: testConnStr }
+  );
+  await enrollV3Device(
+    { githubUser: "alice", githubUserId: 4004, deviceId: "fp-alice", machineId: "ALICE-PC", scope: "work", publicKey: genKey().publicKey, enrollmentJson: secretInviteAlice.enrollmentJson },
+    { storePath, connectionString: testConnStr }
+  );
+
+  // Seed /api/members with OLD-OWNER-LAPTOP, BOB-PC, and DESKTOP-2R3PAUG (so stale /api/members has kicked peers!)
+  for (const reg of [
+    { machineId: "DESKTOP-2R3PAUG", githubUser: "erjadi", scope: "personal" },
+    { machineId: "OLD-OWNER-LAPTOP", githubUser: "erjadi", scope: "work" },
+    { machineId: "BOB-PC", githubUser: "bob", scope: "work" },
+  ]) {
+    saveMemberRegistration(reg, membersPath);
+  }
+
+  // Seed stale local flocks.json on owner (containing BOB-PC + an already-expired guest EXPIRED-GUEST-PC) and on @bob
+  writeConfigFileSecure(
+    {
+      ownerGitHubUser: "erjadi",
+      scope: "work",
+      flocks: {
+        "erjadi/experimental": {
+          flockId: "erjadi/experimental",
+          ownerGitHubUser: "erjadi",
+          flockType: "shared",
+          trustTier: "collaborator",
+          rosterEpoch: 3,
+          rosterFetchedAt: "2026-11-10T00:00:00.000Z",
+          members: [
+            { peerId: "1001:fp-cloud", githubUser: "erjadi", machineId: "CLOUD-DEV-VM", scope: "work", trustTier: "collaborator" },
+            { peerId: "3003:fp-bob", githubUser: "bob", machineId: "BOB-PC", scope: "work", trustTier: "collaborator" },
+            {
+              peerId: "9999:fp-expired",
+              githubUser: "tempguest",
+              machineId: "EXPIRED-GUEST-PC",
+              scope: "work",
+              trustTier: "guest",
+              membershipExpiresAt: new Date(Date.now() - 60000).toISOString(),
+            },
+          ],
+        },
+      },
+    },
+    ownerFlocksPath
+  );
+  writeConfigFileSecure(
+    {
+      ownerGitHubUser: "bob",
+      scope: "work",
+      flocks: {
+        "erjadi/experimental": {
+          flockId: "erjadi/experimental",
+          ownerGitHubUser: "erjadi",
+          flockType: "shared",
+          trustTier: "collaborator",
+          rosterEpoch: 3,
+          members: [
+            { peerId: "1001:fp-cloud", githubUser: "erjadi", machineId: "CLOUD-DEV-VM", scope: "work", trustTier: "collaborator" },
+            { peerId: "3003:fp-bob", githubUser: "bob", machineId: "BOB-PC", scope: "work", trustTier: "collaborator" },
+          ],
+        },
+      },
+    },
+    bobFlocksPath
+  );
+
+  // Kick @bob from erjadi/experimental AND kick OLD-OWNER-LAPTOP from erjadi + erjadi/work
+  await kickV3FlockMember(
+    { callerGitHubUser: "erjadi", callerGitHubUserId: 1001, flockId: "erjadi/experimental", targetUser: "bob" },
+    { storePath, connectionString: testConnStr }
+  );
+  await kickV3FlockMember(
+    { callerGitHubUser: "erjadi", callerGitHubUserId: 1001, flockId: "erjadi", targetMachineId: "OLD-OWNER-LAPTOP" },
+    { storePath, connectionString: testConnStr }
+  );
+  await kickV3FlockMember(
+    { callerGitHubUser: "erjadi", callerGitHubUserId: 1001, flockId: "erjadi/work", targetMachineId: "OLD-OWNER-LAPTOP" },
+    { storePath, connectionString: testConnStr }
+  );
+
+  const ownerCfg = {
+    machineId: "CLOUD-DEV-VM",
+    githubUser: "erjadi",
+    scope: "work",
+    hub: "copilotbridge",
+    endpoint: "https://test-flock.service.signalr.net",
+    bootstrapUrl: "https://your-flock-bootstrap.azurewebsites.net/api/bootstrap",
+    flocksConfigPath: ownerFlocksPath,
+  };
+  const readLegacyMembers = async () => ({
+    attempted: true,
+    ok: true,
+    status: "ok",
+    statusCode: 200,
+    fetchedAt: new Date().toISOString(),
+    error: null,
+    members: Object.values(JSON.parse(fs.readFileSync(membersPath, "utf8"))),
+  });
+
+  // 1. Owner status: BOB-PC, EXPIRED-GUEST-PC, and OLD-OWNER-LAPTOP are NEVER resurrected from stale flocks.json or /api/members
+  const ownerStatus = await executeMcpTool(ownerCfg, "flock_status", {}, {
+    skipSpecsRefresh: true,
+    ensureDaemon: async () => ({ running: true, pid: 1111 }),
+    discoverOnlineMachines: async () => [{ machineId: "CLOUD-DEV-VM", githubUser: "erjadi", scope: "work" }],
+    fetchV3MyFlocks: async () => listV3UserFlocks({ githubUser: "erjadi", githubUserId: 1001 }, { storePath }),
+    fetchLegacyMembers: readLegacyMembers,
+  });
+  const ownerKnownIds = new Set(ownerStatus.knownMembers.map((m) => m.machineId));
+  assert.equal(ownerKnownIds.has("DESKTOP-PSCVM1T"), true);
+  assert.equal(ownerKnownIds.has("BOB-PC"), false, "Kicked collaborator BOB-PC must not be resurrected");
+  assert.equal(ownerKnownIds.has("EXPIRED-GUEST-PC"), false, "Expired guest must not be resurrected");
+  assert.equal(ownerKnownIds.has("OLD-OWNER-LAPTOP"), false, "Kicked owner device must not be resurrected from /api/members");
+
+  // 2. Scoped query (--flock erjadi/experimental or boundFlockId) discloses ZERO metadata from erjadi/personal or erjadi/secret-project
+  const scopedStatus = await executeMcpTool(
+    { ...ownerCfg, boundFlockId: "erjadi/experimental" },
+    "flock_status",
+    {},
+    {
+      skipSpecsRefresh: true,
+      ensureDaemon: async () => ({ running: true, pid: 1111 }),
+      discoverOnlineMachines: async () => [
+        { machineId: "CLOUD-DEV-VM", githubUser: "erjadi", scope: "work" },
+        { machineId: "DESKTOP-2R3PAUG", githubUser: "erjadi", scope: "personal" },
+        { machineId: "ALICE-PC", githubUser: "alice", scope: "work" },
+      ],
+      fetchV3MyFlocks: async () => listV3UserFlocks({ githubUser: "erjadi", githubUserId: 1001 }, { storePath }),
+      fetchLegacyMembers: readLegacyMembers,
+    }
+  );
+  assert.deepEqual(scopedStatus.flocks.map((f) => f.flockId), ["erjadi/experimental"]);
+  assert.deepEqual(
+    scopedStatus.knownMembers.map((m) => m.machineId).sort(),
+    ["CLOUD-DEV-VM", "DESKTOP-PSCVM1T"]
+  );
+  assert.deepEqual(scopedStatus.onlineMachines.map((m) => m.machineId), ["CLOUD-DEV-VM"]);
+  // CLOUD-DEV-VM in scoped erjadi/experimental response must NOT leak its membership in erjadi/secret-project or full private specs
+  const scopedCloud = scopedStatus.knownMembers.find((m) => m.machineId === "CLOUD-DEV-VM");
+  assert.deepEqual(scopedCloud.flocks, ["erjadi/experimental"]);
+  assert.equal(scopedCloud.specs, undefined);
+  await assert.rejects(
+    executeMcpTool(ownerCfg, "flock_status", { flock: "other/unauthorized" }, {
+      skipSpecsRefresh: true,
+      ensureDaemon: async () => ({ running: true, pid: 1111 }),
+      discoverOnlineMachines: async () => [],
+      fetchV3MyFlocks: async () => listV3UserFlocks({ githubUser: "erjadi", githubUserId: 1001 }, { storePath }),
+      fetchLegacyMembers: readLegacyMembers,
+    }),
+    /Not an authorized member/
+  );
+
+  // 3. Collaborator @renepajta: /api/members 403 produces explicit partial refresh without leaking owner's other flocks/machines
+  const reneCfg = {
+    machineId: "DESKTOP-PSCVM1T",
+    githubUser: "renepajta",
+    scope: "work",
+    hub: "copilotbridge",
+    endpoint: "https://test-flock.service.signalr.net",
+    bootstrapUrl: "https://your-flock-bootstrap.azurewebsites.net/api/bootstrap",
+    flocksConfigPath: reneFlocksPath,
+  };
+  const reneStatus = await executeMcpTool(reneCfg, "flock_status", {}, {
+    skipSpecsRefresh: true,
+    ensureDaemon: async () => ({ running: true, pid: 2222 }),
+    discoverOnlineMachines: async () => [
+      { machineId: "DESKTOP-PSCVM1T", githubUser: "renepajta", scope: "work" },
+      { machineId: "DESKTOP-2R3PAUG", githubUser: "erjadi", scope: "personal" }, // unrelated owner PC on shared legacy hub
+    ],
+    fetchV3MyFlocks: async () => listV3UserFlocks({ githubUser: "renepajta", githubUserId: 2002 }, { storePath }),
+    fetchLegacyMembers: async () => ({
+      attempted: true,
+      ok: false,
+      status: "unauthorized",
+      statusCode: 403,
+      fetchedAt: null,
+      error: "Access denied: repository collaborator/write access required",
+      members: [],
+    }),
+  });
+  assert.equal(reneStatus.roster.source, "broker_partial");
+  assert.equal(reneStatus.roster.sources.bootstrapMembers.status, "unauthorized");
+  assert.equal(reneStatus.roster.refresh.status, "partial");
+  assert.equal(reneStatus.roster.refresh.incomplete, true);
+  assert.equal(reneStatus.roster.refresh.failed, false);
+  assert.deepEqual(
+    reneStatus.knownMembers.map((m) => m.machineId).sort(),
+    ["CLOUD-DEV-VM", "DESKTOP-PSCVM1T"]
+  );
+  assert.deepEqual(reneStatus.onlineMachines.map((m) => m.machineId), ["DESKTOP-PSCVM1T"]);
+  assert.equal(JSON.stringify(reneStatus).includes("secret-project"), false);
+  assert.equal(JSON.stringify(reneStatus).includes("ALICE-PC"), false);
+  assert.equal(JSON.stringify(reneStatus).includes("DESKTOP-2R3PAUG"), false);
+
+  // Even if @renepajta somehow received /api/members entries for @erjadi, cross-user /api/members entries are NOT disclosed
+  const reneWithMembers = await executeMcpTool(reneCfg, "list_flocks", {}, {
+    fetchV3MyFlocks: async () => listV3UserFlocks({ githubUser: "renepajta", githubUserId: 2002 }, { storePath }),
+    fetchLegacyMembers: readLegacyMembers,
+  });
+  assert.equal(reneWithMembers.knownMembers.some((m) => m.machineId === "DESKTOP-2R3PAUG"), false);
+
+  // 4. Kicked @bob querying status with stale erjadi/experimental in local flocks.json must NOT resurrect erjadi/experimental
+  const bobStatus = await executeMcpTool(
+    {
+      machineId: "BOB-PC",
+      githubUser: "bob",
+      scope: "work",
+      hub: "copilotbridge",
+      endpoint: "https://test-flock.service.signalr.net",
+      bootstrapUrl: "https://your-flock-bootstrap.azurewebsites.net/api/bootstrap",
+      flocksConfigPath: bobFlocksPath,
+    },
+    "flock_status",
+    {},
+    {
+      skipSpecsRefresh: true,
+      ensureDaemon: async () => ({ running: true, pid: 3333 }),
+      discoverOnlineMachines: async () => [{ machineId: "BOB-PC", githubUser: "bob", scope: "work" }],
+      fetchV3MyFlocks: async () => listV3UserFlocks({ githubUser: "bob", githubUserId: 3003 }, { storePath }),
+      fetchLegacyMembers: async () => ({ attempted: true, ok: false, status: "unauthorized", statusCode: 403, error: "Forbidden", members: [] }),
+    }
+  );
+  assert.equal(bobStatus.flocks.some((f) => f.flockId === "erjadi/experimental"), false);
+  assert.equal(bobStatus.knownMembers.some((m) => m.machineId === "CLOUD-DEV-VM"), false);
+
+  // 5. Epoch rollback rejection + full broker failure fallback to non-expired local cache
+  const rollbackOut = await executeMcpTool(ownerCfg, "list_flocks", { flock: "erjadi/experimental" }, {
+    fetchV3MyFlocks: async () => ({
+      ok: true,
+      githubUser: "erjadi",
+      ownedFlocks: [
+        {
+          flockId: "erjadi/experimental",
+          ownerGitHubUser: "erjadi",
+          flockType: "shared",
+          rosterEpoch: 1, // rolled back below cached epoch in ownerFlocksPath!
+          members: [{ peerId: "3003:fp-bob", githubUser: "bob", machineId: "BOB-PC", scope: "work", trustTier: "collaborator" }],
+        },
+      ],
+      joinedFlocks: [],
+    }),
+    fetchLegacyMembers: readLegacyMembers,
+  });
+  assert.equal(rollbackOut.roster.refresh.incomplete, true);
+  assert.ok(rollbackOut.roster.refresh.warnings.some((w) => /rollback/i.test(w)));
+  assert.equal(rollbackOut.knownMembers.some((m) => m.machineId === "BOB-PC"), false);
+
+  const failedOut = await executeMcpTool(ownerCfg, "flock_status", { flock: "erjadi/experimental" }, {
+    skipSpecsRefresh: true,
+    ensureDaemon: async () => ({ running: true, pid: 1111 }),
+    discoverOnlineMachines: async () => [],
+    fetchV3MyFlocks: async () => ({ ok: false, error: "connect ECONNREFUSED" }),
+    fetchLegacyMembers: async () => ({ attempted: true, ok: false, status: "failed", statusCode: null, error: "connect ECONNREFUSED", members: [] }),
+  });
+  assert.equal(failedOut.roster.source, "local_cache");
+  assert.equal(failedOut.roster.freshness.stale, true);
+  assert.equal(failedOut.roster.refresh.status, "failed");
+  assert.equal(failedOut.roster.refresh.failed, true);
+  assert.equal(failedOut.roster.refresh.incomplete, true);
+  assert.ok(failedOut.roster.refresh.errors.length >= 1);
+  // Offline cached members remain active (missing heartbeats != removal), while expired guest stays excluded
+  assert.deepEqual(
+    failedOut.offlineMembers.map((m) => m.machineId).sort(),
+    ["CLOUD-DEV-VM", "DESKTOP-PSCVM1T"]
+  );
+  assert.ok(failedOut.offlineMembers.every((m) => m.removed === false && m.presence === "offline"));
+});
+
+test("broker-free flock_status and list_flocks surface offline collaborators across post-join enrollments without cross-flock disclosure, resurrection, or legacy fallback", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "flock-status-bf34-"));
+  const prevGhToken = process.env.GH_TOKEN;
+  process.env.GH_TOKEN = "ghp_poison_legacy_token_must_never_be_used";
+  t.after(() => {
+    if (prevGhToken === undefined) delete process.env.GH_TOKEN;
+    else process.env.GH_TOKEN = prevGhToken;
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  const endpoints = azureEndpoints("https://fixture.service.signalr.net", "https://fixture.servicebus.windows.net");
+  const credentials = {
+    connectionString: "Endpoint=https://fixture.service.signalr.net;AccessKey=signalr-fixture",
+    manageConnectionString: "Endpoint=sb://fixture.servicebus.windows.net/;SharedAccessKeyName=RootManageSharedAccessKey;SharedAccessKey=manage-fixture",
+    sendConnectionString: "Endpoint=sb://fixture.servicebus.windows.net/;SharedAccessKeyName=FlockSendRule;SharedAccessKey=send-fixture",
+    listenConnectionString: "Endpoint=sb://fixture.servicebus.windows.net/;SharedAccessKeyName=FlockListenRule;SharedAccessKey=listen-fixture",
+  };
+
+  let nowMs = Date.now();
+  const clock = () => nowMs;
+  const subscribers = new Map();
+  const sockets = new Set();
+  let blockRealtimeDelivery = false;
+
+  const fetchImpl = async (url, options) => {
+    const parsed = new URL(url);
+    assert.ok(
+      parsed.hostname.endsWith(".signalr.net") || parsed.hostname.endsWith(".servicebus.windows.net"),
+      `Unexpected non-Azure request in broker-free mode: ${url}`
+    );
+    const peer = parsed.pathname.match(/\/subscriptions\/(sub-[a-f0-9]{46})/)?.[1];
+    if (options.method === "PUT" && peer && !parsed.pathname.includes("/messages/")) {
+      if (!subscribers.has(peer)) subscribers.set(peer, []);
+      return new Response("", { status: 201 });
+    }
+    if (options.method === "DELETE" && peer && !parsed.pathname.includes("/messages/")) {
+      subscribers.delete(peer);
+      return new Response(null, { status: 204 });
+    }
+    if (parsed.hostname.endsWith(".signalr.net")) {
+      const { target, arguments: args } = JSON.parse(options.body);
+      if (!blockRealtimeDelivery) {
+        for (const socket of sockets) if (!socket.ws.closed) socket.callback(target, structuredClone(args));
+      }
+      return new Response("", { status: 202 });
+    }
+    if (options.method === "POST" && parsed.pathname.endsWith("/messages") && !peer) {
+      for (const queue of subscribers.values()) queue.push(JSON.parse(options.body));
+      return new Response("", { status: 201 });
+    }
+    if (options.method === "POST" && parsed.pathname.endsWith("/messages/head")) {
+      const queue = subscribers.get(peer);
+      if (!queue?.length) return new Response(null, { status: 204 });
+      return new Response(JSON.stringify(queue[0]), {
+        status: 201,
+        headers: { Location: `${endpoints.serviceBusEndpoint}/copilot-bridge-offline/subscriptions/${peer}/messages/lock` },
+      });
+    }
+    if (options.method === "DELETE" && parsed.pathname.endsWith("/messages/lock")) {
+      subscribers.get(peer)?.shift();
+      return new Response(null, { status: 204 });
+    }
+    if (options.method === "PUT" && parsed.pathname.endsWith("/messages/lock")) {
+      return new Response(null, { status: 204 });
+    }
+    throw new Error(`Unexpected transport call: ${options.method} ${parsed.pathname}`);
+  };
+
+  const connect = async (_cfg, { onInvocation }) => {
+    const socket = {
+      ws: { closed: false },
+      callback: onInvocation,
+      close() {
+        this.ws.closed = true;
+        sockets.delete(this);
+      },
+    };
+    sockets.add(socket);
+    return socket;
+  };
+
+  const logs = [];
+  const mkRuntime = (subDir) =>
+    new BrokerFreeRuntime(path.join(root, subDir), {
+      clock,
+      connect,
+      log: (msg) => logs.push(msg),
+      dispatch: async ({ action, assertAuthorized }) => {
+        assertAuthorized();
+        if (action === "ping") return { machineId: subDir.toUpperCase(), scope: "work", version: BRIDGE_VERSION };
+        throw new Error(`Unhandled test action ${action}`);
+      },
+      transportFactory: (config, opts) => new AzureTransport(config, { ...opts, fetchImpl }),
+    });
+
+  const owner = mkRuntime("owner");
+  const peerA = mkRuntime("peer-a");
+  const peerOffline = mkRuntime("peer-offline");
+  const peerGuest = mkRuntime("peer-guest");
+  const peerSecond = mkRuntime("peer-second");
+
+  await owner.initializeOwner({ flockId: "demo/team", machineId: "OWNER-PC", scope: "work", ...credentials });
+  await owner.initializeOwner({ flockId: "demo/second", machineId: "OWNER-PC", scope: "personal", ...credentials });
+  const ownerPinTeam = ownerFingerprint(owner.record("demo/team").ownerPublicKey);
+  const ownerPinSecond = ownerFingerprint(owner.record("demo/second").ownerPublicKey);
+
+  // 1. PEER-A joins demo/team BEFORE DESKTOP-PSCVM1T enrolls
+  const codeA = await peerA.joinRequest({ machineId: "PEER-A", scope: "work", flockId: "demo/team" });
+  const ticketA = await owner.approve({
+    flockId: "demo/team",
+    code: codeA,
+    expectedEd25519Fingerprint: codeA.body.peerId,
+    role: "collaborator",
+    sessionIds: ["priv-session-a"],
+    membershipExpiresAt: nowMs + 7 * 86400000,
+  });
+  await peerA.accept(ticketA, ownerPinTeam);
+
+  // 2. DESKTOP-PSCVM1T joins demo/team AFTER PEER-A (and stays offline — never starts daemon)
+  const codeOff = await peerOffline.joinRequest({ machineId: "DESKTOP-PSCVM1T", scope: "work", flockId: "demo/team" });
+  const ticketOff = await owner.approve({
+    flockId: "demo/team",
+    code: codeOff,
+    expectedEd25519Fingerprint: codeOff.body.peerId,
+    role: "collaborator",
+    sessionIds: ["priv-session-off"],
+    membershipExpiresAt: nowMs + 7 * 86400000,
+  });
+  await peerOffline.accept(ticketOff, ownerPinTeam);
+
+  // Guest joins demo/team, and SECOND-PC joins demo/second
+  const codeGuest = await peerGuest.joinRequest({ machineId: "GUEST-PC", scope: "work", flockId: "demo/team" });
+  const ticketGuest = await owner.approve({
+    flockId: "demo/team",
+    code: codeGuest,
+    expectedEd25519Fingerprint: codeGuest.body.peerId,
+    role: "guest",
+    sessionIds: ["guest-sess"],
+    membershipExpiresAt: nowMs + 7 * 86400000,
+  });
+  await peerGuest.accept(ticketGuest, ownerPinTeam);
+
+  const codeSec = await peerSecond.joinRequest({ machineId: "SECOND-PC", scope: "personal", flockId: "demo/second" });
+  const ticketSec = await owner.approve({
+    flockId: "demo/second",
+    code: codeSec,
+    expectedEd25519Fingerprint: codeSec.body.peerId,
+    role: "collaborator",
+    membershipExpiresAt: nowMs + 7 * 86400000,
+  });
+  await peerSecond.accept(ticketSec, ownerPinSecond);
+
+  let ownerDaemon = await owner.start();
+  t.after(async () => { if (ownerDaemon) await ownerDaemon.close(); });
+
+  const forbidLegacyFallback = {
+    skipSpecsRefresh: true,
+    ensureDaemon: async () => ({ running: true, pid: 7777 }),
+    fetchV3MyFlocks: async () => assert.fail("Legacy /my-flocks must never be called in broker-free mode"),
+    fetchLegacyMembers: async () => assert.fail("Legacy /api/members must never be called in broker-free mode"),
+  };
+
+  // Multi-flock owner without explicit --flock must reject ambiguous flock_status
+  const ownerBfCfg = {
+    protocol: "broker-free-v34",
+    machineId: "OWNER-PC",
+    scope: "work",
+    bootstrapUrl: "https://poison-legacy.invalid/api/bootstrap", // must be ignored in broker-free mode
+  };
+  await assert.rejects(
+    executeMcpTool(ownerBfCfg, "flock_status", {}, {
+      ...forbidLegacyFallback,
+      brokerFreeRuntimeFactory: () => owner,
+      discoverOnlineMachines: async () => [{ machineId: "OWNER-PC", scope: "work" }],
+    }),
+    /ambiguous/
+  );
+
+  // Owner scoped to demo/team sees offline DESKTOP-PSCVM1T without disclosing demo/second or SECOND-PC
+  const ownerTeamStatus = await executeMcpTool(ownerBfCfg, "flock_status", { flock: "demo/team" }, {
+    ...forbidLegacyFallback,
+    brokerFreeRuntimeFactory: () => owner,
+    discoverOnlineMachines: async () => [
+      { machineId: "OWNER-PC", scope: "work" },
+      { machineId: "PEER-A", scope: "work" },
+    ],
+  });
+  assert.equal(ownerTeamStatus.protocol, "broker-free-v34");
+  assert.equal(ownerTeamStatus.roster.source, "broker_free_owner_authority");
+  assert.equal(ownerTeamStatus.roster.refresh.complete, true);
+  assert.deepEqual(ownerTeamStatus.onlineMachines.map((m) => m.machineId).sort(), ["OWNER-PC", "PEER-A"]);
+  assert.deepEqual(ownerTeamStatus.offlineMembers.map((m) => m.machineId).sort(), ["DESKTOP-PSCVM1T", "GUEST-PC"]);
+  assert.equal(JSON.stringify(ownerTeamStatus).includes("demo/second"), false);
+  assert.equal(JSON.stringify(ownerTeamStatus).includes("SECOND-PC"), false);
+
+  // PEER-A (whose local roster predated DESKTOP-PSCVM1T!) syncs owner-signed roster-snapshot over encrypted RPC
+  const peerACfg = {
+    protocol: "broker-free-v34",
+    machineId: "PEER-A",
+    scope: "work",
+    bootstrapUrl: "https://poison-legacy.invalid/api/bootstrap",
+  };
+  const peerAStatus = await executeMcpTool(peerACfg, "flock_status", { flock: "demo/team" }, {
+    ...forbidLegacyFallback,
+    brokerFreeRuntimeFactory: () => peerA,
+    discoverOnlineMachines: async () => [
+      { machineId: "OWNER-PC", scope: "work" },
+      { machineId: "PEER-A", scope: "work" },
+    ],
+  });
+  assert.equal(peerAStatus.roster.source, "broker_free_owner_synced");
+  assert.equal(peerAStatus.roster.refresh.status, "ok");
+  assert.equal(peerAStatus.roster.refresh.complete, true);
+  assert.ok(peerAStatus.offlineMembers.some((m) => m.machineId === "DESKTOP-PSCVM1T" && m.removed === false));
+  // Private sessionIds from other peers' MemberCerts must NEVER be leaked in roster snapshots
+  assert.equal(JSON.stringify(peerAStatus).includes("priv-session-off"), false);
+  assert.equal(JSON.stringify(peerAStatus).includes("guest-sess"), false);
+
+  // Guest role cannot enumerate sibling collaborators via list_roster
+  await assert.rejects(
+    peerGuest.invoke({ flockId: "demo/team", toMachine: "OWNER-PC", action: "list_roster", timeoutMs: 500 }),
+    /forbids/
+  );
+  const guestStatus = await executeMcpTool(
+    { protocol: "broker-free-v34", machineId: "GUEST-PC", scope: "work" },
+    "flock_status",
+    { flock: "demo/team" },
+    {
+      ...forbidLegacyFallback,
+      brokerFreeRuntimeFactory: () => peerGuest,
+      discoverOnlineMachines: async () => [{ machineId: "GUEST-PC", scope: "work" }],
+    }
+  );
+  assert.equal(guestStatus.roster.refresh.status, "local_only");
+  assert.deepEqual(guestStatus.knownMembers.map((m) => m.machineId).sort(), ["GUEST-PC", "OWNER-PC"]);
+
+  // Simulate owner temporarily unreachable BEFORE rotation: PEER-A uses its verified epoch-1 cached snapshot with explicit incomplete/failed refresh
+  blockRealtimeDelivery = true;
+  const peerACachedWhileOwnerUnreachable = await executeMcpTool(peerACfg, "flock_status", { flock: "demo/team" }, {
+    ...forbidLegacyFallback,
+    rosterTimeoutMs: 200,
+    brokerFreeRuntimeFactory: () => peerA,
+    discoverOnlineMachines: async () => [{ machineId: "PEER-A", scope: "work" }],
+  });
+  assert.equal(peerACachedWhileOwnerUnreachable.roster.source, "broker_free_cached_snapshot");
+  assert.equal(peerACachedWhileOwnerUnreachable.roster.freshness.stale, true);
+  assert.equal(peerACachedWhileOwnerUnreachable.roster.refresh.incomplete, true);
+  assert.equal(peerACachedWhileOwnerUnreachable.roster.refresh.failed, true);
+  assert.ok(peerACachedWhileOwnerUnreachable.offlineMembers.some((m) => m.machineId === "DESKTOP-PSCVM1T" && m.removed === false));
+
+  // Owner removes DESKTOP-PSCVM1T -> epoch advances to 2; neither owner nor PEER-A may resurrect DESKTOP-PSCVM1T!
+  await owner.removePeer({ flockId: "demo/team", peerId: codeOff.body.peerId });
+  // Deliver rotation to PEER-A from its queue while realtime owner RPC remains unreachable, testing offline epoch-2 anti-resurrection!
+  await peerA.transport(peerA.record("demo/team")).drain(
+    peerA.record("demo/team").transport,
+    (msg) => peerA.consume(peerA.record("demo/team"), msg)
+  );
+  assert.equal(peerA.record("demo/team").epoch, 2);
+
+  const peerAOfflineAfterRotation = await executeMcpTool(peerACfg, "flock_status", { flock: "demo/team" }, {
+    ...forbidLegacyFallback,
+    rosterTimeoutMs: 200,
+    brokerFreeRuntimeFactory: () => peerA,
+    discoverOnlineMachines: async () => [{ machineId: "PEER-A", scope: "work" }],
+  });
+  assert.equal(peerAOfflineAfterRotation.roster.source, "broker_free_local_certs");
+  assert.equal(peerAOfflineAfterRotation.roster.refresh.incomplete, true);
+  assert.equal(
+    peerAOfflineAfterRotation.knownMembers.some((m) => m.machineId === "DESKTOP-PSCVM1T"),
+    false,
+    "Epoch-1 cached snapshot must not resurrect removed peer after epoch-2 rotation"
+  );
+
+  // Restore realtime connectivity and verify PEER-A syncs epoch-2 snapshot cleanly without DESKTOP-PSCVM1T
+  blockRealtimeDelivery = false;
+  const peerASyncedEpoch2 = await executeMcpTool(peerACfg, "list_flocks", { flock: "demo/team" }, {
+    ...forbidLegacyFallback,
+    brokerFreeRuntimeFactory: () => peerA,
+  });
+  assert.equal(peerASyncedEpoch2.roster.source, "broker_free_owner_synced");
+  assert.equal(peerASyncedEpoch2.roster.freshness.rosterEpoch, 2);
+  assert.equal(peerASyncedEpoch2.knownMembers.some((m) => m.machineId === "DESKTOP-PSCVM1T"), false);
+  assert.equal(peerASyncedEpoch2.knownMembers.some((m) => m.machineId === "PEER-A"), true);
+
+  // Advance clock monotonically +30 hours: retained PEER-A's 24h short cert expired while asleep, 7-day membership still active -> offline, NOT removed!
+  await ownerDaemon.close();
+  ownerDaemon = null;
+  nowMs += 30 * 3600 * 1000;
+  await owner.renewOwn("demo/team");
+  const ownerAfter30h = await executeMcpTool(ownerBfCfg, "flock_status", { flock: "demo/team" }, {
+    ...forbidLegacyFallback,
+    brokerFreeRuntimeFactory: () => owner,
+    discoverOnlineMachines: async () => [{ machineId: "OWNER-PC", scope: "work" }],
+  });
+  const asleepCollab = ownerAfter30h.offlineMembers.find((m) => m.machineId === "PEER-A");
+  assert.ok(asleepCollab, "Asleep collaborator with active 7-day membership must remain in offlineMembers after 24h short-cert window");
+  assert.equal(asleepCollab.credentialExpired, true);
+  assert.equal(asleepCollab.membershipStatus, "active_credential_expired");
+  assert.equal(asleepCollab.removed, false);
+  assert.equal(ownerAfter30h.knownMembers.some((m) => m.machineId === "DESKTOP-PSCVM1T"), false);
 });

@@ -6,7 +6,7 @@ import { AzureTransport, azureEndpoints, parseAzureConnection, validateTransport
 import { createDeviceIdentity, createOwnerState, createJoinCode, approveJoin, acceptWelcome,
   ownerFingerprint, canonical, encryptEnvelope, decryptEnvelope, DurableReceiver,
   createRotation, applyRotation, signedControl, verifyControl, renewOwnerCert, validateCert,
-  verifyJoinCode, peerSubscription } from "./flock-protocol.mjs";
+  verifyRosterMemberCert, verifyJoinCode, peerSubscription } from "./flock-protocol.mjs";
 
 const hash = (value) => crypto.createHash("sha256").update(typeof value === "string" ? value : canonical(value)).digest("hex");
 let processIdentity;
@@ -124,7 +124,8 @@ export class BrokerFreeRuntime {
       const state = createOwnerState({ identity, flockId, machineId, scope, now: this.clock() });
       const record = { ...state, identity, endpoints: azureEndpoints(signalr.endpoint, manage.endpoint),
         ownerSecrets: { signalrKey: signalr.key, manageKey: manage.key, manageRule: manage.rule,
-          sendKey: send.key, listenKey: listen.key }, members: {}, transitions: {}, departed: false };
+          sendKey: send.key, listenKey: listen.key }, members: {}, transitions: {}, departed: false,
+        rosterSeq: 1, rosterUpdatedAt: this.clock() };
       data.flocks[flockId] = record;
       record.transport = this.transport(record).credentials(record.cert, record.ownerPublicKey);
       record.members[record.localPeerId] = { cert: record.cert, membershipExpiresAt: null };
@@ -199,6 +200,8 @@ export class BrokerFreeRuntime {
           return this.transport(record).issue(cert, record.ownerPublicKey);
         }, now: this.clock() });
       record.members[join.peerId] = { cert: issuedCert, membershipExpiresAt };
+      record.rosterSeq = (Number.isSafeInteger(record.rosterSeq) ? record.rosterSeq : 1) + 1;
+      record.rosterUpdatedAt = this.clock();
       delete record.pendingApprovals[join.peerId];
       data.flocks[flockId] = record;
       this.save(data);
@@ -273,6 +276,8 @@ export class BrokerFreeRuntime {
         const rotation = createRotation(record, record.identity, retained, this.clock());
         record.transitions[operationId] = { peerId, rotation, confirmed: false };
         record.members[peerId].removed = true;
+        record.rosterSeq = (Number.isSafeInteger(record.rosterSeq) ? record.rosterSeq : 1) + 1;
+        record.rosterUpdatedAt = this.clock();
         // Advance the receiving owner's floor before any remote await.
         record.minAcceptedEpoch = rotation.body.epoch;
         data.flocks[flockId] = record;
@@ -377,6 +382,10 @@ export class BrokerFreeRuntime {
             if (join.peerId !== member.peerId) throw new Error("Renewal cannot change device identity");
             result = await this.approve({ flockId: fresh.flockId, code: payload.params.code, renew: true,
               expectedEd25519Fingerprint: member.peerId });
+          } else if (header.action === "list_roster") {
+            if (fresh.localPeerId !== fresh.rotationOwnerPeerId) throw new Error("Roster snapshot requires designated owner");
+            if (member.role !== "owner" && member.role !== "collaborator") throw new Error("Member role/session scope forbids this action");
+            result = this.buildRosterSnapshot(fresh, this.clock());
           } else {
             if (!this.dispatch) throw new Error("Local broker-free RPC dispatcher unavailable");
             result = await this.dispatch({ member, payload, action: header.action, assertAuthorized, flockId: fresh.flockId });
@@ -563,5 +572,364 @@ export class BrokerFreeRuntime {
       } catch (error) { results.push({ flockId: record.flockId, confirmed: false, error: error.message }); }
     }
     return results;
+  }
+  buildRosterSnapshot(record, now = this.clock()) {
+    const latest = this.assertOwner(record);
+    const members = [];
+    for (const [peerId, entry] of Object.entries(latest.members || {})) {
+      if (!entry || entry.removed) continue;
+      if (entry.membershipExpiresAt !== null && entry.membershipExpiresAt !== undefined &&
+          entry.membershipExpiresAt <= now) continue;
+      const verified = verifyRosterMemberCert(entry.cert, latest.ownerPublicKey, latest.flockId, now);
+      if (verified.peerId !== peerId) continue;
+      members.push({
+        peerId: verified.peerId,
+        machineId: verified.machineId,
+        role: verified.role,
+        scope: verified.scope,
+        issuedAt: verified.issuedAt,
+        certExpiresAt: verified.expiresAt,
+        membershipExpiresAt: Number.isSafeInteger(entry.membershipExpiresAt) ? entry.membershipExpiresAt : null,
+      });
+    }
+    members.sort((a, b) => (a.peerId < b.peerId ? -1 : a.peerId > b.peerId ? 1 : 0));
+    return signedControl("roster-snapshot", {
+      flockId: latest.flockId,
+      epoch: latest.epoch,
+      rosterSeq: Number.isSafeInteger(latest.rosterSeq) ? latest.rosterSeq : 1,
+      rotationHash: latest.rotationHash || null,
+      issuedAt: now,
+      members,
+    }, latest.identity);
+  }
+  localVerifiedCertMembers(record, now = this.clock()) {
+    const out = new Map();
+    const ownerCert = record.members?.[record.rotationOwnerPeerId]?.cert;
+    if (ownerCert) {
+      const owner = verifyRosterMemberCert(ownerCert, record.ownerPublicKey, record.flockId, now);
+      out.set(owner.peerId, {
+        peerId: owner.peerId,
+        machineId: owner.machineId,
+        role: owner.role,
+        scope: owner.scope,
+        issuedAt: owner.issuedAt,
+        certExpiresAt: owner.expiresAt,
+        credentialExpired: owner.credentialExpired,
+        membershipExpiresAt: null,
+      });
+    }
+    const selfExp = record.metadata?.membershipExpiresAt ?? null;
+    if (selfExp === null || selfExp > now) {
+      const self = verifyRosterMemberCert(record.cert, record.ownerPublicKey, record.flockId, now);
+      out.set(self.peerId, {
+        peerId: self.peerId,
+        machineId: self.machineId,
+        role: self.role,
+        scope: self.scope,
+        issuedAt: self.issuedAt,
+        certExpiresAt: self.expiresAt,
+        credentialExpired: self.credentialExpired,
+        membershipExpiresAt: Number.isSafeInteger(selfExp) ? selfExp : null,
+      });
+    }
+    return [...out.values()];
+  }
+  async inspectRoster(flockId, { refresh = true, timeoutMs = 2000 } = {}) {
+    let record = this.select(flockId);
+    const now = this.clock();
+    const evaluatedAt = new Date(now).toISOString();
+    if (record.localPeerId === record.rotationOwnerPeerId) {
+      const latest = this.assertOwner(record);
+      const members = [];
+      for (const [peerId, entry] of Object.entries(latest.members || {})) {
+        if (!entry || entry.removed) continue;
+        if (entry.membershipExpiresAt !== null && entry.membershipExpiresAt !== undefined &&
+            entry.membershipExpiresAt <= now) continue;
+        const verified = verifyRosterMemberCert(entry.cert, latest.ownerPublicKey, latest.flockId, now);
+        if (verified.peerId !== peerId) continue;
+        members.push({
+          peerId: verified.peerId,
+          machineId: verified.machineId,
+          role: verified.role,
+          scope: verified.scope,
+          issuedAt: verified.issuedAt,
+          certExpiresAt: verified.expiresAt,
+          credentialExpired: verified.credentialExpired,
+          membershipExpiresAt: Number.isSafeInteger(entry.membershipExpiresAt) ? entry.membershipExpiresAt : null,
+        });
+      }
+      members.sort((a, b) => (a.peerId < b.peerId ? -1 : a.peerId > b.peerId ? 1 : 0));
+      const warnings = [];
+      const pendingTransitionCount = Object.values(latest.transitions || {}).filter((t) => !t.confirmed).length;
+      const pendingApprovalCount = Object.keys(latest.pendingApprovals || {}).length;
+      if (pendingTransitionCount > 0) warnings.push(`${pendingTransitionCount} removal transition(s) pending completion`);
+      if (pendingApprovalCount > 0) warnings.push(`${pendingApprovalCount} join approval(s) interrupted before completion`);
+      const incomplete = pendingTransitionCount > 0 || pendingApprovalCount > 0;
+      const fetchedMs = latest.rosterUpdatedAt || latest.cert.body.issuedAt || now;
+      return {
+        flockId: latest.flockId,
+        localPeerId: latest.localPeerId,
+        role: latest.cert.body.role,
+        ownerFingerprint: ownerFingerprint(latest.ownerPublicKey),
+        source: "broker_free_owner_authority",
+        sources: {
+          ownerAuthority: {
+            attempted: true,
+            ok: true,
+            status: incomplete ? "incomplete" : "ok",
+            fetchedAt: new Date(fetchedMs).toISOString(),
+            error: null,
+          },
+        },
+        freshness: {
+          fetchedAt: new Date(fetchedMs).toISOString(),
+          evaluatedAt,
+          stale: false,
+          rosterEpoch: latest.epoch,
+          rosterSeq: Number.isSafeInteger(latest.rosterSeq) ? latest.rosterSeq : 1,
+        },
+        refresh: {
+          status: incomplete ? "incomplete" : "ok",
+          complete: !incomplete,
+          incomplete,
+          failed: false,
+          errors: [],
+          warnings,
+        },
+        members,
+      };
+    }
+
+    const selfExp = record.metadata?.membershipExpiresAt ?? null;
+    if (selfExp !== null && selfExp <= now) {
+      throw new Error(`Membership in flock "${record.flockId}" has expired`);
+    }
+    const localRole = verifyRosterMemberCert(record.cert, record.ownerPublicKey, record.flockId, now).role;
+    if (localRole === "guest") {
+      const members = this.localVerifiedCertMembers(record, now);
+      return {
+        flockId: record.flockId,
+        localPeerId: record.localPeerId,
+        role: localRole,
+        ownerFingerprint: ownerFingerprint(record.ownerPublicKey),
+        source: "broker_free_local_certs",
+        sources: {
+          localBrokerFreeState: {
+            attempted: true,
+            ok: true,
+            status: "local_only",
+            fetchedAt: new Date(record.cert.body.issuedAt).toISOString(),
+            error: null,
+          },
+        },
+        freshness: {
+          fetchedAt: new Date(record.cert.body.issuedAt).toISOString(),
+          evaluatedAt,
+          stale: false,
+          rosterEpoch: record.epoch,
+          rosterSeq: null,
+        },
+        refresh: {
+          status: "local_only",
+          complete: true,
+          incomplete: false,
+          failed: false,
+          errors: [],
+          warnings: ["Guest membership is scoped to owner route only; sibling roster enumeration is forbidden"],
+        },
+        members,
+      };
+    }
+
+    const errors = [];
+    const warnings = [];
+    let rpcAttempted = false;
+    if (refresh !== false && this.connect) {
+      rpcAttempted = true;
+      const ownerMachine = record.members?.[record.rotationOwnerPeerId]?.cert?.body?.machineId;
+      try {
+        if (!ownerMachine) throw new Error("Pinned rotation owner route unavailable");
+        const response = await this.invoke({
+          flockId: record.flockId,
+          toMachine: ownerMachine,
+          action: "list_roster",
+          timeoutMs,
+        });
+        const latest = this.record(record.flockId);
+        const snapshotBody = verifyControl(response.result, latest.ownerPublicKey, "roster-snapshot");
+        if (snapshotBody.flockId !== latest.flockId ||
+            !Number.isSafeInteger(snapshotBody.epoch) ||
+            snapshotBody.epoch < latest.epoch ||
+            !Array.isArray(snapshotBody.members)) {
+          throw new Error("Owner roster snapshot failed flock/epoch verification");
+        }
+        if (latest.rosterSnapshot) {
+          const prevBody = verifyControl(latest.rosterSnapshot, latest.ownerPublicKey, "roster-snapshot");
+          if (snapshotBody.epoch < prevBody.epoch ||
+              (snapshotBody.epoch === prevBody.epoch &&
+                (snapshotBody.rosterSeq || 0) < (prevBody.rosterSeq || 0))) {
+            throw new Error("Owner roster snapshot rollback rejected");
+          }
+        }
+        await this.mutate(async (data) => {
+          if (data.flocks[latest.flockId] && !data.flocks[latest.flockId].departed) {
+            data.flocks[latest.flockId].rosterSnapshot = response.result;
+            data.flocks[latest.flockId].rosterFetchedAt = now;
+            this.save(data);
+          }
+        });
+        record = this.record(record.flockId);
+        const members = snapshotBody.members
+          .filter((m) => m.membershipExpiresAt === null || m.membershipExpiresAt > now)
+          .map((m) => ({
+            ...m,
+            credentialExpired: m.certExpiresAt <= now,
+          }));
+        const fetchedIso = new Date(now).toISOString();
+        return {
+          flockId: record.flockId,
+          localPeerId: record.localPeerId,
+          role: localRole,
+          ownerFingerprint: ownerFingerprint(record.ownerPublicKey),
+          source: "broker_free_owner_synced",
+          sources: {
+            ownerRosterRpc: {
+              attempted: true,
+              ok: true,
+              status: "ok",
+              fetchedAt: fetchedIso,
+              error: null,
+            },
+          },
+          freshness: {
+            fetchedAt: fetchedIso,
+            evaluatedAt,
+            stale: false,
+            rosterEpoch: snapshotBody.epoch,
+            rosterSeq: snapshotBody.rosterSeq,
+          },
+          refresh: {
+            status: "ok",
+            complete: true,
+            incomplete: false,
+            failed: false,
+            errors: [],
+            warnings: [],
+          },
+          members,
+        };
+      } catch (err) {
+        errors.push(err.message);
+        record = this.record(record.flockId);
+      }
+    } else if (refresh !== false && !this.connect) {
+      warnings.push("Broker-free WebSocket adapter unavailable; live owner roster sync skipped");
+    }
+
+    if (record.rosterSnapshot) {
+      try {
+        const snapshotBody = verifyControl(record.rosterSnapshot, record.ownerPublicKey, "roster-snapshot");
+        if (snapshotBody.flockId !== record.flockId) {
+          throw new Error("Cached roster snapshot flock mismatch");
+        }
+        if (snapshotBody.epoch < record.epoch) {
+          warnings.push(`Cached roster snapshot at epoch ${snapshotBody.epoch} predates current epoch ${record.epoch}; stale members withheld`);
+        } else {
+          const members = snapshotBody.members
+            .filter((m) => m.membershipExpiresAt === null || m.membershipExpiresAt > now)
+            .map((m) => ({
+              ...m,
+              credentialExpired: m.certExpiresAt <= now,
+            }));
+          const fetchedMs = record.rosterFetchedAt || snapshotBody.issuedAt;
+          return {
+            flockId: record.flockId,
+            localPeerId: record.localPeerId,
+            role: localRole,
+            ownerFingerprint: ownerFingerprint(record.ownerPublicKey),
+            source: "broker_free_cached_snapshot",
+            sources: {
+              ...(rpcAttempted ? {
+                ownerRosterRpc: {
+                  attempted: true,
+                  ok: false,
+                  status: "failed",
+                  fetchedAt: null,
+                  error: errors[0] || "Owner roster sync failed",
+                },
+              } : {}),
+              localBrokerFreeState: {
+                attempted: true,
+                ok: true,
+                status: "cached",
+                fetchedAt: fetchedMs ? new Date(fetchedMs).toISOString() : null,
+                error: null,
+              },
+            },
+            freshness: {
+              fetchedAt: fetchedMs ? new Date(fetchedMs).toISOString() : null,
+              evaluatedAt,
+              stale: true,
+              rosterEpoch: record.epoch,
+              rosterSeq: snapshotBody.rosterSeq,
+            },
+            refresh: {
+              status: errors.length ? "failed" : "incomplete",
+              complete: false,
+              incomplete: true,
+              failed: errors.length > 0,
+              errors,
+              warnings,
+            },
+            members,
+          };
+        }
+      } catch (snapErr) {
+        warnings.push(`Cached roster snapshot invalid: ${snapErr.message}`);
+      }
+    }
+
+    const members = this.localVerifiedCertMembers(record, now);
+    return {
+      flockId: record.flockId,
+      localPeerId: record.localPeerId,
+      role: localRole,
+      ownerFingerprint: ownerFingerprint(record.ownerPublicKey),
+      source: "broker_free_local_certs",
+      sources: {
+        ...(rpcAttempted ? {
+          ownerRosterRpc: {
+            attempted: true,
+            ok: false,
+            status: "failed",
+            fetchedAt: null,
+            error: errors[0] || "Owner roster sync failed",
+          },
+        } : {}),
+        localBrokerFreeState: {
+          attempted: true,
+          ok: true,
+          status: "local_certs_only",
+          fetchedAt: null,
+          error: null,
+        },
+      },
+      freshness: {
+        fetchedAt: null,
+        evaluatedAt,
+        stale: true,
+        rosterEpoch: record.epoch,
+        rosterSeq: null,
+      },
+      refresh: {
+        status: errors.length ? "failed" : "incomplete",
+        complete: false,
+        incomplete: true,
+        failed: errors.length > 0,
+        errors,
+        warnings,
+      },
+      members,
+    };
   }
 }

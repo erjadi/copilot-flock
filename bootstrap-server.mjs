@@ -365,20 +365,20 @@ export async function ackOfflineStoreItems({
   });
 }
 
-function loadMembersRegistry() {
+function loadMembersRegistry(customPath = MEMBERS_PATH) {
   try {
-    if (fs.existsSync(MEMBERS_PATH)) {
-      return JSON.parse(fs.readFileSync(MEMBERS_PATH, "utf8")) || {};
+    if (fs.existsSync(customPath)) {
+      return JSON.parse(fs.readFileSync(customPath, "utf8")) || {};
     }
   } catch {}
   return {};
 }
 
-function saveMemberRegistration(entry) {
-  if (!entry || !entry.machineId) return loadMembersRegistry();
+export function saveMemberRegistration(entry, customPath = MEMBERS_PATH) {
+  if (!entry || !entry.machineId) return loadMembersRegistry(customPath);
   try {
-    fs.mkdirSync(DATA_DIR, { recursive: true });
-    const registry = loadMembersRegistry();
+    fs.mkdirSync(path.dirname(customPath), { recursive: true });
+    const registry = loadMembersRegistry(customPath);
     const key = String(entry.machineId).trim();
     const prev = registry[key] || {};
     const now = new Date().toISOString();
@@ -397,10 +397,10 @@ function saveMemberRegistration(entry) {
       registeredAt: prev.registeredAt || now,
       lastSeenAt: now,
     };
-    fs.writeFileSync(MEMBERS_PATH, JSON.stringify(registry, null, 2), "utf8");
+    fs.writeFileSync(customPath, JSON.stringify(registry, null, 2), "utf8");
     return registry;
   } catch {
-    return loadMembersRegistry();
+    return loadMembersRegistry(customPath);
   }
 }
 
@@ -1032,6 +1032,9 @@ export async function enrollV3Device(
           ? new Date(item.membershipExpiresAtMs).toISOString()
           : null,
       };
+      if (f.removedMachines) {
+        delete f.removedMachines[`${cleanUser}:${cleanMachine.toLowerCase()}`];
+      }
       if (!prevMember || prevMember.publicKey !== publicKey) {
         f.rosterEpoch = (Number(f.rosterEpoch) || 1) + 1;
       }
@@ -1436,6 +1439,15 @@ export async function kickV3FlockMember(
         targetDeviceId, targetMachineId: cleanTargetMachine })) {
         kickedPeers.push(m);
         delete f.members[peerKey];
+        f.removedMachines ||= {};
+        if (m.machineId) {
+          f.removedMachines[`${String(m.githubUser || "").toLowerCase()}:${String(m.machineId).toLowerCase()}`] = {
+            githubUser: m.githubUser,
+            machineId: m.machineId,
+            peerId: m.peerId,
+            removedAt: new Date().toISOString(),
+          };
+        }
         if (!isSelfLeave) {
           if (cleanTargetUser && !cleanTargetMachine && !targetDeviceId) {
             f.revokedPrincipals[m.githubUser] = new Date().toISOString();
@@ -1545,6 +1557,15 @@ export async function leaveV3Device(request, {
     if (!old) {
       delete flock.members[entries[0][0]];
       flock.rosterEpoch = (Number(flock.rosterEpoch) || 1) + 1;
+      flock.removedMachines ||= {};
+      if (member.machineId) {
+        flock.removedMachines[`${String(member.githubUser || "").toLowerCase()}:${String(member.machineId).toLowerCase()}`] = {
+          githubUser: member.githubUser,
+          machineId: member.machineId,
+          peerId: member.peerId,
+          removedAt: new Date().toISOString(),
+        };
+      }
       flock.leaveReceipts[request.requestId] = { member, confirmed: false };
       saveV3FlockStore(store, storePath);
     }
@@ -1598,8 +1619,15 @@ export async function listV3UserFlocks(
   for (const f of Object.values(store.flocks || {})) {
     if (f.expiresAtMs && f.expiresAtMs <= now) continue;
     const activeMembers = Object.values(f.members || {}).filter(
-      (m) => !m.membershipExpiresAtMs || m.membershipExpiresAtMs > now
+      (m) =>
+        (!m.membershipExpiresAtMs || m.membershipExpiresAtMs > now) &&
+        !f.revokedPrincipals?.[m.peerId] &&
+        !f.revokedPrincipals?.[m.githubUser] &&
+        !(m.githubUserId && f.revokedPrincipals?.[String(m.githubUserId)])
     );
+    const isOwner =
+      f.ownerGitHubUser === cleanUser ||
+      Boolean(githubUserId && f.ownerGitHubUserId && Number(f.ownerGitHubUserId) === Number(githubUserId));
     const summary = {
       flockId: f.flockId,
       flockUuid: f.flockUuid,
@@ -1618,19 +1646,23 @@ export async function listV3UserFlocks(
         trustTier: m.trustTier,
         publicKey: m.publicKey,
         keyFingerprint: m.keyFingerprint,
+        joinedAt: m.joinedAt || null,
+        lastSeenAt: m.lastSeenAt || null,
         membershipExpiresAt: m.membershipExpiresAt || null,
       })),
     };
-    if (
-      f.ownerGitHubUser === cleanUser ||
-      (githubUserId && f.ownerGitHubUserId && Number(f.ownerGitHubUserId) === Number(githubUserId))
-    ) {
-      ownedFlocks.push(summary);
+    if (isOwner) {
+      ownedFlocks.push({
+        ...summary,
+        removedMachines: Object.values(f.removedMachines || {}),
+      });
     }
     if (
       activeMembers.some(
         (m) =>
-          m.githubUser === cleanUser && (!cleanDevice || m.deviceId === cleanDevice)
+          (m.githubUser === cleanUser ||
+            (githubUserId && m.githubUserId && Number(m.githubUserId) === Number(githubUserId))) &&
+          (!cleanDevice || m.deviceId === cleanDevice)
       )
     ) {
       joinedFlocks.push(summary);
@@ -1639,6 +1671,7 @@ export async function listV3UserFlocks(
 
   return {
     ok: true,
+    fetchedAt: new Date(now).toISOString(),
     githubUser: cleanUser,
     ownedFlocks,
     joinedFlocks,
@@ -1667,14 +1700,15 @@ export function createBootstrapServer({
   apiGet = githubApiGet,
   v3StorePath = V3_FLOCKS_PATH,
   v3PreviewStorePath = V3_PREVIEW_FLOCKS_PATH,
+  membersPath = MEMBERS_PATH,
 } = {}) {
   return http.createServer(async (req, res) => {
   const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
 
   if (url.pathname === "/" || url.pathname === "/healthz" || url.pathname === "/health") {
-    const registry = loadMembersRegistry();
+    const registry = loadMembersRegistry(membersPath);
     const qStore = loadOfflineQueueStore();
-    const v3Store = loadV3FlockStore();
+    const v3Store = loadV3FlockStore(v3StorePath);
     sendJson(res, 200, {
       ok: true,
       service: "copilot-flock-bootstrap",
@@ -1718,7 +1752,7 @@ export function createBootstrapServer({
     if ((subPath === "/flocks/leave" || subPath === "/flocks/leave-plan") && req.method === "POST") {
       try {
         const out = subPath === "/flocks/leave-plan" ? planV3DeviceLeave(bodyData, { storePath })
-          : await leaveV3Device(bodyData, { storePath, membersPath: MEMBERS_PATH });
+          : await leaveV3Device(bodyData, { storePath, membersPath });
         sendJson(res, out.ok ? 200 : 409, out);
       } catch (error) {
         sendJson(res, 403, { ok: false, confirmed: false, error: error.message });
@@ -1936,7 +1970,7 @@ export function createBootstrapServer({
       url.searchParams.get("githubUser") ||
       null;
 
-    let registry = loadMembersRegistry();
+    let registry = loadMembersRegistry(membersPath);
     if (machineId && (url.pathname === "/api/bootstrap" || url.pathname === "/api/register")) {
       registry = saveMemberRegistration({
         machineId,
@@ -1947,7 +1981,7 @@ export function createBootstrapServer({
         hostname,
         platform,
         specs: bodyData.specs || null,
-      });
+      }, membersPath);
     }
 
     if (url.pathname === "/api/members") {
