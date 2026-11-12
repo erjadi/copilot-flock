@@ -25,13 +25,14 @@ function rejectSameMachineLoopback(toMachine, selfMachineId) {
 let processIdentity;
 export class BrokerFreeRuntime {
   constructor(root, { transportFactory = (endpoints, options) => new AzureTransport(endpoints, options),
-    clock = Date.now, connect, dispatch, log = (message) => process.stderr.write(`${message}\n`) } = {}) {
+    clock = Date.now, connect, dispatch, onTimeSkip = null, log = (message) => process.stderr.write(`${message}\n`) } = {}) {
     this.root = assertNoLinks(root);
     this.filename = path.join(root, "broker-free.json");
     this.transportFactory = transportFactory;
     this.clock = clock;
     this.connect = connect;
     this.dispatch = dispatch;
+    this.onTimeSkip = onTimeSkip;
     this.log = log;
     this.registry = new FlockMembershipRegistry(this.root, { clock: this.clock });
     this.serial = Promise.resolve();
@@ -1099,10 +1100,17 @@ export class BrokerFreeRuntime {
       let client = await open();
       clients.push(() => client.close());
       let polling = false;
+      let lastPollAt = this.clock();
       const poll = async () => {
         if (polling || stopped) return;
         polling = true;
         try {
+        const now = this.clock();
+        const elapsed = Math.max(0, now - lastPollAt);
+        lastPollAt = now;
+        if (elapsed > 25000 && typeof this.onTimeSkip === "function") {
+          await this.onTimeSkip({ elapsedMs: elapsed, flockId: record.flockId });
+        }
         let current = this.record(record.flockId);
         if (current.transport.expiresAt < this.clock() + 300000) {
           await this.renewMembership(current.flockId);

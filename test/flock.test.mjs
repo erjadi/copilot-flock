@@ -27,6 +27,11 @@ import {
   getLocalSessionTranscriptAsync,
   createIncrementalEventReader,
   isMatchingDispatchedUserEvent,
+  getLocalWsConnectionInfo,
+  invalidateLocalWsConnectionCache,
+  probeActiveDesktopWsListener,
+  verifyLocalWsConnectionInfo,
+  createDaemonHeartbeatMonitor,
   injectLocalSessionMessage,
   handleRpcAction,
   computeMessageDedupKey,
@@ -7626,6 +7631,217 @@ test("control-plane bootstrapUrl validation returns actionable redacted errors f
   }
 });
 
+test("TODO #14: ECONNREFUSED on stale ws.port (portA) invalidates cache, re-reads/re-probes portB, and succeeds on immediate retry without dropping to inbox", async () => {
+  const env = setupTempCopilotEnv();
+  const prevCopilotHome = process.env.COPILOT_HOME;
+  const prevDisableOsProbe = process.env.COPILOT_FLOCK_DISABLE_OS_WS_PROBE;
+  process.env.COPILOT_HOME = env.tempRoot;
+  process.env.COPILOT_FLOCK_DISABLE_OS_WS_PROBE = "1";
+  invalidateLocalWsConnectionCache();
+
+  let serverA = null;
+  let serverB = null;
+  let serverC = null;
+  try {
+    const sessionId = "14141414-2222-4333-8444-555555555555";
+    const eventsPath = env.insertSession({ id: sessionId, title: "Post-Wake Self-Healing Target" });
+    fs.writeFileSync(eventsPath, "", "utf8");
+
+    const receivedOnB = [];
+    const receivedOnC = [];
+
+    // 1. Start serverA on portA, cache portA via getLocalWsConnectionInfo(), then shut down serverA
+    serverA = await startMockCopilotWsServer(() => {});
+    const portA = serverA.port;
+    env.writeWsConfig(portA);
+    assert.equal(getLocalWsConnectionInfo()?.port, portA);
+    await serverA.close();
+    serverA = null;
+
+    // Start serverB on portB and write updated ws.port (simulating Copilot Desktop restart before next periodic poll)
+    serverB = await startMockCopilotWsServer((frame) => {
+      if (frame.type === "send_message") {
+        receivedOnB.push(frame);
+        setTimeout(() => {
+          fs.appendFileSync(
+            eventsPath,
+            JSON.stringify({
+              type: "user.message",
+              id: `evt-${frame.request_id}`,
+              data: {
+                content: frame.prompt,
+                displayContent: frame.display_prompt,
+                requestId: frame.request_id,
+                turnId: "turn-heal-b",
+              },
+            }) + "\n",
+            "utf8"
+          );
+        }, 15);
+      }
+    });
+    const portB = serverB.port;
+    assert.notEqual(portB, portA);
+    env.writeWsConfig(portB);
+
+    // Cached ws.port still points to dead portA until ECONNREFUSED triggers immediate invalidation + re-read
+    assert.equal(getLocalWsConnectionInfo()?.port, portA);
+
+    const cfg = {
+      machineId: "LAPTOP-Q3JLH8RQ",
+      scope: "work",
+      githubUser: "erjadi",
+      hub: "copilotbridge",
+      host: "your-signalr.service.signalr.net",
+      endpoint: "https://your-signalr.service.signalr.net",
+      installedScriptPath: path.join(env.tempRoot, "flock", "flock.mjs"),
+    };
+
+    const healRes = await handleRpcAction(cfg, {
+      requestId: "req-wake-heal-1",
+      fromMachine: "DESKTOP-2R3PAUG",
+      action: "send_message",
+      params: {
+        targetSession: sessionId,
+        message: "Immediate post-wake message after port rebind",
+        fromScope: "personal",
+        fromGitHubUser: "erjadi",
+        fromSessionId: "coord-1",
+        fromSessionName: "Coordinator",
+        dispatchTimeoutMs: 1500,
+      },
+    });
+
+    assert.equal(healRes.status, "delivered");
+    assert.equal(healRes.dispatchedToRuntime, true);
+    assert.equal(healRes.deliveryStage, "admitted_to_events_jsonl");
+    assert.equal(healRes.retriedWsPort, true);
+    assert.equal(healRes.previousWsPort, portA);
+    assert.equal(healRes.wsPort, portB);
+    assert.equal(receivedOnB.length, 1);
+    assert.equal(getLocalWsConnectionInfo()?.port, portB);
+
+    const inboxPath = path.join(env.tempRoot, "flock", "inbox.jsonl");
+    const inboxEntriesAfterHeal = fs
+      .readFileSync(inboxPath, "utf8")
+      .trim()
+      .split(/\r?\n/)
+      .filter(Boolean)
+      .map((line) => JSON.parse(line));
+    assert.equal(inboxEntriesAfterHeal.length, 1);
+    assert.equal(inboxEntriesAfterHeal[0].dispatchedToRuntime, true);
+    assert.equal(inboxEntriesAfterHeal[0].deliveryStage, "admitted_to_events_jsonl");
+    assert.notEqual(inboxEntriesAfterHeal[0].deliveryStage, "dropped_to_inbox");
+    assert.equal(inboxEntriesAfterHeal[0].wsPort, portB);
+    assert.equal(inboxEntriesAfterHeal[0].retriedWsPort, true);
+
+    // 2. Active listener re-probe fallback when ws.port file on disk still contains stale portB
+    await serverB.close();
+    serverB = null;
+
+    serverC = await startMockCopilotWsServer((frame) => {
+      if (frame.type === "send_message") {
+        receivedOnC.push(frame);
+        setTimeout(() => {
+          fs.appendFileSync(
+            eventsPath,
+            JSON.stringify({
+              type: "user.message",
+              id: `evt-${frame.request_id}`,
+              data: {
+                content: frame.prompt,
+                displayContent: frame.display_prompt,
+                requestId: frame.request_id,
+                turnId: "turn-heal-c",
+              },
+            }) + "\n",
+            "utf8"
+          );
+        }, 15);
+      }
+    });
+    const portC = serverC.port;
+    assert.notEqual(portC, portB);
+
+    const probed = await probeActiveDesktopWsListener({
+      token: "test-ws-token",
+      excludePort: portB,
+      candidatePorts: [portB, portC],
+    });
+    assert.equal(probed?.port, portC);
+
+    const probeRetryRes = await injectLocalSessionMessage({
+      cfg,
+      targetSession: sessionId,
+      message: "Message healed via active listener probe while ws.port file is still stale",
+      fromMachine: "DESKTOP-2R3PAUG",
+      fromScope: "personal",
+      fromGitHubUser: "erjadi",
+      fromSessionId: "coord-1",
+      fromSessionName: "Coordinator",
+      dispatchTimeoutMs: 1500,
+      wsRetryPollMs: 0,
+      discoverWsFn: async ({ previousPort, previousToken }) => {
+        assert.equal(previousPort, portB);
+        return probeActiveDesktopWsListener({
+          token: previousToken,
+          excludePort: previousPort,
+          candidatePorts: [portB, portC],
+        });
+      },
+    });
+    assert.equal(probeRetryRes.status, "delivered");
+    assert.equal(probeRetryRes.dispatchedToRuntime, true);
+    assert.equal(probeRetryRes.retriedWsPort, true);
+    assert.equal(probeRetryRes.previousWsPort, portB);
+    assert.equal(probeRetryRes.wsPort, portC);
+    assert.equal(receivedOnC.length, 1);
+
+    // 3. When both initial attempt and retry fail (Desktop genuinely closed), fail over to dropped_to_inbox and reject
+    await serverC.close();
+    serverC = null;
+    env.writeWsConfig(portC);
+    invalidateLocalWsConnectionCache();
+
+    await assert.rejects(
+      () =>
+        handleRpcAction(cfg, {
+          requestId: "req-dead-ws-1",
+          fromMachine: "DESKTOP-2R3PAUG",
+          action: "send_message",
+          params: {
+            targetSession: sessionId,
+            message: "Message while Desktop is genuinely offline",
+            fromScope: "personal",
+            fromGitHubUser: "erjadi",
+          },
+        }),
+      /ECONNREFUSED|closed before upgrade|connect/i
+    );
+
+    const inboxEntriesAfterDead = fs
+      .readFileSync(inboxPath, "utf8")
+      .trim()
+      .split(/\r?\n/)
+      .filter(Boolean)
+      .map((line) => JSON.parse(line));
+    const deadEntry = inboxEntriesAfterDead.find((e) => e.id === "req-dead-ws-1");
+    assert.ok(deadEntry, "Failed dispatch after retry should fail over to inbox record");
+    assert.equal(deadEntry.dispatchedToRuntime, false);
+    assert.equal(deadEntry.deliveryStage, "dropped_to_inbox");
+  } finally {
+    if (serverA) await serverA.close();
+    if (serverB) await serverB.close();
+    if (serverC) await serverC.close();
+    invalidateLocalWsConnectionCache();
+    if (prevDisableOsProbe === undefined) delete process.env.COPILOT_FLOCK_DISABLE_OS_WS_PROBE;
+    else process.env.COPILOT_FLOCK_DISABLE_OS_WS_PROBE = prevDisableOsProbe;
+    if (prevCopilotHome === undefined) delete process.env.COPILOT_HOME;
+    else process.env.COPILOT_HOME = prevCopilotHome;
+    env.cleanup();
+  }
+});
+
 test("flock_status exposes independent installedOnDisk, residentDaemon, and callerMcpProcess health with non-destructive drift guidance", async () => {
   const { spawn } = await import("node:child_process");
   const env = setupTempCopilotEnv();
@@ -8329,4 +8545,110 @@ test("thermal telemetry: strict <= 250ms hard timeout budget, freshness cache wi
   assert.equal("thermal" in noneSanitized, false);
   assert.equal("gpus" in noneSanitized, false);
   assert.equal("disks" in noneSanitized, false);
+});
+
+test("TODO #14: wall-clock time-skip detector triggers immediate ws.port re-discovery and presence refresh, and bridge.mjs stays byte-identical to flock.mjs", async () => {
+  const env = setupTempCopilotEnv();
+  const prevCopilotHome = process.env.COPILOT_HOME;
+  const prevDisableOsProbe = process.env.COPILOT_FLOCK_DISABLE_OS_WS_PROBE;
+  process.env.COPILOT_HOME = env.tempRoot;
+  process.env.COPILOT_FLOCK_DISABLE_OS_WS_PROBE = "1";
+  invalidateLocalWsConnectionCache();
+
+  let serverA = null;
+  let serverB = null;
+  try {
+    serverA = await startMockCopilotWsServer(() => {});
+    const portA = serverA.port;
+    env.writeWsConfig(portA);
+    assert.equal(getLocalWsConnectionInfo()?.port, portA);
+
+    const cfg = {
+      machineId: "LAPTOP-Q3JLH8RQ",
+      scope: "work",
+      githubUser: "erjadi",
+      specs: { cpu: "Test CPU", ramGb: 32, gpus: [], disks: [] },
+    };
+
+    let fakeNowMs = 1_760_000_000_000;
+    const timeSkipEvents = [];
+    const publishedHeartbeats = [];
+
+    const monitor = createDaemonHeartbeatMonitor({
+      cfg,
+      intervalMs: 5000,
+      presenceIntervalMs: 45000,
+      timeSkipThresholdMs: 10000,
+      nowFn: () => fakeNowMs,
+      verifyWsPortFn: (opts) => verifyLocalWsConnectionInfo({ ...opts, retryPollMs: 0 }),
+      collectPresenceFn: () => handleRpcAction(cfg, { action: "ping" }),
+      publishPresenceFn: async (presence, meta) => {
+        publishedHeartbeats.push({ presence, meta });
+      },
+      onTimeSkip: (info) => {
+        timeSkipEvents.push(info);
+      },
+    });
+
+    // 1. Normal 5s tick (no time-skip, <45s periodic presence window) -> idle
+    fakeNowMs += 5000;
+    const tick1 = await monitor.tick();
+    assert.equal(tick1.timeSkipDetected, false);
+    assert.equal(tick1.presencePublished, false);
+    assert.equal(publishedHeartbeats.length, 0);
+
+    // 2. Simulate OS sleep/wake: serverA closes, serverB binds portB and writes ws.port, wall clock jumps +120s
+    await serverA.close();
+    serverA = null;
+    serverB = await startMockCopilotWsServer(() => {});
+    const portB = serverB.port;
+    assert.notEqual(portB, portA);
+    env.writeWsConfig(portB);
+
+    // Before the tick runs, cached ws.port is still stale portA
+    assert.equal(getLocalWsConnectionInfo()?.port, portA);
+
+    fakeNowMs += 120_000;
+    const tick2 = await monitor.tick();
+    assert.equal(tick2.timeSkipDetected, true);
+    assert.equal(tick2.reason, "time_skip");
+    assert.equal(tick2.portChanged, true);
+    assert.equal(tick2.wsPort, portB);
+    assert.equal(tick2.presencePublished, true);
+
+    assert.equal(timeSkipEvents.length, 1);
+    assert.equal(timeSkipEvents[0].previousWsPort, portA);
+    assert.equal(timeSkipEvents[0].wsInfo?.port, portB);
+    assert.equal(publishedHeartbeats.length, 1);
+    assert.equal(publishedHeartbeats[0].meta.reason, "time_skip");
+    assert.equal(publishedHeartbeats[0].presence.wsPort, portB);
+    assert.equal(publishedHeartbeats[0].presence.copilotDesktopRunning, true);
+    assert.equal(getLocalWsConnectionInfo()?.port, portB);
+
+    // 3. Simulate another wake where Desktop exited while leaving stale portB in ws.port -> reports dead port accurately
+    await serverB.close();
+    serverB = null;
+    fakeNowMs += 90_000;
+    const tick3 = await monitor.tick();
+    assert.equal(tick3.timeSkipDetected, true);
+    assert.equal(tick3.wsPort, null);
+    assert.equal(publishedHeartbeats.length, 2);
+    assert.equal(publishedHeartbeats[1].presence.wsPort, null);
+    assert.equal(publishedHeartbeats[1].presence.copilotDesktopRunning, false);
+
+    // 4. Verify bridge.mjs and flock.mjs remain byte-identical
+    const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+    const flockBytes = fs.readFileSync(path.join(repoRoot, "flock.mjs"));
+    const bridgeBytes = fs.readFileSync(path.join(repoRoot, "bridge.mjs"));
+    assert.equal(Buffer.compare(flockBytes, bridgeBytes), 0, "bridge.mjs must remain byte-identical to flock.mjs");
+  } finally {
+    if (serverA) await serverA.close();
+    if (serverB) await serverB.close();
+    invalidateLocalWsConnectionCache();
+    if (prevDisableOsProbe === undefined) delete process.env.COPILOT_FLOCK_DISABLE_OS_WS_PROBE;
+    else process.env.COPILOT_FLOCK_DISABLE_OS_WS_PROBE = prevDisableOsProbe;
+    if (prevCopilotHome === undefined) delete process.env.COPILOT_HOME;
+    else process.env.COPILOT_HOME = prevCopilotHome;
+    env.cleanup();
+  }
 });

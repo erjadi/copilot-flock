@@ -5730,8 +5730,15 @@ export async function connectSignalRClient(cfg, { userId, onInvocation, onClose 
 // 5. Local GitHub Copilot Desktop Introspection & WebSocket Injection
 // ---------------------------------------------------------------------------
 
-export function getLocalWsConnectionInfo() {
-  const copilotDir = getCopilotDir();
+const LOCAL_WS_CACHE_TTL_MS = 30000;
+const LOCAL_WS_DEAD_PORT_TTL_MS = 15000;
+let cachedLocalWsInfo = null;
+
+export function invalidateLocalWsConnectionCache() {
+  cachedLocalWsInfo = null;
+}
+
+function readWsConnectionFilesSync(copilotDir = getCopilotDir()) {
   const portFile = path.join(copilotDir, "run", "ws.port");
   const tokenFile = path.join(copilotDir, "run", "ws.token");
   if (!fs.existsSync(portFile) || !fs.existsSync(tokenFile)) {
@@ -5739,8 +5746,430 @@ export function getLocalWsConnectionInfo() {
   }
   const port = Number(fs.readFileSync(portFile, "utf8").trim().split(/\r?\n/)[0]);
   const token = fs.readFileSync(tokenFile, "utf8").trim().split(/\r?\n/)[0];
-  if (!port || !token) return null;
+  if (!Number.isInteger(port) || port <= 0 || port > 65535 || !token) return null;
   return { port, token };
+}
+
+export function getLocalWsConnectionInfo({ forceRefresh = false, allowStaleDiskFallback = false } = {}) {
+  const copilotDir = getCopilotDir();
+  const nowMs = Date.now();
+
+  if (!forceRefresh && cachedLocalWsInfo && cachedLocalWsInfo.copilotDir === copilotDir) {
+    if (
+      cachedLocalWsInfo.deadDiskPort &&
+      nowMs - cachedLocalWsInfo.cachedAtMs < LOCAL_WS_DEAD_PORT_TTL_MS
+    ) {
+      const disk = readWsConnectionFilesSync(copilotDir);
+      if (!disk) {
+        cachedLocalWsInfo = null;
+        return null;
+      }
+      if (disk.port !== cachedLocalWsInfo.deadDiskPort || disk.token !== cachedLocalWsInfo.deadDiskToken) {
+        cachedLocalWsInfo = {
+          copilotDir,
+          port: disk.port,
+          token: disk.token,
+          cachedAtMs: nowMs,
+          probedOverrideForStaleDiskPort: null,
+          deadDiskPort: null,
+          deadDiskToken: null,
+        };
+        return { port: disk.port, token: disk.token };
+      }
+      return allowStaleDiskFallback ? { port: disk.port, token: disk.token } : null;
+    }
+
+    if (
+      cachedLocalWsInfo.port &&
+      cachedLocalWsInfo.token &&
+      nowMs - cachedLocalWsInfo.cachedAtMs < LOCAL_WS_CACHE_TTL_MS
+    ) {
+      const portFile = path.join(copilotDir, "run", "ws.port");
+      const tokenFile = path.join(copilotDir, "run", "ws.token");
+      if (fs.existsSync(portFile) && fs.existsSync(tokenFile)) {
+        return { port: cachedLocalWsInfo.port, token: cachedLocalWsInfo.token };
+      }
+      cachedLocalWsInfo = null;
+      return null;
+    }
+  }
+
+  const disk = readWsConnectionFilesSync(copilotDir);
+  if (!disk) {
+    if (cachedLocalWsInfo?.copilotDir === copilotDir) {
+      cachedLocalWsInfo = null;
+    }
+    return null;
+  }
+
+  if (
+    !allowStaleDiskFallback &&
+    cachedLocalWsInfo &&
+    cachedLocalWsInfo.copilotDir === copilotDir &&
+    cachedLocalWsInfo.deadDiskPort === disk.port &&
+    cachedLocalWsInfo.deadDiskToken === disk.token &&
+    nowMs - cachedLocalWsInfo.cachedAtMs < LOCAL_WS_DEAD_PORT_TTL_MS
+  ) {
+    return null;
+  }
+
+  if (
+    cachedLocalWsInfo &&
+    cachedLocalWsInfo.copilotDir === copilotDir &&
+    cachedLocalWsInfo.port &&
+    cachedLocalWsInfo.probedOverrideForStaleDiskPort === disk.port &&
+    cachedLocalWsInfo.token === disk.token &&
+    nowMs - cachedLocalWsInfo.cachedAtMs < LOCAL_WS_CACHE_TTL_MS
+  ) {
+    cachedLocalWsInfo.cachedAtMs = nowMs;
+    return { port: cachedLocalWsInfo.port, token: cachedLocalWsInfo.token };
+  }
+
+  cachedLocalWsInfo = {
+    copilotDir,
+    port: disk.port,
+    token: disk.token,
+    cachedAtMs: nowMs,
+    probedOverrideForStaleDiskPort: null,
+    deadDiskPort: null,
+    deadDiskToken: null,
+  };
+  return { port: disk.port, token: disk.token };
+}
+
+export function isLocalWsConnectError(err) {
+  if (!err) return false;
+  const code = String(err.code || "").toUpperCase();
+  if (
+    [
+      "ECONNREFUSED",
+      "ECONNRESET",
+      "ETIMEDOUT",
+      "EPIPE",
+      "ECONNABORTED",
+      "EHOSTUNREACH",
+      "ENETUNREACH",
+      "EADDRNOTAVAIL",
+    ].includes(code)
+  ) {
+    return true;
+  }
+  const msg = String(err.message || "");
+  return /ECONNREFUSED|ECONNRESET|ETIMEDOUT|ECONNABORTED|WebSocket connect timeout|closed before upgrade|WebSocket upgrade failed/i.test(
+    msg
+  );
+}
+
+export async function probeLocalWsEndpoint(wsInfo, { timeoutMs = 600 } = {}) {
+  if (!wsInfo?.port || !wsInfo?.token) return false;
+  const wsUrl = `ws://127.0.0.1:${wsInfo.port}/?token=${encodeURIComponent(wsInfo.token)}`;
+  const client = new RawWebSocketClient(wsUrl, { timeoutMs });
+  try {
+    await client.connect();
+    return true;
+  } catch {
+    return false;
+  } finally {
+    try {
+      client.close();
+    } catch {}
+  }
+}
+
+function listCandidateDesktopLoopbackPorts({ excludePort = null } = {}) {
+  if (process.env.COPILOT_FLOCK_DISABLE_OS_WS_PROBE === "1") return [];
+  const ports = new Set();
+  try {
+    if (process.platform === "win32") {
+      const taskOut = execFileSync(
+        "tasklist",
+        ["/FI", "IMAGENAME eq github.exe", "/FO", "CSV", "/NH"],
+        { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 1500, windowsHide: true }
+      );
+      const pids = new Set();
+      for (const line of taskOut.split(/\r?\n/)) {
+        const m = line.match(/^"github\.exe","(\d+)"/i);
+        if (m) pids.add(m[1]);
+      }
+      if (pids.size === 0) return [];
+      const netOut = execFileSync("netstat", ["-ano", "-p", "tcp"], {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"],
+        timeout: 1500,
+        windowsHide: true,
+      });
+      for (const line of netOut.split(/\r?\n/)) {
+        const m = line.trim().match(/^TCP\s+127\.0\.0\.1:(\d+)\s+\S+\s+LISTENING\s+(\d+)$/i);
+        if (m && pids.has(m[2])) {
+          const p = Number(m[1]);
+          if (p > 0 && p <= 65535 && p !== excludePort) ports.add(p);
+        }
+      }
+    } else {
+      const lsofOut = execFileSync("lsof", ["-Pan", "-iTCP", "-sTCP:LISTEN"], {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"],
+        timeout: 1500,
+      });
+      for (const line of lsofOut.split(/\r?\n/)) {
+        if (!/\b(github|copilot)/i.test(line)) continue;
+        const m = line.match(/127\.0\.0\.1:(\d+)\s+\(LISTEN\)/);
+        if (m) {
+          const p = Number(m[1]);
+          if (p > 0 && p <= 65535 && p !== excludePort) ports.add(p);
+        }
+      }
+    }
+  } catch {}
+  return Array.from(ports);
+}
+
+export async function probeActiveDesktopWsListener({
+  token,
+  excludePort = null,
+  candidatePorts = null,
+  timeoutMs = 500,
+} = {}) {
+  if (!token) return null;
+  const candidates = Array.isArray(candidatePorts)
+    ? candidatePorts.filter((p) => Number.isInteger(p) && p > 0 && p <= 65535 && p !== excludePort)
+    : listCandidateDesktopLoopbackPorts({ excludePort });
+  for (const port of candidates) {
+    const ok = await probeLocalWsEndpoint({ port, token }, { timeoutMs });
+    if (ok) {
+      return { port, token, source: "probed_listener" };
+    }
+  }
+  return null;
+}
+
+export async function rediscoverLocalWsConnectionInfo({
+  previousPort = null,
+  previousToken = null,
+  discoverWsFn = null,
+  retryPollMs = 120,
+  probeTimeoutMs = 500,
+} = {}) {
+  const copilotDir = getCopilotDir();
+  invalidateLocalWsConnectionCache();
+
+  let fresh = readWsConnectionFilesSync(copilotDir);
+  if (fresh && (fresh.port !== previousPort || fresh.token !== previousToken)) {
+    cachedLocalWsInfo = {
+      copilotDir,
+      port: fresh.port,
+      token: fresh.token,
+      cachedAtMs: Date.now(),
+      probedOverrideForStaleDiskPort: null,
+      deadDiskPort: null,
+      deadDiskToken: null,
+    };
+    return { ...fresh, source: "ws.port" };
+  }
+
+  if (retryPollMs > 0) {
+    const deadline = Date.now() + retryPollMs;
+    const stepMs = Math.min(30, Math.max(10, Math.floor(retryPollMs / 4)));
+    while (Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, stepMs));
+      fresh = readWsConnectionFilesSync(copilotDir);
+      if (fresh && (fresh.port !== previousPort || fresh.token !== previousToken)) {
+        cachedLocalWsInfo = {
+          copilotDir,
+          port: fresh.port,
+          token: fresh.token,
+          cachedAtMs: Date.now(),
+          probedOverrideForStaleDiskPort: null,
+          deadDiskPort: null,
+          deadDiskToken: null,
+        };
+        return { ...fresh, source: "ws.port" };
+      }
+    }
+  }
+
+  const fallbackToken = fresh?.token || previousToken || null;
+  if (typeof discoverWsFn === "function") {
+    const custom = await discoverWsFn({ previousPort, previousToken: fallbackToken, copilotDir });
+    const customPort = typeof custom === "number" ? custom : Number(custom?.port) || null;
+    const customToken = (typeof custom === "object" && custom?.token) || fallbackToken;
+    if (customPort && customToken) {
+      cachedLocalWsInfo = {
+        copilotDir,
+        port: customPort,
+        token: customToken,
+        cachedAtMs: Date.now(),
+        probedOverrideForStaleDiskPort: fresh?.port === previousPort ? previousPort : null,
+        deadDiskPort: null,
+        deadDiskToken: null,
+      };
+      return { port: customPort, token: customToken, source: "custom_probe" };
+    }
+  } else if (fallbackToken) {
+    const probed = await probeActiveDesktopWsListener({
+      token: fallbackToken,
+      excludePort: previousPort,
+      timeoutMs: probeTimeoutMs,
+    });
+    if (probed) {
+      cachedLocalWsInfo = {
+        copilotDir,
+        port: probed.port,
+        token: probed.token,
+        cachedAtMs: Date.now(),
+        probedOverrideForStaleDiskPort: fresh?.port === previousPort ? previousPort : null,
+        deadDiskPort: null,
+        deadDiskToken: null,
+      };
+      return probed;
+    }
+  }
+
+  return fresh || null;
+}
+
+export async function verifyLocalWsConnectionInfo({
+  forceRefresh = true,
+  probeReachability = true,
+  discoverWsFn = null,
+  probeTimeoutMs = 600,
+  retryPollMs = 60,
+} = {}) {
+  const copilotDir = getCopilotDir();
+  const current = getLocalWsConnectionInfo({ forceRefresh, allowStaleDiskFallback: true });
+  if (!current) return null;
+  if (!probeReachability) return current;
+
+  const reachable = await probeLocalWsEndpoint(current, { timeoutMs: probeTimeoutMs });
+  if (reachable) {
+    cachedLocalWsInfo = {
+      copilotDir,
+      port: current.port,
+      token: current.token,
+      cachedAtMs: Date.now(),
+      probedOverrideForStaleDiskPort: cachedLocalWsInfo?.probedOverrideForStaleDiskPort ?? null,
+      deadDiskPort: null,
+      deadDiskToken: null,
+    };
+    return { ...current, verified: true, retried: false };
+  }
+
+  const rediscovered = await rediscoverLocalWsConnectionInfo({
+    previousPort: current.port,
+    previousToken: current.token,
+    discoverWsFn,
+    retryPollMs,
+    probeTimeoutMs,
+  });
+  if (
+    rediscovered &&
+    (rediscovered.port !== current.port || rediscovered.token !== current.token)
+  ) {
+    const retryReachable =
+      rediscovered.source === "probed_listener" ||
+      (await probeLocalWsEndpoint(rediscovered, { timeoutMs: probeTimeoutMs }));
+    if (retryReachable) {
+      const diskNow = readWsConnectionFilesSync(copilotDir);
+      cachedLocalWsInfo = {
+        copilotDir,
+        port: rediscovered.port,
+        token: rediscovered.token,
+        cachedAtMs: Date.now(),
+        probedOverrideForStaleDiskPort:
+          diskNow && diskNow.port !== rediscovered.port ? diskNow.port : null,
+        deadDiskPort: null,
+        deadDiskToken: null,
+      };
+      return {
+        port: rediscovered.port,
+        token: rediscovered.token,
+        verified: true,
+        retried: true,
+        previousPort: current.port,
+      };
+    }
+  }
+
+  const diskAfter = readWsConnectionFilesSync(copilotDir);
+  cachedLocalWsInfo = diskAfter
+    ? {
+        copilotDir,
+        port: null,
+        token: null,
+        cachedAtMs: Date.now(),
+        probedOverrideForStaleDiskPort: null,
+        deadDiskPort: diskAfter.port,
+        deadDiskToken: diskAfter.token,
+      }
+    : null;
+  return null;
+}
+
+export async function connectLocalDesktopWebSocket({
+  initialWsInfo = null,
+  timeoutMs = 8000,
+  setupClient = null,
+  discoverWsFn = null,
+  retryPollMs = 120,
+  probeTimeoutMs = 500,
+} = {}) {
+  const firstInfo = initialWsInfo || getLocalWsConnectionInfo({ allowStaleDiskFallback: true });
+  if (!firstInfo) return null;
+
+  const attemptConnect = async (info) => {
+    const wsUrl = `ws://127.0.0.1:${info.port}/?token=${encodeURIComponent(info.token)}`;
+    const client = new RawWebSocketClient(wsUrl, { timeoutMs });
+    if (typeof setupClient === "function") {
+      setupClient(client, info);
+    }
+    try {
+      await client.connect();
+      return { ws: client, wsInfo: info };
+    } catch (err) {
+      try {
+        client.close();
+      } catch {}
+      throw err;
+    }
+  };
+
+  try {
+    const connected = await attemptConnect(firstInfo);
+    return {
+      ...connected,
+      retriedWsPort: false,
+      previousWsPort: null,
+    };
+  } catch (firstErr) {
+    if (!isLocalWsConnectError(firstErr)) {
+      throw firstErr;
+    }
+    const rediscovered = await rediscoverLocalWsConnectionInfo({
+      previousPort: firstInfo.port,
+      previousToken: firstInfo.token,
+      discoverWsFn,
+      retryPollMs,
+      probeTimeoutMs,
+    });
+    if (
+      !rediscovered ||
+      (rediscovered.port === firstInfo.port && rediscovered.token === firstInfo.token)
+    ) {
+      invalidateLocalWsConnectionCache();
+      throw firstErr;
+    }
+    try {
+      const connected = await attemptConnect(rediscovered);
+      return {
+        ...connected,
+        retriedWsPort: true,
+        previousWsPort: firstInfo.port,
+      };
+    } catch (retryErr) {
+      invalidateLocalWsConnectionCache();
+      throw retryErr;
+    }
+  }
 }
 
 function getHeadlessCliSessionsPath() {
@@ -6603,7 +7032,7 @@ export function buildCrossSessionEnvelope({
   trustLevel = "same_user",
   waitForReply = false,
 }) {
-  const scriptPath = cfg.installedScriptPath;
+  const scriptPath = cfg?.installedScriptPath || path.join(getBridgeHome(), "flock.mjs");
   const senderMachine = fromMachine || "remote-machine";
   const senderScope = normalizeScope(fromScope, "work");
   const senderGitHubUser = normalizeGitHubUser(fromGitHubUser);
@@ -6930,10 +7359,12 @@ export async function injectLocalSessionMessage({
   waitTimeoutMs = 90000,
   dispatchTimeoutMs = 8000,
   dispatchPollIntervalMs = 50,
+  discoverWsFn = null,
+  wsRetryPollMs = 120,
   assertAuthorized = () => {},
 }) {
   assertAuthorized();
-  const wsInfo = getLocalWsConnectionInfo();
+  const wsInfo = getLocalWsConnectionInfo({ allowStaleDiskFallback: true });
   const hasDesktopDb = fs.existsSync(path.join(getCopilotDir(), "data.db"));
 
   if (!wsInfo && hasDesktopDb) {
@@ -7000,23 +7431,29 @@ export async function injectLocalSessionMessage({
   }
 
   const requestId = crypto.randomUUID();
-  const wsUrl = `ws://127.0.0.1:${wsInfo.port}/?token=${encodeURIComponent(wsInfo.token)}`;
-  const ws = new RawWebSocketClient(wsUrl, { timeoutMs: 8000 });
-
   let wsError = null;
   let keepWsOpenInBackground = false;
-  ws.onTextMessage = (txt) => {
-    try {
-      const msg = JSON.parse(txt);
-      if (msg && msg.type === "error") {
-        wsError = new Error(
-          `Copilot Desktop WebSocket error: ${msg.message || JSON.stringify(msg)}`
-        );
-      }
-    } catch {}
-  };
-
-  await ws.connect();
+  const wsConn = await connectLocalDesktopWebSocket({
+    initialWsInfo: wsInfo,
+    timeoutMs: 8000,
+    discoverWsFn,
+    retryPollMs: wsRetryPollMs,
+    setupClient: (client) => {
+      wsError = null;
+      client.onTextMessage = (txt) => {
+        try {
+          const msg = JSON.parse(txt);
+          if (msg && msg.type === "error") {
+            wsError = new Error(
+              `Copilot Desktop WebSocket error: ${msg.message || JSON.stringify(msg)}`
+            );
+          }
+        } catch {}
+      };
+    },
+  });
+  const ws = wsConn.ws;
+  const activeWsInfo = wsConn.wsInfo;
   try {
     assertAuthorized();
     const frame = {
@@ -7159,6 +7596,10 @@ export async function injectLocalSessionMessage({
           targetSessionId: resolved.session_id,
           targetSessionTitle: resolved.title,
           mode: frame.mode,
+          wsPort: activeWsInfo.port,
+          ...(wsConn.retriedWsPort
+            ? { retriedWsPort: true, previousWsPort: wsConn.previousWsPort }
+            : {}),
           deliveredAt: new Date().toISOString(),
         };
       }
@@ -7178,6 +7619,10 @@ export async function injectLocalSessionMessage({
       targetSessionId: resolved.session_id,
       targetSessionTitle: resolved.title,
       mode: frame.mode,
+      wsPort: activeWsInfo.port,
+      ...(wsConn.retriedWsPort
+        ? { retriedWsPort: true, previousWsPort: wsConn.previousWsPort }
+        : {}),
       deliveredAt: new Date().toISOString(),
     };
 
@@ -7263,8 +7708,10 @@ export async function createLocalSession({
   mode = "immediate",
   waitForReply = false,
   waitTimeoutMs = 90000,
+  discoverWsFn = null,
+  wsRetryPollMs = 120,
 }) {
-  const wsInfo = getLocalWsConnectionInfo();
+  const wsInfo = getLocalWsConnectionInfo({ allowStaleDiskFallback: true });
   const hasDesktopDb = fs.existsSync(path.join(getCopilotDir(), "data.db"));
   if (!wsInfo && hasDesktopDb) {
     throw new Error(
@@ -7321,9 +7768,6 @@ export async function createLocalSession({
     return out;
   }
 
-  const wsUrl = `ws://127.0.0.1:${wsInfo.port}/?token=${encodeURIComponent(wsInfo.token)}`;
-  const ws = new RawWebSocketClient(wsUrl, { timeoutMs: 10000 });
-
   let resolveWorkspaceCreated;
   let rejectWorkspaceCreated;
   let expectedWorkspaceReqId = null;
@@ -7332,38 +7776,45 @@ export async function createLocalSession({
   let rejectSessionCreated;
   let expectedSessionReqId = null;
 
-  ws.onTextMessage = (txt) => {
-    let msg;
-    try {
-      msg = JSON.parse(txt);
-    } catch {
-      return;
-    }
-    if (msg.type === "error") {
-      const err = new Error(`Copilot Desktop WebSocket error: ${msg.message || JSON.stringify(msg)}`);
-      if (rejectWorkspaceCreated) rejectWorkspaceCreated(err);
-      if (rejectSessionCreated) rejectSessionCreated(err);
-      return;
-    }
-    if (
-      msg.type === "workspace_created" &&
-      expectedWorkspaceReqId &&
-      msg.request_id === expectedWorkspaceReqId
-    ) {
-      if (resolveWorkspaceCreated) resolveWorkspaceCreated(msg.workspace);
-      return;
-    }
-    if (
-      msg.type === "session_created" &&
-      expectedSessionReqId &&
-      msg.request_id === expectedSessionReqId
-    ) {
-      if (resolveSessionCreated) resolveSessionCreated(msg);
-      return;
-    }
-  };
-
-  await ws.connect();
+  const wsConn = await connectLocalDesktopWebSocket({
+    initialWsInfo: wsInfo,
+    timeoutMs: 10000,
+    discoverWsFn,
+    retryPollMs: wsRetryPollMs,
+    setupClient: (client) => {
+      client.onTextMessage = (txt) => {
+        let msg;
+        try {
+          msg = JSON.parse(txt);
+        } catch {
+          return;
+        }
+        if (msg.type === "error") {
+          const err = new Error(`Copilot Desktop WebSocket error: ${msg.message || JSON.stringify(msg)}`);
+          if (rejectWorkspaceCreated) rejectWorkspaceCreated(err);
+          if (rejectSessionCreated) rejectSessionCreated(err);
+          return;
+        }
+        if (
+          msg.type === "workspace_created" &&
+          expectedWorkspaceReqId &&
+          msg.request_id === expectedWorkspaceReqId
+        ) {
+          if (resolveWorkspaceCreated) resolveWorkspaceCreated(msg.workspace);
+          return;
+        }
+        if (
+          msg.type === "session_created" &&
+          expectedSessionReqId &&
+          msg.request_id === expectedSessionReqId
+        ) {
+          if (resolveSessionCreated) resolveSessionCreated(msg);
+          return;
+        }
+      };
+    },
+  });
+  const ws = wsConn.ws;
 
   let createdWorkspace = null;
   let createdSession = null;
@@ -8789,45 +9240,72 @@ export async function handleRpcAction(cfg, req) {
 
   if (action === "create_session") {
     ensureBridgeDir();
-    if (params.message) {
-      const inboxRecord = {
-        id: req.requestId,
-        receivedAt: new Date().toISOString(),
+    const baseInboxRecord = params.message
+      ? {
+          id: req.requestId,
+          receivedAt: new Date().toISOString(),
+          fromMachine: senderIdentity.fromMachine,
+          fromScope: senderIdentity.fromScope,
+          fromGitHubUser: senderIdentity.fromGitHubUser,
+          senderVerified: senderIdentity.senderVerified,
+          trustLevel: senderIdentity.trustLevel,
+          fromSessionId: params.fromSessionId || null,
+          fromSessionName: params.fromSessionName || null,
+          targetSession: "new_session",
+          title: params.title || null,
+          repo: params.repo || null,
+          message: params.message,
+          mode: params.mode || "immediate",
+        }
+      : null;
+
+    try {
+      const created = await createLocalSession({
+        cfg,
+        title: params.title || null,
+        repo: params.repo || null,
+        cwd: params.cwd || null,
+        workspaceType: params.workspaceType || "branch",
+        branch: params.branch || null,
+        model: params.model || null,
+        reasoningEffort: params.reasoningEffort || null,
+        message: params.message || null,
         fromMachine: senderIdentity.fromMachine,
         fromScope: senderIdentity.fromScope,
         fromGitHubUser: senderIdentity.fromGitHubUser,
-        senderVerified: senderIdentity.senderVerified,
-        trustLevel: senderIdentity.trustLevel,
         fromSessionId: params.fromSessionId || null,
         fromSessionName: params.fromSessionName || null,
-        targetSession: "new_session",
-        title: params.title || null,
-        repo: params.repo || null,
-        message: params.message,
         mode: params.mode || "immediate",
-      };
-      fs.appendFileSync(getInboxPath(), JSON.stringify(inboxRecord) + "\n", "utf8");
+        waitForReply: Boolean(params.waitForReply),
+        waitTimeoutMs: Number(params.waitTimeoutMs) || 90000,
+      });
+      if (baseInboxRecord) {
+        fs.appendFileSync(
+          getInboxPath(),
+          JSON.stringify({
+            ...baseInboxRecord,
+            dispatchedToRuntime: Boolean(created.dispatchedToRuntime ?? true),
+            deliveryStage: created.status || "created_and_messaged",
+          }) + "\n",
+          "utf8"
+        );
+      }
+      return created;
+    } catch (err) {
+      if (baseInboxRecord) {
+        fs.appendFileSync(
+          getInboxPath(),
+          JSON.stringify({
+            ...baseInboxRecord,
+            dispatchedToRuntime: false,
+            deliveryStage: "dropped_to_inbox",
+            deliveryError: formatErrorDetail(err),
+          }) + "\n",
+          "utf8"
+        );
+      }
+      throw err;
     }
-
-    return await createLocalSession({
-      cfg,
-      title: params.title || null,
-      repo: params.repo || null,
-      cwd: params.cwd || null,
-      workspaceType: params.workspaceType || "branch",
-      branch: params.branch || null,
-      model: params.model || null,
-      reasoningEffort: params.reasoningEffort || null,
-      message: params.message || null,
-      fromMachine: senderIdentity.fromMachine,
-      fromScope: senderIdentity.fromScope,
-      fromGitHubUser: senderIdentity.fromGitHubUser,
-      fromSessionId: params.fromSessionId || null,
-      fromSessionName: params.fromSessionName || null,
-      mode: params.mode || "immediate",
-      waitForReply: Boolean(params.waitForReply),
-      waitTimeoutMs: Number(params.waitTimeoutMs) || 90000,
-    });
   }
 
   if (action === "send_message") {
@@ -8846,7 +9324,6 @@ export async function handleRpcAction(cfg, req) {
       message: params.message,
       mode: params.mode || "immediate",
     };
-    fs.appendFileSync(getInboxPath(), JSON.stringify(inboxRecord) + "\n", "utf8");
 
     if (params.dryRun) {
       const resolved = resolveLocalSession(params.targetSession || "latest");
@@ -8896,42 +9373,79 @@ export async function handleRpcAction(cfg, req) {
       };
     }
 
-    // Daemon-native worker delegation (`delegate: true` or `targetSession: "auto-worker"`)
-    const targetLower = String(params.targetSession || "latest").trim().toLowerCase();
-    if (
-      params.delegate ||
-      targetLower === "auto-worker" ||
-      targetLower === "new-worker"
-    ) {
-      const delegateTitle =
-        (typeof params.delegate === "object" && params.delegate?.title) ||
-        params.delegateTitle ||
-        params.title ||
-        null;
-      const delegateRepo =
-        (typeof params.delegate === "object" && params.delegate?.repo) ||
-        params.delegateRepo ||
-        params.repo ||
-        null;
-      const sessions = queryLocalSessionsFromDb({ limit: 50, runningOnly: false });
-      const idleWorker =
-        targetLower !== "new-worker"
-          ? sessions.find((s) => {
-              const t = String(s.title || "").toLowerCase();
-              if (t.includes("coordinator")) return false;
-              if (s.is_running) return false;
-              if (delegateTitle && t.includes(String(delegateTitle).toLowerCase())) return true;
-              if (delegateRepo && String(s.repo || "").toLowerCase().includes(String(delegateRepo).toLowerCase())) {
-                return true;
-              }
-              return false;
-            })
-          : null;
+    const recordDeliveredInboxEntry = (res) => {
+      fs.appendFileSync(
+        getInboxPath(),
+        JSON.stringify({
+          ...inboxRecord,
+          dispatchedToRuntime: Boolean(res?.dispatchedToRuntime ?? true),
+          deliveryStage: res?.deliveryStage || "admitted_to_events_jsonl",
+          ...(res?.wsPort ? { wsPort: res.wsPort } : {}),
+          ...(res?.retriedWsPort ? { retriedWsPort: true, previousWsPort: res.previousWsPort } : {}),
+        }) + "\n",
+        "utf8"
+      );
+    };
 
-      if (idleWorker) {
-        const res = await injectLocalSessionMessage({
+    try {
+      // Daemon-native worker delegation (`delegate: true` or `targetSession: "auto-worker"`)
+      const targetLower = String(params.targetSession || "latest").trim().toLowerCase();
+      if (
+        params.delegate ||
+        targetLower === "auto-worker" ||
+        targetLower === "new-worker"
+      ) {
+        const delegateTitle =
+          (typeof params.delegate === "object" && params.delegate?.title) ||
+          params.delegateTitle ||
+          params.title ||
+          null;
+        const delegateRepo =
+          (typeof params.delegate === "object" && params.delegate?.repo) ||
+          params.delegateRepo ||
+          params.repo ||
+          null;
+        const sessions = queryLocalSessionsFromDb({ limit: 50, runningOnly: false });
+        const idleWorker =
+          targetLower !== "new-worker"
+            ? sessions.find((s) => {
+                const t = String(s.title || "").toLowerCase();
+                if (t.includes("coordinator")) return false;
+                if (s.is_running) return false;
+                if (delegateTitle && t.includes(String(delegateTitle).toLowerCase())) return true;
+                if (delegateRepo && String(s.repo || "").toLowerCase().includes(String(delegateRepo).toLowerCase())) {
+                  return true;
+                }
+                return false;
+              })
+            : null;
+
+        if (idleWorker) {
+          const res = await injectLocalSessionMessage({
+            cfg,
+            targetSession: idleWorker.session_id,
+            message: params.message,
+            fromMachine: inboxRecord.fromMachine,
+            fromScope: inboxRecord.fromScope,
+            fromGitHubUser: inboxRecord.fromGitHubUser,
+            fromSessionId: inboxRecord.fromSessionId,
+            fromSessionName: inboxRecord.fromSessionName,
+            mode: params.mode || "immediate",
+            waitForReply: Boolean(params.waitForReply),
+            waitTimeoutMs: Number(params.waitTimeoutMs) || 90000,
+            dispatchTimeoutMs: Number(params.dispatchTimeoutMs) || 8000,
+          });
+          const out = { ...res, delegatedByDaemon: true, workerReused: true };
+          recordDeliveredInboxEntry(out);
+          recentDeliveryCache.set(dedupKey, { timestampMs: Date.now(), result: out });
+          if (req.requestId) recentDeliveryCache.set(`req:${req.requestId}`, { timestampMs: Date.now(), result: out });
+          return out;
+        }
+
+        const created = await createLocalSession({
           cfg,
-          targetSession: idleWorker.session_id,
+          title: delegateTitle || `Worker (${inboxRecord.fromMachine})`,
+          repo: delegateRepo || null,
           message: params.message,
           fromMachine: inboxRecord.fromMachine,
           fromScope: inboxRecord.fromScope,
@@ -8941,57 +9455,51 @@ export async function handleRpcAction(cfg, req) {
           mode: params.mode || "immediate",
           waitForReply: Boolean(params.waitForReply),
           waitTimeoutMs: Number(params.waitTimeoutMs) || 90000,
-          dispatchTimeoutMs: Number(params.dispatchTimeoutMs) || 8000,
         });
-        const out = { ...res, delegatedByDaemon: true, workerReused: true };
+        const out = { ...created, delegatedByDaemon: true, workerReused: false };
+        recordDeliveredInboxEntry(out);
         recentDeliveryCache.set(dedupKey, { timestampMs: Date.now(), result: out });
         if (req.requestId) recentDeliveryCache.set(`req:${req.requestId}`, { timestampMs: Date.now(), result: out });
         return out;
       }
 
-      const created = await createLocalSession({
+      const deliveryRes = await injectLocalSessionMessage({
         cfg,
-        title: delegateTitle || `Worker (${inboxRecord.fromMachine})`,
-        repo: delegateRepo || null,
+        targetSession: params.targetSession || "latest",
         message: params.message,
+        messageType: params.messageType || "message",
         fromMachine: inboxRecord.fromMachine,
         fromScope: inboxRecord.fromScope,
         fromGitHubUser: inboxRecord.fromGitHubUser,
+        senderVerified: senderIdentity.senderVerified,
+        trustLevel: senderIdentity.trustLevel,
         fromSessionId: inboxRecord.fromSessionId,
         fromSessionName: inboxRecord.fromSessionName,
         mode: params.mode || "immediate",
         waitForReply: Boolean(params.waitForReply),
+        notifyOnIdle: Boolean(params.notifyOnIdle),
         waitTimeoutMs: Number(params.waitTimeoutMs) || 90000,
+        dispatchTimeoutMs: Number(params.dispatchTimeoutMs) || 8000,
       });
-      const out = { ...created, delegatedByDaemon: true, workerReused: false };
-      recentDeliveryCache.set(dedupKey, { timestampMs: Date.now(), result: out });
-      if (req.requestId) recentDeliveryCache.set(`req:${req.requestId}`, { timestampMs: Date.now(), result: out });
-      return out;
+      recordDeliveredInboxEntry(deliveryRes);
+      recentDeliveryCache.set(dedupKey, { timestampMs: Date.now(), result: deliveryRes });
+      if (req.requestId) {
+        recentDeliveryCache.set(`req:${req.requestId}`, { timestampMs: Date.now(), result: deliveryRes });
+      }
+      return deliveryRes;
+    } catch (err) {
+      fs.appendFileSync(
+        getInboxPath(),
+        JSON.stringify({
+          ...inboxRecord,
+          dispatchedToRuntime: false,
+          deliveryStage: "dropped_to_inbox",
+          deliveryError: formatErrorDetail(err),
+        }) + "\n",
+        "utf8"
+      );
+      throw err;
     }
-
-    const deliveryRes = await injectLocalSessionMessage({
-      cfg,
-      targetSession: params.targetSession || "latest",
-      message: params.message,
-      messageType: params.messageType || "message",
-      fromMachine: inboxRecord.fromMachine,
-      fromScope: inboxRecord.fromScope,
-      fromGitHubUser: inboxRecord.fromGitHubUser,
-      senderVerified: senderIdentity.senderVerified,
-      trustLevel: senderIdentity.trustLevel,
-      fromSessionId: inboxRecord.fromSessionId,
-      fromSessionName: inboxRecord.fromSessionName,
-      mode: params.mode || "immediate",
-      waitForReply: Boolean(params.waitForReply),
-      notifyOnIdle: Boolean(params.notifyOnIdle),
-      waitTimeoutMs: Number(params.waitTimeoutMs) || 90000,
-      dispatchTimeoutMs: Number(params.dispatchTimeoutMs) || 8000,
-    });
-    recentDeliveryCache.set(dedupKey, { timestampMs: Date.now(), result: deliveryRes });
-    if (req.requestId) {
-      recentDeliveryCache.set(`req:${req.requestId}`, { timestampMs: Date.now(), result: deliveryRes });
-    }
-    return deliveryRes;
   }
 
   if (action === "send_file_chunk") {
@@ -9536,6 +10044,163 @@ export async function drainAndProcessOfflineQueue(
   return offlineDrainInFlight;
 }
 
+export function createDaemonHeartbeatMonitor({
+  cfg = {},
+  intervalMs = 5000,
+  presenceIntervalMs = 45000,
+  timeSkipThresholdMs = 10000,
+  nowFn = () => Date.now(),
+  verifyWsPortFn = verifyLocalWsConnectionInfo,
+  collectPresenceFn = null,
+  publishPresenceFn = null,
+  onTimeSkip = null,
+  onPresenceUpdated = null,
+  checkPidSupersession = null,
+} = {}) {
+  const effectiveCollectPresence =
+    collectPresenceFn || (() => handleRpcAction(cfg, { action: "ping" }));
+  const effectivePublishPresence =
+    publishPresenceFn ||
+    (async (selfInfo) => {
+      if (cfg?.connectionString || cfg?.accessKey) {
+        await sendSignalRBroadcast(cfg, "bridgePresence", selfInfo);
+      }
+    });
+
+  let lastTickAtMs = nowFn();
+  let lastPresenceAtMs = lastTickAtMs;
+  let lastKnownWsPort = getLocalWsConnectionInfo()?.port ?? null;
+  let tickInFlight = false;
+  let timer = null;
+
+  const publishFreshPresence = async ({ reason, elapsedMs, portChanged, verifiedWsInfo }) => {
+    const selfInfo = await effectiveCollectPresence(verifiedWsInfo);
+    const resolvedPort = selfInfo?.wsPort ?? verifiedWsInfo?.port ?? null;
+    lastKnownWsPort = resolvedPort;
+    await effectivePublishPresence(selfInfo, {
+      reason,
+      elapsedMs,
+      portChanged,
+      wsPort: resolvedPort,
+    });
+    lastPresenceAtMs = nowFn();
+    if (typeof onPresenceUpdated === "function") {
+      await onPresenceUpdated({
+        reason,
+        elapsedMs,
+        portChanged,
+        wsPort: resolvedPort,
+        presence: selfInfo,
+      });
+    }
+    return {
+      timeSkipDetected: reason === "time_skip",
+      elapsedMs,
+      portChanged,
+      wsPort: resolvedPort,
+      presencePublished: true,
+      reason,
+      presence: selfInfo,
+    };
+  };
+
+  const tick = async () => {
+    if (tickInFlight) return { skipped: true };
+    tickInFlight = true;
+    try {
+      if (typeof checkPidSupersession === "function") {
+        checkPidSupersession();
+      }
+      const nowMs = nowFn();
+      const elapsedMs = Math.max(0, nowMs - lastTickAtMs);
+      lastTickAtMs = nowMs;
+
+      const timeSkipDetected = elapsedMs > intervalMs + timeSkipThresholdMs;
+      if (timeSkipDetected) {
+        invalidateLocalWsConnectionCache();
+        const verifiedWs = await verifyWsPortFn({
+          forceRefresh: true,
+          probeReachability: true,
+        });
+        const newPort = verifiedWs?.port ?? null;
+        const portChanged = newPort !== lastKnownWsPort;
+        if (typeof onTimeSkip === "function") {
+          await onTimeSkip({
+            elapsedMs,
+            intervalMs,
+            timeSkipThresholdMs,
+            wsInfo: verifiedWs,
+            previousWsPort: lastKnownWsPort,
+            portChanged,
+          });
+        }
+        return await publishFreshPresence({
+          reason: "time_skip",
+          elapsedMs,
+          portChanged,
+          verifiedWsInfo: verifiedWs,
+        });
+      }
+
+      const diskWs = getLocalWsConnectionInfo({ forceRefresh: true });
+      const diskPort = diskWs?.port ?? null;
+      if (diskPort !== lastKnownWsPort) {
+        const verifiedWs = await verifyWsPortFn({
+          forceRefresh: true,
+          probeReachability: true,
+        });
+        const newPort = verifiedWs?.port ?? null;
+        if (newPort !== lastKnownWsPort) {
+          return await publishFreshPresence({
+            reason: "ws_port_changed",
+            elapsedMs,
+            portChanged: true,
+            verifiedWsInfo: verifiedWs,
+          });
+        }
+      }
+
+      if (nowMs - lastPresenceAtMs >= presenceIntervalMs) {
+        return await publishFreshPresence({
+          reason: "periodic",
+          elapsedMs,
+          portChanged: false,
+          verifiedWsInfo: diskWs,
+        });
+      }
+
+      return {
+        timeSkipDetected: false,
+        elapsedMs,
+        portChanged: false,
+        wsPort: lastKnownWsPort,
+        presencePublished: false,
+        reason: "idle",
+      };
+    } finally {
+      tickInFlight = false;
+    }
+  };
+
+  return {
+    tick,
+    getLastKnownWsPort: () => lastKnownWsPort,
+    start() {
+      if (timer) return;
+      timer = setInterval(() => {
+        tick().catch(() => {});
+      }, intervalMs);
+      timer.unref?.();
+    },
+    stop() {
+      if (timer) {
+        clearInterval(timer);
+        timer = null;
+      }
+    },
+  };
+}
+
 export async function runDaemon(cfg) {
   ensureBridgeDir();
   pinDaemonIdentity(getBridgeHome(), __filename);
@@ -9695,25 +10360,43 @@ export async function runDaemon(cfg) {
       } catch {}
       drainAndProcessOfflineQueue(cfg).catch(() => {});
 
-      const presenceTimer = setInterval(async () => {
-        try {
-          if (fs.existsSync(DAEMON_PID_PATH)) {
-            const activePid = Number(fs.readFileSync(DAEMON_PID_PATH, "utf8").trim());
+      const heartbeatMonitor = createDaemonHeartbeatMonitor({
+        cfg,
+        intervalMs: 5000,
+        presenceIntervalMs: 45000,
+        timeSkipThresholdMs: 10000,
+        checkPidSupersession: () => {
+          if (fs.existsSync(pidPath)) {
+            const activePid = Number(fs.readFileSync(pidPath, "utf8").trim());
             if (activePid && activePid !== process.pid) {
               logDaemon(`Superseded by newer daemon PID ${activePid}; exiting PID ${process.pid}`);
               process.exit(0);
             }
           }
-          const selfInfo = await handleRpcAction(cfg, { action: "ping" });
+        },
+        onTimeSkip: ({ elapsedMs, wsInfo, previousWsPort, portChanged }) => {
+          logDaemon(
+            `Detected wall-clock time-skip of ${elapsedMs}ms (OS sleep/wake resume); re-verified local WS port`,
+            {
+              previousWsPort,
+              wsPort: wsInfo?.port ?? null,
+              portChanged,
+            }
+          );
+        },
+        collectPresenceFn: () => handleRpcAction(cfg, { action: "ping" }),
+        publishPresenceFn: async (selfInfo) => {
           await sendSignalRBroadcast(cfg, "bridgePresence", selfInfo);
+        },
+        onPresenceUpdated: ({ wsPort, reason }) => {
           drainAndProcessOfflineQueue(cfg).catch(() => {});
-          updateStateFile("connected");
-        } catch {}
-      }, 45000);
-      presenceTimer.unref?.();
+          updateStateFile("connected", { wsPort, lastHeartbeatReason: reason });
+        },
+      });
+      heartbeatMonitor.start();
 
       await disconnectPromise;
-      clearInterval(presenceTimer);
+      heartbeatMonitor.stop();
       client.close();
       if (activeSignalRClient === client) activeSignalRClient = null;
       if (fs.existsSync(pidPath)) {
@@ -14671,9 +15354,9 @@ export async function deleteOldBridgeSessions(wsInfo) {
 
   if (wsInfo && targets.length > 0) {
     try {
-      const wsUrl = `ws://127.0.0.1:${wsInfo.port}/?token=${encodeURIComponent(wsInfo.token)}`;
-      const ws = new RawWebSocketClient(wsUrl, { timeoutMs: 6000 });
-      await ws.connect();
+      const wsConn = await connectLocalDesktopWebSocket({ initialWsInfo: wsInfo, timeoutMs: 6000 });
+      if (!wsConn) return removed;
+      const ws = wsConn.ws;
       for (const s of targets) {
         ws.sendText(
           JSON.stringify({
@@ -15091,8 +15774,6 @@ export async function queryWsPermissionModes(wsInfo, sessionIds = []) {
   const validIds = sessionIds.filter(Boolean);
   if (validIds.length === 0) return result;
 
-  const wsUrl = `ws://127.0.0.1:${wsInfo.port}/?token=${encodeURIComponent(wsInfo.token)}`;
-  const ws = new RawWebSocketClient(wsUrl, { timeoutMs: 4000 });
   const reqToSession = new Map();
   let resolvedCount = 0;
   let doneResolve;
@@ -15100,20 +15781,27 @@ export async function queryWsPermissionModes(wsInfo, sessionIds = []) {
     doneResolve = res;
   });
 
-  ws.onTextMessage = (txt) => {
-    try {
-      const msg = JSON.parse(txt);
-      if (msg.type === "command_result" && msg.request_id && reqToSession.has(msg.request_id)) {
-        const sid = reqToSession.get(msg.request_id);
-        result.set(sid, msg.data || null);
-        resolvedCount++;
-        if (resolvedCount >= validIds.length && doneResolve) doneResolve();
-      }
-    } catch {}
-  };
-
+  let ws = null;
   try {
-    await ws.connect();
+    const wsConn = await connectLocalDesktopWebSocket({
+      initialWsInfo: wsInfo,
+      timeoutMs: 4000,
+      setupClient: (client) => {
+        client.onTextMessage = (txt) => {
+          try {
+            const msg = JSON.parse(txt);
+            if (msg.type === "command_result" && msg.request_id && reqToSession.has(msg.request_id)) {
+              const sid = reqToSession.get(msg.request_id);
+              result.set(sid, msg.data || null);
+              resolvedCount++;
+              if (resolvedCount >= validIds.length && doneResolve) doneResolve();
+            }
+          } catch {}
+        };
+      },
+    });
+    if (!wsConn) return result;
+    ws = wsConn.ws;
     for (const sid of validIds) {
       const rid = crypto.randomUUID();
       reqToSession.set(rid, sid);
@@ -15127,7 +15815,7 @@ export async function queryWsPermissionModes(wsInfo, sessionIds = []) {
     }
     await Promise.race([donePromise, new Promise((r) => setTimeout(r, 1500))]);
   } catch {}
-  ws.close();
+  ws?.close();
   return result;
 }
 
@@ -15798,9 +16486,9 @@ Confirm briefly in one plain-text sentence that you are online and standing by (
 export async function ensureSessionApproveAll(wsInfo, sessionId, title = null) {
   if (!wsInfo || !sessionId) return;
   try {
-    const wsUrl = `ws://127.0.0.1:${wsInfo.port}/?token=${encodeURIComponent(wsInfo.token)}`;
-    const ws = new RawWebSocketClient(wsUrl, { timeoutMs: 5000 });
-    await ws.connect();
+    const wsConn = await connectLocalDesktopWebSocket({ initialWsInfo: wsInfo, timeoutMs: 5000 });
+    if (!wsConn) return;
+    const ws = wsConn.ws;
     ws.sendText(
       JSON.stringify({
         type: "set_session_auto_approve",
@@ -16530,6 +17218,15 @@ export function brokerFreeRuntime(cfg = {}, options = {}) {
     connect: connectSignalRClient,
     dispatch: (request) => dispatchBrokerFreeRpc(cfg, request),
     log: (message) => logDaemon(message),
+    onTimeSkip: async ({ elapsedMs, flockId }) => {
+      const verified = await verifyLocalWsConnectionInfo({
+        forceRefresh: true,
+        probeReachability: true,
+      });
+      logDaemon(`Broker-free wake time-skip (${elapsedMs}ms) on ${flockId}; re-verified local WS port`, {
+        wsPort: verified?.port ?? null,
+      });
+    },
     ...merged,
   });
 }
