@@ -6,10 +6,22 @@ import { AzureTransport, azureEndpoints, parseAzureConnection, validateTransport
 import { createDeviceIdentity, createOwnerState, createJoinCode, approveJoin, acceptWelcome,
   ownerFingerprint, canonical, encryptEnvelope, decryptEnvelope, DurableReceiver,
   createRotation, applyRotation, signedControl, verifyControl, renewOwnerCert, validateCert,
-  verifyRosterMemberCert, verifyJoinCode, peerSubscription } from "./flock-protocol.mjs";
+  verifyRosterMemberCert, verifyJoinCode, peerSubscription, authorizeAction } from "./flock-protocol.mjs";
 import { FlockMembershipRegistry, createSignedRosterSnapshot, createSignedRosterDelta } from "./flock-registry.mjs";
 
 const hash = (value) => crypto.createHash("sha256").update(typeof value === "string" ? value : canonical(value)).digest("hex");
+function isExplicitTargetMachine(toMachine) {
+  if (toMachine === undefined || toMachine === null) return false;
+  if (typeof toMachine !== "string") throw new Error("Target machine selector must be a string");
+  const trimmed = toMachine.trim();
+  if (!trimmed || trimmed === "*" || trimmed.toLowerCase() === "all" || trimmed.toLowerCase() === "auto") return false;
+  return true;
+}
+function rejectSameMachineLoopback(toMachine, selfMachineId) {
+  throw new Error(
+    `Target machine "${toMachine}" is THIS local computer (${selfMachineId}). Use native Copilot tools (list_sessions_and_chats / send_session_message) for same-machine thread communication, or pass --allow-loopback for bridge testing.`
+  );
+}
 let processIdentity;
 export class BrokerFreeRuntime {
   constructor(root, { transportFactory = (endpoints, options) => new AzureTransport(endpoints, options),
@@ -80,11 +92,171 @@ export class BrokerFreeRuntime {
     return record;
   }
   anchorPath(flockId) { return path.join(this.root, `epoch-${hash(flockId)}.json`); }
-  select(flockId) {
-    if (flockId) return this.record(flockId);
+  select(flockId, options = null) {
+    if (options && (options.toMachine !== undefined || options.action !== undefined)) {
+      return this.resolveRoute({ flockId, ...options }).record;
+    }
+    if (flockId !== undefined) {
+      if (typeof flockId !== "string" || !flockId.trim() || !/^[a-z0-9-]+\/[a-z0-9-]+$/.test(flockId) || flockId.length > 128) {
+        throw new Error(`Invalid explicit broker-free flock selector "${String(flockId)}"`);
+      }
+      return this.record(flockId);
+    }
     const records = Object.values(this.read().flocks).filter((record) => !record.departed);
-    if (records.length !== 1) throw new Error("Select an explicit --flock; broker-free dispatch is ambiguous");
+    if (records.length !== 1) {
+      const choices = records.length > 1 ? ` (${records.map((r) => r.flockId).sort().join(", ")})` : "";
+      throw new Error(`Select an explicit --flock${choices}; broker-free dispatch is ambiguous`);
+    }
     return this.record(records[0].flockId);
+  }
+  findAuthorizedMember(record, toMachine, { allowLoopback = false, now = this.clock() } = {}) {
+    if (typeof toMachine !== "string" || !/^[A-Za-z0-9._-]{1,128}$/.test(toMachine)) {
+      return { ok: false, reason: "invalid_target" };
+    }
+    const targetLower = toMachine.toLowerCase();
+    const selfMachineId = record.cert?.body?.machineId || "";
+    const selfLower = String(selfMachineId).toLowerCase();
+    if (!allowLoopback && selfLower && targetLower === selfLower) {
+      rejectSameMachineLoopback(toMachine, selfMachineId);
+    }
+    const entries = Object.entries(record.members || {});
+    if (allowLoopback && selfLower && targetLower === selfLower && !record.members?.[record.localPeerId]) {
+      entries.push([record.localPeerId, { cert: record.cert, membershipExpiresAt: record.metadata?.membershipExpiresAt ?? null }]);
+    }
+    const matching = entries.filter(([, entry]) => String(entry?.cert?.body?.machineId || "").toLowerCase() === targetLower);
+    if (matching.length === 0) return { ok: false, reason: "absent" };
+    const activeEntries = matching.filter(([, entry]) => entry && !entry.removed);
+    if (activeEntries.length === 0) return { ok: false, reason: "revoked" };
+    const valid = [];
+    const reasons = [];
+    for (const [peerId, entry] of activeEntries) {
+      if (!allowLoopback && peerId === record.localPeerId) {
+        reasons.push("loopback");
+        continue;
+      }
+      if (entry.membershipExpiresAt !== null && entry.membershipExpiresAt !== undefined &&
+          (!Number.isSafeInteger(entry.membershipExpiresAt) || entry.membershipExpiresAt <= now)) {
+        reasons.push("expired");
+        continue;
+      }
+      try {
+        const member = validateCert(entry.cert, record.ownerPublicKey, now);
+        if (member.peerId !== peerId || member.flockId !== record.flockId ||
+            (member.role === "owner" && peerId !== record.rotationOwnerPeerId)) {
+          reasons.push("invalid_cert");
+          continue;
+        }
+        valid.push({ peerId, member });
+      } catch (error) {
+        reasons.push(/expired/i.test(error.message) ? "expired" : "invalid_cert");
+      }
+    }
+    if (valid.length === 1) return { ok: true, peerId: valid[0].peerId, member: valid[0].member };
+    if (valid.length > 1) return { ok: false, reason: "duplicate_peer" };
+    return { ok: false, reason: reasons[0] || "expired" };
+  }
+  resolveRoute({ flockId, toMachine = "*", action = null, params = {}, allowLoopback = false, localMachineId = null } = {}) {
+    const explicitTarget = isExplicitTargetMachine(toMachine);
+    if (flockId !== undefined) {
+      if (typeof flockId !== "string" || !flockId.trim() || !/^[a-z0-9-]+\/[a-z0-9-]+$/.test(flockId) || flockId.length > 128) {
+        throw new Error(`Invalid explicit broker-free flock selector "${String(flockId)}"; refusing route inference fallback`);
+      }
+      const record = this.assertActive(this.record(flockId));
+      if (action !== "leave" && record.leaveOperationId) {
+        throw new Error(`Explicit flock "${flockId}" has a pending leave operation; refusing dispatch`);
+      }
+      if (action === "leave") {
+        if (!record.members?.[record.rotationOwnerPeerId]) throw new Error("Pinned rotation owner route unavailable");
+        return { record, targetPeerId: record.rotationOwnerPeerId, toMachine: explicitTarget ? toMachine.trim() : "*" };
+      }
+      if (action) authorizeAction(record.cert.body, action, { params });
+      if (explicitTarget) {
+        const target = toMachine.trim();
+        if (!allowLoopback && localMachineId && target.toLowerCase() === String(localMachineId).toLowerCase()) {
+          rejectSameMachineLoopback(target, localMachineId);
+        }
+        const match = this.findAuthorizedMember(record, target, { allowLoopback, now: this.clock() });
+        if (!match.ok) {
+          throw new Error(`Explicit flock "${flockId}" has no active, non-expired authorized route to target machine "${target}" (${match.reason}); refusing route inference fallback`);
+        }
+        return { record, targetPeerId: match.peerId, toMachine: match.member.machineId };
+      }
+      return { record, targetPeerId: "*", toMachine: "*" };
+    }
+    if (explicitTarget) {
+      const target = toMachine.trim();
+      const targetLower = target.toLowerCase();
+      const now = this.clock();
+      if (!allowLoopback && localMachineId && targetLower === String(localMachineId).toLowerCase()) {
+        rejectSameMachineLoopback(target, localMachineId);
+      }
+      const data = this.read();
+      if (!allowLoopback) {
+        for (const raw of Object.values(data.flocks)) {
+          if (!raw?.departed && String(raw?.cert?.body?.machineId || "").toLowerCase() === targetLower) {
+            rejectSameMachineLoopback(target, raw.cert.body.machineId);
+          }
+        }
+      }
+      const eligible = [];
+      const stale = [];
+      for (const [candidateId, raw] of Object.entries(data.flocks).sort(([a], [b]) => a.localeCompare(b))) {
+        const mentionsTarget = Object.values(raw?.members || {}).some(
+          (entry) => String(entry?.cert?.body?.machineId || "").toLowerCase() === targetLower
+        ) || (allowLoopback && String(raw?.cert?.body?.machineId || "").toLowerCase() === targetLower);
+        if (!raw || raw.departed || raw.leaveOperationId) {
+          if (mentionsTarget) stale.push(`${candidateId} (${raw?.departed ? "departed" : "pending_leave"})`);
+          continue;
+        }
+        let activeRecord;
+        try {
+          activeRecord = this.assertActive(raw);
+        } catch (error) {
+          if (mentionsTarget) stale.push(`${candidateId} (${error.message})`);
+          continue;
+        }
+        const match = this.findAuthorizedMember(activeRecord, target, { allowLoopback, now });
+        if (match.ok) {
+          eligible.push({ record: activeRecord, peerId: match.peerId, member: match.member });
+        } else if (match.reason !== "absent") {
+          stale.push(`${candidateId} (${match.reason})`);
+        }
+      }
+      if (eligible.length > 1) {
+        const choices = eligible.map((item) => item.record.flockId);
+        throw new Error(
+          `Ambiguous broker-free route to target machine "${target}": multiple active authorized flocks can reach this target (${choices.join(", ")}). Select an explicit --flock <owner/flock> (or MCP flock parameter).`
+        );
+      }
+      if (eligible.length === 0) {
+        const detail = stale.length > 0 ? ` (stale, expired, or revoked membership evidence: ${stale.join("; ")})` : "";
+        throw new Error(
+          `No active, non-expired authorized broker-free route reaches target machine "${target}"${detail}; refusing broadcast or fallback`
+        );
+      }
+      const chosen = eligible[0];
+      if (action) {
+        try {
+          authorizeAction(chosen.record.cert.body, action, { params });
+        } catch (error) {
+          throw new Error(
+            `No authorized broker-free route to target machine "${target}" in flock "${chosen.record.flockId}": ${error.message}`
+          );
+        }
+      }
+      return { record: chosen.record, targetPeerId: chosen.peerId, toMachine: chosen.member.machineId };
+    }
+    const activeCandidates = Object.values(this.read().flocks).filter((record) => !record.departed && !record.leaveOperationId);
+    if (activeCandidates.length === 0) {
+      throw new Error("No active broker-free flock enrolled; select or enroll an explicit --flock");
+    }
+    if (activeCandidates.length > 1) {
+      const choices = activeCandidates.map((record) => record.flockId).sort().join(", ");
+      throw new Error(`Select an explicit --flock (${choices}); broker-free dispatch is ambiguous`);
+    }
+    const record = this.assertActive(activeCandidates[0]);
+    if (action) authorizeAction(record.cert.body, action, { params });
+    return { record, targetPeerId: "*", toMachine: "*" };
   }
   transport(record) {
     return this.transportFactory(record.endpoints, { secrets: record.ownerSecrets || null, clock: this.clock });
@@ -288,8 +460,20 @@ export class BrokerFreeRuntime {
   }
   assertActive(record) {
     const latest = this.record(record.flockId);
-    validateCert(latest.cert, latest.ownerPublicKey, this.clock());
-    validateTransport(latest.transport, latest.endpoints, latest.localPeerId, latest.cert.body.expiresAt, this.clock());
+    const now = this.clock();
+    const selfEntry = latest.members?.[latest.localPeerId];
+    if (selfEntry?.removed === true) throw new Error(`Local membership in flock "${latest.flockId}" is revoked`);
+    for (const exp of [latest.metadata?.membershipExpiresAt, selfEntry?.membershipExpiresAt]) {
+      if (exp !== null && exp !== undefined && (!Number.isSafeInteger(exp) || exp <= now)) {
+        throw new Error(`Membership in flock "${latest.flockId}" has expired`);
+      }
+    }
+    const localMember = validateCert(latest.cert, latest.ownerPublicKey, now);
+    if (localMember.peerId !== latest.localPeerId || localMember.flockId !== latest.flockId ||
+        (localMember.role === "owner" && localMember.peerId !== latest.rotationOwnerPeerId)) {
+      throw new Error("Invalid or unbound local MemberCert");
+    }
+    validateTransport(latest.transport, latest.endpoints, latest.localPeerId, latest.cert.body.expiresAt, now);
     return latest;
   }
   async initializeOwner({ flockId, machineId, scope, connectionString, manageConnectionString,
@@ -797,8 +981,10 @@ export class BrokerFreeRuntime {
       return true;
     }
   }
-  async invoke({ flockId, toMachine = "*", action, params = {}, timeoutMs = 8000, collectAll = false }) {
-    const record = this.assertActive(this.select(flockId));
+  async invoke({ flockId, toMachine = "*", action, params = {}, timeoutMs = 8000, collectAll = false, allowLoopback = false }) {
+    const resolved = this.resolveRoute({ flockId, toMachine, action, params, allowLoopback });
+    const record = resolved.record;
+    toMachine = resolved.toMachine;
     if (!this.connect) throw new Error("Broker-free WebSocket adapter unavailable");
     const requestId = crypto.randomUUID();
     const responses = [];
@@ -806,11 +992,7 @@ export class BrokerFreeRuntime {
     let reject;
     const responsePromise = new Promise((resolve, fail) => { settle = resolve; reject = fail; });
     responsePromise.catch(() => {}); // The socket can reject while the queue-first send is still awaited.
-    const expectedPeer = Object.entries(record.members).find(([, entry]) =>
-      !entry.removed && entry.cert.body.machineId.toLowerCase() === toMachine.toLowerCase())?.[0] ||
-      (this.registry.hasFlock(record.flockId)
-        ? this.registry.listMembers(record.flockId).find((m) => !m.removed && m.machineId.toLowerCase() === toMachine.toLowerCase())?.peerId
-        : undefined);
+    const expectedPeer = resolved.targetPeerId !== "*" ? resolved.targetPeerId : undefined;
     const client = await this.connect(this.clientConfig(record), { userId: record.localPeerId,
       onInvocation: (target, args) => {
         if (target !== "flock34" || args[0]?.flockId !== record.flockId) return;

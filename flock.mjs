@@ -1124,6 +1124,7 @@ export function loadConfig({ autoFetchAz = true, refreshSpecs = false } = {}) {
   if (cfg.protocol === "broker-free-v34") {
     const activeFlocks = Object.values(brokerFreeRuntime(cfg).read().flocks).filter((record) => !record.departed);
     return { ...cfg, flockId: activeFlocks.length === 1 ? activeFlocks[0].flockId : undefined,
+      autoFlockId: activeFlocks.length === 1 && !cfg.explicitFlock,
       hub: DEFAULT_HUB, bootstrapUrl: null, connectionString: null,
       installedScriptPath: path.join(getBridgeHome(), "flock.mjs") };
   }
@@ -1619,8 +1620,14 @@ export function authorizeCallerFlockSelection(cfg, rawSelector, options = {}) {
   const now = Date.now();
 
   if (cfg?.protocol === "broker-free-v34") {
+    if (typeof rawSelector === "string" && rawSelector.trim() !== rawSelector.trim().toLowerCase()) {
+      const err = new Error(`Invalid explicit broker-free flock selector "${rawSelector}"`);
+      err.code = "INVALID_FLOCK_SELECTOR";
+      err.statusCode = 400;
+      throw err;
+    }
     if (!parsed.flockName) {
-      const err = new Error(`Broker-free flock selector must be <owner>/<flock>: "${rawSelector}"`);
+      const err = new Error(`Invalid explicit broker-free flock selector "${rawSelector}": must be <owner>/<flock>`);
       err.code = "INVALID_FLOCK_SELECTOR";
       err.statusCode = 400;
       throw err;
@@ -5167,7 +5174,8 @@ export async function invokeRemoteRpc(
     params = {},
     timeoutMs = 8000,
     collectAll = false,
-    flockId = cfg.flockId,
+    flockId = cfg.protocol === "broker-free-v34" && cfg.autoFlockId && !cfg.explicitFlock ? undefined : cfg.flockId,
+    allowLoopback = false,
   }
 ) {
   const hasExplicitFlockId = flockId !== undefined && flockId !== null;
@@ -5225,6 +5233,7 @@ export async function invokeRemoteRpc(
       params: effectiveParams,
       timeoutMs,
       collectAll,
+      allowLoopback,
     });
   }
 
@@ -8328,7 +8337,11 @@ const MCP_TOOLS = [
 ];
 
 for (const tool of MCP_TOOLS) {
-  tool.inputSchema.properties.flock ||= { type: "string", description: "Explicit <owner>/<flock> membership. Required when more than one broker-free flock is enrolled." };
+  tool.inputSchema.properties.flock ||= {
+    type: "string",
+    description:
+      "Explicit <owner>/<flock> membership selector (validated first when supplied). Required for multi-flock broker-free calls unless an explicit to_machine has a single active, non-expired authorized route.",
+  };
 }
 Object.assign(MCP_TOOLS.find((tool) => tool.name === "kick_flock_member").inputSchema.properties, {
   peer_id: { type: "string", description: "Exact signed device fingerprint; conjunctive with machine_id when both are supplied." },
@@ -8338,6 +8351,13 @@ Object.assign(MCP_TOOLS.find((tool) => tool.name === "kick_flock_member").inputS
 export async function executeMcpTool(cfg, name, args = {}, options = {}) {
   const ensureDaemon = options.ensureDaemon || ensureDaemonStarted;
   const discoverOnlineMachines = options.discoverOnlineMachines || discoverMachines;
+  if (options.runtimeOptions) {
+    cfg = {
+      ...cfg,
+      _brokerFreeOptions: { ...(cfg?._brokerFreeOptions || {}), ...options.runtimeOptions },
+      brokerFreeOptions: { ...(cfg?.brokerFreeOptions || {}), ...options.runtimeOptions },
+    };
+  }
   if (name === "unenroll_flock") {
     if (args.traceless !== true) throw new Error("Specify traceless=true to remove this installation");
     return uninstallBridge();
@@ -8348,14 +8368,40 @@ export async function executeMcpTool(cfg, name, args = {}, options = {}) {
       .joinRequest({ machineId: cfg.machineId, scope: cfg.scope, flockId: args.flock });
   }
   if (cfg.protocol === "broker-free-v34") {
-    const hasExplicitFlockArg = args.flock !== undefined && args.flock !== null;
-    if (hasExplicitFlockArg && (typeof args.flock !== "string" || !args.flock.trim())) {
-      const err = new Error(`Invalid explicit flock selector: "${args.flock}"`);
+    const hasExplicitFlock = Object.prototype.hasOwnProperty.call(args, "flock") && args.flock !== undefined && args.flock !== null;
+    if (
+      hasExplicitFlock &&
+      (typeof args.flock !== "string" || !args.flock.trim() || args.flock.trim() !== args.flock.trim().toLowerCase())
+    ) {
+      const err = new Error(`Invalid explicit broker-free flock selector "${String(args.flock)}"; refusing route inference fallback`);
       err.code = "INVALID_FLOCK_SELECTOR";
       err.statusCode = 400;
       throw err;
     }
-    cfg = { ...cfg, flockId: hasExplicitFlockArg ? args.flock.trim() : cfg.flockId };
+    let explicitFlock = hasExplicitFlock ? args.flock.trim() : (cfg.explicitFlock ? cfg.flockId : undefined);
+    let targetMachineFromFlock = null;
+    if (explicitFlock) {
+      let parsedExp;
+      try {
+        parsedExp = parseExplicitFlockSelector(explicitFlock);
+      } catch {
+        const err = new Error(`Invalid explicit broker-free flock selector "${String(explicitFlock)}"; refusing route inference fallback`);
+        err.code = "INVALID_FLOCK_SELECTOR";
+        err.statusCode = 400;
+        throw err;
+      }
+      if (!parsedExp.flockName) {
+        const err = new Error(`Invalid explicit broker-free flock selector "${explicitFlock}": must be <owner>/<flock>`);
+        err.code = "INVALID_FLOCK_SELECTOR";
+        err.statusCode = 400;
+        throw err;
+      }
+      explicitFlock = parsedExp.flockId;
+      targetMachineFromFlock = parsedExp.machineId || null;
+    }
+    if (hasExplicitFlock) {
+      cfg = { ...cfg, flockId: explicitFlock, explicitFlock: true, autoFlockId: false };
+    }
     const runtime = (options.brokerFreeRuntimeFactory || brokerFreeRuntime)(cfg, options.runtimeOptions || {});
     if (name === "approve_join") return runtime.approve({
       flockId: args.flock, code: args.join_code, role: args.role || "collaborator",
@@ -8364,9 +8410,9 @@ export async function executeMcpTool(cfg, name, args = {}, options = {}) {
     });
     if (name === "accept_welcome") return installBridge({ welcomeTicketArg: args.welcome_ticket,
       ownerFingerprintArg: args.owner_fingerprint, protocolArg: "broker-free-v34" });
-    if (name === "renew_membership") return runtime.renewMembership(runtime.select(args.flock).flockId);
+    if (name === "renew_membership") return runtime.renewMembership(runtime.select(explicitFlock).flockId);
     if (name === "list_flock_members") {
-      const selected = runtime.select(args.flock);
+      const selected = runtime.select(explicitFlock);
       if (args.sync_owner === true) await runtime.syncRoster(selected.flockId);
       return runtime.getFlockRegistryView(selected.flockId, {
         includeRemoved: Boolean(args.include_removed),
@@ -8376,7 +8422,7 @@ export async function executeMcpTool(cfg, name, args = {}, options = {}) {
       let onlineMachines = null;
       let liveSignalRSource = null;
       if (args.probe_presence === true) {
-        const selected = runtime.select(cfg.flockId || null);
+        const selected = runtime.select(explicitFlock);
         await ensureDaemon(cfg);
         try {
           onlineMachines = await discoverOnlineMachines(
@@ -8404,14 +8450,14 @@ export async function executeMcpTool(cfg, name, args = {}, options = {}) {
       return resolveBrokerFreeFlockRoster(cfg, {
         ...options,
         runtime,
-        targetFlock: args.flock || cfg.flockId || null,
-        allowMultipleLocalOverview: !args.flock && !cfg.flockId,
+        targetFlock: explicitFlock || null,
+        allowMultipleLocalOverview: !explicitFlock,
         onlineMachines,
         liveSignalRSource,
       });
     }
     if (name === "kick_flock_member") {
-      const record = runtime.assertOwner(runtime.select(args.flock));
+      const record = runtime.assertOwner(runtime.select(explicitFlock));
       if (args.github_user) throw new Error("Broker-free identities are device-key bound; a GitHub label is not a member selector");
       const candidates = Object.entries(record.members).filter(([id, entry]) => !entry.removed &&
         (!args.peer_id || id === args.peer_id) && (!args.machine_id || entry.cert.body.machineId === args.machine_id));
@@ -8424,8 +8470,8 @@ export async function executeMcpTool(cfg, name, args = {}, options = {}) {
     if (!supported.has(name)) throw new Error(`Tool ${name} is not a broker-free operation; legacy broker fallback is forbidden`);
 
     if (name === "flock_status" || name === "bridge_status") {
-      const selected = runtime.select(cfg.flockId || null);
-      const scopedCfg = { ...cfg, flockId: selected.flockId };
+      const selected = runtime.select(explicitFlock);
+      const scopedCfg = { ...cfg, flockId: selected.flockId, explicitFlock: true, autoFlockId: false };
       const daemonStatus = await ensureDaemon(scopedCfg);
       let machines = [];
       let liveSignalRSource = null;
@@ -8485,6 +8531,66 @@ export async function executeMcpTool(cfg, name, args = {}, options = {}) {
         flocks: merged.flocks,
         roster: merged.roster,
       };
+    }
+
+    const rpcRouteSpec = {
+      list_remote_machines: { toMachine: "*", action: "ping", params: {} },
+      broadcast_remote_session_message: {
+        toMachine: "*",
+        action: args.new_session ? "create_session" : "send_message",
+        params: { targetSession: args.to_session || "latest", newSession: Boolean(args.new_session) },
+      },
+      list_remote_sessions: {
+        toMachine: targetMachineFromFlock || (args.machine ?? args.to_machine ?? "*"),
+        action: "list_sessions",
+        params: {},
+      },
+      get_remote_session_transcript: {
+        toMachine: targetMachineFromFlock || args.to_machine,
+        action: "get_transcript",
+        params: { session: args.session || "latest" },
+      },
+      send_remote_session_message: {
+        toMachine: targetMachineFromFlock || args.to_machine,
+        action: "send_message",
+        params: { targetSession: args.to_session, delegate: Boolean(args.delegate) },
+      },
+    }[name];
+    if (rpcRouteSpec) {
+      if (targetMachineFromFlock) {
+        const suppliedMachine = name === "list_remote_sessions" ? (args.machine ?? args.to_machine) : args.to_machine;
+        if (
+          suppliedMachine &&
+          suppliedMachine !== "*" &&
+          String(suppliedMachine).toLowerCase() !== "all" &&
+          String(suppliedMachine).toLowerCase() !== "auto" &&
+          String(suppliedMachine).toLowerCase() !== targetMachineFromFlock.toLowerCase()
+        ) {
+          const err = new Error(
+            `Explicit flock selector "${args.flock}" conflicts with machine argument "${suppliedMachine}"`
+          );
+          err.code = "FLOCK_TARGET_CONFLICT";
+          err.statusCode = 400;
+          throw err;
+        }
+      }
+      const resolved = runtime.resolveRoute({
+        flockId: explicitFlock,
+        toMachine: rpcRouteSpec.toMachine,
+        action: rpcRouteSpec.action,
+        params: rpcRouteSpec.params,
+        allowLoopback: Boolean(args.allow_loopback),
+        localMachineId: cfg.machineId,
+      });
+      if (args.from_session) {
+        let senderId = args.from_session;
+        try { senderId = resolveLocalSession(args.from_session).session_id; } catch {}
+        const boundFlock = loadLocalFlocksConfig(cfg).threadBindings?.[senderId];
+        if (boundFlock && boundFlock !== resolved.record.flockId) {
+          throw new Error(`Thread is bound to another flock (${boundFlock})`);
+        }
+      }
+      cfg = { ...cfg, flockId: resolved.record.flockId, explicitFlock: true, autoFlockId: false };
     }
   }
   if (name === "flock_status" || name === "bridge_status") {
@@ -8552,7 +8658,7 @@ export async function executeMcpTool(cfg, name, args = {}, options = {}) {
   }
 
   if (name === "list_remote_machines") {
-    await ensureDaemonStarted(cfg);
+    await ensureDaemon(cfg);
     return await discoverMachines(cfg, {
       includeSelf: args.include_self !== false,
       scope: args.scope || null,
@@ -8565,10 +8671,12 @@ export async function executeMcpTool(cfg, name, args = {}, options = {}) {
   }
 
   if (name === "list_remote_sessions") {
-    const rawFlock = args.flock !== undefined && args.flock !== null ? args.flock : cfg.flockId;
+    const rawFlock = args.flock !== undefined && args.flock !== null
+      ? args.flock
+      : (cfg.protocol === "broker-free-v34" && cfg.autoFlockId && !cfg.explicitFlock ? undefined : cfg.flockId);
     const flockSel =
       rawFlock !== undefined && rawFlock !== null ? authorizeCallerFlockSelection(cfg, rawFlock) : null;
-    let machineArg = args.machine || "*";
+    let machineArg = args.machine ?? args.to_machine ?? "*";
     if (flockSel?.targetMachineId) {
       if (
         args.machine &&
@@ -8585,7 +8693,7 @@ export async function executeMcpTool(cfg, name, args = {}, options = {}) {
       }
       machineArg = flockSel.targetMachineId;
     }
-    await ensureDaemonStarted(cfg);
+    await ensureDaemon(cfg);
     const scopeFilter =
       args.scope && String(args.scope).toLowerCase() !== "all" && String(args.scope).trim() !== "*"
         ? normalizeScope(args.scope, "")
@@ -8654,6 +8762,7 @@ export async function executeMcpTool(cfg, name, args = {}, options = {}) {
           ...(flockSel ? { flock: effectiveFlockSelector } : {}),
         },
         timeoutMs: 8000,
+        allowLoopback: Boolean(args.allow_loopback),
       });
       return {
         ...res.result,
@@ -8663,7 +8772,9 @@ export async function executeMcpTool(cfg, name, args = {}, options = {}) {
   }
 
   if (name === "get_remote_session_transcript") {
-    const rawFlock = args.flock !== undefined && args.flock !== null ? args.flock : cfg.flockId;
+    const rawFlock = args.flock !== undefined && args.flock !== null
+      ? args.flock
+      : (cfg.protocol === "broker-free-v34" && cfg.autoFlockId && !cfg.explicitFlock ? undefined : cfg.flockId);
     const flockSel =
       rawFlock !== undefined && rawFlock !== null ? authorizeCallerFlockSelection(cfg, rawFlock) : null;
     let requestedMachine = args.to_machine;
@@ -8683,7 +8794,7 @@ export async function executeMcpTool(cfg, name, args = {}, options = {}) {
       }
       requestedMachine = flockSel.targetMachineId;
     }
-    await ensureDaemonStarted(cfg);
+    await ensureDaemon(cfg);
     const effectiveFlockSelector = flockSel ? flockSel.canonicalPath : undefined;
     const targetMachine = await resolveTargetMachine(cfg, requestedMachine, {
       allowLoopback: Boolean(args.allow_loopback),
@@ -8699,14 +8810,16 @@ export async function executeMcpTool(cfg, name, args = {}, options = {}) {
         ...(flockSel ? { flock: effectiveFlockSelector } : {}),
       },
       timeoutMs: 10000,
+      allowLoopback: Boolean(args.allow_loopback),
     });
     return res.result;
   }
 
   if (name === "send_remote_session_message") {
-    await ensureDaemonStarted(cfg);
+    await ensureDaemon(cfg);
     const targetMachine = await resolveTargetMachine(cfg, args.to_machine, {
       allowLoopback: Boolean(args.allow_loopback),
+      scope: args.scope || null,
     });
     let senderSessionId = args.from_session || "latest";
     let senderSessionName = null;
@@ -8749,6 +8862,7 @@ export async function executeMcpTool(cfg, name, args = {}, options = {}) {
         action: "send_message",
         params: rpcParams,
         timeoutMs: rpcTimeoutMs,
+        allowLoopback: Boolean(args.allow_loopback),
       });
     } catch (err) {
       const allowOfflineQueue = args.offline_queue !== false && !waitForReply;
@@ -8876,7 +8990,7 @@ export async function executeMcpTool(cfg, name, args = {}, options = {}) {
   }
 
   if (name === "broadcast_remote_session_message") {
-    await ensureDaemonStarted(cfg);
+    await ensureDaemon(cfg);
     const includeSelf = Boolean(args.include_self);
     const scopeFilter =
       args.scope && String(args.scope).toLowerCase() !== "all" && String(args.scope).trim() !== "*"
@@ -12119,12 +12233,12 @@ export async function installBridge({
 }
 
 export function brokerFreeRuntime(cfg = {}, options = {}) {
-  const mergedOptions = { ...(cfg?.brokerFreeOptions || {}), ...options };
-  return new BrokerFreeRuntime(mergedOptions.root || getBridgeHome(), {
+  const merged = { ...(cfg?.brokerFreeOptions || {}), ...(cfg?._brokerFreeOptions || {}), ...options };
+  return new BrokerFreeRuntime(merged.root || getBridgeHome(), {
     connect: connectSignalRClient,
     dispatch: (request) => dispatchBrokerFreeRpc(cfg, request),
     log: (message) => logDaemon(message),
-    ...mergedOptions,
+    ...merged,
   });
 }
 
@@ -13639,11 +13753,15 @@ Usage:
   }
 
   const cfg = loadConfig({ autoFetchAz: true, refreshSpecs: Boolean(flags.refresh) });
-  if (flags.flock !== undefined) cfg.flockId = flags.flock;
+  if (flags.flock !== undefined) {
+    cfg.flockId = flags.flock;
+    cfg.explicitFlock = true;
+    cfg.autoFlockId = false;
+  }
   if (cfg.protocol === "broker-free-v34") {
     if (["members", "enrolled", "flock", "registry"].includes(command)) {
       const runtime = brokerFreeRuntime(cfg);
-      const selected = runtime.select(cfg.flockId);
+      const selected = runtime.select(cfg.explicitFlock ? cfg.flockId : undefined);
       if (flags["sync-owner"]) await runtime.syncRoster(selected.flockId);
       const view = runtime.getFlockRegistryView(selected.flockId, {
         includeRemoved: Boolean(flags["include-removed"]),
@@ -14255,15 +14373,6 @@ Usage:
       console.log(JSON.stringify(out, null, 2));
       return;
     }
-    await ensureDaemonStarted(cfg);
-    const toMachine = await resolveTargetMachine(
-      cfg,
-      flags["to-machine"] || flags.machine || "auto",
-      {
-        allowLoopback: Boolean(flags["allow-loopback"]),
-        scope: flags.scope || flags.profile || null,
-      }
-    );
     const toSession = flags["to-session"] || flags.session || "latest";
     const message = resolveCliMessage(flags, positional);
     if (!message) {
@@ -14287,7 +14396,8 @@ Usage:
 
     if (!flags["dry-run"]) {
       const out = await executeMcpTool(cfg, "send_remote_session_message", {
-        to_machine: toMachine,
+        to_machine: rawMachineArg,
+        scope: flags.scope || flags.profile || null,
         to_session: toSession,
         message,
         from_session: fromSessionId,
@@ -14305,6 +14415,29 @@ Usage:
       console.log(JSON.stringify(out, null, 2));
       return;
     }
+
+    if (cfg.protocol === "broker-free-v34") {
+      const resolved = brokerFreeRuntime(cfg).resolveRoute({
+        flockId: cfg.explicitFlock ? cfg.flockId : undefined,
+        toMachine: rawMachineArg,
+        action: "send_message",
+        params: { targetSession: toSession, delegate: Boolean(flags.delegate) },
+        allowLoopback: Boolean(flags["allow-loopback"]),
+        localMachineId: cfg.machineId,
+      });
+      cfg.flockId = resolved.record.flockId;
+      cfg.explicitFlock = true;
+      cfg.autoFlockId = false;
+    }
+    await ensureDaemonStarted(cfg);
+    const toMachine = await resolveTargetMachine(
+      cfg,
+      rawMachineArg,
+      {
+        allowLoopback: Boolean(flags["allow-loopback"]),
+        scope: flags.scope || flags.profile || null,
+      }
+    );
 
     const res = await invokeRemoteRpc(cfg, {
       toMachine,
@@ -14328,6 +14461,7 @@ Usage:
         dryRun: true,
       },
       timeoutMs: dispatchTimeoutMs + 7000,
+      allowLoopback: Boolean(flags["allow-loopback"]),
     });
     console.log(JSON.stringify(res.result, null, 2));
     return;
@@ -14341,6 +14475,7 @@ Usage:
       action: "list_sessions",
       params: { limit: 5 },
       timeoutMs: 6000,
+      allowLoopback: true,
     });
     const drySendResp = await invokeRemoteRpc(cfg, {
       toMachine: cfg.machineId,
@@ -14355,6 +14490,7 @@ Usage:
         dryRun: true,
       },
       timeoutMs: 6000,
+      allowLoopback: true,
     });
     console.log(
       JSON.stringify(
