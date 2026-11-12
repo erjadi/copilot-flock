@@ -118,6 +118,12 @@ import {
   inspectLocalRuntimeHealth,
   reapOrphanedMcpProcesses,
   SAFE_CALLER_MCP_RECONNECT_GUIDANCE,
+  THERMAL_TELEMETRY_MAX_BUDGET_MS,
+  probeThermalTelemetry,
+  resetThermalTelemetryCache,
+  parseNvidiaSmiThermalOutput,
+  parseWin32ThermalCounterOutput,
+  sanitizeSpecsForFlockPolicy,
 } from "../flock.mjs";
 import {
   verifyGitHubRepoAccess,
@@ -7791,4 +7797,399 @@ test("flock_status exposes independent installedOnDisk, residentDaemon, and call
     else process.env.APPDATA = prevAppData;
     env.cleanup();
   }
+});
+
+test("thermal telemetry: valid nvidia-smi, Linux hwmon/thermal_zone (die/edge vs acpi), and win32 provider parsing", () => {
+  resetThermalTelemetryCache();
+  const fixedNow = Date.parse("2026-11-12T01:00:00.000Z");
+  let virtualPerfMs = 0;
+  const deterministicPerfNow = () => (virtualPerfMs += 1);
+
+  // 1. nvidia-smi multi-GPU with NVML idle bit (0x01 -> false) vs thermal slowdown (0x60 -> true) + legacy field fallback
+  let nvCalls = 0;
+  const nvSample = probeThermalTelemetry({
+    platform: "linux",
+    sysfsRoot: path.join(os.tmpdir(), `nonexistent-sysfs-${crypto.randomUUID()}`),
+    nowFn: () => fixedNow,
+    perfNowFn: deterministicPerfNow,
+    forceRefresh: true,
+    execFn: (_cmd, args) => {
+      nvCalls++;
+      if (args[0].includes("clocks_event_reasons.active")) {
+        const err = new Error('Field "clocks_event_reasons.active" is not a valid field to query.');
+        throw err;
+      }
+      assert.ok(args[0].includes("clocks_throttle_reasons.active"));
+      return [
+        "0, NVIDIA GeForce RTX 4090, 44, 31.24, 450.00, 0x0000000000000001",
+        "1, NVIDIA RTX A6000, 83, 298.66, 300.00, 0x0000000000000060",
+      ].join("\n");
+    },
+  });
+
+  assert.equal(nvCalls, 2);
+  assert.equal(nvSample.available, true);
+  assert.equal(nvSample.provider, "nvidia-smi");
+  assert.deepEqual(nvSample.providers, ["nvidia-smi"]);
+  assert.equal(nvSample.sensorType, "die");
+  assert.equal(nvSample.temperatureC, 44);
+  assert.equal(nvSample.powerWatts, 31.2);
+  assert.equal(nvSample.powerLimitWatts, 450);
+  assert.equal(nvSample.throttled, true);
+  assert.equal(nvSample.unit, "C");
+  assert.equal(nvSample.sampledAt, "2026-11-12T01:00:00.000Z");
+  assert.equal(nvSample.unavailableReason, null);
+  assert.equal(nvSample.readings.length, 2);
+  assert.deepEqual(nvSample.readings[0], {
+    name: "NVIDIA GeForce RTX 4090",
+    deviceKind: "gpu",
+    gpuIndex: 0,
+    temperatureC: 44,
+    powerWatts: 31.2,
+    powerLimitWatts: 450,
+    throttled: false,
+    unit: "C",
+    provider: "nvidia-smi",
+    sensorType: "die",
+    sampledAt: "2026-11-12T01:00:00.000Z",
+    unavailableReason: null,
+  });
+  assert.equal(nvSample.readings[1].throttled, true);
+  assert.equal(nvSample.readings[1].temperatureC, 83);
+  assert.equal(nvSample.readings[1].powerWatts, 298.7);
+
+  // 2. Linux sysfs hwmon + thermal_zone distinguishing die and edge sensors from acpi zones
+  const tmpSysfs = fs.mkdtempSync(path.join(os.tmpdir(), "flock-sysfs-"));
+  try {
+    const hwmon0 = path.join(tmpSysfs, "hwmon", "hwmon0"); // amdgpu with edge + junction + microwatt power
+    const hwmon1 = path.join(tmpSysfs, "hwmon", "hwmon1"); // k10temp CPU die + noisy Core 0
+    const hwmon2 = path.join(tmpSysfs, "hwmon", "hwmon2"); // acpitz motherboard zone
+    const tz0 = path.join(tmpSysfs, "thermal", "thermal_zone0"); // acpitz
+    const tz1 = path.join(tmpSysfs, "thermal", "thermal_zone1"); // x86_pkg_temp
+    for (const d of [hwmon0, hwmon1, hwmon2, tz0, tz1]) {
+      fs.mkdirSync(d, { recursive: true });
+    }
+
+    fs.writeFileSync(path.join(hwmon0, "name"), "amdgpu\n");
+    fs.writeFileSync(path.join(hwmon0, "temp1_label"), "edge\n");
+    fs.writeFileSync(path.join(hwmon0, "temp1_input"), "58000\n");
+    fs.writeFileSync(path.join(hwmon0, "temp2_label"), "junction\n");
+    fs.writeFileSync(path.join(hwmon0, "temp2_input"), "67500\n");
+    fs.writeFileSync(path.join(hwmon0, "power1_average"), "142500000\n");
+    fs.writeFileSync(path.join(hwmon0, "power1_cap"), "250000000\n");
+    fs.writeFileSync(path.join(hwmon0, "power1_cap_alarm"), "0\n");
+
+    fs.writeFileSync(path.join(hwmon1, "name"), "k10temp\n");
+    fs.writeFileSync(path.join(hwmon1, "temp1_label"), "Tctl\n");
+    fs.writeFileSync(path.join(hwmon1, "temp1_input"), "61250\n");
+    fs.writeFileSync(path.join(hwmon1, "temp2_label"), "Core 0\n");
+    fs.writeFileSync(path.join(hwmon1, "temp2_input"), "59000\n");
+
+    fs.writeFileSync(path.join(hwmon2, "name"), "acpitz\n");
+    fs.writeFileSync(path.join(hwmon2, "temp1_input"), "29000\n");
+
+    fs.writeFileSync(path.join(tz0, "type"), "acpitz\n");
+    fs.writeFileSync(path.join(tz0, "temp"), "27800\n");
+    fs.writeFileSync(path.join(tz1, "type"), "x86_pkg_temp\n");
+    fs.writeFileSync(path.join(tz1, "temp"), "63000\n");
+
+    const linuxSample = probeThermalTelemetry({
+      platform: "linux",
+      sysfsRoot: tmpSysfs,
+      nowFn: () => fixedNow,
+      perfNowFn: deterministicPerfNow,
+      forceRefresh: true,
+      execFn: () => {
+        const err = new Error("spawnSync nvidia-smi ENOENT");
+        err.code = "ENOENT";
+        throw err;
+      },
+    });
+
+    assert.equal(linuxSample.available, true);
+    assert.equal(linuxSample.unavailableReason, null);
+    assert.equal(linuxSample.sensorType, "die");
+    assert.equal(linuxSample.provider, "linux-hwmon");
+    assert.equal(linuxSample.powerWatts, 142.5);
+    assert.equal(linuxSample.powerLimitWatts, 250);
+    assert.equal(linuxSample.throttled, false);
+    assert.deepEqual(linuxSample.providers.sort(), ["linux-hwmon", "linux-thermal-zone"]);
+
+    const byName = new Map(linuxSample.readings.map((r) => [r.name, r]));
+    assert.equal(byName.get("amdgpu:edge")?.sensorType, "edge");
+    assert.equal(byName.get("amdgpu:edge")?.temperatureC, 58);
+    assert.equal(byName.get("amdgpu:edge")?.powerWatts, 142.5);
+    assert.equal(byName.get("amdgpu:junction")?.sensorType, "die");
+    assert.equal(byName.get("amdgpu:junction")?.temperatureC, 67.5);
+    assert.equal(byName.get("k10temp:Tctl")?.sensorType, "die");
+    assert.equal(byName.get("k10temp:Tctl")?.temperatureC, 61.3);
+    assert.equal(byName.has("k10temp:Core 0"), false);
+    assert.equal(byName.get("acpitz")?.sensorType, "acpi");
+    assert.equal(byName.get("thermal_zone0:acpitz")?.sensorType, "acpi");
+    assert.equal(byName.get("thermal_zone1:x86_pkg_temp")?.sensorType, "die");
+    // Primary top-level reading prefers die/edge silicon sensors over motherboard acpi zones
+    assert.notEqual(linuxSample.temperatureC, 27.8);
+    assert.notEqual(linuxSample.temperatureC, 29);
+  } finally {
+    fs.rmSync(tmpSysfs, { recursive: true, force: true });
+  }
+
+  // 3. Windows thermal counter parsing (valid dK/K conversion + dummy EC/273.2K rejection)
+  const winSample = probeThermalTelemetry({
+    platform: "win32",
+    baseSpecs: { gpus: [{ name: "AMD Radeon Graphics", vramGb: 2 }] },
+    nowFn: () => fixedNow,
+    perfNowFn: deterministicPerfNow,
+    forceRefresh: true,
+    execFn: (cmd) => {
+      assert.equal(cmd, "cscript.exe");
+      return [
+        "\\_TZ.TZ00\t301\t3015\t0",
+        "\\_SB.PCI0.LPCB.H_EC.TZ0\t10\t100\t0",
+        "\\_TZ.DUMMY\t273\t2732\t0",
+      ].join("\r\n");
+    },
+  });
+  assert.equal(winSample.available, true);
+  assert.equal(winSample.provider, "win32-thermal-counter");
+  assert.equal(winSample.sensorType, "acpi");
+  assert.equal(winSample.temperatureC, 28.4);
+  assert.equal(winSample.powerWatts, null);
+  assert.equal(winSample.powerLimitWatts, null);
+  assert.equal(winSample.throttled, false);
+  assert.equal(winSample.readings.length, 1);
+  assert.equal(winSample.readings[0].name, "\\_TZ.TZ00");
+});
+
+test("thermal telemetry: missing/unsupported sensors return null + unavailableReason (never fabricated 0) and malformed output degrades safely", () => {
+  resetThermalTelemetryCache();
+
+  // 1. Unsupported platform (darwin without nvidia-smi)
+  const darwinSample = probeThermalTelemetry({
+    platform: "darwin",
+    forceRefresh: true,
+    execFn: () => {
+      const err = new Error("ENOENT");
+      err.code = "ENOENT";
+      throw err;
+    },
+  });
+  assert.equal(darwinSample.available, false);
+  assert.equal(darwinSample.temperatureC, null);
+  assert.equal(darwinSample.powerWatts, null);
+  assert.equal(darwinSample.powerLimitWatts, null);
+  assert.equal(darwinSample.throttled, null);
+  assert.equal(darwinSample.unavailableReason, "unsupported_platform:darwin");
+
+  // 2. nvidia-smi with [Not Supported], N/A, and 0 values -> strictly null (never 0) + explicit unavailableReason
+  const unsupportedGpuSample = probeThermalTelemetry({
+    platform: "linux",
+    sysfsRoot: path.join(os.tmpdir(), `empty-sysfs-${crypto.randomUUID()}`),
+    forceRefresh: true,
+    execFn: () =>
+      "0, NVIDIA A10G-vGPU, [Not Supported], [Not Supported], 0.00, [Not Supported]\n",
+  });
+  assert.equal(unsupportedGpuSample.available, false);
+  assert.equal(unsupportedGpuSample.temperatureC, null);
+  assert.equal(unsupportedGpuSample.powerWatts, null);
+  assert.equal(unsupportedGpuSample.powerLimitWatts, null);
+  assert.equal(unsupportedGpuSample.throttled, null);
+  assert.equal(unsupportedGpuSample.unavailableReason, "sensor_not_supported");
+  assert.equal(unsupportedGpuSample.readings.length, 1);
+  assert.equal(unsupportedGpuSample.readings[0].temperatureC, null);
+  assert.equal(unsupportedGpuSample.readings[0].powerWatts, null);
+  assert.equal(unsupportedGpuSample.readings[0].powerLimitWatts, null);
+  assert.equal(unsupportedGpuSample.readings[0].unavailableReason, "sensor_not_supported");
+
+  // 3. Partial [Not Supported] power on valid GPU temp never fabricates 0W
+  const partialGpu = parseNvidiaSmiThermalOutput(
+    "0, NVIDIA Tesla T4, 56, [Not Supported], N/A, 0x0000000000000000\n",
+    "2026-11-12T01:00:00.000Z"
+  );
+  assert.equal(partialGpu.readings.length, 1);
+  assert.equal(partialGpu.readings[0].temperatureC, 56);
+  assert.equal(partialGpu.readings[0].powerWatts, null);
+  assert.equal(partialGpu.readings[0].powerLimitWatts, null);
+  assert.equal(partialGpu.readings[0].throttled, false);
+  assert.match(String(partialGpu.readings[0].unavailableReason), /power_not_supported/);
+
+  // 4. Malformed nvidia-smi, Linux sysfs, and Windows outputs
+  const malformedSysfs = fs.mkdtempSync(path.join(os.tmpdir(), "flock-bad-sysfs-"));
+  try {
+    const badHwmon = path.join(malformedSysfs, "hwmon", "hwmon0");
+    const badTz = path.join(malformedSysfs, "thermal", "thermal_zone0");
+    fs.mkdirSync(badHwmon, { recursive: true });
+    fs.mkdirSync(badTz, { recursive: true });
+    fs.writeFileSync(path.join(badHwmon, "name"), "coretemp\n");
+    fs.writeFileSync(path.join(badHwmon, "temp1_input"), "CORRUPT_VALUE\n");
+    fs.writeFileSync(path.join(badHwmon, "power1_average"), "-99999999\n");
+    fs.writeFileSync(path.join(badTz, "type"), "x86_pkg_temp\n");
+    fs.writeFileSync(path.join(badTz, "temp"), "9999999\n");
+
+    let badPerfMs = 0;
+    const badSample = probeThermalTelemetry({
+      platform: "linux",
+      sysfsRoot: malformedSysfs,
+      perfNowFn: () => (badPerfMs += 1),
+      forceRefresh: true,
+      execFn: () =>
+        "NVIDIA-SMI has failed because it couldn't communicate with the NVIDIA driver.\n0, BadGPU, ERR!, NaN, -50, 0xZZZ\n",
+    });
+    assert.equal(badSample.available, false);
+    assert.equal(badSample.temperatureC, null);
+    assert.equal(badSample.powerWatts, null);
+    assert.equal(badSample.powerLimitWatts, null);
+    assert.equal(badSample.throttled, null);
+    assert.equal(badSample.unavailableReason, "malformed_provider_output");
+    assert.deepEqual(badSample.readings, []);
+  } finally {
+    fs.rmSync(malformedSysfs, { recursive: true, force: true });
+  }
+
+  const badWin = parseWin32ThermalCounterOutput("{broken json", "2026-11-12T01:00:00.000Z");
+  assert.equal(badWin.hadMalformed, true);
+  assert.deepEqual(badWin.readings, []);
+});
+
+test("thermal telemetry: strict <= 250ms hard timeout budget, freshness cache window, and flock specs-sharing boundaries", async () => {
+  resetThermalTelemetryCache();
+
+  // 1. Real hanging subprocess is killed within strict <= 250ms budget
+  const hangStart = performance.now();
+  const timedOutSample = probeThermalTelemetry({
+    platform: "linux",
+    sysfsRoot: path.join(os.tmpdir(), `hang-sysfs-${crypto.randomUUID()}`),
+    forceRefresh: true,
+    budgetMs: THERMAL_TELEMETRY_MAX_BUDGET_MS,
+    execFn: (_cmd, _args, opts) =>
+      execFileSync(process.execPath, ["-e", "setTimeout(() => {}, 3000)"], opts),
+  });
+  const hangElapsedMs = performance.now() - hangStart;
+  assert.ok(
+    hangElapsedMs <= 250,
+    `Expected probeThermalTelemetry hard timeout <= 250ms, took ${Math.round(hangElapsedMs)}ms`
+  );
+  assert.equal(timedOutSample.available, false);
+  assert.equal(timedOutSample.temperatureC, null);
+  assert.equal(timedOutSample.powerWatts, null);
+  assert.equal(timedOutSample.unavailableReason, "probe_timeout");
+
+  // 2. Freshness window serves cached samples without re-probing until TTL expires
+  let fakeNowMs = 1_700_000_000_000;
+  let probeCount = 0;
+  const cacheStore = { entry: null };
+  const cachedExec = () => {
+    probeCount++;
+    return `0, NVIDIA RTX 4090, ${60 + probeCount}, 150.0, 450.0, 0x0000000000000000\n`;
+  };
+
+  const first = probeThermalTelemetry({
+    platform: "linux",
+    sysfsRoot: path.join(os.tmpdir(), "cache-test-sysfs"),
+    nowFn: () => fakeNowMs,
+    ttlMs: 10000,
+    cacheStore,
+    execFn: cachedExec,
+  });
+  assert.equal(probeCount, 1);
+  assert.equal(first.cached, false);
+  assert.equal(first.ageMs, 0);
+  assert.equal(first.freshness.isFresh, true);
+  assert.equal(first.temperatureC, 61);
+
+  fakeNowMs += 4200;
+  const secondStart = performance.now();
+  const second = probeThermalTelemetry({
+    platform: "linux",
+    sysfsRoot: path.join(os.tmpdir(), "cache-test-sysfs"),
+    nowFn: () => fakeNowMs,
+    ttlMs: 10000,
+    cacheStore,
+    execFn: cachedExec,
+  });
+  assert.ok(performance.now() - secondStart < 25);
+  assert.equal(probeCount, 1);
+  assert.equal(second.cached, true);
+  assert.equal(second.ageMs, 4200);
+  assert.equal(second.freshness.cached, true);
+  assert.equal(second.freshness.ageMs, 4200);
+  assert.equal(second.temperatureC, 61);
+
+  fakeNowMs += 6000; // 10200ms > 10000ms TTL -> triggers fresh probe
+  const third = probeThermalTelemetry({
+    platform: "linux",
+    sysfsRoot: path.join(os.tmpdir(), "cache-test-sysfs"),
+    nowFn: () => fakeNowMs,
+    ttlMs: 10000,
+    cacheStore,
+    execFn: cachedExec,
+  });
+  assert.equal(probeCount, 2);
+  assert.equal(third.cached, false);
+  assert.equal(third.ageMs, 0);
+  assert.equal(third.temperatureC, 62);
+
+  // 3. refreshLiveSpecs exposes thermal telemetry for owner and completes within <= 250ms
+  resetThermalTelemetryCache();
+  const liveSpecsStart = performance.now();
+  const liveSpecs = refreshLiveSpecs({
+    gpus: [{ name: "NVIDIA GeForce RTX 4090", vramGb: 24, vramFreeGb: 20, utilizationPct: 15 }],
+    disks: [
+      { mount: "C:", label: "OS", type: "fixed", totalGb: 1000, freeGb: 500 },
+      { mount: "Z:", label: "PrivateNAS", type: "network", totalGb: 8000, freeGb: 4000 },
+    ],
+  });
+  const liveSpecsElapsed = performance.now() - liveSpecsStart;
+  assert.ok(
+    liveSpecsElapsed <= 250,
+    `Expected refreshLiveSpecs <= 250ms, took ${Math.round(liveSpecsElapsed)}ms`
+  );
+  assert.ok(liveSpecs.thermal && typeof liveSpecs.thermal.sampledAt === "string");
+
+  // 4. Flock specs-sharing boundaries: owner receives thermal; collaborator/guest/cross-user/none never do
+  const ownerPing = await handleRpcAction(
+    { machineId: "GPU-TOWER", scope: "work", githubUser: "erjadi", specs: liveSpecs },
+    {
+      action: "ping",
+      flockPolicy: { flockId: "erjadi/work", trustTier: "owner", shareSpecs: "full" },
+      params: {},
+    }
+  );
+  assert.ok(ownerPing.specs.thermal, "Owner flock ping should include thermal telemetry");
+
+  const collabPolicy = {
+    flockId: "erjadi/studio-team",
+    trustTier: "collaborator",
+    shareSpecs: "summary",
+    sharedSessionIds: [],
+  };
+  const collabPing = await handleRpcAction(
+    { machineId: "GPU-TOWER", scope: "work", githubUser: "erjadi", specs: liveSpecs },
+    { action: "ping", flockPolicy: collabPolicy, params: {} }
+  );
+  assert.equal("thermal" in collabPing.specs, false);
+  assert.equal(collabPing.specs.disks.some((d) => d.type === "network"), false);
+  assert.equal("vramFreeGb" in (collabPing.specs.gpus[0] || {}), false);
+  assert.equal("utilizationPct" in (collabPing.specs.gpus[0] || {}), false);
+
+  const collabDiagnose = await handleRpcAction(
+    { machineId: "GPU-TOWER", scope: "work", githubUser: "erjadi", specs: liveSpecs },
+    { action: "diagnose", flockPolicy: collabPolicy, params: { fix: false } }
+  );
+  assert.equal("thermal" in collabDiagnose.specs, false);
+
+  const crossUserSanitized = sanitizeSpecsForFlockPolicy(liveSpecs, null, {
+    isCrossUser: true,
+    fromGitHubUser: "alice",
+  });
+  assert.equal("thermal" in crossUserSanitized, false);
+
+  const noneSanitized = sanitizeSpecsForFlockPolicy(liveSpecs, {
+    flockId: "erjadi/guest-1",
+    trustTier: "guest",
+    shareSpecs: "none",
+  });
+  assert.equal("thermal" in noneSanitized, false);
+  assert.equal("gpus" in noneSanitized, false);
+  assert.equal("disks" in noneSanitized, false);
 });

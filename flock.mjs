@@ -16,7 +16,7 @@ import tls from "node:tls";
 import path from "node:path";
 import https from "node:https";
 import crypto from "node:crypto";
-import { spawn, execFileSync } from "node:child_process";
+import { spawn, execFile, execFileSync } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import {
   uninstallFlock,
@@ -1470,7 +1470,7 @@ function round1(num) {
 let lastNvidiaLiveProbeAt = 0;
 let lastNvidiaLiveMetrics = [];
 
-function probeLiveNvidiaGpuMetrics() {
+function probeLiveNvidiaGpuMetrics(timeoutMs = 90) {
   const now = Date.now();
   if (now - lastNvidiaLiveProbeAt < 5000) {
     return lastNvidiaLiveMetrics;
@@ -1478,7 +1478,7 @@ function probeLiveNvidiaGpuMetrics() {
   lastNvidiaLiveProbeAt = now;
   try {
     const nvOut = execFileSync(
-      "nvidia-smi",
+      resolveNvidiaSmiBinary("nvidia-smi"),
       [
         "--query-gpu=name,memory.total,memory.free,utilization.gpu",
         "--format=csv,noheader,nounits",
@@ -1486,7 +1486,7 @@ function probeLiveNvidiaGpuMetrics() {
       {
         encoding: "utf8",
         stdio: ["ignore", "pipe", "ignore"],
-        timeout: 1500,
+        timeout: Math.max(15, Math.min(180, Number(timeoutMs) || 90)),
         windowsHide: true,
       }
     ).trim();
@@ -1513,7 +1513,1164 @@ function probeLiveNvidiaGpuMetrics() {
   return lastNvidiaLiveMetrics;
 }
 
-export function refreshLiveSpecs(baseSpecs = null, { passive = false } = {}) {
+export const THERMAL_TELEMETRY_MAX_BUDGET_MS = 250;
+export const THERMAL_TELEMETRY_DEFAULT_TTL_MS = 10000;
+const THERMAL_TELEMETRY_NEGATIVE_TTL_MS = 2500;
+const THERMAL_TELEMETRY_MAX_READINGS = 16;
+const NVML_THERMAL_POWER_THROTTLE_MASK = 0xecn;
+
+let defaultThermalTelemetryCache = null;
+let win32ThermalScriptSeq = 0;
+let win32AsyncProbeInFlight = false;
+
+export function resetThermalTelemetryCache() {
+  defaultThermalTelemetryCache = null;
+}
+
+const WIN32_THERMAL_JSCRIPT_SOURCE = [
+  'var svc = GetObject("winmgmts:\\\\\\\\.\\\\root\\\\cimv2");',
+  'var items = new Enumerator(svc.ExecQuery("SELECT Name, Temperature, HighPrecisionTemperature, ThrottleReasons FROM Win32_PerfFormattedData_Counters_ThermalZoneInformation"));',
+  "for (; !items.atEnd(); items.moveNext()) {",
+  "  var it = items.item();",
+  '  WScript.Echo([it.Name || "", it.Temperature == null ? "" : it.Temperature, it.HighPrecisionTemperature == null ? "" : it.HighPrecisionTemperature, it.ThrottleReasons == null ? "" : it.ThrottleReasons].join("\\t"));',
+  "}",
+].join("\n");
+
+function buildThermalTelemetrySample({
+  allReadings,
+  enabled,
+  timedOut,
+  timedOutProvider,
+  hadMalformedOutput,
+  hadUnreportedSensors,
+  asyncRefreshPending = false,
+  platform,
+  sampledAt,
+  nowMs,
+  ttlMs,
+  negativeTtlMs,
+  budgetMs,
+  probeDurationMs,
+}) {
+  const sensorRank = { die: 0, edge: 1, board: 2, acpi: 3, unknown: 4 };
+  const providerRank = {
+    "nvidia-smi": 0,
+    "linux-hwmon": 1,
+    "linux-thermal-zone": 2,
+    "win32-thermal-counter": 3,
+    none: 4,
+  };
+
+  const sorted = [...allReadings].sort((a, b) => {
+    const aValid = a.temperatureC !== null || a.powerWatts !== null ? 0 : 1;
+    const bValid = b.temperatureC !== null || b.powerWatts !== null ? 0 : 1;
+    if (aValid !== bValid) return aValid - bValid;
+    const sDiff = (sensorRank[a.sensorType] ?? 4) - (sensorRank[b.sensorType] ?? 4);
+    if (sDiff !== 0) return sDiff;
+    return (providerRank[a.provider] ?? 4) - (providerRank[b.provider] ?? 4);
+  });
+
+  const boundedReadings = sorted.slice(0, THERMAL_TELEMETRY_MAX_READINGS);
+  const validReadings = boundedReadings.filter(
+    (r) => r.temperatureC !== null || r.powerWatts !== null
+  );
+
+  const available = validReadings.length > 0;
+  const effectiveTtlMs = available ? ttlMs : negativeTtlMs;
+  const freshUntil = new Date(nowMs + effectiveTtlMs).toISOString();
+
+  let temperatureC = null;
+  let powerWatts = null;
+  let powerLimitWatts = null;
+  let throttled = null;
+  let unit = "C";
+  let provider = "none";
+  let providers = [];
+  let sensorType = "unknown";
+  let unavailableReason = null;
+
+  if (available) {
+    const primaryTemp = validReadings.find((r) => r.temperatureC !== null) || validReadings[0];
+    const primaryPower = validReadings.find((r) => r.powerWatts !== null) || null;
+    const throttleKnown = validReadings.filter((r) => typeof r.throttled === "boolean");
+
+    temperatureC = primaryTemp.temperatureC;
+    powerWatts = primaryPower ? primaryPower.powerWatts : null;
+    powerLimitWatts = primaryPower ? primaryPower.powerLimitWatts : null;
+    throttled =
+      throttleKnown.length === 0 ? null : throttleKnown.some((r) => r.throttled === true);
+    unit = temperatureC !== null ? "C" : "W";
+    provider = primaryTemp.provider;
+    providers = [...new Set(validReadings.map((r) => r.provider))];
+    sensorType = primaryTemp.sensorType;
+    unavailableReason = null;
+  } else {
+    provider =
+      boundedReadings[0]?.provider ||
+      timedOutProvider ||
+      (asyncRefreshPending ? "win32-thermal-counter" : "none");
+    sensorType = boundedReadings[0]?.sensorType || "unknown";
+    if (!enabled) {
+      unavailableReason = "disabled_by_configuration";
+    } else if (asyncRefreshPending) {
+      unavailableReason = "windows_async_refresh_pending";
+    } else if (timedOut) {
+      unavailableReason = "probe_timeout";
+    } else if (boundedReadings.some((r) => r.unavailableReason)) {
+      unavailableReason = boundedReadings[0].unavailableReason;
+    } else if (hadMalformedOutput) {
+      unavailableReason = "malformed_provider_output";
+    } else if (platform !== "linux" && platform !== "win32") {
+      unavailableReason = `unsupported_platform:${platform}`;
+    } else if (hadUnreportedSensors) {
+      unavailableReason = "sensors_unreported";
+    } else {
+      unavailableReason = "no_supported_sensors";
+    }
+  }
+
+  return {
+    available,
+    temperatureC,
+    powerWatts,
+    powerLimitWatts,
+    throttled,
+    unit,
+    provider,
+    providers,
+    sensorType,
+    sampledAt,
+    freshUntil,
+    ttlMs: effectiveTtlMs,
+    ageMs: 0,
+    cached: false,
+    freshness: {
+      sampledAt,
+      freshUntil,
+      ttlMs: effectiveTtlMs,
+      ageMs: 0,
+      cached: false,
+      isFresh: effectiveTtlMs > 0,
+      budgetMs,
+      probeDurationMs,
+    },
+    unavailableReason,
+    readings: boundedReadings,
+  };
+}
+
+function triggerWin32AsyncThermalRefresh({
+  cacheKey,
+  cacheStore,
+  seedReadings,
+  ttlMs,
+  negativeTtlMs,
+  budgetMs,
+}) {
+  if (win32AsyncProbeInFlight || ttlMs <= 0) return;
+  win32AsyncProbeInFlight = true;
+  const tempScriptPath = path.join(
+    os.tmpdir(),
+    `copilot-flock-tz-async-${process.pid}-${++win32ThermalScriptSeq}.js`
+  );
+  const startedPerf = performance.now();
+  try {
+    fs.writeFileSync(tempScriptPath, WIN32_THERMAL_JSCRIPT_SOURCE, {
+      encoding: "utf8",
+      mode: 0o600,
+      flag: "wx",
+    });
+  } catch {
+    win32AsyncProbeInFlight = false;
+    return;
+  }
+
+  const cleanup = () => {
+    process.removeListener("exit", cleanup);
+    try {
+      fs.unlinkSync(tempScriptPath);
+    } catch {}
+  };
+  process.once("exit", cleanup);
+
+  try {
+    const child = execFile(
+      "cscript.exe",
+      ["//NoLogo", "//T:1", "//E:JScript", tempScriptPath],
+      {
+        encoding: "utf8",
+        timeout: 1200,
+        windowsHide: true,
+      },
+      (err, stdout) => {
+        cleanup();
+        win32AsyncProbeInFlight = false;
+        const doneMs = Date.now();
+        const doneIso = new Date(doneMs).toISOString();
+        const durationMs = Math.max(0, Math.round(performance.now() - startedPerf));
+        const combined = Array.isArray(seedReadings) ? seedReadings.map((r) => ({ ...r })) : [];
+        let hadMalformed = false;
+        let hadUnreported = false;
+        const timedOut = isExecTimeoutError(err);
+        if (!err && stdout) {
+          const parsed = parseWin32ThermalCounterOutput(stdout, doneIso);
+          hadMalformed = parsed.hadMalformed;
+          hadUnreported = parsed.hadUnreported;
+          combined.push(...parsed.readings);
+        }
+        const sample = buildThermalTelemetrySample({
+          allReadings: combined,
+          enabled: true,
+          timedOut,
+          timedOutProvider: timedOut ? "win32-thermal-counter" : null,
+          hadMalformedOutput: hadMalformed,
+          hadUnreportedSensors: hadUnreported,
+          platform: "win32",
+          sampledAt: doneIso,
+          nowMs: doneMs,
+          ttlMs,
+          negativeTtlMs,
+          budgetMs,
+          probeDurationMs: durationMs,
+        });
+        const nextEntry = {
+          key: cacheKey,
+          execFn: null,
+          sampledAtMs: doneMs,
+          expiresAtMs: doneMs + sample.ttlMs,
+          value: sample,
+        };
+        if (cacheStore) {
+          cacheStore.entry = nextEntry;
+        } else {
+          defaultThermalTelemetryCache = nextEntry;
+        }
+      }
+    );
+    child.unref?.();
+  } catch {
+    cleanup();
+    win32AsyncProbeInFlight = false;
+  }
+}
+
+function resolveNvidiaSmiBinary(fallback = "nvidia-smi", fsImpl = fs, platform = process.platform) {
+  if (process.env.COPILOT_FLOCK_NVIDIA_SMI) {
+    return process.env.COPILOT_FLOCK_NVIDIA_SMI;
+  }
+  if (platform === "win32") {
+    for (const candidate of [
+      "C:\\Windows\\System32\\nvidia-smi.exe",
+      "C:\\Program Files\\NVIDIA Corporation\\NVSMI\\nvidia-smi.exe",
+    ]) {
+      try {
+        if (fsImpl.existsSync(candidate)) return candidate;
+      } catch {}
+    }
+  }
+  return fallback;
+}
+
+function inspectPositiveMetric(
+  raw,
+  { minExclusive = 0, minPlausible = 0, maxInclusive = 10000, scale = 1 } = {}
+) {
+  if (raw === null || raw === undefined) return { value: null, state: "empty" };
+  if (typeof raw === "boolean" || typeof raw === "object") return { value: null, state: "malformed" };
+  const s = String(raw).trim();
+  if (!s) return { value: null, state: "empty" };
+  if (/^(?:n\/?a|\[n\/?a\]|\[?not\s+supported\]?|unknown|none|-+)$/i.test(s)) {
+    return { value: null, state: "unsupported" };
+  }
+  if (!/^[+-]?\d+(?:\.\d+)?$/.test(s)) {
+    return { value: null, state: "malformed" };
+  }
+  const scaled = Number(s) * scale;
+  if (!Number.isFinite(scaled)) {
+    return { value: null, state: "malformed" };
+  }
+  if (scaled > maxInclusive || scaled < minPlausible) {
+    return { value: null, state: "malformed" };
+  }
+  if (scaled <= minExclusive) {
+    return { value: null, state: "unreported" };
+  }
+  const rounded = Math.round(scaled * 10) / 10;
+  if (rounded <= minExclusive) {
+    return { value: null, state: "unreported" };
+  }
+  return { value: rounded, state: "ok" };
+}
+
+function inspectNvidiaThrottleField(raw) {
+  if (raw === null || raw === undefined) return { value: null, state: "empty" };
+  const s = String(raw).trim();
+  if (!s) return { value: null, state: "empty" };
+  if (/^(?:n\/?a|\[n\/?a\]|\[?not\s+supported\]?|unknown|-+)$/i.test(s)) {
+    return { value: null, state: "unsupported" };
+  }
+  if (/^0x[0-9a-f]+$/i.test(s)) {
+    try {
+      const mask = BigInt(s);
+      return { value: (mask & NVML_THERMAL_POWER_THROTTLE_MASK) !== 0n, state: "ok" };
+    } catch {
+      return { value: null, state: "malformed" };
+    }
+  }
+  if (
+    /^(?:active|true|yes|throttled|1|sw_power_cap|hw_slowdown|sw_thermal_slowdown|hw_thermal_slowdown|hw_power_brake_slowdown)$/i.test(
+      s
+    )
+  ) {
+    return { value: true, state: "ok" };
+  }
+  if (/^(?:not\s+active|inactive|false|no|none|0)$/i.test(s)) {
+    return { value: false, state: "ok" };
+  }
+  return { value: null, state: "malformed" };
+}
+
+export function parseNvidiaSmiThermalOutput(rawOutput, sampledAt = new Date().toISOString()) {
+  const text = String(rawOutput ?? "").trim();
+  if (!text) {
+    return { readings: [], hadMalformed: false, hadUnsupported: false };
+  }
+  const readings = [];
+  let hadMalformed = false;
+  let hadUnsupported = false;
+
+  for (const rawLine of text.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    const cols = line.split(",").map((part) => part.trim());
+    if (cols.length < 5 || !/^\d+$/.test(cols[0])) {
+      hadMalformed = true;
+      continue;
+    }
+    const gpuIndex = Number(cols[0]);
+    const hasThrottleCol = cols.length >= 6;
+    const gpuName = (hasThrottleCol ? cols.slice(1, cols.length - 4).join(", ") : cols[1]).trim();
+    if (!gpuName) {
+      hadMalformed = true;
+      continue;
+    }
+    const tempRaw = hasThrottleCol ? cols[cols.length - 4] : cols[2];
+    const powerDrawRaw = hasThrottleCol ? cols[cols.length - 3] : cols[3];
+    const powerLimitRaw = hasThrottleCol ? cols[cols.length - 2] : cols[4];
+    const throttleRaw = hasThrottleCol ? cols[cols.length - 1] : null;
+
+    const temp = inspectPositiveMetric(tempRaw, { minExclusive: 0, maxInclusive: 200 });
+    const power = inspectPositiveMetric(powerDrawRaw, { minExclusive: 0, maxInclusive: 10000 });
+    const limit = inspectPositiveMetric(powerLimitRaw, { minExclusive: 0, maxInclusive: 10000 });
+    const throttle = hasThrottleCol
+      ? inspectNvidiaThrottleField(throttleRaw)
+      : { value: null, state: "unsupported" };
+
+    const states = [temp.state, power.state, limit.state, throttle.state];
+    if (states.includes("malformed")) hadMalformed = true;
+    if (states.includes("unsupported")) hadUnsupported = true;
+
+    const hasAnyReading = temp.value !== null || power.value !== null;
+    if (!hasAnyReading && states.includes("malformed")) {
+      hadMalformed = true;
+      continue;
+    }
+    if (!hasAnyReading && states.every((st) => st === "empty")) {
+      hadMalformed = true;
+      continue;
+    }
+
+    const missingReasons = [];
+    if (temp.value === null) {
+      missingReasons.push(
+        temp.state === "malformed" ? "malformed_temperature" : "temperature_not_supported"
+      );
+    }
+    if (power.value === null) {
+      missingReasons.push(
+        power.state === "malformed" ? "malformed_power" : "power_not_supported"
+      );
+    }
+    if (limit.value === null && power.value === null && temp.value === null) {
+      missingReasons.push("power_limit_not_supported");
+    }
+    if (throttle.value === null && throttle.state === "malformed") {
+      missingReasons.push("malformed_throttle_state");
+    }
+
+    let unavailableReason = null;
+    if (!hasAnyReading) {
+      unavailableReason = states.includes("malformed")
+        ? "malformed_provider_output"
+        : "sensor_not_supported";
+    } else if (missingReasons.length > 0) {
+      unavailableReason = missingReasons.join(",");
+    }
+
+    readings.push({
+      name: gpuName,
+      deviceKind: "gpu",
+      gpuIndex,
+      temperatureC: temp.value,
+      powerWatts: power.value,
+      powerLimitWatts: limit.value,
+      throttled: throttle.value,
+      unit: temp.value === null && power.value !== null ? "W" : "C",
+      provider: "nvidia-smi",
+      sensorType: "die",
+      sampledAt,
+      unavailableReason,
+    });
+  }
+
+  return { readings, hadMalformed, hadUnsupported };
+}
+
+function classifyLinuxHwmonSensor(chipName, label) {
+  const chip = String(chipName || "").trim().toLowerCase();
+  const lbl = String(label || "").trim().toLowerCase();
+  if (/^(?:acpitz|acpi|pch_|thinkpad_acpi)/.test(chip) || /\bacpi\b/.test(lbl)) {
+    return { sensorType: "acpi", deviceKind: "acpi" };
+  }
+  const isGpuChip = /^(?:amdgpu|radeon|nouveau|xe|i915)$/.test(chip);
+  if (/\bedge\b/.test(lbl) || (isGpuChip && !lbl && /^(?:amdgpu|radeon)$/.test(chip))) {
+    return { sensorType: "edge", deviceKind: isGpuChip ? "gpu" : "cpu" };
+  }
+  if (
+    /\b(?:die|tdie|tctl|package|pkg|core|ccd|junction|hotspot|cpu|gpu|soc)\b/.test(lbl) ||
+    /^(?:coretemp|k10temp|zenpower|cpu_thermal|soc_thermal|x86_pkg_temp|amdgpu|radeon|nouveau|xe|i915|tegra|rp1_adc)$/.test(
+      chip
+    )
+  ) {
+    return { sensorType: "die", deviceKind: isGpuChip ? "gpu" : "cpu" };
+  }
+  return { sensorType: "board", deviceKind: "board" };
+}
+
+function classifyLinuxThermalZone(zoneType) {
+  const zt = String(zoneType || "").trim().toLowerCase();
+  if (/^(?:acpitz|acpi|int3400|pch_)/.test(zt)) {
+    return { sensorType: "acpi", deviceKind: "acpi" };
+  }
+  if (/\bedge\b/.test(zt)) {
+    return { sensorType: "edge", deviceKind: /gpu/.test(zt) ? "gpu" : "cpu" };
+  }
+  if (/(?:x86_pkg_temp|cpu|pkg|soc|gpu|tcpu|core|die|junction|b0d4|tegra)/.test(zt)) {
+    return { sensorType: "die", deviceKind: /gpu/.test(zt) ? "gpu" : "cpu" };
+  }
+  return { sensorType: "board", deviceKind: "board" };
+}
+
+function naturalSortNames(entries) {
+  return [...entries].sort((a, b) =>
+    String(a).localeCompare(String(b), undefined, { numeric: true, sensitivity: "base" })
+  );
+}
+
+function readTrimmedFileSafe(fsImpl, filePath) {
+  try {
+    if (!fsImpl.existsSync(filePath)) return null;
+    return String(fsImpl.readFileSync(filePath, "utf8")).replace(/\0/g, "").trim();
+  } catch {
+    return null;
+  }
+}
+
+function probeLinuxSysfsThermal({ sysfsRoot, fsImpl, sampledAt, isOverBudget }) {
+  const readings = [];
+  let hadMalformed = false;
+  let hadUnreported = false;
+  let timedOut = false;
+
+  const hwmonRoot = path.join(sysfsRoot, "hwmon");
+  try {
+    if (fsImpl.existsSync(hwmonRoot)) {
+      const hwmonEntries = naturalSortNames(fsImpl.readdirSync(hwmonRoot)).filter((name) =>
+        /^hwmon\d+$/i.test(String(name))
+      );
+      for (const entryName of hwmonEntries) {
+        if (isOverBudget()) {
+          timedOut = true;
+          break;
+        }
+        const chipDir = path.join(hwmonRoot, String(entryName));
+        let files = [];
+        try {
+          files = naturalSortNames(fsImpl.readdirSync(chipDir)).map(String);
+        } catch {
+          continue;
+        }
+        const chipName = readTrimmedFileSafe(fsImpl, path.join(chipDir, "name")) || String(entryName);
+
+        const rawPower =
+          readTrimmedFileSafe(fsImpl, path.join(chipDir, "power1_average")) ??
+          readTrimmedFileSafe(fsImpl, path.join(chipDir, "power1_input"));
+        const rawCap =
+          readTrimmedFileSafe(fsImpl, path.join(chipDir, "power1_cap")) ??
+          readTrimmedFileSafe(fsImpl, path.join(chipDir, "power1_max"));
+        const powerMetric = inspectPositiveMetric(rawPower, {
+          minExclusive: 0,
+          maxInclusive: 10000,
+          scale: 1e-6,
+        });
+        const capMetric = inspectPositiveMetric(rawCap, {
+          minExclusive: 0,
+          maxInclusive: 10000,
+          scale: 1e-6,
+        });
+        if (powerMetric.state === "malformed" || capMetric.state === "malformed") {
+          hadMalformed = true;
+        }
+
+        const rawAlarm =
+          readTrimmedFileSafe(fsImpl, path.join(chipDir, "power1_cap_alarm")) ??
+          readTrimmedFileSafe(fsImpl, path.join(chipDir, "temp1_crit_alarm"));
+        const chipThrottled =
+          rawAlarm === "1" ? true : rawAlarm === "0" ? false : null;
+
+        const tempInputs = files
+          .map((f) => {
+            const m = f.match(/^temp(\d+)_input$/i);
+            return m ? { file: f, idx: Number(m[1]) } : null;
+          })
+          .filter(Boolean)
+          .sort((a, b) => a.idx - b.idx);
+
+        const rawChipSensors = [];
+        for (const ti of tempInputs) {
+          if (isOverBudget()) {
+            timedOut = true;
+            break;
+          }
+          const rawTemp = readTrimmedFileSafe(fsImpl, path.join(chipDir, ti.file));
+          const label = readTrimmedFileSafe(fsImpl, path.join(chipDir, `temp${ti.idx}_label`));
+          const parsedTemp = inspectPositiveMetric(rawTemp, {
+            minExclusive: 0,
+            maxInclusive: 200,
+            scale: 0.001,
+          });
+          if (parsedTemp.state === "malformed") {
+            hadMalformed = true;
+            continue;
+          }
+          if (parsedTemp.value === null) {
+            hadUnreported = true;
+            continue;
+          }
+          rawChipSensors.push({ idx: ti.idx, label, temperatureC: parsedTemp.value });
+        }
+
+        const hasPackageSummary = rawChipSensors.some((s) =>
+          /\b(?:package|pkg|tctl|tdie|composite)\b/i.test(String(s.label || ""))
+        );
+        const filteredSensors = hasPackageSummary
+          ? rawChipSensors.filter((s) => !/^core\s+\d+$/i.test(String(s.label || "").trim()))
+          : rawChipSensors;
+
+        if (filteredSensors.length > 0) {
+          filteredSensors.forEach((sensor, i) => {
+            const { sensorType, deviceKind } = classifyLinuxHwmonSensor(chipName, sensor.label);
+            const sensorName = sensor.label ? `${chipName}:${sensor.label}` : chipName;
+            readings.push({
+              name: sensorName,
+              deviceKind,
+              gpuIndex: null,
+              temperatureC: sensor.temperatureC,
+              powerWatts: i === 0 ? powerMetric.value : null,
+              powerLimitWatts: i === 0 ? capMetric.value : null,
+              throttled: i === 0 ? chipThrottled : null,
+              unit: "C",
+              provider: "linux-hwmon",
+              sensorType,
+              sampledAt,
+              unavailableReason: null,
+            });
+          });
+        } else if (powerMetric.value !== null) {
+          const { sensorType, deviceKind } = classifyLinuxHwmonSensor(chipName, null);
+          readings.push({
+            name: chipName,
+            deviceKind,
+            gpuIndex: null,
+            temperatureC: null,
+            powerWatts: powerMetric.value,
+            powerLimitWatts: capMetric.value,
+            throttled: chipThrottled,
+            unit: "W",
+            provider: "linux-hwmon",
+            sensorType,
+            sampledAt,
+            unavailableReason: "temperature_not_supported",
+          });
+        }
+      }
+    }
+  } catch {}
+
+  const thermalRoot = path.join(sysfsRoot, "thermal");
+  if (!timedOut) {
+    try {
+      if (fsImpl.existsSync(thermalRoot)) {
+        const zoneEntries = naturalSortNames(fsImpl.readdirSync(thermalRoot)).filter((name) =>
+          /^thermal_zone\d+$/i.test(String(name))
+        );
+        for (const zoneName of zoneEntries) {
+          if (isOverBudget()) {
+            timedOut = true;
+            break;
+          }
+          const zoneDir = path.join(thermalRoot, String(zoneName));
+          const zoneType = readTrimmedFileSafe(fsImpl, path.join(zoneDir, "type")) || String(zoneName);
+          const rawTemp = readTrimmedFileSafe(fsImpl, path.join(zoneDir, "temp"));
+          const parsedTemp = inspectPositiveMetric(rawTemp, {
+            minExclusive: 0,
+            maxInclusive: 200,
+            scale: 0.001,
+          });
+          if (parsedTemp.state === "malformed") {
+            hadMalformed = true;
+            continue;
+          }
+          if (parsedTemp.value === null) {
+            hadUnreported = true;
+            continue;
+          }
+          const { sensorType, deviceKind } = classifyLinuxThermalZone(zoneType);
+          readings.push({
+            name: `${zoneName}:${zoneType}`,
+            deviceKind,
+            gpuIndex: null,
+            temperatureC: parsedTemp.value,
+            powerWatts: null,
+            powerLimitWatts: null,
+            throttled: null,
+            unit: "C",
+            provider: "linux-thermal-zone",
+            sensorType,
+            sampledAt,
+            unavailableReason: null,
+          });
+        }
+      }
+    } catch {}
+  }
+
+  return { readings, hadMalformed, hadUnreported, timedOut };
+}
+
+export function parseWin32ThermalCounterOutput(rawOutput, sampledAt = new Date().toISOString()) {
+  const text = String(rawOutput ?? "").trim();
+  if (!text) {
+    return { readings: [], hadMalformed: false, hadUnreported: false };
+  }
+  const readings = [];
+  let hadMalformed = false;
+  let hadUnreported = false;
+
+  const consumeRow = (nameRaw, tempKelvinRaw, highPrecDeciKelvinRaw, throttleRaw) => {
+    const zoneName = String(nameRaw ?? "").trim();
+    if (!zoneName) {
+      hadMalformed = true;
+      return;
+    }
+
+    let temperatureC = null;
+    const hpStr = String(highPrecDeciKelvinRaw ?? "").trim();
+    const kStr = String(tempKelvinRaw ?? "").trim();
+
+    if (hpStr) {
+      if (!/^[+-]?\d+(?:\.\d+)?$/.test(hpStr)) {
+        hadMalformed = true;
+      } else {
+        const kelvin = Number(hpStr) / 10;
+        if (kelvin > 274.15 && kelvin <= 423.15) {
+          temperatureC = Math.round((kelvin - 273.15) * 10) / 10;
+        } else if (kelvin > 423.15 || kelvin < 0) {
+          hadMalformed = true;
+        } else {
+          hadUnreported = true;
+        }
+      }
+    }
+
+    if (temperatureC === null && kStr) {
+      if (!/^[+-]?\d+(?:\.\d+)?$/.test(kStr)) {
+        hadMalformed = true;
+      } else {
+        const kelvin = Number(kStr);
+        if (kelvin > 274.15 && kelvin <= 423.15) {
+          temperatureC = Math.round((kelvin - 273.15) * 10) / 10;
+        } else if (kelvin > 423.15 || kelvin < 0) {
+          hadMalformed = true;
+        } else {
+          hadUnreported = true;
+        }
+      }
+    }
+
+    if (temperatureC === null || temperatureC <= 0) {
+      return;
+    }
+
+    const thStr = String(throttleRaw ?? "").trim();
+    let throttled = null;
+    if (thStr) {
+      if (/^\d+$/.test(thStr)) {
+        throttled = Number(thStr) > 0;
+      } else if (/^(?:true|false)$/i.test(thStr)) {
+        throttled = /^true$/i.test(thStr);
+      } else {
+        hadMalformed = true;
+      }
+    }
+
+    const lowerName = zoneName.toLowerCase();
+    const sensorType = /\b(?:edge)\b/.test(lowerName)
+      ? "edge"
+      : /(?:cpu|pkg|core|die|soc)/.test(lowerName)
+        ? "die"
+        : "acpi";
+    const deviceKind = sensorType === "acpi" ? "acpi" : "cpu";
+
+    readings.push({
+      name: zoneName,
+      deviceKind,
+      gpuIndex: null,
+      temperatureC,
+      powerWatts: null,
+      powerLimitWatts: null,
+      throttled,
+      unit: "C",
+      provider: "win32-thermal-counter",
+      sensorType,
+      sampledAt,
+      unavailableReason: null,
+    });
+  };
+
+  if (text.startsWith("[") || text.startsWith("{")) {
+    try {
+      const parsed = JSON.parse(text);
+      const items = Array.isArray(parsed) ? parsed : [parsed];
+      for (const item of items) {
+        if (!item || typeof item !== "object") {
+          hadMalformed = true;
+          continue;
+        }
+        consumeRow(
+          item.Name ?? item.name,
+          item.Temperature ?? item.temperature,
+          item.HighPrecisionTemperature ?? item.highPrecisionTemperature,
+          item.ThrottleReasons ?? item.throttleReasons
+        );
+      }
+      return { readings, hadMalformed, hadUnreported };
+    } catch {
+      return { readings: [], hadMalformed: true, hadUnreported: false };
+    }
+  }
+
+  for (const rawLine of text.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    if (!line.includes("\t")) {
+      hadMalformed = true;
+      continue;
+    }
+    const parts = rawLine.split("\t");
+    consumeRow(parts[0], parts[1], parts[2], parts[3]);
+  }
+
+  return { readings, hadMalformed, hadUnreported };
+}
+
+function isExecTimeoutError(err) {
+  if (!err) return false;
+  return (
+    err.code === "ETIMEDOUT" ||
+    err.killed === true ||
+    err.signal === "SIGTERM" ||
+    err.signal === "SIGKILL" ||
+    /timed?\s*out|etimedout/i.test(String(err.message || ""))
+  );
+}
+
+function cloneThermalTelemetryResult(sample, { ageMs = sample.ageMs, cached = sample.cached } = {}) {
+  const safeAgeMs = Math.max(0, Math.round(Number(ageMs) || 0));
+  const isCached = Boolean(cached);
+  return {
+    ...sample,
+    providers: Array.isArray(sample.providers) ? [...sample.providers] : [],
+    cached: isCached,
+    ageMs: safeAgeMs,
+    freshness: {
+      ...sample.freshness,
+      ageMs: safeAgeMs,
+      cached: isCached,
+      isFresh: safeAgeMs < sample.freshness.ttlMs,
+    },
+    readings: Array.isArray(sample.readings) ? sample.readings.map((r) => ({ ...r })) : [],
+  };
+}
+
+export function probeThermalTelemetry(options = {}) {
+  const platform = options.platform || process.platform;
+  const sysfsRoot = options.sysfsRoot || "/sys/class";
+  const fsImpl = options.fsImpl || fs;
+  const customExecFn = typeof options.execFn === "function" ? options.execFn : null;
+  const runExec = customExecFn || execFileSync;
+  const nowFn = typeof options.nowFn === "function" ? options.nowFn : Date.now;
+  const perfNowFn =
+    typeof options.perfNowFn === "function" ? options.perfNowFn : () => performance.now();
+  const forceRefresh = Boolean(options.forceRefresh);
+  const enabled =
+    options.enabled !== undefined
+      ? Boolean(options.enabled)
+      : process.env.COPILOT_FLOCK_DISABLE_THERMAL !== "1";
+
+  const rawBudget = options.budgetMs ?? options.timeoutMs ?? THERMAL_TELEMETRY_MAX_BUDGET_MS;
+  const budgetMs = Math.max(
+    1,
+    Math.min(
+      THERMAL_TELEMETRY_MAX_BUDGET_MS,
+      Number.isFinite(Number(rawBudget)) ? Number(rawBudget) : THERMAL_TELEMETRY_MAX_BUDGET_MS
+    )
+  );
+  const rawTtl = options.freshnessMs ?? options.ttlMs ?? THERMAL_TELEMETRY_DEFAULT_TTL_MS;
+  const ttlMs = Math.max(
+    0,
+    Number.isFinite(Number(rawTtl)) ? Number(rawTtl) : THERMAL_TELEMETRY_DEFAULT_TTL_MS
+  );
+  const negativeTtlMs =
+    options.negativeTtlMs !== undefined
+      ? Math.max(0, Number(options.negativeTtlMs) || 0)
+      : Math.min(THERMAL_TELEMETRY_NEGATIVE_TTL_MS, ttlMs);
+
+  const nowMs = nowFn();
+  const cacheKey = `${platform}|${sysfsRoot}|${enabled ? "1" : "0"}`;
+  const activeCache = options.cacheStore ? options.cacheStore.entry : defaultThermalTelemetryCache;
+
+  if (
+    !forceRefresh &&
+    ttlMs > 0 &&
+    activeCache &&
+    activeCache.key === cacheKey &&
+    activeCache.execFn === customExecFn &&
+    nowMs >= activeCache.sampledAtMs &&
+    nowMs < activeCache.expiresAtMs
+  ) {
+    return cloneThermalTelemetryResult(activeCache.value, {
+      ageMs: nowMs - activeCache.sampledAtMs,
+      cached: true,
+    });
+  }
+
+  const startedAtPerf = perfNowFn();
+  const sampledAt = new Date(nowMs).toISOString();
+  const elapsedPerf = () => Math.max(0, perfNowFn() - startedAtPerf);
+  const remainingPerf = () => budgetMs - elapsedPerf();
+  const isOverBudget = () => remainingPerf() <= 0;
+  const computeChildTimeout = () => {
+    const rem = remainingPerf();
+    if (rem <= 8) return 0;
+    if (budgetMs >= 100) {
+      return Math.min(85, Math.floor(rem * 0.36));
+    }
+    return Math.max(5, Math.floor(rem * 0.6));
+  };
+
+  const allReadings = [];
+  let timedOut = false;
+  let timedOutProvider = null;
+  let hadMalformedOutput = false;
+  let hadUnreportedSensors = false;
+  let asyncRefreshPending = false;
+
+  if (enabled) {
+    const baseGpus = Array.isArray(options.baseSpecs?.gpus) ? options.baseSpecs.gpus : null;
+    const baseSpecsMentionsNvidia =
+      Array.isArray(baseGpus) &&
+      baseGpus.some((g) =>
+        /nvidia|geforce|rtx|gtx|quadro|tesla|a100|h100|l40|t4/i.test(String(g?.name || ""))
+      );
+    const hasKnownNonNvidiaOnly =
+      Array.isArray(baseGpus) && baseGpus.length > 0 && !baseSpecsMentionsNvidia;
+
+    const nvBinary = customExecFn
+      ? "nvidia-smi"
+      : resolveNvidiaSmiBinary("nvidia-smi", fsImpl, platform);
+    let linuxNvidiaPresent = false;
+    if (!customExecFn && platform === "linux") {
+      try {
+        linuxNvidiaPresent =
+          Boolean(process.env.COPILOT_FLOCK_NVIDIA_SMI) ||
+          fsImpl.existsSync("/proc/driver/nvidia/version") ||
+          fsImpl.existsSync("/dev/nvidiactl");
+      } catch {}
+    }
+
+    const shouldTryNvidiaSmi = Boolean(customExecFn)
+      ? !hasKnownNonNvidiaOnly
+      : platform === "win32"
+        ? nvBinary !== "nvidia-smi" || baseSpecsMentionsNvidia
+        : platform === "linux"
+          ? (linuxNvidiaPresent || baseSpecsMentionsNvidia) && !hasKnownNonNvidiaOnly
+          : baseSpecsMentionsNvidia || Boolean(process.env.COPILOT_FLOCK_NVIDIA_SMI);
+
+    if (shouldTryNvidiaSmi && !isOverBudget()) {
+      const nvTimeoutMs = computeChildTimeout();
+      if (nvTimeoutMs < 5) {
+        timedOut = true;
+        timedOutProvider = "nvidia-smi";
+      } else {
+        const queryNvidia = (throttleField) =>
+          runExec(
+            nvBinary,
+            [
+              `--query-gpu=index,name,temperature.gpu,power.draw,power.limit,${throttleField}`,
+              "--format=csv,noheader,nounits",
+            ],
+            {
+              encoding: "utf8",
+              stdio: ["ignore", "pipe", "pipe"],
+              timeout: nvTimeoutMs,
+              windowsHide: true,
+            }
+          );
+
+        let nvRaw = null;
+        try {
+          nvRaw = queryNvidia("clocks_event_reasons.active");
+          if (isOverBudget()) {
+            timedOut = true;
+            timedOutProvider = "nvidia-smi";
+          }
+        } catch (err) {
+          if (isExecTimeoutError(err) || isOverBudget()) {
+            timedOut = true;
+            timedOutProvider = "nvidia-smi";
+          } else {
+            const errMsg = `${err?.stderr || ""} ${err?.stdout || ""} ${err?.message || ""}`;
+            if (/clocks_event_reasons|not a valid field/i.test(errMsg)) {
+              const retryTimeoutMs = computeChildTimeout();
+              if (retryTimeoutMs >= 5) {
+                try {
+                  nvRaw = queryNvidia("clocks_throttle_reasons.active");
+                } catch (err2) {
+                  if (isExecTimeoutError(err2) || isOverBudget()) {
+                    timedOut = true;
+                    timedOutProvider = "nvidia-smi";
+                  }
+                }
+              } else {
+                timedOut = true;
+                timedOutProvider = "nvidia-smi";
+              }
+            }
+          }
+        }
+
+        if (nvRaw !== null && (!timedOut || String(nvRaw).trim().length > 0)) {
+          const parsedNv = parseNvidiaSmiThermalOutput(nvRaw, sampledAt);
+          if (parsedNv.hadMalformed) hadMalformedOutput = true;
+          allReadings.push(...parsedNv.readings);
+        }
+      }
+    }
+
+    if (platform === "linux" && !timedOut) {
+      if (isOverBudget()) {
+        timedOut = true;
+        timedOutProvider = timedOutProvider || "linux-hwmon";
+      } else {
+        const linuxRes = probeLinuxSysfsThermal({
+          sysfsRoot,
+          fsImpl,
+          sampledAt,
+          isOverBudget,
+        });
+        if (linuxRes.hadMalformed) hadMalformedOutput = true;
+        if (linuxRes.hadUnreported) hadUnreportedSensors = true;
+        if (linuxRes.timedOut) {
+          timedOut = true;
+          timedOutProvider = timedOutProvider || "linux-hwmon";
+        }
+        allReadings.push(...linuxRes.readings);
+      }
+    } else if (platform === "win32" && !timedOut) {
+      if (!customExecFn && !forceRefresh) {
+        triggerWin32AsyncThermalRefresh({
+          cacheKey,
+          cacheStore: options.cacheStore || null,
+          seedReadings: allReadings,
+          ttlMs,
+          negativeTtlMs,
+          budgetMs,
+        });
+        if (allReadings.length === 0) {
+          asyncRefreshPending = true;
+        }
+      } else {
+        const winTimeoutMs = customExecFn
+          ? computeChildTimeout()
+          : Math.min(185, Math.max(15, Math.floor(remainingPerf() - 40)));
+        if (winTimeoutMs < 10) {
+          if (allReadings.length === 0) {
+            timedOut = true;
+            timedOutProvider = timedOutProvider || "win32-thermal-counter";
+          }
+        } else {
+          let winRaw = null;
+          let tempScriptPath = null;
+          try {
+            let scriptArg = "win32-thermal-counter";
+            if (!customExecFn) {
+              tempScriptPath = path.join(
+                os.tmpdir(),
+                `copilot-flock-tz-${process.pid}-${++win32ThermalScriptSeq}.js`
+              );
+              fs.writeFileSync(tempScriptPath, WIN32_THERMAL_JSCRIPT_SOURCE, {
+                encoding: "utf8",
+                mode: 0o600,
+                flag: "wx",
+              });
+              scriptArg = tempScriptPath;
+            }
+            winRaw = runExec(
+              "cscript.exe",
+              ["//NoLogo", "//T:1", "//E:JScript", scriptArg],
+              {
+                encoding: "utf8",
+                stdio: ["ignore", "pipe", "pipe"],
+                timeout: winTimeoutMs,
+                windowsHide: true,
+              }
+            );
+            if (isOverBudget()) {
+              timedOut = true;
+              timedOutProvider = timedOutProvider || "win32-thermal-counter";
+            }
+          } catch (err) {
+            if (isExecTimeoutError(err) || isOverBudget()) {
+              timedOut = true;
+              timedOutProvider = timedOutProvider || "win32-thermal-counter";
+            }
+          } finally {
+            if (tempScriptPath) {
+              try {
+                fs.unlinkSync(tempScriptPath);
+              } catch {}
+            }
+          }
+
+          if (winRaw !== null && (!timedOut || String(winRaw).trim().length > 0)) {
+            const parsedWin = parseWin32ThermalCounterOutput(winRaw, sampledAt);
+            if (parsedWin.hadMalformed) hadMalformedOutput = true;
+            if (parsedWin.hadUnreported) hadUnreportedSensors = true;
+            allReadings.push(...parsedWin.readings);
+          }
+        }
+      }
+    }
+  }
+
+  const probeDurationMs = Math.max(0, Math.round(elapsedPerf()));
+  const sample = buildThermalTelemetrySample({
+    allReadings,
+    enabled,
+    timedOut,
+    timedOutProvider,
+    hadMalformedOutput,
+    hadUnreportedSensors,
+    asyncRefreshPending,
+    platform,
+    sampledAt,
+    nowMs,
+    ttlMs,
+    negativeTtlMs,
+    budgetMs,
+    probeDurationMs,
+  });
+
+  if (sample.ttlMs > 0) {
+    const nextEntry = {
+      key: cacheKey,
+      execFn: customExecFn,
+      sampledAtMs: nowMs,
+      expiresAtMs: nowMs + sample.ttlMs,
+      value: sample,
+    };
+    if (options.cacheStore) {
+      options.cacheStore.entry = nextEntry;
+    } else {
+      defaultThermalTelemetryCache = nextEntry;
+    }
+  }
+
+  return cloneThermalTelemetryResult(sample, { ageMs: 0, cached: false });
+}
+
+export function sanitizeSpecsForFlockPolicy(specs, flockPolicy = null, senderIdentity = null) {
+  if (!specs || typeof specs !== "object") return specs;
+  const isCrossUser = Boolean(senderIdentity?.isCrossUser);
+  const isRestrictedFlock = Boolean(flockPolicy && flockPolicy.trustTier !== "owner");
+  const shareMode = flockPolicy?.shareSpecs || (isRestrictedFlock || isCrossUser ? "summary" : "full");
+
+  if (!isCrossUser && !isRestrictedFlock && shareMode === "full") {
+    return specs;
+  }
+
+  if (shareMode === "none") {
+    return {
+      os: specs.os || null,
+      publicKey: specs.publicKey || null,
+      keyFingerprint: specs.keyFingerprint || null,
+    };
+  }
+
+  const sanitized = {
+    model: specs.model || null,
+    os: specs.os || null,
+    publicKey: specs.publicKey || null,
+    keyFingerprint: specs.keyFingerprint || null,
+    cpu: specs.cpu
+      ? {
+          model: specs.cpu.model || null,
+          logicalCores: specs.cpu.logicalCores ?? null,
+          physicalCores: specs.cpu.physicalCores ?? null,
+          arch: specs.cpu.arch || null,
+        }
+      : null,
+    memory: specs.memory
+      ? {
+          totalGb: specs.memory.totalGb ?? null,
+          freeGb: specs.memory.freeGb ?? null,
+        }
+      : null,
+    gpus: Array.isArray(specs.gpus)
+      ? specs.gpus.map((g) => ({
+          name: g?.name || null,
+          vramGb: g?.vramGb ?? null,
+        }))
+      : [],
+    disks: Array.isArray(specs.disks)
+      ? specs.disks
+          .filter((d) => d && d.type !== "network")
+          .map((d) => ({
+            mount: d.mount,
+            type: "fixed",
+            totalGb: d.totalGb,
+            freeGb: d.freeGb,
+          }))
+      : [],
+  };
+
+  return sanitized;
+}
+
+export function refreshLiveSpecs(baseSpecs = null, options = {}) {
+  const passive = Boolean(options?.passive);
+  const refreshStartedAt = performance.now();
   const cpus = os.cpus() || [];
   const totalRamGb = round1(os.totalmem() / 1073741824);
   const freeRamGb = round1(os.freemem() / 1073741824);
@@ -1527,7 +2684,7 @@ export function refreshLiveSpecs(baseSpecs = null, { passive = false } = {}) {
     !passive &&
     baseGpus.some((g) => /nvidia|geforce|rtx|gtx|quadro|tesla/i.test(String(g?.name || "")))
   ) {
-    const liveNv = probeLiveNvidiaGpuMetrics();
+    const liveNv = probeLiveNvidiaGpuMetrics(90);
     if (liveNv.length > 0) {
       for (const g of baseGpus) {
         const nvMatch = liveNv.find(
@@ -1586,11 +2743,30 @@ export function refreshLiveSpecs(baseSpecs = null, { passive = false } = {}) {
     }
   }
 
+  if (options?.includeThermal !== false && (!passive || options?.includeThermal === true)) {
+    const remainingBudgetMs = Math.max(
+      20,
+      THERMAL_TELEMETRY_MAX_BUDGET_MS - Math.ceil(performance.now() - refreshStartedAt)
+    );
+    const callerThermalOpts = options?.thermalOptions || {};
+    specs.thermal = probeThermalTelemetry({
+      baseSpecs: specs,
+      ...callerThermalOpts,
+      budgetMs:
+        callerThermalOpts.budgetMs !== undefined || callerThermalOpts.timeoutMs !== undefined
+          ? Math.min(
+              remainingBudgetMs,
+              Number(callerThermalOpts.budgetMs ?? callerThermalOpts.timeoutMs) || remainingBudgetMs
+            )
+          : remainingBudgetMs,
+    });
+  }
+
   return specs;
 }
 
 export function collectLocalMachineSpecs() {
-  const base = refreshLiveSpecs(null);
+  const base = refreshLiveSpecs(null, { includeThermal: false });
 
   if (process.platform === "win32") {
     // 1. Try nvidia-smi for exact NVIDIA GPU name and VRAM (>4GB safe)
@@ -1817,6 +2993,7 @@ export function collectLocalMachineSpecs() {
     } catch {}
   }
 
+  base.thermal = probeThermalTelemetry({ baseSpecs: base, forceRefresh: true });
   return base;
 }
 export function loadConfig({ autoFetchAz = true, refreshSpecs = false, passive = false } = {}) {
@@ -7379,6 +8556,10 @@ export async function handleRpcAction(cfg, req) {
     enforceFlockPolicyAndWalls(cfg, flockPolicy, req, senderIdentity, localFlocks);
   }
   const isRestrictedFlock = isExplicitOptInFlockPolicy(flockPolicy);
+  const allowFullSpecs =
+    !isRestrictedFlock &&
+    !senderIdentity?.isCrossUser &&
+    (!flockPolicy || !flockPolicy.shareSpecs || flockPolicy.shareSpecs === "full");
   const fromMachine = senderIdentity.fromMachine;
 
   if (action === "ping") {
@@ -7398,12 +8579,11 @@ export async function handleRpcAction(cfg, req) {
         .slice(0, sessionLimit);
     }
     const githubUser = normalizeGitHubUser(cfg.githubUser || resolveLocalGitHubUser());
-    const specs = refreshLiveSpecs(cfg.specs, { passive: Boolean(params.passive) });
-    if (isRestrictedFlock && flockPolicy.shareSpecs === "summary" && Array.isArray(specs?.disks)) {
-      specs.disks = specs.disks
-        .filter((d) => d.type !== "network")
-        .map((d) => ({ mount: d.mount, type: "fixed", totalGb: d.totalGb, freeGb: d.freeGb }));
-    }
+    const rawSpecs = refreshLiveSpecs(cfg.specs, {
+      passive: Boolean(params.passive),
+      includeThermal: Boolean(params.passive) ? false : allowFullSpecs,
+    });
+    const specs = sanitizeSpecsForFlockPolicy(rawSpecs, flockPolicy, senderIdentity);
     const runtimeStates = await getLocalRuntimeStatesAsync({ inDaemonProcess: true });
     const out = {
       machineId: cfg.machineId,
@@ -7882,11 +9062,15 @@ export async function handleRpcAction(cfg, req) {
 
   if (action === "diagnose") {
     const fix = params.passive ? false : Boolean(params.fix);
-    return await diagnoseLocalBridgeState(cfg, {
+    const diagRes = await diagnoseLocalBridgeState(cfg, {
       fix,
       passive: Boolean(params.passive) || !fix,
       inDaemonRpc: true,
     });
+    if (!allowFullSpecs && diagRes?.specs) {
+      diagRes.specs = sanitizeSpecsForFlockPolicy(diagRes.specs, flockPolicy, senderIdentity);
+    }
+    return diagRes;
   }
 
   if (action === "reprovision") {
@@ -11008,7 +12192,22 @@ export async function executeMcpTool(cfg, name, args = {}, options = {}) {
           scope: normalizeScope(cfg.scope, "work"),
           publicKey: idKey.publicKey,
           keyFingerprint: idKey.fingerprint,
-          specs: cfg.specs || null,
+          specs: cfg.specs
+            ? sanitizeSpecsForFlockPolicy(cfg.specs, {
+                trustTier:
+                  enrollmentJson?.trustTier === "owner" &&
+                  normalizeGitHubUser(enrollmentJson?.ownerGitHubUser)?.toLowerCase() ===
+                    normalizeGitHubUser(cfg.githubUser)?.toLowerCase()
+                    ? "owner"
+                    : "collaborator",
+                shareSpecs:
+                  enrollmentJson?.trustTier === "owner" &&
+                  normalizeGitHubUser(enrollmentJson?.ownerGitHubUser)?.toLowerCase() ===
+                    normalizeGitHubUser(cfg.githubUser)?.toLowerCase()
+                    ? "full"
+                    : "summary",
+              })
+            : null,
           enrollmentJson,
           maintainerVisibilityAck: args.maintainer_visibility_ack !== false,
           timestamp,
@@ -14990,7 +16189,18 @@ export async function installBridge({
         scope: cfg.scope,
         publicKey: idKey.publicKey,
         keyFingerprint: idKey.fingerprint,
-        specs: cfg.specs,
+        specs:
+          parsedEnrollmentJson &&
+          (parsedEnrollmentJson.trustTier !== "owner" ||
+            (cfg.githubUser &&
+              parsedEnrollmentJson.ownerGitHubUser &&
+              normalizeGitHubUser(parsedEnrollmentJson.ownerGitHubUser)?.toLowerCase() !==
+                normalizeGitHubUser(cfg.githubUser)?.toLowerCase()))
+            ? sanitizeSpecsForFlockPolicy(cfg.specs, {
+                trustTier: parsedEnrollmentJson.trustTier || "collaborator",
+                shareSpecs: "summary",
+              })
+            : cfg.specs,
         enrollmentJson: parsedEnrollmentJson || null,
         maintainerVisibilityAck: true,
         timestamp: new Date().toISOString(),

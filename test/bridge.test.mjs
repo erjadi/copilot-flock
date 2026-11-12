@@ -92,6 +92,12 @@ import {
   diagnoseFleetMachines,
   inspectLocalDaemonPassive,
   getMcpSelfInfo,
+  THERMAL_TELEMETRY_MAX_BUDGET_MS,
+  probeThermalTelemetry,
+  resetThermalTelemetryCache,
+  parseNvidiaSmiThermalOutput,
+  parseWin32ThermalCounterOutput,
+  sanitizeSpecsForFlockPolicy,
 } from "../bridge.mjs";
 import {
   verifyGitHubRepoAccess,
@@ -3148,4 +3154,31 @@ test("mcp_self_info tool and self-info CLI report in-memory loadTimeDigest and d
       fs.rmSync(tempRoot, { recursive: true, force: true });
     } catch {}
   }
+});
+
+test("thermal telemetry parity via bridge.mjs: bounded timeout, provider parsing, and collaborator redaction", async () => {
+  resetThermalTelemetryCache();
+  const sample = probeThermalTelemetry({
+    platform: "linux",
+    sysfsRoot: path.join(os.tmpdir(), `bridge-sysfs-${crypto.randomUUID()}`),
+    forceRefresh: true,
+    execFn: () => "0, NVIDIA RTX 4090, 59, 120.5, 450.0, 0x0000000000000000\n",
+  });
+  assert.equal(sample.available, true);
+  assert.equal(sample.provider, "nvidia-smi");
+  assert.equal(sample.temperatureC, 59);
+  assert.equal(sample.powerWatts, 120.5);
+  assert.equal(sample.powerLimitWatts, 450);
+  assert.equal(sample.throttled, false);
+  assert.equal(sample.unavailableReason, null);
+  assert.equal(THERMAL_TELEMETRY_MAX_BUDGET_MS, 250);
+
+  const redacted = sanitizeSpecsForFlockPolicy(
+    { os: "linux", gpus: [{ name: "RTX 4090", vramGb: 24, utilizationPct: 80 }], thermal: sample },
+    { flockId: "erjadi/studio-team", trustTier: "collaborator", shareSpecs: "summary" }
+  );
+  assert.equal("thermal" in redacted, false);
+  assert.equal("utilizationPct" in redacted.gpus[0], false);
+  assert.equal(parseNvidiaSmiThermalOutput("").readings.length, 0);
+  assert.equal(parseWin32ThermalCounterOutput("").readings.length, 0);
 });
