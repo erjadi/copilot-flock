@@ -55,6 +55,17 @@ import {
   listSharedThreadsForMachine,
   enforceFlockPolicyAndWalls,
   validatePinnedBootstrapOrigin,
+  validateBootstrapControlPlaneUrl,
+  redactBootstrapUrlForDiagnostic,
+  callBootstrapV3Endpoint,
+  getOfflineQueueStatus,
+  loadConfig,
+  executeMcpTool,
+  captureCallerMcpSnapshot,
+  inspectLocalRuntimeHealth,
+  diagnoseLocalBridgeState,
+  reapOrphanedMcpProcesses,
+  SAFE_CALLER_MCP_RECONNECT_GUIDANCE,
   recordSandboxManifestResource,
   teardownLocalSandbox,
 } from "../flock.mjs";
@@ -2338,6 +2349,470 @@ test("v3.0.0 multi-flock platform: universal <owner>/<flock>[/<machineId>] addre
   } finally {
     if (prevCopilotHome === undefined) delete process.env.COPILOT_HOME;
     else process.env.COPILOT_HOME = prevCopilotHome;
+    env.cleanup();
+  }
+});
+
+test("control-plane bootstrapUrl validation returns actionable redacted errors for missing, empty, and malformed URLs", async () => {
+  const env = setupTempCopilotEnv();
+  const prevCopilotHome = process.env.COPILOT_HOME;
+  const prevFlockBoot = process.env.COPILOT_FLOCK_BOOTSTRAP_URL;
+  const prevBridgeBoot = process.env.COPILOT_BRIDGE_BOOTSTRAP_URL;
+  const prevAllowedOrigin = process.env.COPILOT_FLOCK_ALLOWED_BOOTSTRAP_ORIGIN;
+  process.env.COPILOT_HOME = env.tempRoot;
+  delete process.env.COPILOT_FLOCK_BOOTSTRAP_URL;
+  delete process.env.COPILOT_BRIDGE_BOOTSTRAP_URL;
+  delete process.env.COPILOT_FLOCK_ALLOWED_BOOTSTRAP_ORIGIN;
+
+  try {
+    const flockDir = path.join(env.tempRoot, "flock");
+    fs.mkdirSync(flockDir, { recursive: true });
+    const configPath = path.join(flockDir, "config.json");
+    const validSignalR =
+      "Endpoint=https://demo-signalr.service.signalr.net;AccessKey=YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXo=;Version=1.0;";
+
+    // 1. Missing bootstrapUrl in config.json: loadConfig succeeds for SignalR, control-plane rejects with MISSING_BOOTSTRAP_URL + configPath
+    writeConfigFileSecure(
+      {
+        machineId: "TEST-MISSING-BOOT",
+        scope: "personal",
+        githubUser: "erjadi",
+        specs: { cpu: { model: "Test CPU" } },
+        connectionString: validSignalR,
+      },
+      configPath
+    );
+    const missingCfg = loadConfig({ autoFetchAz: false });
+    assert.equal(missingCfg.bootstrapUrl, null);
+    assert.equal(path.resolve(missingCfg.configPath), path.resolve(configPath));
+
+    await assert.rejects(
+      () => executeMcpTool(missingCfg, "list_flocks", {}),
+      (err) => {
+        assert.equal(err.code, "MISSING_BOOTSTRAP_URL");
+        assert.equal(err.reason, "missing");
+        assert.equal(path.resolve(err.configPath), path.resolve(configPath));
+        assert.match(err.message, /Missing required control-plane bootstrapUrl \(unset\)/);
+        assert.ok(err.message.includes(path.resolve(configPath)));
+        assert.doesNotMatch(err.message, /Invalid URL/i);
+        return true;
+      }
+    );
+
+    assert.throws(
+      () => getOfflineQueueStatus({ bootstrapUrl: missingCfg.bootstrapUrl, configPath }),
+      (err) => err.code === "MISSING_BOOTSTRAP_URL" && err.reason === "missing"
+    );
+
+    // 2. Empty and whitespace-only bootstrapUrl in config.json
+    for (const emptyCandidate of ["", "   \t  "]) {
+      writeConfigFileSecure(
+        {
+          machineId: "TEST-EMPTY-BOOT",
+          scope: "personal",
+          githubUser: "erjadi",
+          specs: { cpu: { model: "Test CPU" } },
+          connectionString: validSignalR,
+          bootstrapUrl: emptyCandidate,
+        },
+        configPath
+      );
+      const emptyCfg = loadConfig({ autoFetchAz: false });
+      await assert.rejects(
+        () => executeMcpTool(emptyCfg, "list_flocks", {}),
+        (err) => {
+          assert.equal(err.code, "MISSING_BOOTSTRAP_URL");
+          assert.equal(err.reason, "empty");
+          assert.equal(path.resolve(err.configPath), path.resolve(configPath));
+          assert.match(err.message, /Missing required control-plane bootstrapUrl \(empty value\)/);
+          assert.ok(err.message.includes(path.resolve(configPath)));
+          assert.doesNotMatch(err.message, /Invalid URL/i);
+          return true;
+        }
+      );
+    }
+
+    // 3. Malformed bootstrapUrl values (including accidentally pasted secrets/tokens/credentials) must be redacted
+    const secretSignalR =
+      "Endpoint=https://demo.service.signalr.net;AccessKey=SUPER_SECRET_SIGNALR_KEY_999;Version=1.0;";
+    const credentialedUrl =
+      "https://admin:SUPER_SECRET_PASS_888@broker.demo-flock.net/api/bootstrap?token=ghp_SuperSecretPatToken1234567890#fragSecret";
+    const whitespaceBearer =
+      "https://broker.demo-flock.net/api/bootstrap Bearer ghp_AnotherSecretToken987654321";
+
+    for (const badCandidate of ["not-a-valid-url", secretSignalR, credentialedUrl, whitespaceBearer, 42]) {
+      assert.throws(
+        () =>
+          callBootstrapV3Endpoint(
+            { machineId: "TEST-BAD-BOOT", bootstrapUrl: badCandidate, configPath },
+            "/my-flocks",
+            { method: "GET" }
+          ),
+        (err) => {
+          assert.equal(err.code, "MALFORMED_BOOTSTRAP_URL");
+          assert.equal(err.reason, "malformed");
+          assert.equal(path.resolve(err.configPath), path.resolve(configPath));
+          assert.match(err.message, /Malformed control-plane bootstrapUrl/);
+          assert.ok(err.message.includes(path.resolve(configPath)));
+          assert.doesNotMatch(
+            err.message,
+            /SUPER_SECRET_SIGNALR_KEY_999|SUPER_SECRET_PASS_888|SuperSecretPatToken|AnotherSecretToken|fragSecret/
+          );
+          assert.doesNotMatch(err.message, /^Invalid URL$/i);
+          return true;
+        }
+      );
+    }
+
+    // 4. Malformed existing pinned bootstrapUrl in config.json during enroll_from_invite_json also fails cleanly without raw URL TypeError
+    await assert.rejects(
+      () =>
+        executeMcpTool(
+          { machineId: "TEST-BAD-PIN", bootstrapUrl: secretSignalR, configPath },
+          "enroll_from_invite_json",
+          {
+            enrollment_json: {
+              bootstrapUrl: "https://broker.demo-flock.net/api/bootstrap",
+              flocks: [],
+            },
+          }
+        ),
+      (err) => {
+        assert.equal(err.code, "MALFORMED_BOOTSTRAP_URL");
+        assert.doesNotMatch(err.message, /SUPER_SECRET_SIGNALR_KEY_999/);
+        assert.ok(err.message.includes(path.resolve(configPath)));
+        return true;
+      }
+    );
+
+    assert.equal(
+      redactBootstrapUrlForDiagnostic(credentialedUrl),
+      "https://[redacted]@broker.demo-flock.net/api/bootstrap?[redacted]#[redacted]"
+    );
+    const validParsed = validateBootstrapControlPlaneUrl(
+      "https://broker.demo-flock.net/api/bootstrap",
+      { configPath }
+    );
+    assert.equal(validParsed.origin, "https://broker.demo-flock.net");
+  } finally {
+    if (prevCopilotHome === undefined) delete process.env.COPILOT_HOME;
+    else process.env.COPILOT_HOME = prevCopilotHome;
+    if (prevFlockBoot === undefined) delete process.env.COPILOT_FLOCK_BOOTSTRAP_URL;
+    else process.env.COPILOT_FLOCK_BOOTSTRAP_URL = prevFlockBoot;
+    if (prevBridgeBoot === undefined) delete process.env.COPILOT_BRIDGE_BOOTSTRAP_URL;
+    else process.env.COPILOT_BRIDGE_BOOTSTRAP_URL = prevBridgeBoot;
+    if (prevAllowedOrigin === undefined) delete process.env.COPILOT_FLOCK_ALLOWED_BOOTSTRAP_ORIGIN;
+    else process.env.COPILOT_FLOCK_ALLOWED_BOOTSTRAP_ORIGIN = prevAllowedOrigin;
+    env.cleanup();
+  }
+});
+
+test("flock_status exposes independent installedOnDisk, residentDaemon, and callerMcpProcess health with non-destructive drift guidance", async () => {
+  const { spawn } = await import("node:child_process");
+  const env = setupTempCopilotEnv();
+  const prevCopilotHome = process.env.COPILOT_HOME;
+  const prevAppData = process.env.APPDATA;
+  process.env.COPILOT_HOME = env.tempRoot;
+  process.env.APPDATA = path.join(env.tempRoot, "AppData", "Roaming");
+
+  try {
+    const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+    const flockDir = path.join(env.tempRoot, "flock");
+    fs.mkdirSync(flockDir, { recursive: true });
+
+    // Copy flock.mjs + companion modules into temp installed bridge home
+    const installedScript = path.join(flockDir, "flock.mjs");
+    fs.copyFileSync(path.join(repoRoot, "flock.mjs"), installedScript);
+    for (const modName of [
+      "flock-azure.mjs",
+      "flock-broker-free.mjs",
+      "flock-lifecycle.mjs",
+      "flock-membership.mjs",
+      "flock-protocol.mjs",
+    ]) {
+      fs.copyFileSync(path.join(repoRoot, modName), path.join(flockDir, modName));
+    }
+
+    const configPath = path.join(flockDir, "config.json");
+    const validSignalR =
+      "Endpoint=https://demo-signalr.service.signalr.net;AccessKey=YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXo=;Version=1.0;";
+    writeConfigFileSecure(
+      {
+        machineId: "MCP-HEALTH-PC",
+        scope: "personal",
+        githubUser: "erjadi",
+        bootstrapUrl: "https://broker.demo-flock.net/api/bootstrap",
+        connectionString: validSignalR,
+        specs: { cpu: { model: "Test CPU" }, publicKey: "test-pub" },
+        updatedAt: "2026-11-12T00:00:00.000Z",
+      },
+      configPath
+    );
+
+    const initialIdentity = ensureMachineIdentityKeypair();
+    const cfg = loadConfig({ autoFetchAz: false });
+    const callerSnap = captureCallerMcpSnapshot(cfg, {
+      scriptPath: installedScript,
+      configPath,
+      surface: "mcp-stdio",
+    });
+
+    // Write matching resident daemon state.json + daemon.pid
+    fs.writeFileSync(path.join(flockDir, "daemon.pid"), String(process.pid), "utf8");
+    fs.writeFileSync(
+      path.join(flockDir, "state.json"),
+      JSON.stringify(
+        {
+          status: "connected",
+          version: BRIDGE_VERSION,
+          startedAt: callerSnap.loadedAt,
+          scriptPath: installedScript,
+          scriptSha256: callerSnap.scriptSha256,
+          codeDigest: callerSnap.codeDigest,
+          configSha256: callerSnap.configSha256,
+          configGeneration: callerSnap.configGeneration,
+          machineId: "MCP-HEALTH-PC",
+          pid: process.pid,
+          updatedAt: new Date().toISOString(),
+        },
+        null,
+        2
+      ),
+      "utf8"
+    );
+
+    // 1. Clean baseline: installedOnDisk, residentDaemon, and callerMcpProcess are all current & healthy
+    const baselineStatus = await executeMcpTool(
+      cfg,
+      "flock_status",
+      {},
+      {
+        ensureDaemonFn: async () => ({ running: true, pid: process.pid }),
+        discoverMachinesFn: async () => [{ machineId: "MCP-HEALTH-PC", version: BRIDGE_VERSION }],
+        callerSnapshot: callerSnap,
+      }
+    );
+    assert.equal(baselineStatus.installedOnDisk.healthy, true);
+    assert.equal(baselineStatus.installedOnDisk.version, BRIDGE_VERSION);
+    assert.equal(baselineStatus.installedOnDisk.controlPlaneBootstrap.valid, true);
+    assert.equal(baselineStatus.residentDaemon.healthy, true);
+    assert.equal(baselineStatus.residentDaemon.version, BRIDGE_VERSION);
+    assert.equal(baselineStatus.residentDaemon.matchesInstalledDisk, true);
+    assert.equal(baselineStatus.callerMcpProcess.healthy, true);
+    assert.equal(baselineStatus.callerMcpProcess.stale, false);
+    assert.equal(baselineStatus.callerMcpProcess.reconnectRequired, false);
+    assert.equal(baselineStatus.callerMcpProcess.reconnectGuidance, null);
+    assert.equal(baselineStatus.callerMcpProcess.comparison.configDigestMatch, true);
+    assert.equal(baselineStatus.callerMcpProcess.comparison.configGenerationMatch, true);
+    assert.equal(baselineStatus.callerMcpProcess.comparison.codeDigestMatch, true);
+
+    // 2. Mutate config.json on disk -> callerMcpProcess detects config generation / digest drift
+    writeConfigFileSecure(
+      {
+        machineId: "MCP-HEALTH-PC",
+        scope: "personal",
+        githubUser: "erjadi",
+        bootstrapUrl: "https://updated-broker.demo-flock.net/api/bootstrap",
+        connectionString: validSignalR,
+        specs: { cpu: { model: "Test CPU" }, publicKey: "test-pub" },
+        updatedAt: "2026-11-12T01:00:00.000Z",
+      },
+      configPath
+    );
+
+    // Even using cfg._callerSnapshot automatically (without passing callerSnapshot override), config drift is detected!
+    const afterConfigDrift = await executeMcpTool(
+      cfg,
+      "bridge_status",
+      {},
+      {
+        ensureDaemonFn: async () => ({ running: true, pid: process.pid }),
+        discoverMachinesFn: async () => [{ machineId: "MCP-HEALTH-PC", version: BRIDGE_VERSION }],
+      }
+    );
+    assert.equal(afterConfigDrift.installedOnDisk.healthy, true);
+    assert.equal(afterConfigDrift.callerMcpProcess.configDrift, true);
+    assert.equal(afterConfigDrift.callerMcpProcess.reconnectRequired, true);
+    assert.equal(afterConfigDrift.callerMcpProcess.healthy, false);
+    assert.equal(afterConfigDrift.callerMcpProcess.comparison.configDigestMatch, false);
+    assert.equal(afterConfigDrift.callerMcpProcess.comparison.configGenerationMatch, false);
+    assert.equal(afterConfigDrift.callerMcpProcess.repairStrategy, "owner_manager_mcp_reconnect");
+    assert.equal(afterConfigDrift.callerMcpProcess.reconnectGuidance, SAFE_CALLER_MCP_RECONNECT_GUIDANCE);
+    assert.doesNotMatch(
+      afterConfigDrift.callerMcpProcess.reconnectGuidance,
+      /kill|taskkill|Stop-Process|pkill|re-enroll|reenroll|reprovision|regenerate/i
+    );
+
+    // 3. Mutate installed flock.mjs on disk to simulate an on-disk upgrade -> independent code/version drift across all 3 planes
+    const upgradedSource = fs
+      .readFileSync(installedScript, "utf8")
+      .replace(
+        `export const BRIDGE_VERSION = "${BRIDGE_VERSION}";`,
+        `export const BRIDGE_VERSION = "3.5.0-candidate";`
+      );
+    fs.writeFileSync(installedScript, upgradedSource, "utf8");
+
+    const afterCodeDrift = inspectLocalRuntimeHealth(cfg, {
+      daemonStatus: { running: true, pid: process.pid },
+      callerSnapshot: callerSnap,
+    });
+    assert.equal(afterCodeDrift.installedOnDisk.version, "3.5.0-candidate");
+    assert.equal(afterCodeDrift.residentDaemon.version, BRIDGE_VERSION);
+    assert.equal(afterCodeDrift.residentDaemon.matchesInstalledDisk, false);
+    assert.equal(afterCodeDrift.residentDaemon.healthy, false);
+    assert.ok(afterCodeDrift.residentDaemon.driftReasons.includes("version_differs_from_installed_disk"));
+    assert.equal(afterCodeDrift.callerMcpProcess.version, BRIDGE_VERSION);
+    assert.equal(afterCodeDrift.callerMcpProcess.codeDrift, true);
+    assert.equal(afterCodeDrift.callerMcpProcess.configDrift, true);
+    assert.equal(afterCodeDrift.callerMcpProcess.reconnectRequired, true);
+    assert.equal(afterCodeDrift.callerMcpProcess.comparison.versionMatch, false);
+    assert.equal(afterCodeDrift.callerMcpProcess.comparison.codeDigestMatch, false);
+
+    // 4. Non-destructive repair guarantees: reapOrphanedMcpProcesses is a safe no-op and diagnose --fix preserves identity without killing MCP processes
+    assert.deepEqual(reapOrphanedMcpProcesses(), []);
+    const diagFixed = await diagnoseLocalBridgeState(cfg, {
+      fix: true,
+      callerSnapshot: callerSnap,
+      configureBootPersistenceFn: () => ({
+        platform: process.platform,
+        type: "sandboxed-test",
+        path: path.join(flockDir, "boot.stub"),
+      }),
+      registerBootstrapFn: () => null,
+    });
+    assert.equal(diagFixed.identity.fingerprint, initialIdentity.fingerprint);
+    assert.equal(ensureMachineIdentityKeypair().fingerprint, initialIdentity.fingerprint);
+    assert.ok(
+      !(diagFixed.repairedActions || []).some((act) => /reap|kill|reenroll|re-enroll/i.test(act))
+    );
+    assert.equal(diagFixed.callerMcpProcess.reconnectRequired, true);
+
+    // 5. Live stdio `mcp` subprocess test: verify end-to-end drift detection across live JSON-RPC calls & redacted control-plane error
+    fs.copyFileSync(path.join(repoRoot, "flock.mjs"), installedScript);
+    const offlineFastSignalR =
+      "Endpoint=https://127.0.0.1:1;AccessKey=YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXo=;Version=1.0;";
+    writeConfigFileSecure(
+      {
+        machineId: "MCP-HEALTH-PC",
+        scope: "personal",
+        githubUser: "erjadi",
+        bootstrapUrl: "https://broker.demo-flock.net/api/bootstrap",
+        connectionString: offlineFastSignalR,
+        specs: { cpu: { model: "Test CPU" }, publicKey: "test-pub" },
+        updatedAt: "2026-11-12T02:00:00.000Z",
+      },
+      configPath
+    );
+
+    const mcpChild = spawn(process.execPath, [installedScript, "mcp"], {
+      env: { ...process.env, COPILOT_HOME: env.tempRoot },
+      stdio: ["pipe", "pipe", "pipe"],
+      windowsHide: true,
+    });
+    try {
+      const pending = new Map();
+      let outBuf = "";
+      mcpChild.stdout.on("data", (chunk) => {
+        outBuf += chunk.toString("utf8");
+        while (true) {
+          const idx = outBuf.indexOf("\n");
+          if (idx === -1) break;
+          const line = outBuf.slice(0, idx).trim();
+          outBuf = outBuf.slice(idx + 1);
+          if (!line) continue;
+          const msg = JSON.parse(line);
+          if (msg.id !== undefined && pending.has(msg.id)) {
+            pending.get(msg.id)(msg);
+            pending.delete(msg.id);
+          }
+        }
+      });
+      const rpc = (id, method, params = {}) =>
+        new Promise((resolve, reject) => {
+          const timer = setTimeout(() => reject(new Error(`MCP RPC ${method} timed out`)), 10000);
+          pending.set(id, (res) => {
+            clearTimeout(timer);
+            resolve(res);
+          });
+          mcpChild.stdin.write(JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n");
+        });
+
+      const initRes = await rpc(1, "initialize", { protocolVersion: "2024-11-05" });
+      assert.equal(initRes.result.serverInfo.name, "copilot-flock");
+
+      // Initial flock_status over stdio: callerMcpProcess matches on-disk code & config
+      const statusBeforeRes = await rpc(2, "tools/call", {
+        name: "flock_status",
+        arguments: {},
+      });
+      assert.notEqual(statusBeforeRes.result.isError, true);
+      const statusBefore = JSON.parse(statusBeforeRes.result.content[0].text);
+      assert.equal(statusBefore.callerMcpProcess.surface, "mcp-stdio");
+      assert.equal(statusBefore.callerMcpProcess.reconnectRequired, false);
+      assert.equal(statusBefore.callerMcpProcess.healthy, true);
+
+      // Mutate both config.json and installed flock.mjs on disk while mcpChild remains running
+      writeConfigFileSecure(
+        {
+          machineId: "MCP-HEALTH-PC",
+          scope: "personal",
+          githubUser: "erjadi",
+          bootstrapUrl: "https://user:TOP_SECRET_PW@broker.demo-flock.net/api/bootstrap?sig=SEC123",
+          connectionString: offlineFastSignalR,
+          specs: { cpu: { model: "Test CPU" }, publicKey: "test-pub" },
+          updatedAt: "2026-11-12T03:00:00.000Z",
+        },
+        configPath
+      );
+      fs.writeFileSync(
+        installedScript,
+        fs
+          .readFileSync(installedScript, "utf8")
+          .replace(
+            `export const BRIDGE_VERSION = "${BRIDGE_VERSION}";`,
+            `export const BRIDGE_VERSION = "3.5.0-live-stdio";`
+          ),
+        "utf8"
+      );
+
+      // Subsequent flock_status over the SAME stdio process detects both configDrift and codeDrift!
+      const statusAfterRes = await rpc(3, "tools/call", {
+        name: "flock_status",
+        arguments: {},
+      });
+      assert.notEqual(statusAfterRes.result.isError, true);
+      const statusAfter = JSON.parse(statusAfterRes.result.content[0].text);
+      assert.equal(statusAfter.installedOnDisk.version, "3.5.0-live-stdio");
+      assert.equal(statusAfter.installedOnDisk.controlPlaneBootstrap.valid, false);
+      assert.doesNotMatch(
+        statusAfter.installedOnDisk.controlPlaneBootstrap.error,
+        /TOP_SECRET_PW|SEC123/
+      );
+      assert.equal(statusAfter.callerMcpProcess.version, BRIDGE_VERSION);
+      assert.equal(statusAfter.callerMcpProcess.codeDrift, true);
+      assert.equal(statusAfter.callerMcpProcess.configDrift, true);
+      assert.equal(statusAfter.callerMcpProcess.reconnectRequired, true);
+      assert.equal(statusAfter.callerMcpProcess.reconnectGuidance, SAFE_CALLER_MCP_RECONNECT_GUIDANCE);
+    } finally {
+      mcpChild.stdin.end();
+      await new Promise((resolve) => {
+        const t = setTimeout(() => {
+          try {
+            mcpChild.kill();
+          } catch {}
+          resolve();
+        }, 2000);
+        mcpChild.once("exit", () => {
+          clearTimeout(t);
+          resolve();
+        });
+      });
+    }
+  } finally {
+    if (prevCopilotHome === undefined) delete process.env.COPILOT_HOME;
+    else process.env.COPILOT_HOME = prevCopilotHome;
+    if (prevAppData === undefined) delete process.env.APPDATA;
+    else process.env.APPDATA = prevAppData;
     env.cleanup();
   }
 });
