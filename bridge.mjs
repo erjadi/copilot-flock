@@ -587,6 +587,509 @@ function ensureBridgeDir() {
   }
 }
 
+const RUNTIME_COMPANION_MODULES = [
+  "flock-azure.mjs",
+  "flock-broker-free.mjs",
+  "flock-lifecycle.mjs",
+  "flock-membership.mjs",
+  "flock-protocol.mjs",
+];
+
+export const SAFE_CALLER_MCP_RECONNECT_GUIDANCE =
+  "On-disk Copilot Flock code or config.json is newer than this caller-owned MCP stdio process. Use the owning MCP host manager (for example GitHub Copilot Desktop MCP server reconnect/reload, VS Code MCP Restart Server, or starting a new CLI session) to reconnect the 'copilot-flock' stdio server while preserving the existing installation and device identity.";
+
+function computeFileSha256(filePath) {
+  try {
+    if (!filePath || !fs.existsSync(filePath)) {
+      return { exists: false, sha256: null, mtimeMs: null, sizeBytes: null };
+    }
+    const stat = fs.statSync(filePath);
+    if (!stat.isFile()) {
+      return { exists: false, sha256: null, mtimeMs: null, sizeBytes: null };
+    }
+    const bytes = fs.readFileSync(filePath);
+    return {
+      exists: true,
+      sha256: crypto.createHash("sha256").update(bytes).digest("hex"),
+      mtimeMs: stat.mtimeMs,
+      sizeBytes: stat.size,
+    };
+  } catch {
+    return { exists: false, sha256: null, mtimeMs: null, sizeBytes: null };
+  }
+}
+
+function parseVersionFromScriptFile(filePath) {
+  try {
+    if (!filePath || !fs.existsSync(filePath)) return null;
+    const src = fs.readFileSync(filePath, "utf8");
+    const match = src.match(/export\s+const\s+BRIDGE_VERSION\s*=\s*"([^"]+)"/);
+    return match ? match[1] : null;
+  } catch {
+    return null;
+  }
+}
+
+function computeRuntimeDirectoryCodeDigest(entryScriptPath) {
+  const entryMeta = computeFileSha256(entryScriptPath);
+  if (!entryMeta.exists) {
+    return {
+      exists: false,
+      scriptSha256: null,
+      codeDigest: null,
+      latestMtimeMs: null,
+    };
+  }
+  const dir = path.dirname(path.resolve(entryScriptPath));
+  const hasher = crypto.createHash("sha256");
+  hasher.update(`entry:${entryMeta.sha256}\n`);
+  let latestMtimeMs = entryMeta.mtimeMs;
+  for (const modName of RUNTIME_COMPANION_MODULES) {
+    const modMeta = computeFileSha256(path.join(dir, modName));
+    if (modMeta.exists) {
+      hasher.update(`${modName}:${modMeta.sha256}\n`);
+      if (modMeta.mtimeMs != null && (latestMtimeMs == null || modMeta.mtimeMs > latestMtimeMs)) {
+        latestMtimeMs = modMeta.mtimeMs;
+      }
+    }
+  }
+  return {
+    exists: true,
+    scriptSha256: entryMeta.sha256,
+    codeDigest: hasher.digest("hex"),
+    latestMtimeMs,
+  };
+}
+
+export function computeConfigFileSnapshot(configPath = getConfigPath()) {
+  const resolvedPath = path.resolve(configPath);
+  try {
+    if (!fs.existsSync(resolvedPath)) {
+      return {
+        configPath: resolvedPath,
+        exists: false,
+        sha256: null,
+        mtimeMs: null,
+        updatedAt: null,
+        generation: "absent",
+        parsed: null,
+        parseError: null,
+      };
+    }
+    const stat = fs.statSync(resolvedPath);
+    const rawBytes = fs.readFileSync(resolvedPath);
+    const sha256 = crypto.createHash("sha256").update(rawBytes).digest("hex");
+    let parsed = null;
+    let parseError = null;
+    try {
+      parsed = JSON.parse(rawBytes.toString("utf8"));
+    } catch (err) {
+      parseError = err.message;
+    }
+    const updatedAt = typeof parsed?.updatedAt === "string" && parsed.updatedAt.trim()
+      ? parsed.updatedAt.trim()
+      : null;
+    const generation = `${updatedAt || `mtime:${Math.trunc(stat.mtimeMs)}`}#${sha256.slice(0, 16)}`;
+    return {
+      configPath: resolvedPath,
+      exists: true,
+      sha256,
+      mtimeMs: stat.mtimeMs,
+      updatedAt,
+      generation,
+      parsed,
+      parseError,
+    };
+  } catch (err) {
+    return {
+      configPath: resolvedPath,
+      exists: false,
+      sha256: null,
+      mtimeMs: null,
+      updatedAt: null,
+      generation: "absent",
+      parsed: null,
+      parseError: err.message,
+    };
+  }
+}
+
+const MODULE_LOAD_SNAPSHOT = (() => {
+  const loadedAtMs = Date.now();
+  const codeMeta = computeRuntimeDirectoryCodeDigest(__filename);
+  return {
+    pid: process.pid,
+    version: BRIDGE_VERSION,
+    loadedAt: new Date(loadedAtMs).toISOString(),
+    loadedAtMs,
+    scriptPath: path.resolve(__filename),
+    scriptSha256: codeMeta.scriptSha256,
+    codeDigest: codeMeta.codeDigest,
+    scriptMtimeMs: codeMeta.latestMtimeMs,
+  };
+})();
+
+let activeCallerMcpSnapshot = null;
+
+export function setActiveCallerMcpSnapshot(snapshot = null) {
+  activeCallerMcpSnapshot = snapshot || null;
+  return activeCallerMcpSnapshot;
+}
+
+export function captureCallerMcpSnapshot(
+  cfg = null,
+  {
+    scriptPath = null,
+    configPath = null,
+    surface = "mcp-stdio",
+    version = null,
+    loadedAtMs = null,
+  } = {}
+) {
+  const baseSnap = cfg?._callerSnapshot || null;
+  const resolvedScriptPath = path.resolve(scriptPath || baseSnap?.scriptPath || MODULE_LOAD_SNAPSHOT.scriptPath);
+  const useModuleCodeSnap =
+    !scriptPath && resolvedScriptPath === MODULE_LOAD_SNAPSHOT.scriptPath;
+  const codeMeta = useModuleCodeSnap
+    ? {
+        scriptSha256: baseSnap?.scriptSha256 ?? MODULE_LOAD_SNAPSHOT.scriptSha256,
+        codeDigest: baseSnap?.codeDigest ?? MODULE_LOAD_SNAPSHOT.codeDigest,
+        latestMtimeMs: baseSnap?.scriptMtimeMs ?? MODULE_LOAD_SNAPSHOT.scriptMtimeMs,
+      }
+    : computeRuntimeDirectoryCodeDigest(resolvedScriptPath);
+
+  const resolvedConfigPath = path.resolve(
+    configPath || cfg?.configPath || baseSnap?.configPath || getConfigPath()
+  );
+  const reuseBaseConfig =
+    !configPath && baseSnap && path.resolve(baseSnap.configPath) === resolvedConfigPath;
+  const cfgSnap = reuseBaseConfig ? null : computeConfigFileSnapshot(resolvedConfigPath);
+  const effectiveLoadedAtMs =
+    loadedAtMs ?? baseSnap?.loadedAtMs ?? MODULE_LOAD_SNAPSHOT.loadedAtMs;
+
+  return {
+    pid: process.pid,
+    surface,
+    ownerManaged: true,
+    version: version || baseSnap?.version || (useModuleCodeSnap ? MODULE_LOAD_SNAPSHOT.version : parseVersionFromScriptFile(resolvedScriptPath) || BRIDGE_VERSION),
+    loadedAt: new Date(effectiveLoadedAtMs).toISOString(),
+    loadedAtMs: effectiveLoadedAtMs,
+    scriptPath: resolvedScriptPath,
+    scriptSha256: codeMeta.scriptSha256,
+    codeDigest: codeMeta.codeDigest,
+    scriptMtimeMs: codeMeta.latestMtimeMs,
+    configPath: resolvedConfigPath,
+    configSha256: reuseBaseConfig ? baseSnap.configSha256 : cfgSnap.sha256,
+    configMtimeMs: reuseBaseConfig ? baseSnap.configMtimeMs : cfgSnap.mtimeMs,
+    configUpdatedAt: reuseBaseConfig ? baseSnap.configUpdatedAt : cfgSnap.updatedAt,
+    configGeneration: reuseBaseConfig ? baseSnap.configGeneration : cfgSnap.generation,
+  };
+}
+
+export function inspectLocalRuntimeHealth(
+  cfg = null,
+  {
+    daemonStatus = null,
+    onlineMachines = null,
+    callerSnapshot = null,
+    bridgeHome = null,
+    configPath = null,
+  } = {}
+) {
+  const resolvedBridgeHome = path.resolve(bridgeHome || getBridgeHome());
+  const resolvedConfigPath = path.resolve(
+    configPath || cfg?.configPath || path.join(resolvedBridgeHome, "config.json")
+  );
+  const flockScript = path.join(resolvedBridgeHome, "flock.mjs");
+  const compatScript = path.join(resolvedBridgeHome, "bridge.mjs");
+  const installed = fs.existsSync(flockScript) || fs.existsSync(compatScript);
+  const installedScriptPath = fs.existsSync(flockScript)
+    ? flockScript
+    : fs.existsSync(compatScript)
+    ? compatScript
+    : flockScript;
+
+  const diskCodeMeta = installed
+    ? computeRuntimeDirectoryCodeDigest(installedScriptPath)
+    : { exists: false, scriptSha256: null, codeDigest: null, latestMtimeMs: null };
+  const diskVersion = installed ? parseVersionFromScriptFile(installedScriptPath) : null;
+  const diskConfig = computeConfigFileSnapshot(resolvedConfigPath);
+  const diskProtocol = diskConfig.parsed?.protocol || cfg?.protocol || "legacy-v3";
+
+  let controlPlaneBootstrap;
+  if (diskProtocol === "broker-free-v34") {
+    controlPlaneBootstrap = {
+      required: false,
+      status: "not_applicable",
+      valid: true,
+      origin: null,
+      error: null,
+    };
+  } else {
+    const candidateBootstrapUrl = diskConfig.exists
+      ? Object.prototype.hasOwnProperty.call(diskConfig.parsed || {}, "bootstrapUrl")
+        ? diskConfig.parsed.bootstrapUrl
+        : undefined
+      : cfg && Object.prototype.hasOwnProperty.call(cfg, "bootstrapUrl")
+      ? cfg.bootstrapUrl
+      : undefined;
+    try {
+      const parsedOriginUrl = validateBootstrapControlPlaneUrl(candidateBootstrapUrl, {
+        configPath: resolvedConfigPath,
+        fieldName: "bootstrapUrl",
+      });
+      controlPlaneBootstrap = {
+        required: true,
+        status: "valid",
+        valid: true,
+        origin: parsedOriginUrl.origin,
+        error: null,
+      };
+    } catch (err) {
+      controlPlaneBootstrap = {
+        required: true,
+        status: err.reason || "invalid",
+        code: err.code || "INVALID_BOOTSTRAP_URL",
+        valid: false,
+        origin: null,
+        error: err.message,
+      };
+    }
+  }
+
+  const installedOnDisk = {
+    healthy: Boolean(installed && diskConfig.exists && !diskConfig.parseError),
+    installed,
+    version: diskVersion,
+    scriptPath: path.resolve(installedScriptPath),
+    scriptSha256: diskCodeMeta.scriptSha256,
+    codeDigest: diskCodeMeta.codeDigest,
+    scriptMtimeMs: diskCodeMeta.latestMtimeMs,
+    configPath: resolvedConfigPath,
+    configExists: diskConfig.exists,
+    configSha256: diskConfig.sha256,
+    configMtimeMs: diskConfig.mtimeMs,
+    configUpdatedAt: diskConfig.updatedAt,
+    configGeneration: diskConfig.generation,
+    protocol: diskProtocol,
+    controlPlaneBootstrap,
+  };
+
+  const effectiveDaemon = daemonStatus || isLocalDaemonRunning();
+  const statePath = path.join(resolvedBridgeHome, "state.json");
+  const pinPath = path.join(resolvedBridgeHome, "daemon-identity.json");
+  let stateJson = null;
+  let pinJson = null;
+  try {
+    if (fs.existsSync(statePath)) stateJson = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  } catch {}
+  try {
+    if (fs.existsSync(pinPath)) pinJson = JSON.parse(fs.readFileSync(pinPath, "utf8"));
+  } catch {}
+
+  const selfMachine = Array.isArray(onlineMachines)
+    ? onlineMachines.find(
+        (m) =>
+          cfg?.machineId &&
+          String(m?.machineId || "").toLowerCase() === String(cfg.machineId).toLowerCase()
+      ) || null
+    : null;
+
+  const daemonRunning = Boolean(effectiveDaemon?.running);
+  const daemonPid = effectiveDaemon?.pid || (daemonRunning ? stateJson?.pid : null) || null;
+  const activeState =
+    daemonRunning && stateJson && (!stateJson.pid || !daemonPid || stateJson.pid === daemonPid)
+      ? stateJson
+      : effectiveDaemon?.state || null;
+  const daemonVersion = activeState?.version || selfMachine?.version || null;
+  const daemonScriptSha256 = activeState?.scriptSha256 || null;
+  const daemonCodeDigest = activeState?.codeDigest || null;
+  const daemonConfigSha256 = activeState?.configSha256 || null;
+  const daemonConfigGeneration = activeState?.configGeneration || null;
+
+  const daemonDriftReasons = [];
+  if (daemonRunning) {
+    if (installedOnDisk.version && daemonVersion && daemonVersion !== installedOnDisk.version) {
+      daemonDriftReasons.push("version_differs_from_installed_disk");
+    }
+    if (installedOnDisk.codeDigest && daemonCodeDigest && daemonCodeDigest !== installedOnDisk.codeDigest) {
+      daemonDriftReasons.push("code_digest_differs_from_installed_disk");
+    }
+    if (installedOnDisk.configSha256 && daemonConfigSha256 && daemonConfigSha256 !== installedOnDisk.configSha256) {
+      daemonDriftReasons.push("config_digest_differs_from_installed_disk");
+    }
+  }
+  const daemonConnectionStatus = activeState?.status || (daemonRunning ? "running" : "stopped");
+  const matchesInstalledDisk = !daemonRunning
+    ? false
+    : daemonVersion || daemonCodeDigest || daemonConfigSha256
+    ? daemonDriftReasons.length === 0
+    : null;
+
+  const residentDaemon = {
+    healthy: Boolean(
+      daemonRunning && daemonConnectionStatus !== "error" && daemonDriftReasons.length === 0
+    ),
+    running: daemonRunning,
+    pid: daemonPid,
+    status: daemonConnectionStatus,
+    version: daemonVersion,
+    startedAt: activeState?.startedAt || pinJson?.start || null,
+    updatedAt: activeState?.updatedAt || null,
+    scriptPath: activeState?.scriptPath || pinJson?.script || null,
+    scriptSha256: daemonScriptSha256,
+    codeDigest: daemonCodeDigest,
+    configSha256: daemonConfigSha256,
+    configGeneration: daemonConfigGeneration,
+    matchesInstalledDisk,
+    driftReasons: daemonDriftReasons,
+  };
+
+  const snap =
+    callerSnapshot ||
+    activeCallerMcpSnapshot ||
+    cfg?._callerSnapshot ||
+    captureCallerMcpSnapshot(cfg, { configPath: resolvedConfigPath, surface: "caller-process" });
+
+  const loadedScriptNow = computeRuntimeDirectoryCodeDigest(snap.scriptPath);
+  const loadedScriptVersionNow = parseVersionFromScriptFile(snap.scriptPath);
+  const snapConfigPath = path.resolve(snap.configPath || resolvedConfigPath);
+  const snapConfigNow =
+    snapConfigPath === resolvedConfigPath ? diskConfig : computeConfigFileSnapshot(snapConfigPath);
+
+  const codeDriftReasons = [];
+  if (installedOnDisk.installed) {
+    if (installedOnDisk.version && snap.version !== installedOnDisk.version) {
+      codeDriftReasons.push("installed_version_changed");
+    }
+    if (
+      installedOnDisk.scriptSha256 &&
+      snap.scriptSha256 &&
+      snap.scriptSha256 !== installedOnDisk.scriptSha256
+    ) {
+      codeDriftReasons.push("installed_script_digest_changed");
+    }
+    if (
+      installedOnDisk.codeDigest &&
+      snap.codeDigest &&
+      snap.codeDigest !== installedOnDisk.codeDigest
+    ) {
+      codeDriftReasons.push("installed_code_digest_changed");
+    }
+    if (
+      installedOnDisk.scriptMtimeMs != null &&
+      (snap.scriptMtimeMs != null && path.resolve(snap.scriptPath) === installedOnDisk.scriptPath
+        ? installedOnDisk.scriptMtimeMs > snap.scriptMtimeMs
+        : snap.loadedAtMs != null && Math.floor(installedOnDisk.scriptMtimeMs) > snap.loadedAtMs)
+    ) {
+      codeDriftReasons.push("installed_code_newer_than_loaded_process");
+    }
+  }
+  if (
+    loadedScriptNow.exists &&
+    (!installedOnDisk.installed || path.resolve(snap.scriptPath) !== installedOnDisk.scriptPath)
+  ) {
+    if (loadedScriptVersionNow && snap.version !== loadedScriptVersionNow) {
+      codeDriftReasons.push("loaded_script_version_changed");
+    }
+    if (snap.scriptSha256 && loadedScriptNow.scriptSha256 !== snap.scriptSha256) {
+      codeDriftReasons.push("loaded_script_digest_changed");
+    }
+    if (snap.codeDigest && loadedScriptNow.codeDigest !== snap.codeDigest) {
+      codeDriftReasons.push("loaded_code_digest_changed");
+    }
+    if (
+      loadedScriptNow.latestMtimeMs != null &&
+      (snap.scriptMtimeMs != null
+        ? loadedScriptNow.latestMtimeMs > snap.scriptMtimeMs
+        : snap.loadedAtMs != null && Math.floor(loadedScriptNow.latestMtimeMs) > snap.loadedAtMs)
+    ) {
+      codeDriftReasons.push("loaded_script_newer_than_loaded_process");
+    }
+  }
+
+  const configDriftReasons = [];
+  if (snap.configSha256 !== snapConfigNow.sha256) {
+    configDriftReasons.push("config_digest_changed");
+  }
+  if (snap.configGeneration !== snapConfigNow.generation) {
+    configDriftReasons.push("config_generation_changed");
+  }
+  if (
+    snapConfigNow.mtimeMs != null &&
+    (snap.configMtimeMs != null
+      ? snapConfigNow.mtimeMs > snap.configMtimeMs
+      : snap.loadedAtMs != null && Math.floor(snapConfigNow.mtimeMs) > snap.loadedAtMs)
+  ) {
+    configDriftReasons.push("config_newer_than_loaded_process");
+  }
+
+  const codeDrift = codeDriftReasons.length > 0;
+  const configDrift = configDriftReasons.length > 0;
+  const driftReasons = [...codeDriftReasons, ...configDriftReasons];
+  const reconnectRequired = codeDrift || configDrift;
+  const targetCodeVersion = installedOnDisk.installed ? installedOnDisk.version : loadedScriptVersionNow;
+  const targetScriptSha256 = installedOnDisk.installed
+    ? installedOnDisk.scriptSha256
+    : loadedScriptNow.scriptSha256;
+  const targetCodeDigest = installedOnDisk.installed
+    ? installedOnDisk.codeDigest
+    : loadedScriptNow.codeDigest;
+
+  const callerMcpProcess = {
+    healthy: !reconnectRequired,
+    stale: reconnectRequired,
+    reconnectRequired,
+    status: reconnectRequired ? "stale_reconnect_required" : "current",
+    pid: snap.pid,
+    surface: snap.surface,
+    ownerManaged: true,
+    version: snap.version,
+    loadedAt: snap.loadedAt,
+    loadedAtMs: snap.loadedAtMs,
+    scriptPath: snap.scriptPath,
+    loadedScriptSha256: snap.scriptSha256,
+    loadedCodeDigest: snap.codeDigest,
+    configPath: snapConfigPath,
+    loadedConfigSha256: snap.configSha256,
+    loadedConfigMtimeMs: snap.configMtimeMs,
+    loadedConfigUpdatedAt: snap.configUpdatedAt,
+    loadedConfigGeneration: snap.configGeneration,
+    codeDrift,
+    configDrift,
+    driftReasons,
+    comparison: {
+      versionMatch: targetCodeVersion ? snap.version === targetCodeVersion : true,
+      loadedVersion: snap.version,
+      diskVersion: targetCodeVersion,
+      scriptDigestMatch:
+        targetScriptSha256 && snap.scriptSha256
+          ? snap.scriptSha256 === targetScriptSha256
+          : !codeDrift,
+      loadedScriptSha256: snap.scriptSha256,
+      diskScriptSha256: targetScriptSha256,
+      codeDigestMatch:
+        targetCodeDigest && snap.codeDigest ? snap.codeDigest === targetCodeDigest : !codeDrift,
+      loadedCodeDigest: snap.codeDigest,
+      diskCodeDigest: targetCodeDigest,
+      configDigestMatch: snap.configSha256 === snapConfigNow.sha256,
+      loadedConfigSha256: snap.configSha256,
+      diskConfigSha256: snapConfigNow.sha256,
+      configGenerationMatch: snap.configGeneration === snapConfigNow.generation,
+      loadedConfigGeneration: snap.configGeneration,
+      diskConfigGeneration: snapConfigNow.generation,
+    },
+    repairStrategy: reconnectRequired ? "owner_manager_mcp_reconnect" : "none",
+    reconnectGuidance: reconnectRequired ? SAFE_CALLER_MCP_RECONNECT_GUIDANCE : null,
+  };
+
+  return {
+    installedOnDisk,
+    residentDaemon,
+    callerMcpProcess,
+  };
+}
+
 export function formatErrorDetail(err) {
   if (!err) return "Unknown error (empty error object)";
   if (typeof err === "string") return err.trim() || "Unknown error (empty string)";
@@ -1339,10 +1842,28 @@ export function loadConfig({ autoFetchAz = true, refreshSpecs = false, passive =
     } catch (err) {
       if (!passive) throw err;
     }
-    return { ...cfg, flockId: activeFlocks.length === 1 ? activeFlocks[0].flockId : undefined,
+    const brokerFreeResult = { ...cfg, flockId: activeFlocks.length === 1 ? activeFlocks[0].flockId : undefined,
       autoFlockId: activeFlocks.length === 1 && !cfg.explicitFlock,
       hub: DEFAULT_HUB, bootstrapUrl: null, connectionString: null,
+      configPath: activeConfigPath,
       installedScriptPath: path.join(getBridgeHome(), "flock.mjs") };
+    const cfgSnap = computeConfigFileSnapshot(activeConfigPath);
+    Object.defineProperty(brokerFreeResult, "_callerSnapshot", {
+      value: {
+        ...MODULE_LOAD_SNAPSHOT,
+        loadedAtMs: Date.now(),
+        loadedAt: new Date().toISOString(),
+        configPath: cfgSnap.configPath,
+        configSha256: cfgSnap.sha256,
+        configMtimeMs: cfgSnap.mtimeMs,
+        configUpdatedAt: cfgSnap.updatedAt,
+        configGeneration: cfgSnap.generation,
+      },
+      enumerable: false,
+      configurable: true,
+    });
+    return brokerFreeResult;
+  }
   }
   if (fs.existsSync(path.join(getBridgeHome(), "broker-free.json"))) {
     throw new Error("Broker-free state requires its explicit protocol config; refusing legacy credential fallback");
@@ -1380,10 +1901,15 @@ export function loadConfig({ autoFetchAz = true, refreshSpecs = false, passive =
     cfg.hub ||
     DEFAULT_HUB;
 
+  const envBootstrapUrl =
+    process.env.COPILOT_FLOCK_BOOTSTRAP_URL ??
+    process.env.COPILOT_BRIDGE_BOOTSTRAP_URL;
   const bootstrapUrl =
-    process.env.COPILOT_BRIDGE_BOOTSTRAP_URL ||
-    cfg.bootstrapUrl ||
-    DEFAULT_BOOTSTRAP_URL;
+    envBootstrapUrl !== undefined
+      ? envBootstrapUrl
+      : Object.prototype.hasOwnProperty.call(cfg, "bootstrapUrl")
+      ? cfg.bootstrapUrl
+      : DEFAULT_BOOTSTRAP_URL || null;
 
   let specs = cfg.specs || null;
   const needsSpecsProbe = refreshSpecs || !specs || !specs.cpu;
@@ -1486,12 +2012,14 @@ export function loadConfig({ autoFetchAz = true, refreshSpecs = false, passive =
   }
 
   const parsed = parseConnectionString(connectionString);
-  return {
+  const finalConfigSnap = computeConfigFileSnapshot(activeConfigPath);
+  const resolvedResult = {
     machineId,
     scope,
     githubUser,
     specs,
     bootstrapUrl,
+    configPath: activeConfigPath,
     hub,
     connectionString,
     endpoint: parsed.endpoint,
@@ -1501,6 +2029,21 @@ export function loadConfig({ autoFetchAz = true, refreshSpecs = false, passive =
       ? path.join(getBridgeHome(), "bridge.mjs")
       : __filename,
   };
+  Object.defineProperty(resolvedResult, "_callerSnapshot", {
+    value: {
+      ...MODULE_LOAD_SNAPSHOT,
+      loadedAtMs: Date.now(),
+      loadedAt: new Date().toISOString(),
+      configPath: finalConfigSnap.configPath,
+      configSha256: finalConfigSnap.sha256,
+      configMtimeMs: finalConfigSnap.mtimeMs,
+      configUpdatedAt: finalConfigSnap.updatedAt,
+      configGeneration: finalConfigSnap.generation,
+    },
+    enumerable: false,
+    configurable: true,
+  });
+  return resolvedResult;
 }
 
 // ---------------------------------------------------------------------------
@@ -2678,40 +3221,220 @@ export function enforceFlockPolicyAndWalls(
   }
 }
 
-export function validatePinnedBootstrapOrigin(bootstrapUrl, expectedOrigin = null) {
-  let u;
-  try {
-    u = new URL(String(bootstrapUrl || expectedOrigin || DEFAULT_BOOTSTRAP_ORIGIN));
-  } catch {
-    const err = new Error(`Untrusted or invalid bootstrapUrl: "${bootstrapUrl}"`);
-    err.code = "UNTRUSTED_BOOTSTRAP_ORIGIN";
+export function redactBootstrapUrlForDiagnostic(rawUrl) {
+  if (rawUrl === undefined || rawUrl === null) return "<missing>";
+  if (typeof rawUrl !== "string") return `<non-string:${typeof rawUrl}>`;
+  const trimmed = rawUrl.trim();
+  if (!trimmed) return "<empty>";
+
+  const redactSecretsInText = (text) =>
+    String(text)
+      .replace(
+        /(AccessKey|SharedAccessKey|AccountKey|Password|Secret|Token|Sig|Signature)\s*=\s*[^;&\s"']+/gi,
+        "$1=[redacted]"
+      )
+      .replace(/(Bearer\s+)\S+/gi, "$1[redacted]")
+      .replace(/\b(gh[pousr]_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]+)\b/g, "[redacted]")
+      .replace(/([a-z][a-z0-9+.-]*:\/\/)([^/\s@]+)@/gi, "$1[redacted]@")
+      .replace(/([^\s/:@]+):([^\s/@]+)@/g, "[redacted]@")
+      .replace(/\?[^\s#]*/g, "?[redacted]")
+      .replace(/#[^\s]*/g, "#[redacted]");
+
+  if (!/\s/.test(trimmed)) {
+    try {
+      const u = new URL(trimmed);
+      if (u.hostname) {
+        const hasAuth = Boolean(u.username || u.password);
+        const safePath = redactSecretsInText(u.pathname || "");
+        const queryMark = u.search ? "?[redacted]" : "";
+        const hashMark = u.hash ? "#[redacted]" : "";
+        const formatted = `${u.protocol}//${hasAuth ? "[redacted]@" : ""}${u.host}${safePath}${queryMark}${hashMark}`;
+        return formatted.length > 96 ? `${formatted.slice(0, 96)}...` : formatted;
+      }
+    } catch {}
+  }
+
+  const sanitized = redactSecretsInText(trimmed);
+  return sanitized.length > 96 ? `${sanitized.slice(0, 96)}...` : sanitized;
+}
+
+export function validateBootstrapControlPlaneUrl(
+  bootstrapUrl,
+  {
+    configPath = null,
+    fieldName = "bootstrapUrl",
+    expectedOrigin = null,
+    allowEnvFallback = true,
+  } = {}
+) {
+  const resolvedConfigPath = path.resolve(configPath || getConfigPath());
+  const envFallback = allowEnvFallback
+    ? process.env.COPILOT_FLOCK_BOOTSTRAP_URL ??
+      process.env.COPILOT_BRIDGE_BOOTSTRAP_URL ??
+      (DEFAULT_BOOTSTRAP_URL || undefined)
+    : undefined;
+  const candidate = bootstrapUrl === undefined ? envFallback : bootstrapUrl;
+
+  if (candidate === undefined || candidate === null) {
+    const err = new Error(
+      `Missing required control-plane ${fieldName} (unset) in ${resolvedConfigPath}. Raw SignalR messaging may still operate, but flock control-plane endpoints require a valid HTTPS "${fieldName}" (for example "https://<your-bootstrap-host>/api/bootstrap") in ${resolvedConfigPath}.`
+    );
+    err.code = "MISSING_BOOTSTRAP_URL";
+    err.reason = "missing";
+    err.field = fieldName;
+    err.configPath = resolvedConfigPath;
+    err.redactedUrl = "<missing>";
     err.statusCode = 400;
     throw err;
   }
-  if (u.protocol !== "https:" || /evil-attacker|example\.com/i.test(u.hostname)) {
+
+  if (typeof candidate !== "string") {
+    const redacted = redactBootstrapUrlForDiagnostic(candidate);
     const err = new Error(
-      `Security policy: Enrollment JSON bootstrapUrl origin "${u.origin}" is untrusted or non-HTTPS`
+      `Malformed control-plane ${fieldName} (${redacted}) in ${resolvedConfigPath}: expected a valid HTTPS URL string (for example "https://<your-bootstrap-host>/api/bootstrap").`
+    );
+    err.code = "MALFORMED_BOOTSTRAP_URL";
+    err.reason = "malformed";
+    err.field = fieldName;
+    err.configPath = resolvedConfigPath;
+    err.redactedUrl = redacted;
+    err.statusCode = 400;
+    throw err;
+  }
+
+  const trimmed = candidate.trim();
+  if (!trimmed) {
+    const err = new Error(
+      `Missing required control-plane ${fieldName} (empty value) in ${resolvedConfigPath}. Raw SignalR messaging may still operate, but flock control-plane endpoints require a non-empty HTTPS "${fieldName}" (for example "https://<your-bootstrap-host>/api/bootstrap") in ${resolvedConfigPath}.`
+    );
+    err.code = "MISSING_BOOTSTRAP_URL";
+    err.reason = "empty";
+    err.field = fieldName;
+    err.configPath = resolvedConfigPath;
+    err.redactedUrl = "<empty>";
+    err.statusCode = 400;
+    throw err;
+  }
+
+  if (/\s/.test(trimmed)) {
+    const redacted = redactBootstrapUrlForDiagnostic(trimmed);
+    const err = new Error(
+      `Malformed control-plane ${fieldName} (${redacted}) in ${resolvedConfigPath}: URL must not contain whitespace; set "${fieldName}" to "https://<your-bootstrap-host>/api/bootstrap".`
+    );
+    err.code = "MALFORMED_BOOTSTRAP_URL";
+    err.reason = "malformed";
+    err.field = fieldName;
+    err.configPath = resolvedConfigPath;
+    err.redactedUrl = redacted;
+    err.statusCode = 400;
+    throw err;
+  }
+
+  let u;
+  try {
+    u = new URL(trimmed);
+  } catch {
+    const redacted = redactBootstrapUrlForDiagnostic(trimmed);
+    const err = new Error(
+      `Malformed control-plane ${fieldName} (${redacted}) in ${resolvedConfigPath}: expected a valid HTTPS URL (for example "https://<your-bootstrap-host>/api/bootstrap").`
+    );
+    err.code = "MALFORMED_BOOTSTRAP_URL";
+    err.reason = "malformed";
+    err.field = fieldName;
+    err.configPath = resolvedConfigPath;
+    err.redactedUrl = redacted;
+    err.statusCode = 400;
+    throw err;
+  }
+
+  if (!u.hostname || u.username || u.password) {
+    const redacted = redactBootstrapUrlForDiagnostic(trimmed);
+    const err = new Error(
+      `Malformed control-plane ${fieldName} (${redacted}) in ${resolvedConfigPath}: URL must include a valid hostname without embedded credentials.`
+    );
+    err.code = "MALFORMED_BOOTSTRAP_URL";
+    err.reason = "malformed";
+    err.field = fieldName;
+    err.configPath = resolvedConfigPath;
+    err.redactedUrl = redacted;
+    err.statusCode = 400;
+    throw err;
+  }
+
+  if (u.protocol !== "https:" || /evil-attacker|example\.com/i.test(u.hostname)) {
+    const redacted = redactBootstrapUrlForDiagnostic(trimmed);
+    const err = new Error(
+      u.protocol !== "https:"
+        ? `Malformed non-HTTPS control-plane ${fieldName} (${redacted}) in ${resolvedConfigPath}: Security policy requires an "https://" bootstrapUrl origin.`
+        : `Security policy: Enrollment JSON bootstrapUrl origin "${u.origin}" is untrusted or non-HTTPS (config: ${resolvedConfigPath})`
     );
     err.code = "UNTRUSTED_BOOTSTRAP_ORIGIN";
+    err.reason = u.protocol !== "https:" ? "non_https" : "untrusted_origin";
+    err.field = fieldName;
+    err.configPath = resolvedConfigPath;
+    err.redactedUrl = redacted;
     err.statusCode = 403;
     throw err;
   }
+
   const configuredPin =
-    expectedOrigin ||
-    process.env.COPILOT_FLOCK_ALLOWED_BOOTSTRAP_ORIGIN ||
-    process.env.COPILOT_BRIDGE_ALLOWED_BOOTSTRAP_ORIGIN ||
-    DEFAULT_BOOTSTRAP_ORIGIN;
-  if (configuredPin) {
-    const allowedOrigin = new URL(configuredPin).origin.toLowerCase();
+    expectedOrigin ??
+    (process.env.COPILOT_FLOCK_ALLOWED_BOOTSTRAP_ORIGIN ||
+      process.env.COPILOT_BRIDGE_ALLOWED_BOOTSTRAP_ORIGIN ||
+      DEFAULT_BOOTSTRAP_ORIGIN ||
+      null);
+  if (configuredPin !== null && configuredPin !== undefined && String(configuredPin).trim() !== "") {
+    let pinUrl;
+    try {
+      pinUrl = new URL(String(configuredPin).trim());
+    } catch {
+      const redactedPin = redactBootstrapUrlForDiagnostic(configuredPin);
+      const err = new Error(
+        `Malformed pinned bootstrapUrl (${redactedPin}) in ${resolvedConfigPath}: fix the configured "bootstrapUrl" in ${resolvedConfigPath}.`
+      );
+      err.code = "MALFORMED_BOOTSTRAP_URL";
+      err.reason = "malformed";
+      err.field = "bootstrapUrl";
+      err.configPath = resolvedConfigPath;
+      err.redactedUrl = redactedPin;
+      err.statusCode = 400;
+      throw err;
+    }
+    if (!pinUrl.hostname || pinUrl.protocol !== "https:" || pinUrl.username || pinUrl.password) {
+      const redactedPin = redactBootstrapUrlForDiagnostic(configuredPin);
+      const err = new Error(
+        `Malformed pinned bootstrapUrl (${redactedPin}) in ${resolvedConfigPath}: pinned origin must be a valid HTTPS URL without embedded credentials.`
+      );
+      err.code = "MALFORMED_BOOTSTRAP_URL";
+      err.reason = "malformed";
+      err.field = "bootstrapUrl";
+      err.configPath = resolvedConfigPath;
+      err.redactedUrl = redactedPin;
+      err.statusCode = 400;
+      throw err;
+    }
+    const allowedOrigin = pinUrl.origin.toLowerCase();
     if (u.origin.toLowerCase() !== allowedOrigin) {
       const err = new Error(
-        `Security policy: Enrollment JSON bootstrapUrl origin "${u.origin}" does not match pinned "${allowedOrigin}"`
+        `Security policy: Enrollment JSON bootstrapUrl origin "${u.origin}" does not match pinned "${allowedOrigin}" (config: ${resolvedConfigPath})`
       );
       err.code = "UNTRUSTED_BOOTSTRAP_ORIGIN";
+      err.reason = "origin_mismatch";
+      err.field = fieldName;
+      err.configPath = resolvedConfigPath;
       err.statusCode = 403;
       throw err;
     }
   }
+
+  return u;
+}
+
+export function validatePinnedBootstrapOrigin(bootstrapUrl, expectedOrigin = null, options = {}) {
+  const u = validateBootstrapControlPlaneUrl(bootstrapUrl, {
+    ...(options || {}),
+    expectedOrigin,
+  });
   return u.origin;
 }
 
@@ -2886,7 +3609,7 @@ export function fetchConnectionStringViaGitHubBootstrap({
   if (!ghToken || !bootstrapUrl) return null;
 
   try {
-    const u = new URL(bootstrapUrl);
+    const u = validateBootstrapControlPlaneUrl(bootstrapUrl);
     if (machineId) u.searchParams.set("machineId", machineId);
     if (scope) u.searchParams.set("scope", scope);
     if (githubUser) u.searchParams.set("githubUser", githubUser);
@@ -2964,7 +3687,7 @@ export function registerWithBootstrapServer({
   if (!ghToken || !bootstrapUrl) return null;
 
   try {
-    const registerUrl = new URL(bootstrapUrl);
+    const registerUrl = validateBootstrapControlPlaneUrl(bootstrapUrl);
     registerUrl.pathname = registerUrl.pathname.replace(/\/api\/bootstrap\/?$/, "/api/register");
     const payload = JSON.stringify({
       machineId,
@@ -3060,7 +3783,7 @@ export function fetchBootstrapMembersStatus({ bootstrapUrl = DEFAULT_BOOTSTRAP_U
   }
 
   try {
-    const membersUrl = new URL(bootstrapUrl, pinnedOrigin);
+    const membersUrl = validateBootstrapControlPlaneUrl(bootstrapUrl);
     membersUrl.pathname = membersUrl.pathname.replace(/\/api\/bootstrap\/?$/, "/api/members");
     const inlineScript = `
       const https = require("node:https");
@@ -3176,7 +3899,7 @@ export function callBootstrapQueueApi({
   if (!ghToken || !bootstrapUrl) return null;
 
   try {
-    const apiUrl = new URL(bootstrapUrl);
+    const apiUrl = validateBootstrapControlPlaneUrl(bootstrapUrl);
     apiUrl.pathname = apiUrl.pathname.replace(/\/api\/bootstrap\/?$/, endpointPath);
     const payload = bodyObj ? JSON.stringify(bodyObj) : "";
     const inlineScript = `
@@ -3265,8 +3988,12 @@ export function ackOfflineQueueMessages({
 export function getOfflineQueueStatus({
   bootstrapUrl = DEFAULT_BOOTSTRAP_URL,
   machineId = null,
+  configPath = null,
 } = {}) {
-  const u = new URL(bootstrapUrl);
+  const u = validateBootstrapControlPlaneUrl(bootstrapUrl, {
+    configPath,
+    fieldName: "bootstrapUrl",
+  });
   u.pathname = u.pathname.replace(/\/api\/bootstrap\/?$/, "/api/queue/status");
   if (machineId) u.searchParams.set("machineId", machineId);
   return callBootstrapQueueApi({
@@ -7617,6 +8344,7 @@ export async function drainAndProcessOfflineQueue(
 export async function runDaemon(cfg) {
   ensureBridgeDir();
   pinDaemonIdentity(getBridgeHome(), __filename);
+  const daemonSnapshot = captureCallerMcpSnapshot(cfg, { surface: "resident-daemon" });
   const pidPath = getDaemonPidPath();
   const statePath = getStatePath();
   fs.writeFileSync(pidPath, String(process.pid), "utf8");
@@ -7629,6 +8357,12 @@ export async function runDaemon(cfg) {
       version: BRIDGE_VERSION,
       manifestDigest: RUNTIME_MODULE_MANIFEST?.manifestDigest || null,
       residentRuntime: buildInProcessResidentRuntime(),
+      startedAt: daemonSnapshot.loadedAt,
+      scriptPath: daemonSnapshot.scriptPath,
+      scriptSha256: daemonSnapshot.scriptSha256,
+      codeDigest: daemonSnapshot.codeDigest,
+      configSha256: daemonSnapshot.configSha256,
+      configGeneration: daemonSnapshot.configGeneration,
       pid: process.pid,
       updatedAt: new Date().toISOString(),
     });
@@ -7648,6 +8382,13 @@ export async function runDaemon(cfg) {
         JSON.stringify(
           {
             status,
+            version: BRIDGE_VERSION,
+            startedAt: daemonSnapshot.loadedAt,
+            scriptPath: daemonSnapshot.scriptPath,
+            scriptSha256: daemonSnapshot.scriptSha256,
+            codeDigest: daemonSnapshot.codeDigest,
+            configSha256: daemonSnapshot.configSha256,
+            configGeneration: daemonSnapshot.configGeneration,
             machineId: cfg.machineId,
             scope: cfg.scope,
             version: BRIDGE_VERSION,
@@ -8077,7 +8818,7 @@ const MCP_TOOLS = [
   {
     name: "flock_status",
     description:
-      "Check local Copilot Flock daemon status, machine ID, local WebSocket status, live online machines, and authenticated flock roster (including offline shared-flock/collaborator machines).",
+      "Check local Copilot Flock health across installedOnDisk, residentDaemon, and callerMcpProcess (including config/code drift and safe reconnectRequired guidance), local WebSocket status, live online machines, and authenticated flock roster (including offline shared-flock/collaborator machines).",
     inputSchema: {
       type: "object",
       properties: {
@@ -8939,11 +9680,12 @@ Object.assign(MCP_TOOLS.find((tool) => tool.name === "kick_flock_member").inputS
 });
 
 export async function executeMcpTool(cfg, name, args = {}, options = {}) {
+  const deps = options;
   if (name === "mcp_self_info") {
     return getMcpSelfInfo(cfg);
   }
-  const ensureDaemon = options.ensureDaemon || ensureDaemonStarted;
-  const discoverOnlineMachines = options.discoverOnlineMachines || discoverMachines;
+  const ensureDaemon = options.ensureDaemon || options.ensureDaemonFn || ensureDaemonStarted;
+  const discoverOnlineMachines = options.discoverOnlineMachines || options.discoverMachinesFn || discoverMachines;
   if (options.runtimeOptions) {
     cfg = {
       ...cfg,
@@ -9256,6 +9998,13 @@ export async function executeMcpTool(cfg, name, args = {}, options = {}) {
               running: false,
               reason: "missing_transport_config",
             };
+        const runtimeHealth = inspectLocalRuntimeHealth(cfg, {
+          daemonStatus: effectiveDaemon,
+          onlineMachines: [],
+          callerSnapshot: deps.callerSnapshot || activeCallerMcpSnapshot || null,
+          bridgeHome: deps.bridgeHome || null,
+          configPath: deps.configPath || cfg?.configPath || null,
+        });
         return {
           status: "unavailable",
           passive: true,
@@ -9272,6 +10021,9 @@ export async function executeMcpTool(cfg, name, args = {}, options = {}) {
           hub,
           endpoint,
           daemon: effectiveDaemon,
+          installedOnDisk: runtimeHealth.installedOnDisk,
+          residentDaemon: runtimeHealth.residentDaemon,
+          callerMcpProcess: runtimeHealth.callerMcpProcess,
           localCopilotWs,
           onlineMachines: [],
           onlineMachinesStatus: "unavailable",
@@ -9284,6 +10036,13 @@ export async function executeMcpTool(cfg, name, args = {}, options = {}) {
           timeoutMs: 2200,
           passive: true,
         });
+        const runtimeHealth = inspectLocalRuntimeHealth(cfg, {
+          daemonStatus,
+          onlineMachines: machines,
+          callerSnapshot: deps.callerSnapshot || activeCallerMcpSnapshot || null,
+          bridgeHome: deps.bridgeHome || null,
+          configPath: deps.configPath || cfg?.configPath || null,
+        });
         return {
           status: "ok",
           passive: true,
@@ -9295,11 +10054,21 @@ export async function executeMcpTool(cfg, name, args = {}, options = {}) {
           hub,
           endpoint,
           daemon: daemonStatus,
+          installedOnDisk: runtimeHealth.installedOnDisk,
+          residentDaemon: runtimeHealth.residentDaemon,
+          callerMcpProcess: runtimeHealth.callerMcpProcess,
           localCopilotWs,
           onlineMachines: machines,
         };
       } catch (err) {
         const reason = formatErrorDetail(err);
+        const runtimeHealth = inspectLocalRuntimeHealth(cfg, {
+          daemonStatus,
+          onlineMachines: [],
+          callerSnapshot: deps.callerSnapshot || activeCallerMcpSnapshot || null,
+          bridgeHome: deps.bridgeHome || null,
+          configPath: deps.configPath || cfg?.configPath || null,
+        });
         return {
           status: "unavailable",
           passive: true,
@@ -9312,6 +10081,9 @@ export async function executeMcpTool(cfg, name, args = {}, options = {}) {
           hub,
           endpoint,
           daemon: { ...daemonStatus, status: "unavailable", transportError: reason },
+          installedOnDisk: runtimeHealth.installedOnDisk,
+          residentDaemon: runtimeHealth.residentDaemon,
+          callerMcpProcess: runtimeHealth.callerMcpProcess,
           localCopilotWs,
           onlineMachines: [],
           onlineMachinesStatus: "unavailable",
@@ -9324,6 +10096,7 @@ export async function executeMcpTool(cfg, name, args = {}, options = {}) {
       parseFlockAddress(targetFlock, cfg.githubUser || "erjadi");
     }
     const daemonStatus = await ensureDaemon(cfg);
+    let discoveryError = null;
     const [liveOutcome, legacyRoster] = await Promise.all([
       (async () => {
         try {
@@ -9339,6 +10112,7 @@ export async function executeMcpTool(cfg, name, args = {}, options = {}) {
             },
           };
         } catch (err) {
+          discoveryError = formatErrorDetail(err);
           return {
             machines: [],
             source: {
@@ -9364,6 +10138,13 @@ export async function executeMcpTool(cfg, name, args = {}, options = {}) {
       daemonStatus,
       residentOverride: selfPing?.resident || null,
     });
+    const runtimeHealth = inspectLocalRuntimeHealth(cfg, {
+      daemonStatus,
+      onlineMachines: liveOutcome.machines,
+      callerSnapshot: deps.callerSnapshot || activeCallerMcpSnapshot || null,
+      bridgeHome: deps.bridgeHome || null,
+      configPath: deps.configPath || cfg?.configPath || null,
+    });
     const merged = applyLivePresenceToLegacyRoster(
       legacyRoster,
       liveOutcome.machines,
@@ -9386,12 +10167,16 @@ export async function executeMcpTool(cfg, name, args = {}, options = {}) {
       hub: cfg.hub,
       endpoint: cfg.endpoint,
       daemon: daemonStatus,
+      installedOnDisk: runtimeHealth.installedOnDisk,
+      residentDaemon: runtimeHealth.residentDaemon,
+      callerMcpProcess: runtimeHealth.callerMcpProcess,
       localCopilotWs: getLocalWsConnectionInfo() ? "online" : "offline",
       onlineMachines: merged.onlineMachines,
       knownMembers: merged.knownMembers,
       offlineMembers: merged.offlineMembers,
       flocks: merged.flocks,
       roster: merged.roster,
+      ...(discoveryError ? { discoveryError } : {}),
     };
   }
 
@@ -10185,12 +10970,23 @@ export async function executeMcpTool(cfg, name, args = {}, options = {}) {
       typeof args.enrollment_json === "string"
         ? JSON.parse(args.enrollment_json)
         : args.enrollment_json;
+    const activeConfigPath = getConfigPath();
+    const hasConfiguredPin = Boolean(
+      cfg &&
+        Object.prototype.hasOwnProperty.call(cfg, "bootstrapUrl") &&
+        cfg.bootstrapUrl !== null &&
+        cfg.bootstrapUrl !== undefined &&
+        String(cfg.bootstrapUrl).trim() !== ""
+    );
     const pinnedOrigin = validatePinnedBootstrapOrigin(
       enrollmentJson?.bootstrapUrl,
-      cfg?.bootstrapUrl || null
+      hasConfiguredPin ? cfg.bootstrapUrl : null,
+      {
+        configPath: cfg?.configPath || activeConfigPath,
+        fieldName: "enrollmentJson.bootstrapUrl",
+      }
     );
     const effectiveBootstrapUrl = `${pinnedOrigin}/api/bootstrap`;
-    const activeConfigPath = getConfigPath();
     if (!cfg.bootstrapUrl && fs.existsSync(activeConfigPath)) {
       try {
         const updatedCfg = JSON.parse(fs.readFileSync(activeConfigPath, "utf8"));
@@ -10810,6 +11606,7 @@ export async function generateFlockTopologyDiagram(
 }
 
 export async function runMcpServer(cfg, { passive = false } = {}) {
+  activeCallerMcpSnapshot = captureCallerMcpSnapshot(cfg, { surface: "mcp-stdio" });
   // Start local daemon in background if not already running (unless passive)
   if (!passive) {
     ensureDaemonStarted(cfg).catch(() => {});
@@ -12213,35 +13010,10 @@ export async function voteReleaseAcrossFlock(
 }
 
 export function reapOrphanedMcpProcesses() {
-  const reapedPids = [];
-  try {
-    if (process.platform === "win32") {
-      const psScript = `
-        $ErrorActionPreference = 'SilentlyContinue'
-        $procs = Get-CimInstance Win32_Process -Filter "Name='node.exe' and CommandLine like '%bridge.mjs%mcp%'"
-        $reaped = @()
-        foreach ($p in $procs) {
-          if ($p.ProcessId -eq ${process.pid}) { continue }
-          $parent = Get-Process -Id $p.ParentProcessId -ErrorAction SilentlyContinue
-          if (-not $parent) {
-            Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue
-            $reaped += $p.ProcessId
-          }
-        }
-        ConvertTo-Json @($reaped) -Compress
-      `;
-      const out = execFileSync(
-        "powershell.exe",
-        ["-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", psScript],
-        { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 5000, windowsHide: true }
-      ).trim();
-      if (out) {
-        const parsed = JSON.parse(out);
-        if (Array.isArray(parsed)) reapedPids.push(...parsed);
-      }
-    }
-  } catch {}
-  return reapedPids;
+  // Caller-owned MCP stdio processes are managed exclusively by their owning host
+  // (e.g., Copilot Desktop, VS Code, or CLI) and exit naturally on stdin EOF.
+  // Never perform destructive process-tree kills against MCP processes.
+  return [];
 }
 
 export async function performLocalSelfUpdate(
@@ -12718,7 +13490,7 @@ export async function reprovisionLocalBridge(
     onAfterStageFile = null,
     onDuringCutover = null,
     installFn = installBridge,
-    reapFn = reapOrphanedMcpProcesses,
+    reapFn = null,
     spawnDetachedInstall = true,
   } = {}
 ) {
@@ -12806,7 +13578,7 @@ export async function reprovisionLocalBridge(
   });
 
   const wsInfo = getLocalWsConnectionInfo();
-  const reapedMcpPids = reapFn();
+  const reapedMcpPids = typeof reapFn === "function" ? reapFn() : [];
 
   // 2. Abort and delete all old bridge sessions (Coordinator, Thread Tracker, Upgrade bridge v1.7.0, etc.)
   const removedSessions = await deleteOldBridgeSessions(wsInfo);
@@ -13189,7 +13961,14 @@ export function checkBootPersistenceStatus({ passive = false } = {}) {
 
 export async function diagnoseLocalBridgeState(
   cfg,
-  { fix = false, passive = !fix, inDaemonRpc = false } = {}
+  {
+    fix = false,
+    passive = !fix,
+    inDaemonRpc = false,
+    callerSnapshot = null,
+    configureBootPersistenceFn = configureBootPersistence,
+    registerBootstrapFn = registerWithBootstrapServer,
+  } = {}
 ) {
   const effectiveFix = passive ? false : Boolean(fix);
   const effectivePassive = Boolean(passive) || !effectiveFix;
@@ -13203,9 +13982,7 @@ export async function diagnoseLocalBridgeState(
   let repairedActions = [];
 
   if (effectiveFix) {
-    const reaped = reapOrphanedMcpProcesses();
-    if (reaped.length > 0) repairedActions.push(`reaped_orphaned_mcp_pids:${reaped.join(",")}`);
-    const bp = configureBootPersistence(scriptToUse);
+    const bp = configureBootPersistenceFn(scriptToUse);
     if (bp) repairedActions.push(`configured_boot_persistence:${bp.type}`);
     const tr = await ensureThreadTrackerSession(cfg);
     if (tr?.created) repairedActions.push(`created_thread_tracker:${tr.sessionId}`);
@@ -13334,12 +14111,13 @@ export async function diagnoseLocalBridgeState(
   if (!bootPersistence.configured) {
     issues.push(`Boot persistence (${bootPersistence.type}) is not configured`);
   }
-  if (process.platform !== "win32" && fs.existsSync(activeConfigPath)) {
+  const activeCfgPath = getConfigPath();
+  if (process.platform !== "win32" && fs.existsSync(activeCfgPath)) {
     try {
-      const st = fs.statSync(activeConfigPath);
+      const st = fs.statSync(activeCfgPath);
       if ((st.mode & 0o077) !== 0) {
         if (effectiveFix) {
-          fs.chmodSync(activeConfigPath, 0o600);
+          fs.chmodSync(activeCfgPath, 0o600);
           repairedActions.push("tightened_config_json_mode_0600");
         } else {
           issues.push(`config.json file permissions (${(st.mode & 0o777).toString(8)}) allow group/other access (expected 0600)`);
@@ -13387,15 +14165,15 @@ export async function diagnoseLocalBridgeState(
   if (effectiveFix) {
     try {
       cfg.specs = collectLocalMachineSpecs();
-      if (fs.existsSync(activeConfigPath)) {
-        const updatedCfg = JSON.parse(fs.readFileSync(activeConfigPath, "utf8"));
+      if (fs.existsSync(activeCfgPath)) {
+        const updatedCfg = JSON.parse(fs.readFileSync(activeCfgPath, "utf8"));
         updatedCfg.specs = cfg.specs;
-        writeConfigFileSecure(updatedCfg);
+        writeConfigFileSecure(updatedCfg, activeCfgPath);
       }
       try {
-        registerWithBootstrapServer(cfg);
+        registerBootstrapFn(cfg);
       } catch {}
-      repairedActions.push("refreshed_system_specs_and_identity_key");
+      repairedActions.push("refreshed_system_specs");
     } catch {}
   }
 
@@ -13444,6 +14222,12 @@ export async function diagnoseLocalBridgeState(
     );
   }
 
+  const runtimeHealth = inspectLocalRuntimeHealth(cfg, {
+    daemonStatus: daemonReport,
+    callerSnapshot: callerSnapshot || activeCallerMcpSnapshot || null,
+    configPath: cfg?.configPath || activeCfgPath,
+  });
+
   return {
     machineId: cfg.machineId,
     version: BRIDGE_VERSION,
@@ -13473,6 +14257,9 @@ export async function diagnoseLocalBridgeState(
     issues,
     repairedActions: effectiveFix ? repairedActions : undefined,
     daemon: daemonReport,
+    installedOnDisk: runtimeHealth.installedOnDisk,
+    residentDaemon: runtimeHealth.residentDaemon,
+    callerMcpProcess: runtimeHealth.callerMcpProcess,
     runtime: {
       type: wsInfo ? "copilot-desktop" : "copilot-cli",
       copilotDesktopRunning: Boolean(wsInfo),
@@ -13710,6 +14497,9 @@ export async function diagnoseFleetMachines(
       verified: diag?.verified || livePings[0].verified || null,
       daemonInstanceCount,
       daemonPid: diag?.daemon?.pid || livePings[0].pid || null,
+      installedOnDisk: diag?.installedOnDisk || null,
+      residentDaemon: diag?.residentDaemon || null,
+      callerMcpProcess: diag?.callerMcpProcess || null,
       runtime: diag?.runtime || null,
       bootPersistence: diag?.bootPersistence || null,
       threads: diag?.threads || null,
@@ -13927,8 +14717,16 @@ export function callBootstrapV3Endpoint(
   { method = "POST", body = null, sandbox = isSandboxV3Mode() } = {}
 ) {
   const ghToken = resolveLocalGitHubToken();
-  const baseBoot = cfg?.bootstrapUrl || DEFAULT_BOOTSTRAP_URL;
-  const origin = validatePinnedBootstrapOrigin(baseBoot);
+  const hasCfgBootstrap = Boolean(
+    cfg && Object.prototype.hasOwnProperty.call(cfg, "bootstrapUrl")
+  );
+  const baseBoot = hasCfgBootstrap
+    ? cfg.bootstrapUrl
+    : DEFAULT_BOOTSTRAP_URL || undefined;
+  const origin = validatePinnedBootstrapOrigin(baseBoot, null, {
+    configPath: cfg?.configPath || null,
+    fieldName: "bootstrapUrl",
+  });
   const prefix = sandbox ? "/api/v3/preview" : "/api/v3";
   const u = new URL(`${prefix}${subPath}`, origin);
   if (method === "GET" && cfg?.githubUser) {
@@ -14085,8 +14883,8 @@ export async function installBridge({
       } catch {}
     }
     if (protocolArg === "broker-free-v34" || welcomeTicketArg ||
-        (!Object.keys(existing).length && !bootstrapUrlArg && !enrollmentJsonArg)) {
-      if (bootstrapUrlArg || enrollmentJsonArg) throw new Error("Broker-free mode cannot silently enroll through a legacy broker invite");
+        (!Object.keys(existing).length && bootstrapUrlArg === undefined && !enrollmentJsonArg)) {
+      if (bootstrapUrlArg !== undefined || enrollmentJsonArg) throw new Error("Broker-free mode cannot silently enroll through a legacy broker invite");
       if (Object.keys(existing).length && existing.protocol !== "broker-free-v34") {
         throw new Error("Existing legacy installation remains unchanged; broker-free migration requires explicit separate enrollment");
       }
@@ -14114,16 +14912,26 @@ export async function installBridge({
     if (enrollmentJsonArg) {
       parsedEnrollmentJson =
         typeof enrollmentJsonArg === "string" ? JSON.parse(enrollmentJsonArg) : enrollmentJsonArg;
-      if (parsedEnrollmentJson?.bootstrapUrl) {
+      if (
+        parsedEnrollmentJson &&
+        Object.prototype.hasOwnProperty.call(parsedEnrollmentJson, "bootstrapUrl")
+      ) {
         const origin = validatePinnedBootstrapOrigin(
           parsedEnrollmentJson.bootstrapUrl,
-          existing.bootstrapUrl || null
+          existing.bootstrapUrl || null,
+          {
+            configPath: activeConfigPath,
+            fieldName: "enrollmentJson.bootstrapUrl",
+          }
         );
         existing.bootstrapUrl = `${origin}/api/bootstrap`;
       }
     }
-    if (bootstrapUrlArg) {
-      const origin = validatePinnedBootstrapOrigin(bootstrapUrlArg, null);
+    if (bootstrapUrlArg !== undefined) {
+      const origin = validatePinnedBootstrapOrigin(bootstrapUrlArg, null, {
+        configPath: activeConfigPath,
+        fieldName: "bootstrapUrl",
+      });
       existing.bootstrapUrl = `${origin}/api/bootstrap`;
     }
     if (subscriptionArg) existing.subscription = subscriptionArg;
@@ -16550,8 +17358,12 @@ Usage:
       return;
     }
     const st = getOfflineQueueStatus({
-      bootstrapUrl: cfg.bootstrapUrl || DEFAULT_BOOTSTRAP_URL,
+      bootstrapUrl:
+        cfg && Object.prototype.hasOwnProperty.call(cfg, "bootstrapUrl")
+          ? cfg.bootstrapUrl
+          : DEFAULT_BOOTSTRAP_URL || undefined,
       machineId: flags.machine || flags["to-machine"] || positional[0] || null,
+      configPath: cfg?.configPath || getConfigPath(),
     });
     console.log(
       JSON.stringify(
