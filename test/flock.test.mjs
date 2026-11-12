@@ -6841,18 +6841,59 @@ test("release voter extracts complete modular dependency closure into isolated f
     assert.match(missingModBallot.stderr, /uncommitted-missing-module\.mjs/);
     assert.equal(verifyVoteBallotSignature(missingModBallot, voterKey.publicKey), true);
 
-    // Branch 3: nonzero test failure with bounded multi-byte UTF-8 stdout/stderr (`rc-failing-test`)
+    // Raw-stream capture must not depend on the Node test reporter's stream routing.
+    gitRun(originWorkDir, ["checkout", "-b", "rc-failing-preflight", "main"]);
+    writeTreeFiles(originWorkDir, {
+      ...baseModularCandidate,
+      "flock.mjs": [
+        baseModularCandidate["flock.mjs"],
+        'import fs from "node:fs";',
+        'fs.writeSync(1, "HEAD-STDOUT-αβγ🚀-" + "ω".repeat(900) + "-TAIL-STDOUT-END\\n");',
+        'fs.writeSync(2, "HEAD-STDERR-δεζ❌-" + "λ".repeat(900) + "-TAIL-STDERR-END\\n");',
+        'process.exitCode = 1;',
+      ].join("\n"),
+    });
+    gitRun(originWorkDir, ["add", "-A"]);
+    gitRun(originWorkDir, ["commit", "-m", "failing preflight with separate native streams"]);
+    const rawStreamCommit = gitRun(originWorkDir, ["rev-parse", "HEAD"]);
+    const maxBytes = 768;
+    const rawStreamBallot = await reviewReleaseCandidate(
+      voterCfg,
+      { branch: "rc-failing-preflight" },
+      { repoDir: originWorkDir, fetchFromOrigin: false, maxOutputBytes: maxBytes }
+    );
+    assert.equal(rawStreamBallot.vote, "REJECT");
+    assert.equal(rawStreamBallot.failureCategory, "candidate_test_failure");
+    assert.equal(rawStreamBallot.candidateCommit, rawStreamCommit);
+    assert.equal(rawStreamBallot.exitCode, 1);
+    assert.equal(rawStreamBallot.signal, null);
+    assert.equal(rawStreamBallot.timedOut, false);
+    assert.equal(rawStreamBallot.checks.unitTestsOk, false);
+    for (const [stream, head, tail] of [
+      [rawStreamBallot.stdout, "HEAD-STDOUT-αβγ🚀", "TAIL-STDOUT-END"],
+      [rawStreamBallot.stderr, "HEAD-STDERR-δεζ❌", "TAIL-STDERR-END"],
+    ]) {
+      assert.ok(Buffer.byteLength(stream, "utf8") <= maxBytes);
+      assert.equal(stream.includes("\uFFFD"), false);
+      assert.ok(stream.includes(head));
+      assert.ok(stream.includes(tail));
+      assert.match(stream, /\[truncated \d+ bytes\]/);
+    }
+    assert.equal(verifyVoteBallotSignature(rawStreamBallot, voterKey.publicKey), true);
+
+    // Branch 3: test failure diagnostics may share TAP stdout on older Node versions.
     gitRun(originWorkDir, ["checkout", "-b", "rc-failing-test", "main"]);
     writeTreeFiles(originWorkDir, {
       ...baseModularCandidate,
       "test/flock.test.mjs": [
-        'process.stdout.write("HEAD-STDOUT-αβγ🚀-" + "ω".repeat(900) + "\\n");',
-        'process.stderr.write("HEAD-STDERR-δεζ❌-" + "λ".repeat(900) + "-TAIL-STDERR-END\\n");',
+        'import fs from "node:fs";',
+        'fs.writeSync(1, "HEAD-STDOUT-αβγ🚀\\n");',
+        'fs.writeSync(2, "HEAD-STDERR-δεζ❌-TAIL-STDERR-END\\n");',
         'import test from "node:test";',
         'import assert from "node:assert/strict";',
         'test("deliberate candidate failure with multibyte UTF-8 output", () => {',
-        '  console.log("HEAD-STDOUT-αβγ🚀-" + "ω".repeat(900) + "-TAIL-STDOUT-END");',
-        '  console.error("HEAD-STDERR-δεζ❌-" + "λ".repeat(900) + "-TAIL-STDERR-END");',
+        '  fs.writeSync(1, "HEAD-STDOUT-αβγ🚀-" + "ω".repeat(900) + "-TAIL-STDOUT-END\\n");',
+        '  fs.writeSync(2, "HEAD-STDERR-δεζ❌-" + "λ".repeat(900) + "-TAIL-STDERR-END\\n");',
         '  assert.equal("broken-candidate", "expected-behavior");',
         '});',
       ].join("\n"),
@@ -6861,7 +6902,6 @@ test("release voter extracts complete modular dependency closure into isolated f
     gitRun(originWorkDir, ["commit", "-m", "failing test candidate"]);
     const failTestCommit = gitRun(originWorkDir, ["rev-parse", "HEAD"]);
 
-    const maxBytes = 768;
     const failBallot = await reviewReleaseCandidate(
       voterCfg,
       { branch: "rc-failing-test" },
@@ -6893,11 +6933,12 @@ test("release voter extracts complete modular dependency closure into isolated f
     writeTreeFiles(originWorkDir, {
       ...baseModularCandidate,
       "test/flock.test.mjs": [
-        'process.stdout.write("STDOUT-BEFORE-TIMEOUT\\n");',
-        'process.stderr.write("STDERR-BEFORE-TIMEOUT\\n");',
+        'import fs from "node:fs";',
+        'fs.writeSync(1, "STDOUT-BEFORE-TIMEOUT\\n");',
+        'fs.writeSync(2, "STDERR-BEFORE-TIMEOUT\\n");',
         'import test from "node:test";',
         'test("hanging candidate test", async () => {',
-        '  await new Promise(() => {});',
+        '  await new Promise((resolve) => setTimeout(resolve, 30000));',
         '});',
       ].join("\n"),
     });
