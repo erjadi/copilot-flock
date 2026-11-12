@@ -33,7 +33,14 @@ Agent entrypoints (Copilot executes them, not the human):
 | Approve | `approve-join --join-code-file <file> --flock owner/team --device-fingerprint <verified-pin> --membership-expires-at <epoch-ms> --role guest --session-ids <comma-separated-ids>` | `approve_join` |
 | Accept | `accept-welcome --welcome-file <file> --owner-fingerprint <independent-pin>` | `accept_welcome` |
 | Renew | `renew-membership --flock owner/team` | `renew_membership` |
+| List durable roster (no live pings) | `registry --flock owner/team` | `list_flock_members` |
 | Remove local installation | `uninstall` or `unenroll --traceless` | `unenroll_flock` |
+
+See [`docs/FLOCK_MEMBERSHIP_REGISTRY.md`](./FLOCK_MEMBERSHIP_REGISTRY.md) for the
+durable per-flock membership registry architecture (owner-signed roster
+snapshots and deltas, epoch/hash anti-rollback, removal tombstones, and strict
+separation from live presence, 24h MemberCert validity, and shared-thread
+visibility).
 
 Use an explicit flock selector when multiple memberships exist, including
 replies. Ambiguous dispatch fails. A legacy installation requires a separately

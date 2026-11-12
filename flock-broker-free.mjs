@@ -7,6 +7,7 @@ import { createDeviceIdentity, createOwnerState, createJoinCode, approveJoin, ac
   ownerFingerprint, canonical, encryptEnvelope, decryptEnvelope, DurableReceiver,
   createRotation, applyRotation, signedControl, verifyControl, renewOwnerCert, validateCert,
   verifyJoinCode, peerSubscription } from "./flock-protocol.mjs";
+import { FlockMembershipRegistry, createSignedRosterSnapshot, createSignedRosterDelta } from "./flock-registry.mjs";
 
 const hash = (value) => crypto.createHash("sha256").update(typeof value === "string" ? value : canonical(value)).digest("hex");
 let processIdentity;
@@ -20,6 +21,7 @@ export class BrokerFreeRuntime {
     this.connect = connect;
     this.dispatch = dispatch;
     this.log = log;
+    this.registry = new FlockMembershipRegistry(this.root, { clock: this.clock });
     this.serial = Promise.resolve();
   }
   read() {
@@ -95,12 +97,194 @@ export class BrokerFreeRuntime {
     return latest;
   }
   refreshOwnerCredentials(record) {
+    this._ensureOwnerRosterInitialized(record);
     if (record.cert.body.expiresAt < this.clock() + 300000) {
       record.cert = renewOwnerCert(record, record.identity, this.clock());
       record.transport = this.transport(record).credentials(record.cert, record.ownerPublicKey);
-      record.members[record.localPeerId] = { ...record.members[record.localPeerId], cert: record.cert };
+      const nextRev = (record.rosterRevision || 1) + 1;
+      record.members[record.localPeerId] = {
+        ...record.members[record.localPeerId],
+        cert: record.cert,
+        updatedAtRevision: nextRev,
+      };
+      const built = this._buildOwnerRosterArtifacts(record, { revision: nextRev });
+      this._commitOwnerRoster(record, built.snapshot);
     }
     return record;
+  }
+  _compileOwnerMembersAndTombstones(record, { defaultEpoch = record.epoch, defaultRevision = record.rosterRevision || 1 } = {}) {
+    const members = [];
+    const tombstones = [];
+    for (const [peerId, entry] of Object.entries(record.members || {})) {
+      if (entry.removed) {
+        tombstones.push({
+          peerId,
+          keyFingerprint: peerId,
+          machineId: entry.cert.body.machineId,
+          githubUser: null,
+          removedAtMs: entry.removedAtMs ?? this.clock(),
+          removedAtEpoch: entry.removedAtEpoch ?? defaultEpoch,
+          removedAtRevision: entry.removedAtRevision ?? defaultRevision,
+          reason: entry.removalReason || "removed",
+          operationId: entry.removalOperationId || null,
+        });
+      } else {
+        members.push({
+          peerId,
+          keyFingerprint: peerId,
+          deviceEd25519Pub: entry.cert.body.deviceEd25519Pub,
+          deviceX25519Pub: entry.cert.body.deviceX25519Pub,
+          machineId: entry.cert.body.machineId,
+          githubUser: null,
+          role: entry.cert.body.role,
+          scope: entry.cert.body.scope,
+          membershipExpiresAtMs: entry.membershipExpiresAt ?? null,
+          certIssuedAtMs: entry.cert.body.issuedAt,
+          certExpiresAtMs: entry.cert.body.expiresAt,
+          addedAtEpoch: entry.addedAtEpoch ?? 1,
+          addedAtRevision: entry.addedAtRevision ?? 1,
+          updatedAtRevision: entry.updatedAtRevision ?? 1,
+        });
+      }
+    }
+    return { members, tombstones };
+  }
+  _buildOwnerRosterArtifacts(record, {
+    epoch = record.epoch,
+    minAcceptedEpoch = record.minAcceptedEpoch || epoch,
+    rotationHash = record.rotationHash || null,
+    revision,
+    membersOverride = null,
+    tombstonesOverride = null,
+  }) {
+    const prevSnapshot = record.lastRosterSnapshot || null;
+    const compiled = membersOverride && tombstonesOverride
+      ? { members: membersOverride, tombstones: tombstonesOverride }
+      : this._compileOwnerMembersAndTombstones(record, { defaultEpoch: epoch, defaultRevision: revision });
+    const issuedAt = this.clock();
+    const snapshot = createSignedRosterSnapshot({
+      flockId: record.flockId,
+      ownerIdentity: record.identity,
+      epoch,
+      minAcceptedEpoch,
+      rotationHash,
+      revision,
+      previousRosterHash: prevSnapshot?.body.rosterHash || null,
+      members: compiled.members,
+      tombstones: compiled.tombstones,
+      issuedAt,
+    });
+    let delta = null;
+    if (prevSnapshot && (epoch > prevSnapshot.body.epoch || (epoch === prevSnapshot.body.epoch && revision > prevSnapshot.body.revision))) {
+      const prevMembersByKey = new Map(prevSnapshot.body.members.map((m) => [m.identityKey, canonical(m)]));
+      const prevTombsByKey = new Map(prevSnapshot.body.tombstones.map((t) => [t.identityKey, canonical(t)]));
+      const upserts = snapshot.body.members.filter((m) => prevMembersByKey.get(m.identityKey) !== canonical(m));
+      const removals = snapshot.body.tombstones.filter((t) => prevTombsByKey.get(t.identityKey) !== canonical(t));
+      delta = createSignedRosterDelta({
+        flockId: record.flockId,
+        ownerIdentity: record.identity,
+        baseEpoch: prevSnapshot.body.epoch,
+        baseRevision: prevSnapshot.body.revision,
+        baseRosterHash: prevSnapshot.body.rosterHash,
+        epoch,
+        minAcceptedEpoch,
+        rotationHash,
+        revision,
+        upserts,
+        removals,
+        resultingMembers: snapshot.body.members,
+        resultingTombstones: snapshot.body.tombstones,
+        issuedAt,
+      });
+    }
+    return { snapshot, delta };
+  }
+  _commitOwnerRoster(record, snapshot) {
+    record.rosterRevision = snapshot.body.revision;
+    record.rosterHash = snapshot.body.rosterHash;
+    record.lastRosterSnapshot = snapshot;
+    this.registry.applySignedSnapshot(snapshot, {
+      ownerPublicKey: record.ownerPublicKey,
+      expectedFlockId: record.flockId,
+      minAcceptedEpoch: record.minAcceptedEpoch || 1,
+      now: this.clock(),
+    });
+  }
+  _ensureOwnerRosterInitialized(record) {
+    if (!record?.ownerSecrets || record.localPeerId !== record.rotationOwnerPeerId) return;
+    if (!record.lastRosterSnapshot) {
+      const rev = record.rosterRevision || 1;
+      const built = this._buildOwnerRosterArtifacts(record, { revision: rev });
+      this._commitOwnerRoster(record, built.snapshot);
+    } else if (!this.registry.hasFlock(record.flockId)) {
+      this.registry.applySignedSnapshot(record.lastRosterSnapshot, {
+        ownerPublicKey: record.ownerPublicKey,
+        expectedFlockId: record.flockId,
+        minAcceptedEpoch: record.minAcceptedEpoch || 1,
+        now: this.clock(),
+      });
+    }
+  }
+  ensureRegistrySeeded(flockId) {
+    const record = this.record(flockId);
+    if (this.registry.hasFlock(record.flockId)) return;
+    if (record.lastRosterSnapshot) {
+      this.registry.applySignedSnapshot(record.lastRosterSnapshot, {
+        ownerPublicKey: record.ownerPublicKey,
+        expectedFlockId: record.flockId,
+        minAcceptedEpoch: record.minAcceptedEpoch || 1,
+        now: this.clock(),
+      });
+      return;
+    }
+    if (record.ownerSecrets && record.localPeerId === record.rotationOwnerPeerId) {
+      this._ensureOwnerRosterInitialized(record);
+    }
+  }
+  exportSignedRosterSnapshot(flockId) {
+    const record = this.assertOwner(this.select(flockId));
+    this._ensureOwnerRosterInitialized(record);
+    return record.lastRosterSnapshot;
+  }
+  getFlockRegistryView(flockId, options = {}) {
+    const record = this.select(flockId);
+    this.ensureRegistrySeeded(record.flockId);
+    return this.registry.getFlockView(record.flockId, options);
+  }
+  listRegisteredMembers(flockId, options = {}) {
+    return this.getFlockRegistryView(flockId, options).members;
+  }
+  async syncRoster(flockId) {
+    const record = this.select(flockId);
+    if (record.localPeerId === record.rotationOwnerPeerId) {
+      this._ensureOwnerRosterInitialized(record);
+      return this.getFlockRegistryView(record.flockId);
+    }
+    const ownerMachine = record.members[record.rotationOwnerPeerId]?.cert.body.machineId;
+    if (!ownerMachine) throw new Error("Pinned rotation owner route unavailable for roster sync");
+    const response = await this.invoke({
+      flockId: record.flockId,
+      toMachine: ownerMachine,
+      action: "roster_sync",
+      params: {},
+      timeoutMs: 10000,
+    });
+    return this.mutate(async (data) => {
+      const latest = this.record(record.flockId);
+      this.registry.applySignedSnapshot(response.result, {
+        ownerPublicKey: latest.ownerPublicKey,
+        expectedFlockId: latest.flockId,
+        expectedOwnerFingerprint: ownerFingerprint(latest.ownerPublicKey),
+        minAcceptedEpoch: latest.minAcceptedEpoch || 1,
+        now: this.clock(),
+      });
+      latest.lastRosterSnapshot = response.result;
+      latest.rosterRevision = response.result.body.revision;
+      latest.rosterHash = response.result.body.rosterHash;
+      data.flocks[latest.flockId] = latest;
+      this.save(data);
+      return this.registry.getFlockView(latest.flockId);
+    });
   }
   assertActive(record) {
     const latest = this.record(record.flockId);
@@ -127,10 +311,12 @@ export class BrokerFreeRuntime {
           sendKey: send.key, listenKey: listen.key }, members: {}, transitions: {}, departed: false };
       data.flocks[flockId] = record;
       record.transport = this.transport(record).credentials(record.cert, record.ownerPublicKey);
-      record.members[record.localPeerId] = { cert: record.cert, membershipExpiresAt: null };
+      record.members[record.localPeerId] = { cert: record.cert, membershipExpiresAt: null, addedAtEpoch: 1, addedAtRevision: 1, updatedAtRevision: 1 };
       this.save(data); // Keep recovery for an interrupted subscription operation.
       record.transport = await this.transport(record).issue(record.cert, record.ownerPublicKey);
-      record.members[record.localPeerId] = { cert: record.cert, membershipExpiresAt: null };
+      record.members[record.localPeerId] = { cert: record.cert, membershipExpiresAt: null, addedAtEpoch: 1, addedAtRevision: 1, updatedAtRevision: 1 };
+      const initialRoster = this._buildOwnerRosterArtifacts(record, { epoch: 1, minAcceptedEpoch: 1, revision: 1 });
+      this._commitOwnerRoster(record, initialRoster.snapshot);
       this.save(data);
       return { flockId, peerId: record.localPeerId, ownerFingerprint: ownerFingerprint(record.ownerPublicKey), enrolled: true };
     });
@@ -181,27 +367,62 @@ export class BrokerFreeRuntime {
       if (role === "owner") throw new Error("Owner delegation is not a join operation");
       if (!Number.isSafeInteger(membershipExpiresAt) || membershipExpiresAt <= this.clock()) throw new Error("Explicit finite membership expiry required");
       let issuedCert;
+      let nextRoster = null;
+      const nextRevision = (record.rosterRevision || 1) + 1;
+      const ticketMetadata = { endpoints: record.endpoints, rotationHash: record.rotationHash || null,
+        ownerCert: record.cert, membershipExpiresAt };
+      const otherRetainedPeers = Object.entries(record.members).filter(([id, entry]) =>
+        id !== record.localPeerId && id !== join.peerId && !entry.removed);
       const ticket = await approveJoin({ code, ownerIdentity: record.identity, ownerPublicKey: record.ownerPublicKey,
         rotationOwnerPeerId: record.rotationOwnerPeerId, flockId, role, sessionIds, membershipExpiresAt,
         epoch: record.epoch, keyId: record.keyId, groupKey: Buffer.from(record.groupKey, "base64url"),
-        metadata: { endpoints: record.endpoints, rotationHash: record.rotationHash || null,
-          ownerCert: record.cert, membershipExpiresAt },
+        metadata: ticketMetadata,
         authorizeOwner: async () => { record = this.assertOwner(record); },
         verifyIdentityPolicy: async () => {
           if (join.peerId !== expectedEd25519Fingerprint) throw new Error("Identity policy changed");
         },
-        provisionTransport: ({ cert }) => {
+        provisionTransport: async ({ cert }) => {
           issuedCert = cert;
           record.pendingApprovals ||= {};
           record.pendingApprovals[join.peerId] = { cert, membershipExpiresAt };
           data.flocks[flockId] = record;
           this.save(data);
-          return this.transport(record).issue(cert, record.ownerPublicKey);
+          const issuedTransport = await this.transport(record).issue(cert, record.ownerPublicKey);
+          const candidateRecord = {
+            ...record,
+            members: {
+              ...record.members,
+              [join.peerId]: {
+                cert,
+                membershipExpiresAt,
+                addedAtEpoch: previous?.addedAtEpoch ?? record.epoch,
+                addedAtRevision: previous?.addedAtRevision ?? nextRevision,
+                updatedAtRevision: nextRevision,
+              },
+            },
+          };
+          nextRoster = this._buildOwnerRosterArtifacts(candidateRecord, { revision: nextRevision });
+          ticketMetadata.rosterSnapshot = nextRoster.snapshot;
+          return issuedTransport;
         }, now: this.clock() });
-      record.members[join.peerId] = { cert: issuedCert, membershipExpiresAt };
+      record.members[join.peerId] = {
+        cert: issuedCert,
+        membershipExpiresAt,
+        addedAtEpoch: previous?.addedAtEpoch ?? record.epoch,
+        addedAtRevision: previous?.addedAtRevision ?? nextRevision,
+        updatedAtRevision: nextRevision,
+      };
       delete record.pendingApprovals[join.peerId];
+      if (nextRoster) this._commitOwnerRoster(record, nextRoster.snapshot);
       data.flocks[flockId] = record;
       this.save(data);
+      if (otherRetainedPeers.length > 0 && nextRoster?.delta) {
+        try {
+          await this.publish(record, { type: "roster-update", delta: nextRoster.delta });
+        } catch (err) {
+          this.log(`Broker-free roster delta broadcast deferred: ${err.message}`);
+        }
+      }
       return ticket;
     });
   }
@@ -225,6 +446,18 @@ export class BrokerFreeRuntime {
       flockId: welcome.cert.body.flockId, localPeerId: welcome.cert.body.peerId,
       minAcceptedEpoch: welcome.epoch, rotationHash: welcome.metadata.rotationHash,
       members: { [welcome.rotationOwnerPeerId]: { cert: welcome.metadata.ownerCert } }, transitions: {}, departed: false };
+    if (welcome.metadata.rosterSnapshot) {
+      this.registry.applySignedSnapshot(welcome.metadata.rosterSnapshot, {
+        ownerPublicKey: welcome.ownerPublicKey,
+        expectedFlockId: record.flockId,
+        expectedOwnerFingerprint: pinnedOwnerFingerprint,
+        minAcceptedEpoch: record.minAcceptedEpoch,
+        now: this.clock(),
+      });
+      record.lastRosterSnapshot = welcome.metadata.rosterSnapshot;
+      record.rosterRevision = welcome.metadata.rosterSnapshot.body.revision;
+      record.rosterHash = welcome.metadata.rosterSnapshot.body.rosterHash;
+    }
     data.flocks[record.flockId] = record;
     delete data.pendingJoins[ticket.body.joinHash];
     this.save(data);
@@ -243,9 +476,18 @@ export class BrokerFreeRuntime {
   async renewOwn(flockId) {
     return this.mutate(async (data) => {
       const record = this.assertOwner(data.flocks[flockId] || {});
+      this._ensureOwnerRosterInitialized(record);
       record.cert = renewOwnerCert(record, record.identity, this.clock());
       record.transport = await this.transport(record).issue(record.cert, record.ownerPublicKey);
-      record.members[record.localPeerId] = { cert: record.cert, membershipExpiresAt: null };
+      const nextRev = (record.rosterRevision || 1) + 1;
+      record.members[record.localPeerId] = {
+        ...record.members[record.localPeerId],
+        cert: record.cert,
+        membershipExpiresAt: null,
+        updatedAtRevision: nextRev,
+      };
+      const built = this._buildOwnerRosterArtifacts(record, { revision: nextRev });
+      this._commitOwnerRoster(record, built.snapshot);
       data.flocks[flockId] = record;
       this.save(data);
     });
@@ -271,8 +513,30 @@ export class BrokerFreeRuntime {
         const retained = Object.entries(record.members).filter(([id, entry]) => id !== peerId &&
           !entry.removed && entry.cert.body.expiresAt > this.clock()).map(([, entry]) => entry.cert);
         const rotation = createRotation(record, record.identity, retained, this.clock());
-        record.transitions[operationId] = { peerId, rotation, confirmed: false };
-        record.members[peerId].removed = true;
+        const nextRev = (record.rosterRevision || 1) + 1;
+        const removedAtMs = this.clock();
+        record.members[peerId] = {
+          ...record.members[peerId],
+          removed: true,
+          removedAtMs,
+          removedAtEpoch: rotation.body.epoch,
+          removedAtRevision: nextRev,
+          removalReason: selfLeave ? "self_leave" : "removed",
+          removalOperationId: operationId,
+        };
+        const rosterArtifacts = this._buildOwnerRosterArtifacts(record, {
+          epoch: rotation.body.epoch,
+          minAcceptedEpoch: rotation.body.epoch,
+          rotationHash: hash(rotation),
+          revision: nextRev,
+        });
+        record.transitions[operationId] = {
+          peerId,
+          rotation,
+          rosterDelta: rosterArtifacts.delta,
+          rosterSnapshot: rosterArtifacts.snapshot,
+          confirmed: false,
+        };
         // Advance the receiving owner's floor before any remote await.
         record.minAcceptedEpoch = rotation.body.epoch;
         data.flocks[flockId] = record;
@@ -291,7 +555,13 @@ export class BrokerFreeRuntime {
       await this.transport(record).subscription(peerId, "DELETE");
       this.assertOwner(record);
       // The rotation is owner-signed and recipient-sealed; it is not encrypted under a revoked epoch.
-      await this.transport(record).publish(record.transport, { type: "rotation", flockId, rotation: transition.rotation });
+      await this.transport(record).publish(record.transport, {
+        type: "rotation",
+        flockId,
+        rotation: transition.rotation,
+        ...(transition.rosterDelta ? { rosterDelta: transition.rosterDelta } : {}),
+        ...(transition.rosterSnapshot ? { rosterSnapshot: transition.rosterSnapshot } : {}),
+      });
       this.assertOwner(record);
       if (!selfLeave) {
         const next = applyRotation(this.anchorPath(flockId), transition.rotation, record.identity, {
@@ -299,6 +569,7 @@ export class BrokerFreeRuntime {
         });
         record = { ...record, epoch: next.epoch, keyId: next.keyId, groupKey: next.groupKey,
           minAcceptedEpoch: next.minAcceptedEpoch, rotationHash: next.rotationHash };
+        if (transition.rosterSnapshot) this._commitOwnerRoster(record, transition.rosterSnapshot);
       }
       const receipt = signedControl("leave-receipt", { flockId, peerId, operationId,
         epoch: transition.rotation.body.epoch, confirmed: true, subscriptionDeleted: peerSubscription(peerId) }, record.identity);
@@ -318,6 +589,64 @@ export class BrokerFreeRuntime {
         throw new Error("Invalid leave receipt");
       }
       return true;
+    }
+    if (message.type === "roster-update") {
+      return this.mutate(async (data) => {
+        const latest = this.record(record.flockId);
+        this.ensureRegistrySeeded(latest.flockId);
+        const expectedOwnerFp = ownerFingerprint(latest.ownerPublicKey);
+        if (message.delta) {
+          try {
+            const applied = this.registry.applySignedDelta(message.delta, {
+              ownerPublicKey: latest.ownerPublicKey,
+              expectedFlockId: latest.flockId,
+              expectedOwnerFingerprint: expectedOwnerFp,
+              minAcceptedEpoch: latest.minAcceptedEpoch || 1,
+              now: this.clock(),
+            });
+            latest.rosterRevision = applied.rosterRevision;
+            latest.rosterHash = applied.rosterHash;
+            data.flocks[latest.flockId] = latest;
+            this.save(data);
+            return true;
+          } catch (err) {
+            if (err.code === "ROSTER_ROLLBACK_REJECTED") {
+              this.log(`Broker-free stale roster delta ignored for ${latest.flockId}: ${err.message}`);
+              return true;
+            }
+            if (err.code !== "ROSTER_DELTA_GAP" || !message.snapshot) {
+              if (err.code === "ROSTER_DELTA_GAP") {
+                this.log(`Broker-free roster delta gap for ${latest.flockId}; full snapshot sync required`);
+                return true;
+              }
+              throw err;
+            }
+          }
+        }
+        if (message.snapshot) {
+          try {
+            const applied = this.registry.applySignedSnapshot(message.snapshot, {
+              ownerPublicKey: latest.ownerPublicKey,
+              expectedFlockId: latest.flockId,
+              expectedOwnerFingerprint: expectedOwnerFp,
+              minAcceptedEpoch: latest.minAcceptedEpoch || 1,
+              now: this.clock(),
+            });
+            latest.lastRosterSnapshot = message.snapshot;
+            latest.rosterRevision = applied.rosterRevision;
+            latest.rosterHash = applied.rosterHash;
+            data.flocks[latest.flockId] = latest;
+            this.save(data);
+          } catch (err) {
+            if (err.code === "ROSTER_ROLLBACK_REJECTED") {
+              this.log(`Broker-free stale roster snapshot ignored for ${latest.flockId}: ${err.message}`);
+              return true;
+            }
+            throw err;
+          }
+        }
+        return true;
+      });
     }
     if (message.type === "leave-request") {
       if (record.localPeerId !== record.rotationOwnerPeerId) return true;
@@ -343,8 +672,41 @@ export class BrokerFreeRuntime {
       return this.mutate(async (data) => {
         const latest = this.record(record.flockId);
         const next = applyRotation(this.anchorPath(record.flockId), message.rotation, latest.identity, latest);
-        data.flocks[record.flockId] = { ...latest, epoch: next.epoch, keyId: next.keyId,
+        const updated = { ...latest, epoch: next.epoch, keyId: next.keyId,
           groupKey: next.groupKey, rotationHash: next.rotationHash, minAcceptedEpoch: next.minAcceptedEpoch };
+        const expectedOwnerFp = ownerFingerprint(updated.ownerPublicKey);
+        if (message.rosterDelta || message.rosterSnapshot) {
+          let rosterApplied = false;
+          if (message.rosterDelta && this.registry.hasFlock(updated.flockId)) {
+            try {
+              const res = this.registry.applySignedDelta(message.rosterDelta, {
+                ownerPublicKey: updated.ownerPublicKey,
+                expectedFlockId: updated.flockId,
+                expectedOwnerFingerprint: expectedOwnerFp,
+                minAcceptedEpoch: updated.minAcceptedEpoch,
+                now: this.clock(),
+              });
+              updated.rosterRevision = res.rosterRevision;
+              updated.rosterHash = res.rosterHash;
+              rosterApplied = true;
+            } catch (err) {
+              if (err.code !== "ROSTER_DELTA_GAP") throw err;
+            }
+          }
+          if (!rosterApplied && message.rosterSnapshot) {
+            const res = this.registry.applySignedSnapshot(message.rosterSnapshot, {
+              ownerPublicKey: updated.ownerPublicKey,
+              expectedFlockId: updated.flockId,
+              expectedOwnerFingerprint: expectedOwnerFp,
+              minAcceptedEpoch: updated.minAcceptedEpoch,
+              now: this.clock(),
+            });
+            updated.lastRosterSnapshot = message.rosterSnapshot;
+            updated.rosterRevision = res.rosterRevision;
+            updated.rosterHash = res.rosterHash;
+          }
+        }
+        data.flocks[record.flockId] = updated;
         this.save(data);
         return true;
       });
@@ -363,6 +725,16 @@ export class BrokerFreeRuntime {
         this.assertActive(this.record(record.flockId));
         if (typeof payload.requestId !== "string" || payload.requestId !== header.messageId ||
             payload.fromMachine !== member.machineId) throw new Error("RPC request identity binding mismatch");
+        if (this.registry.hasFlock(fresh.flockId)) {
+          try {
+            this.registry.recordPresence(fresh.flockId, [{
+              peerId: member.peerId,
+              machineId: member.machineId,
+              observedAtMs: this.clock(),
+              liveVerified: true,
+            }], { now: this.clock() });
+          } catch {}
+        }
         let result;
         let error;
         try {
@@ -377,6 +749,9 @@ export class BrokerFreeRuntime {
             if (join.peerId !== member.peerId) throw new Error("Renewal cannot change device identity");
             result = await this.approve({ flockId: fresh.flockId, code: payload.params.code, renew: true,
               expectedEd25519Fingerprint: member.peerId });
+          } else if (header.action === "roster_sync") {
+            if (fresh.localPeerId !== fresh.rotationOwnerPeerId) throw new Error("Roster sync requires designated owner");
+            result = this.exportSignedRosterSnapshot(fresh.flockId);
           } else {
             if (!this.dispatch) throw new Error("Local broker-free RPC dispatcher unavailable");
             result = await this.dispatch({ member, payload, action: header.action, assertAuthorized, flockId: fresh.flockId });
@@ -423,7 +798,10 @@ export class BrokerFreeRuntime {
     const responsePromise = new Promise((resolve, fail) => { settle = resolve; reject = fail; });
     responsePromise.catch(() => {}); // The socket can reject while the queue-first send is still awaited.
     const expectedPeer = Object.entries(record.members).find(([, entry]) =>
-      !entry.removed && entry.cert.body.machineId.toLowerCase() === toMachine.toLowerCase())?.[0];
+      !entry.removed && entry.cert.body.machineId.toLowerCase() === toMachine.toLowerCase())?.[0] ||
+      (this.registry.hasFlock(record.flockId)
+        ? this.registry.listMembers(record.flockId).find((m) => !m.removed && m.machineId.toLowerCase() === toMachine.toLowerCase())?.peerId
+        : undefined);
     const client = await this.connect(this.clientConfig(record), { userId: record.localPeerId,
       onInvocation: (target, args) => {
         if (target !== "flock34" || args[0]?.flockId !== record.flockId) return;
@@ -442,10 +820,22 @@ export class BrokerFreeRuntime {
           if (payload.requestId !== requestId || payload.fromMachine !== member.machineId ||
               (expectedPeer && member.peerId !== expectedPeer) ||
               (toMachine !== "*" && toMachine.toLowerCase() !== member.machineId.toLowerCase())) return;
-          if ((action === "renew" || action === "leave") && member.peerId !== record.rotationOwnerPeerId) throw new Error("Control response not from designated owner");
+          if ((action === "renew" || action === "leave" || action === "roster_sync") && member.peerId !== record.rotationOwnerPeerId) throw new Error("Control response not from designated owner");
           const receiver = new DurableReceiver(path.join(this.root, `responses-${hash(record.flockId)}.json`),
             () => this.record(record.flockId), this.clock);
           this.serial = this.serial.then(() => receiver.dispatch(message.envelope, async () => payload)).then(() => {
+            if (this.registry.hasFlock(record.flockId)) {
+              try {
+                this.registry.recordPresence(record.flockId, [{
+                  peerId: member.peerId,
+                  machineId: member.machineId,
+                  observedAtMs: this.clock(),
+                  version: payload.result?.version ?? null,
+                  activeSessionCount: payload.result?.activeSessionCount ?? null,
+                  liveVerified: true,
+                }], { now: this.clock() });
+              } catch {}
+            }
             if (!responses.some((response) => response.fromMachine === payload.fromMachine)) responses.push(payload);
             if (!collectAll) settle(payload);
           }).catch((error) => { this.log(`Broker-free response admission rejected: ${error.message}`); reject(error); });

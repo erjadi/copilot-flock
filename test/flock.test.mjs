@@ -57,7 +57,16 @@ import {
   validatePinnedBootstrapOrigin,
   recordSandboxManifestResource,
   teardownLocalSandbox,
+  FlockMembershipRegistry,
+  createSignedRosterSnapshot,
+  createSignedRosterDelta,
+  computeRosterHash,
+  applyV3EnrollmentResult,
+  queryFlockMembershipRegistry,
 } from "../flock.mjs";
+import { AzureTransport, azureEndpoints } from "../flock-azure.mjs";
+import { BrokerFreeRuntime } from "../flock-broker-free.mjs";
+import { createDeviceIdentity, ownerFingerprint } from "../flock-protocol.mjs";
 
 import {
   verifyGitHubRepoAccess,
@@ -2322,6 +2331,7 @@ test("v3.0.0 multi-flock platform: universal <owner>/<flock>[/<machineId>] addre
         "README.md",
         "docs/BOOTSTRAP_NEW_FLOCK_BYO_AZURE.md",
         "docs/JOINING_AND_SHARING_GUIDE.md",
+        "docs/FLOCK_MEMBERSHIP_REGISTRY.md",
         "skills/flock-topology/SKILL.md",
         "skills/copilot-flock/SKILL.md",
         "docs/assets/flock-topology-light.svg",
@@ -2340,4 +2350,570 @@ test("v3.0.0 multi-flock platform: universal <owner>/<flock>[/<machineId>] addre
     else process.env.COPILOT_HOME = prevCopilotHome;
     env.cleanup();
   }
+});
+
+test("durable v3 broker-backed membership registry: offline collaborators, cryptographic indexing over shared hostnames, stale caches, presence/thread isolation, restart persistence, tombstones, and rollback rejection", async (t) => {
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "flock-registry-v3-"));
+  t.after(() => fs.rmSync(tempRoot, { recursive: true, force: true }));
+
+  const storePath = path.join(tempRoot, "broker-v3-store.json");
+  const registryPath = path.join(tempRoot, "flock-registry.json");
+  const testConnStr =
+    "Endpoint=https://your-signalr.service.signalr.net;AccessKey=MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=;Version=1.0;";
+
+  const ownerKey = crypto.generateKeyPairSync("ed25519", {
+    publicKeyEncoding: { type: "spki", format: "pem" },
+    privateKeyEncoding: { type: "pkcs8", format: "pem" },
+  });
+  const aliceKey = crypto.generateKeyPairSync("ed25519", {
+    publicKeyEncoding: { type: "spki", format: "pem" },
+    privateKeyEncoding: { type: "pkcs8", format: "pem" },
+  });
+  const bobKey = crypto.generateKeyPairSync("ed25519", {
+    publicKeyEncoding: { type: "spki", format: "pem" },
+    privateKeyEncoding: { type: "pkcs8", format: "pem" },
+  });
+
+  let clockNow = 1_750_000_000_000;
+  const registry = new FlockMembershipRegistry(registryPath, {
+    clock: () => clockNow,
+    staleAfterMs: 300_000,
+    presenceTtlMs: 60_000,
+  });
+
+  // 1. Hostname-only member records without cryptographic identity must fail closed
+  assert.throws(
+    () =>
+      registry.reconcileV3BrokerFlock({
+        flockId: "erjadi/studio-team",
+        rosterEpoch: 1,
+        members: [{ machineId: "HOSTNAME-ONLY-PC", githubUser: "alice", scope: "work" }],
+      }),
+    (err) => err.code === "ROSTER_IDENTITY_REQUIRED"
+  );
+
+  // 2. Enroll owner in personal + work flocks, plus invite @alice and @bob to erjadi/studio-team
+  //    BOTH @alice and @bob use identical hostname `WORK-LAPTOP` with distinct Ed25519 identities
+  await enrollV3Device(
+    {
+      githubUser: "erjadi",
+      githubUserId: 1001,
+      deviceId: "fp-owner-pc",
+      machineId: "MAIN-WORKSTATION",
+      scope: "personal",
+      publicKey: ownerKey.publicKey,
+      keyFingerprint: "fp-owner-pc",
+    },
+    { storePath, connectionString: testConnStr }
+  );
+  const inviteAlice = await createV3FlockInvite(
+    {
+      callerGitHubUser: "erjadi",
+      callerGitHubUserId: 1001,
+      targetAddress: "erjadi/studio-team",
+      invitedUser: "alice",
+      invitedGitHubUserId: 2002,
+    },
+    { storePath }
+  );
+  const inviteBob = await createV3FlockInvite(
+    {
+      callerGitHubUser: "erjadi",
+      callerGitHubUserId: 1001,
+      targetAddress: "erjadi/studio-team",
+      invitedUser: "bob",
+      invitedGitHubUserId: 3003,
+    },
+    { storePath }
+  );
+  await enrollV3Device(
+    {
+      githubUser: "alice",
+      githubUserId: 2002,
+      deviceId: "fp-alice-1",
+      machineId: "WORK-LAPTOP",
+      scope: "work",
+      publicKey: aliceKey.publicKey,
+      keyFingerprint: "fp-alice-1",
+      enrollmentJson: inviteAlice.enrollmentJson,
+    },
+    { storePath, connectionString: testConnStr }
+  );
+  await enrollV3Device(
+    {
+      githubUser: "bob",
+      githubUserId: 3003,
+      deviceId: "fp-bob-1",
+      machineId: "WORK-LAPTOP",
+      scope: "work",
+      publicKey: bobKey.publicKey,
+      keyFingerprint: "fp-bob-1",
+      enrollmentJson: inviteBob.enrollmentJson,
+    },
+    { storePath, connectionString: testConnStr }
+  );
+
+  // Reconcile /api/v3/my-flocks + /api/members without pinging any machine
+  const myFlocksBeforeKick = await listV3UserFlocks(
+    { githubUser: "erjadi", githubUserId: 1001, deviceId: "fp-owner-pc" },
+    { storePath }
+  );
+  const bootstrapMembers = [
+    {
+      machineId: "WORK-LAPTOP",
+      githubUser: "alice",
+      keyFingerprint: "fp-alice-1",
+      scope: "work",
+      version: "3.4.1",
+      specs: { memory: { totalGb: 64 }, gpus: [{ name: "RTX 4090", vramGb: 24 }] },
+      registeredAt: new Date(clockNow - 10_000).toISOString(),
+      lastSeenAt: new Date(clockNow - 5_000).toISOString(),
+    },
+  ];
+  registry.reconcileV3Broker({ myFlocksResponse: myFlocksBeforeKick, bootstrapMembers });
+
+  // 3. Offline collaborators & shared-hostname coexistence without live pings
+  const teamView = registry.getFlockView("erjadi/studio-team");
+  assert.equal(teamView.isStale, false);
+  assert.equal(teamView.sharedThreadVisibility, "isolated");
+  const aliceMember = teamView.members.find((m) => m.peerId === "2002:fp-alice-1");
+  const bobMember = teamView.members.find((m) => m.peerId === "3003:fp-bob-1");
+  assert.ok(aliceMember && bobMember, "Both WORK-LAPTOP devices must coexist via cryptographic identity");
+  assert.equal(aliceMember.keyFingerprint, "fp-alice-1");
+  assert.equal(bobMember.keyFingerprint, "fp-bob-1");
+  assert.equal(aliceMember.machineId, "WORK-LAPTOP");
+  assert.equal(bobMember.machineId, "WORK-LAPTOP");
+  assert.equal(aliceMember.specs?.memory?.totalGb, 64, "Matched /api/members specs by keyFingerprint");
+  assert.equal(bobMember.specs, null, "Alice's /api/members specs must not bleed onto Bob's WORK-LAPTOP");
+  assert.equal(aliceMember.membershipStatus, "active");
+  assert.equal(aliceMember.presenceStatus, "unknown", "Broker registration lastSeenAt must never masquerade as live online");
+  assert.ok(aliceMember.lastSeenAt);
+  assert.equal(aliceMember.sharedThreadsExposed, false);
+
+  // 4. Cross-flock isolation: erjadi/personal never sees studio-team collaborators
+  const personalView = registry.getFlockView("erjadi/personal");
+  assert.equal(personalView.members.length, 1);
+  assert.equal(personalView.members[0].peerId, "1001:fp-owner-pc");
+
+  // 5. Shared-thread isolation: registry membership grants zero access to unshared local sessions
+  const localFlocksPath = path.join(tempRoot, "flocks.json");
+  const hostCfg = { machineId: "MAIN-WORKSTATION", githubUser: "erjadi", scope: "work" };
+  shareThreadWithFlock(
+    hostCfg,
+    {
+      flockId: "erjadi/studio-team",
+      sessionId: "approved-only",
+      title: "Approved thread",
+      summarySnapshot: "Clean summary",
+    },
+    localFlocksPath
+  );
+  const teamPolicy = loadLocalFlocksConfig(hostCfg, localFlocksPath).flocks["erjadi/studio-team"];
+  await assert.rejects(
+    () =>
+      handleRpcAction(hostCfg, {
+        action: "get_transcript",
+        flockPolicy: teamPolicy,
+        params: { session: "private-local-thread" },
+      }),
+    (err) => err.code === "SESSION_NOT_SHARED" && err.statusCode === 403
+  );
+
+  // 6. Live presence updates never mutate rosterEpoch, rosterRevision, or rosterHash, and decay back to unknown
+  const hashBeforePresence = teamView.rosterHash;
+  registry.recordPresence("erjadi/studio-team", [
+    { peerId: "3003:fp-bob-1", observedAtMs: clockNow, version: "3.4.1" },
+  ]);
+  const withLiveBob = registry.getFlockView("erjadi/studio-team");
+  assert.equal(withLiveBob.rosterHash, hashBeforePresence);
+  assert.equal(withLiveBob.rosterRevision, teamView.rosterRevision);
+  assert.equal(withLiveBob.members.find((m) => m.peerId === "3003:fp-bob-1").presenceStatus, "online");
+  assert.equal(withLiveBob.members.find((m) => m.peerId === "2002:fp-alice-1").presenceStatus, "unknown");
+
+  // Advance clock past presenceTtlMs (60s) and staleAfterMs (300s): stale cache still serves offline members
+  clockNow += 360_000;
+  const staleView = registry.getFlockView("erjadi/studio-team");
+  assert.equal(staleView.isStale, true);
+  assert.equal(staleView.totalMembers, teamView.totalMembers);
+  assert.equal(staleView.members.find((m) => m.peerId === "3003:fp-bob-1").presenceStatus, "unknown");
+
+  // 7. Restart persistence: brand-new registry instance reloads exact durable state from disk
+  const oldCacheBackup = structuredClone(registry.read());
+  const restartedRegistry = new FlockMembershipRegistry(registryPath, { clock: () => clockNow });
+  assert.equal(restartedRegistry.getFlockView("erjadi/studio-team").rosterHash, hashBeforePresence);
+  assert.equal(restartedRegistry.getFlockView("erjadi/studio-team").totalMembers, teamView.totalMembers);
+
+  // 8. Kick @alice's device -> revisioned tombstone, Bob's WORK-LAPTOP survives, rollback & resurrection rejected
+  await kickV3FlockMember(
+    {
+      callerGitHubUser: "erjadi",
+      callerGitHubUserId: 1001,
+      flockId: "erjadi/studio-team",
+      targetUser: "alice",
+      targetDeviceId: "fp-alice-1",
+    },
+    { storePath, connectionString: testConnStr }
+  );
+  const myFlocksAfterKick = await listV3UserFlocks(
+    { githubUser: "erjadi", githubUserId: 1001, deviceId: "fp-owner-pc" },
+    { storePath }
+  );
+  restartedRegistry.reconcileV3Broker({ myFlocksResponse: myFlocksAfterKick, bootstrapMembers });
+
+  const afterKickView = restartedRegistry.getFlockView("erjadi/studio-team");
+  assert.equal(afterKickView.tombstoneCount, 1);
+  assert.equal(afterKickView.members.some((m) => m.peerId === "2002:fp-alice-1"), false);
+  assert.equal(afterKickView.members.some((m) => m.peerId === "3003:fp-bob-1"), true, "Bob's WORK-LAPTOP must remain active");
+
+  const withRemovedView = restartedRegistry.getFlockView("erjadi/studio-team", { includeRemoved: true });
+  const aliceTombstone = withRemovedView.members.find((m) => m.peerId === "2002:fp-alice-1");
+  assert.equal(aliceTombstone.removed, true);
+  assert.equal(aliceTombstone.membershipStatus, "removed");
+  assert.equal(aliceTombstone.removedAtEpoch, afterKickView.rosterEpoch);
+
+  // Stale broker rollback must be rejected
+  assert.throws(
+    () => restartedRegistry.reconcileV3Broker({ myFlocksResponse: myFlocksBeforeKick }),
+    (err) => err.code === "ROSTER_ROLLBACK_REJECTED"
+  );
+
+  // Merging an older persisted cache must be rejected and cannot resurrect Alice
+  assert.throws(
+    () => restartedRegistry.mergeRegistryCache(oldCacheBackup),
+    (err) => err.code === "ROSTER_ROLLBACK_REJECTED"
+  );
+
+  // Crafted higher-revision cache attempting to resurrect tombstoned Alice at <= removedAtEpoch must be rejected
+  const craftedStore = structuredClone(restartedRegistry.read());
+  const craftedTeam = craftedStore.flocks["erjadi/studio-team"];
+  craftedTeam.rosterRevision += 1;
+  craftedTeam.members["2002:fp-alice-1"] = {
+    ...oldCacheBackup.flocks["erjadi/studio-team"].members["2002:fp-alice-1"],
+    addedAtEpoch: 1,
+    updatedAtRevision: 1,
+  };
+  delete craftedTeam.tombstones["2002:fp-alice-1"];
+  craftedTeam.rosterHash = computeRosterHash({
+    flockId: "erjadi/studio-team",
+    protocol: "v3-broker",
+    rosterEpoch: craftedTeam.rosterEpoch,
+    rosterRevision: craftedTeam.rosterRevision,
+    members: craftedTeam.members,
+    tombstones: craftedTeam.tombstones,
+  });
+  assert.throws(
+    () => restartedRegistry.mergeRegistryCache(craftedStore),
+    (err) => err.code === "ROSTER_RESURRECTION_REJECTED"
+  );
+  assert.equal(restartedRegistry.getFlockView("erjadi/studio-team").members.some((m) => m.peerId === "2002:fp-alice-1"), false);
+
+  // 9. applyV3EnrollmentResult + queryFlockMembershipRegistry auto-persistence without live pings
+  const enrollClientDir = path.join(tempRoot, "client-home");
+  fs.mkdirSync(enrollClientDir, { recursive: true });
+  const enrollFlocksPath = path.join(enrollClientDir, "flocks.json");
+  const bobReEnroll = await enrollV3Device(
+    {
+      githubUser: "bob",
+      githubUserId: 3003,
+      deviceId: "fp-bob-1",
+      machineId: "WORK-LAPTOP",
+      scope: "work",
+      publicKey: bobKey.publicKey,
+      keyFingerprint: "fp-bob-1",
+      enrollmentJson: inviteBob.enrollmentJson,
+    },
+    { storePath, connectionString: testConnStr }
+  );
+  applyV3EnrollmentResult({ machineId: "WORK-LAPTOP", githubUser: "bob", scope: "work" }, bobReEnroll, enrollFlocksPath);
+  const queried = await queryFlockMembershipRegistry(
+    { machineId: "WORK-LAPTOP", githubUser: "bob", scope: "work" },
+    { flockId: "erjadi/studio-team", customFlocksPath: enrollFlocksPath }
+  );
+  assert.equal(queried.flockId, "erjadi/studio-team");
+  assert.ok(queried.members.some((m) => m.peerId === "3003:fp-bob-1" && m.presenceStatus === "unknown"));
+});
+
+test("broker-free v3.4 owner-signed roster snapshots/deltas: offline collaborators, missed deltas + syncRoster recovery, 24h cert vs membership separation, removal tombstones, rollback rejection, restart persistence, and cross-flock isolation", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "flock-registry-34-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+
+  const endpoints = azureEndpoints("https://fixture.service.signalr.net", "https://fixture.servicebus.windows.net");
+  const credentials = {
+    connectionString: "Endpoint=https://fixture.service.signalr.net;AccessKey=signalr-fixture",
+    manageConnectionString: "Endpoint=sb://fixture.servicebus.windows.net/;SharedAccessKeyName=RootManageSharedAccessKey;SharedAccessKey=manage-fixture",
+    sendConnectionString: "Endpoint=sb://fixture.servicebus.windows.net/;SharedAccessKeyName=FlockSendRule;SharedAccessKey=send-fixture",
+    listenConnectionString: "Endpoint=sb://fixture.servicebus.windows.net/;SharedAccessKeyName=FlockListenRule;SharedAccessKey=listen-fixture",
+  };
+
+  let clockNow = 1_760_000_000_000;
+  const subscribers = new Map();
+  const sockets = new Set();
+
+  const fetchImpl = async (url, options) => {
+    const parsed = new URL(url);
+    const peer = parsed.pathname.match(/\/subscriptions\/(sub-[a-f0-9]{46})/)?.[1];
+    if (options.method === "PUT" && peer && !parsed.pathname.includes("/messages/")) {
+      if (!subscribers.has(peer)) subscribers.set(peer, []);
+      return new Response("", { status: 201 });
+    }
+    if (options.method === "DELETE" && peer && !parsed.pathname.includes("/messages/")) {
+      subscribers.delete(peer);
+      return new Response(null, { status: 204 });
+    }
+    if (parsed.hostname.endsWith(".signalr.net")) {
+      const { target, arguments: args } = JSON.parse(options.body);
+      for (const socket of sockets) if (!socket.ws.closed) socket.callback(target, structuredClone(args));
+      return new Response("", { status: 202 });
+    }
+    if (options.method === "POST" && parsed.pathname.endsWith("/messages") && !peer) {
+      for (const queue of subscribers.values()) queue.push(JSON.parse(options.body));
+      return new Response("", { status: 201 });
+    }
+    if (options.method === "POST" && parsed.pathname.endsWith("/messages/head")) {
+      const queue = subscribers.get(peer);
+      if (!queue?.length) return new Response(null, { status: 204 });
+      return new Response(JSON.stringify(queue[0]), {
+        status: 201,
+        headers: { Location: `${endpoints.serviceBusEndpoint}/copilot-bridge-offline/subscriptions/${peer}/messages/lock` },
+      });
+    }
+    if (options.method === "DELETE" && parsed.pathname.endsWith("/messages/lock")) {
+      subscribers.get(peer)?.shift();
+      return new Response(null, { status: 204 });
+    }
+    if (options.method === "PUT" && parsed.pathname.endsWith("/messages/lock")) {
+      return new Response(null, { status: 204 });
+    }
+    throw new Error(`Unexpected synthetic transport call: ${options.method} ${parsed.pathname}`);
+  };
+
+  const connect = async (_cfg, { onInvocation }) => {
+    const socket = {
+      ws: { closed: false },
+      callback: onInvocation,
+      close() {
+        this.ws.closed = true;
+        sockets.delete(this);
+      },
+    };
+    sockets.add(socket);
+    return socket;
+  };
+
+  const rpcTargetsHit = [];
+  const runtimeOpts = {
+    clock: () => clockNow,
+    connect,
+    log: () => {},
+    dispatch: async ({ action }) => {
+      rpcTargetsHit.push(action);
+      return { ok: true };
+    },
+    transportFactory: (cfg, opts) => new AzureTransport(cfg, { ...opts, fetchImpl }),
+  };
+
+  const owner = new BrokerFreeRuntime(path.join(root, "owner"), runtimeOpts);
+  const peerA = new BrokerFreeRuntime(path.join(root, "peerA"), runtimeOpts);
+  const peerB = new BrokerFreeRuntime(path.join(root, "peerB"), runtimeOpts);
+  const peerC = new BrokerFreeRuntime(path.join(root, "peerC"), runtimeOpts);
+
+  await owner.initializeOwner({ flockId: "demo/team", machineId: "OWNER-PC", scope: "personal", ...credentials });
+  await owner.initializeOwner({ flockId: "demo/second", machineId: "OWNER-PC", scope: "personal", ...credentials });
+  const ownerTeamFp = ownerFingerprint(owner.record("demo/team").ownerPublicKey);
+  const ownerSecondFp = ownerFingerprint(owner.record("demo/second").ownerPublicKey);
+  const thirtyDaysMs = 30 * 86_400_000;
+
+  // 1. PEER-A joins demo/team (rev 2) and demo/second, then goes OFFLINE
+  const codeA = await peerA.joinRequest({ machineId: "PEER-A-LAPTOP", scope: "work", flockId: "demo/team" });
+  const ticketA = await owner.approve({
+    flockId: "demo/team",
+    code: codeA,
+    expectedEd25519Fingerprint: codeA.body.peerId,
+    role: "collaborator",
+    membershipExpiresAt: clockNow + thirtyDaysMs,
+  });
+  await peerA.accept(ticketA, ownerTeamFp);
+
+  const codeASecond = await peerA.joinRequest({ machineId: "PEER-A-LAPTOP", scope: "work", flockId: "demo/second" });
+  const ticketASecond = await owner.approve({
+    flockId: "demo/second",
+    code: codeASecond,
+    expectedEd25519Fingerprint: codeASecond.body.peerId,
+    role: "collaborator",
+    membershipExpiresAt: clockNow + thirtyDaysMs,
+  });
+  await peerA.accept(ticketASecond, ownerSecondFp);
+
+  // 2. While PEER-A is completely offline, PEER-B joins demo/team (rev 3)
+  const codeB = await peerB.joinRequest({ machineId: "PEER-B-DESKTOP", scope: "work", flockId: "demo/team" });
+  const ticketB = await owner.approve({
+    flockId: "demo/team",
+    code: codeB,
+    expectedEd25519Fingerprint: codeB.body.peerId,
+    role: "collaborator",
+    membershipExpiresAt: clockNow + thirtyDaysMs,
+  });
+  await peerB.accept(ticketB, ownerTeamFp);
+
+  // PEER-B immediately sees OWNER, offline PEER-A, and PEER-B from the Welcome Ticket's signed snapshot without pinging!
+  const peerBInitialView = peerB.getFlockRegistryView("demo/team");
+  assert.equal(peerBInitialView.totalMembers, 3);
+  assert.equal(peerBInitialView.rosterRevision, 3);
+  assert.deepEqual(
+    peerBInitialView.members.map((m) => m.machineId).sort(),
+    ["OWNER-PC", "PEER-A-LAPTOP", "PEER-B-DESKTOP"]
+  );
+  assert.equal(
+    peerBInitialView.members.find((m) => m.machineId === "PEER-A-LAPTOP").presenceStatus,
+    "unknown"
+  );
+  assert.equal(rpcTargetsHit.length, 0, "Zero live peer pings must occur when reading the registry");
+
+  // PEER-B goes offline; PEER-A wakes up and drains its Service Bus queue (consuming owner-signed roster-update delta 2 -> 3)
+  const recA = peerA.record("demo/team");
+  await peerA.transport(recA).drain(recA.transport, (msg) => peerA.consume(peerA.record("demo/team"), msg));
+  const peerAAfterDelta = peerA.getFlockRegistryView("demo/team");
+  assert.equal(peerAAfterDelta.rosterRevision, 3);
+  assert.equal(peerAAfterDelta.rosterHash, peerBInitialView.rosterHash);
+  assert.ok(peerAAfterDelta.members.some((m) => m.peerId === codeB.body.peerId && m.presenceStatus === "unknown"));
+
+  // 3. Certificate validity separation: after 48h, 24h MemberCert is expired while 30-day membership remains active
+  const future48h = clockNow + 2 * 86_400_000;
+  const certSeparatedView = peerA.getFlockRegistryView("demo/team", { now: future48h });
+  const peerBIn48h = certSeparatedView.members.find((m) => m.peerId === codeB.body.peerId);
+  assert.equal(peerBIn48h.certStatus, "expired");
+  assert.equal(peerBIn48h.membershipStatus, "active");
+
+  // 4. Missed delta detection (ROSTER_DELTA_GAP) + owner-mediated syncRoster recovery (without pinging peers)
+  const snapshotRev3 = owner.exportSignedRosterSnapshot("demo/team");
+  const codeC = await peerC.joinRequest({ machineId: "PEER-C-WORKSTATION", scope: "personal", flockId: "demo/team" });
+  const ticketC = await owner.approve({
+    flockId: "demo/team",
+    code: codeC,
+    expectedEd25519Fingerprint: codeC.body.peerId,
+    role: "guest",
+    membershipExpiresAt: clockNow + thirtyDaysMs,
+  });
+  await peerC.accept(ticketC, ownerTeamFp);
+  const snapshotRev4 = owner.exportSignedRosterSnapshot("demo/team");
+
+  const ownerRec = owner.record("demo/team");
+  const delta4to5 = createSignedRosterDelta({
+    flockId: "demo/team",
+    ownerIdentity: ownerRec.identity,
+    baseEpoch: 1,
+    baseRevision: 4,
+    baseRosterHash: snapshotRev4.body.rosterHash,
+    epoch: 1,
+    minAcceptedEpoch: 1,
+    revision: 5,
+    upserts: snapshotRev4.body.members.map((m) =>
+      m.peerId === ownerRec.localPeerId ? { ...m, updatedAtRevision: 5 } : m
+    ),
+    removals: [],
+    resultingMembers: snapshotRev4.body.members.map((m) =>
+      m.peerId === ownerRec.localPeerId ? { ...m, updatedAtRevision: 5 } : m
+    ),
+    resultingTombstones: [],
+    issuedAt: clockNow,
+  });
+
+  assert.throws(
+    () =>
+      peerB.registry.applySignedDelta(delta4to5, {
+        ownerPublicKey: ownerRec.ownerPublicKey,
+        expectedFlockId: "demo/team",
+        expectedOwnerFingerprint: ownerTeamFp,
+        minAcceptedEpoch: 1,
+      }),
+    (err) => err.code === "ROSTER_DELTA_GAP"
+  );
+  assert.equal(peerB.getFlockRegistryView("demo/team").needsSnapshotSync, true);
+  assert.equal(peerB.getFlockRegistryView("demo/team").isStale, true);
+
+  // Start owner daemon ONLY (PEER-A and PEER-C remain offline!) and recover PEER-B via syncRoster
+  const ownerDaemon = await owner.start();
+  t.after(() => ownerDaemon.close());
+  const syncedViewB = await peerB.syncRoster("demo/team");
+  assert.equal(syncedViewB.needsSnapshotSync, false);
+  assert.equal(syncedViewB.rosterRevision, 4);
+  assert.equal(syncedViewB.totalMembers, 4);
+  assert.equal(syncedViewB.rosterHash, snapshotRev4.body.rosterHash);
+  assert.equal(rpcTargetsHit.length, 0, "syncRoster contacts only owner control action, never peer dispatchers");
+
+  // 5. Forged non-owner signatures and cross-flock snapshot replays must fail closed
+  const forgedByPeer = createSignedRosterSnapshot({
+    flockId: "demo/team",
+    ownerIdentity: createDeviceIdentity(),
+    epoch: 1,
+    revision: 99,
+    members: snapshotRev4.body.members,
+    tombstones: [],
+    issuedAt: clockNow,
+  });
+  assert.throws(
+    () =>
+      peerB.registry.applySignedSnapshot(forgedByPeer, {
+        ownerPublicKey: ownerRec.ownerPublicKey,
+        expectedFlockId: "demo/team",
+      }),
+    /ROSTER_OWNER_MISMATCH|Invalid control\/roster-snapshot signature/
+  );
+  assert.throws(
+    () =>
+      peerA.registry.applySignedSnapshot(snapshotRev4, {
+        ownerPublicKey: ownerRec.ownerPublicKey,
+        expectedFlockId: "demo/second",
+      }),
+    (err) => err.code === "ROSTER_FLOCK_MISMATCH"
+  );
+
+  // 6. Owner removes PEER-C (advancing epoch 1 -> 2 + tombstone); PEER-A (even at rev 3, having missed rev 4!)
+  //    converges cleanly via rotation's snapshot fallback, while demo/second stays isolated!
+  const peerASub = `sub-${crypto.createHash("sha256").update("copilot-flock/3.4/subscription\n" + codeA.body.peerId).digest("hex").slice(0, 46)}`;
+  subscribers.set(peerASub, []);
+  await owner.removePeer({ flockId: "demo/team", peerId: codeC.body.peerId, operationId: "kick-peer-c" });
+  await peerA.transport(peerA.record("demo/team")).drain(
+    peerA.record("demo/team").transport,
+    (msg) => peerA.consume(peerA.record("demo/team"), msg)
+  );
+
+  const ownerAfterRemove = owner.getFlockRegistryView("demo/team", { includeRemoved: true });
+  const peerAAfterRemove = peerA.getFlockRegistryView("demo/team", { includeRemoved: true });
+  assert.equal(peerAAfterRemove.rosterEpoch, 2);
+  assert.equal(peerAAfterRemove.rosterHash, ownerAfterRemove.rosterHash);
+  assert.equal(peerAAfterRemove.totalMembers, 3);
+  assert.equal(peerAAfterRemove.tombstoneCount, 1);
+  const peerCTomb = peerAAfterRemove.members.find((m) => m.peerId === codeC.body.peerId);
+  assert.equal(peerCTomb.removed, true);
+  assert.equal(peerCTomb.membershipStatus, "removed");
+  assert.equal(peerCTomb.removedAtEpoch, 2);
+
+  // Cross-flock isolation: demo/second on PEER-A and OWNER is untouched at epoch 1 with PEER-A active
+  const secondView = peerA.getFlockRegistryView("demo/second");
+  assert.equal(secondView.rosterEpoch, 1);
+  assert.equal(secondView.totalMembers, 2);
+  assert.equal(secondView.tombstoneCount, 0);
+
+  // 7. Rollback rejection: replaying snapshotRev3 or snapshotRev4 after epoch 2 must fail closed
+  for (const staleSnap of [snapshotRev3, snapshotRev4]) {
+    assert.throws(
+      () =>
+        peerA.registry.applySignedSnapshot(staleSnap, {
+          ownerPublicKey: ownerRec.ownerPublicKey,
+          expectedFlockId: "demo/team",
+          expectedOwnerFingerprint: ownerTeamFp,
+          minAcceptedEpoch: peerA.record("demo/team").minAcceptedEpoch,
+        }),
+      (err) => err.code === "ROSTER_ROLLBACK_REJECTED"
+    );
+  }
+
+  // 8. Restart persistence: brand-new BrokerFreeRuntime reloaded from disk preserves epochs, hashes, members, and tombstones
+  const restartedPeerA = new BrokerFreeRuntime(path.join(root, "peerA"), runtimeOpts);
+  const reloadedView = restartedPeerA.getFlockRegistryView("demo/team", { includeRemoved: true });
+  assert.equal(reloadedView.rosterEpoch, 2);
+  assert.equal(reloadedView.rosterHash, ownerAfterRemove.rosterHash);
+  assert.equal(reloadedView.totalMembers, 3);
+  assert.equal(reloadedView.tombstoneCount, 1);
 });

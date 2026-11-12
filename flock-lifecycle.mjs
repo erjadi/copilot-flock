@@ -8,8 +8,8 @@ import { signLeave } from "./flock-membership.mjs";
 const hash = (data) => crypto.createHash("sha256").update(data).digest("hex");
 const names = ["copilot-flock", "copilot-signalr-bridge"];
 const runtimeFiles = [
-  "flock.mjs", "bridge.mjs", "flock-lifecycle.mjs", "flock-membership.mjs",
-  "config.json", "identity.json", "flocks.json", "state.json", "daemon.pid",
+  "flock.mjs", "bridge.mjs", "flock-lifecycle.mjs", "flock-membership.mjs", "flock-registry.mjs",
+  "config.json", "identity.json", "flocks.json", "flock-registry.json", "state.json", "daemon.pid",
   "daemon-identity.json", "daemon.log", "inbox.jsonl", "outbox.jsonl", "locks.json",
   "cli-sessions.json", "processed-offline-ids.json", "last-vote-report.json",
   "installation.json", "uninstall-progress.json",

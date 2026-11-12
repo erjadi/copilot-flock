@@ -21,6 +21,29 @@ import { fileURLToPath } from "node:url";
 import { uninstallFlock, lifecyclePaths, recordInstalledArtifact, pinDaemonIdentity, atomicJson, assertNoLinks, stopPinnedDaemon, inspectProcess } from "./flock-lifecycle.mjs";
 import { BrokerFreeRuntime } from "./flock-broker-free.mjs";
 import { authorizeAction, ownerFingerprint } from "./flock-protocol.mjs";
+import {
+  FlockMembershipRegistry,
+  createSignedRosterSnapshot,
+  verifySignedRosterSnapshot,
+  createSignedRosterDelta,
+  verifySignedRosterDelta,
+  computeRosterHash,
+  resolveMemberIdentityKey,
+  deriveKeyFingerprint,
+  compareRosterVersion,
+} from "./flock-registry.mjs";
+
+export {
+  FlockMembershipRegistry,
+  createSignedRosterSnapshot,
+  verifySignedRosterSnapshot,
+  createSignedRosterDelta,
+  verifySignedRosterDelta,
+  computeRosterHash,
+  resolveMemberIdentityKey,
+  deriveKeyFingerprint,
+  compareRosterVersion,
+};
 
 if (typeof dns.setDefaultResultOrder === "function") {
   try {
@@ -78,7 +101,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 function copyRuntimeModules(sourceDirectory, destinationDirectory, installedEntrypoints) {
-  for (const module of ["flock-lifecycle.mjs", "flock-membership.mjs", "flock-protocol.mjs", "flock-azure.mjs", "flock-broker-free.mjs"]) {
+  for (const module of ["flock-lifecycle.mjs", "flock-membership.mjs", "flock-protocol.mjs", "flock-azure.mjs", "flock-broker-free.mjs", "flock-registry.mjs"]) {
     const source = path.join(sourceDirectory, module);
     const destination = assertNoLinks(path.join(destinationDirectory, module));
     if (path.resolve(source) !== path.resolve(destination)) fs.copyFileSync(source, destination);
@@ -300,6 +323,20 @@ function getFlocksConfigPath() {
   return path.join(getBridgeHome(), "flocks.json");
 }
 
+export function getFlockRegistryPath(customFlocksPath = null) {
+  if (!customFlocksPath || path.basename(customFlocksPath) === "flocks.json") {
+    return path.join(customFlocksPath ? path.dirname(customFlocksPath) : getBridgeHome(), "flock-registry.json");
+  }
+  if (customFlocksPath.endsWith(".json")) {
+    return `${customFlocksPath.slice(0, -5)}.registry.json`;
+  }
+  return path.join(customFlocksPath, "flock-registry.json");
+}
+
+export function openFlockMembershipRegistry(customFlocksPath = null, options = {}) {
+  return new FlockMembershipRegistry(getFlockRegistryPath(customFlocksPath), options);
+}
+
 function getSandboxManifestPath() {
   return path.join(getBridgeHome(), "sandbox-manifest.json");
 }
@@ -323,6 +360,7 @@ function ensureBridgeDir() {
         "config.json",
         "identity.json",
         "flocks.json",
+        "flock-registry.json",
         "locks.json",
         "inbox.jsonl",
         "outbox.jsonl",
@@ -1325,6 +1363,14 @@ export function applyV3EnrollmentResult(cfg, result, customPath = getFlocksConfi
     };
   }
   saveLocalFlocksConfig(localFlocks, customPath);
+  const enrolledWithMembers = [...selected.values()].filter(
+    (flock) => Array.isArray(flock.members) && flock.members.length > 0
+  );
+  if (enrolledWithMembers.length > 0) {
+    try {
+      openFlockMembershipRegistry(customPath).reconcileV3Broker({ enrolledFlocks: enrolledWithMembers });
+    } catch {}
+  }
   return { ...result, enrolledFlocks: [...selected.values()] };
 }
 
@@ -5955,7 +6001,7 @@ export async function handleRpcAction(cfg, req) {
     }
 
     try {
-      for (const module of ["flock-lifecycle.mjs", "flock-membership.mjs", "flock-protocol.mjs", "flock-azure.mjs", "flock-broker-free.mjs"]) {
+      for (const module of ["flock-lifecycle.mjs", "flock-membership.mjs", "flock-protocol.mjs", "flock-azure.mjs", "flock-broker-free.mjs", "flock-registry.mjs"]) {
         const content = execFileSync("git", ["-C", repoDir, "show", `${candidateCommit}:${module}`], {
           encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: 5000,
         });
@@ -7277,6 +7323,32 @@ const MCP_TOOLS = [
     },
   },
   {
+    name: "list_flock_members",
+    description:
+      "Query the durable per-flock membership registry (all authorized online + offline owner/collaborator/guest members, epochs, revisions, and optional removal tombstones) without pinging peers live.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        flock: {
+          type: "string",
+          description: "Optional flock identifier in <owner> or <owner>/<flock> format (required when multiple broker-free flocks are enrolled).",
+        },
+        include_removed: {
+          type: "boolean",
+          description: "Include revisioned removal tombstones in the returned member list (default: false).",
+        },
+        refresh_broker: {
+          type: "boolean",
+          description: "In legacy broker-backed v3 mode, reconcile /api/v3/my-flocks + /api/members before reading (default: false; never pings peers).",
+        },
+        sync_owner: {
+          type: "boolean",
+          description: "In broker-free v3.4 mode, fetch the latest owner-signed roster snapshot from the designated owner before reading (default: false; never pings other peers).",
+        },
+      },
+    },
+  },
+  {
     name: "invite_to_flock",
     description:
       "Create or invite a GitHub user to a flock or single PC (<owner>/<flock>[/<machineId>]), optionally with time-bound duration_minutes, and return a pasteable Copilot prompt + signed Enrollment JSON.",
@@ -7454,6 +7526,13 @@ async function executeMcpTool(cfg, name, args = {}) {
       ownerFingerprintArg: args.owner_fingerprint, protocolArg: "broker-free-v34" });
     if (name === "renew_membership") return runtime.renewMembership(runtime.select(args.flock).flockId);
     if (name === "list_flocks") return brokerFreeFlockSummaries(runtime);
+    if (name === "list_flock_members") {
+      const selected = runtime.select(args.flock);
+      if (args.sync_owner === true) await runtime.syncRoster(selected.flockId);
+      return runtime.getFlockRegistryView(selected.flockId, {
+        includeRemoved: Boolean(args.include_removed),
+      });
+    }
     if (name === "kick_flock_member") {
       const record = runtime.assertOwner(runtime.select(args.flock));
       if (args.github_user) throw new Error("Broker-free identities are device-key bound; a GitHub label is not a member selector");
@@ -8068,6 +8147,14 @@ async function executeMcpTool(cfg, name, args = {}) {
   if (name === "list_flocks") {
     const localFlocks = loadLocalFlocksConfig(cfg);
     const remoteRes = callBootstrapV3Endpoint(cfg, "/my-flocks", { method: "GET" });
+    const registry = openFlockMembershipRegistry();
+    if (remoteRes?.ok) {
+      try {
+        const bootstrapMembers = fetchBootstrapMembers({ bootstrapUrl: cfg.bootstrapUrl });
+        registry.reconcileV3Broker({ myFlocksResponse: remoteRes, bootstrapMembers });
+      } catch {}
+    }
+    const cachedFlocks = registry.listFlockIds().map((fid) => registry.getFlockView(fid));
     return {
       machineId: cfg.machineId,
       canonicalAddress: `${(cfg.githubUser || "unknown").toLowerCase()}/${normalizeScope(cfg.scope, "work")}/${cfg.machineId}`,
@@ -8075,7 +8162,17 @@ async function executeMcpTool(cfg, name, args = {}) {
       localFlocks: Object.values(localFlocks.flocks || {}),
       remoteOwnedFlocks: remoteRes?.ownedFlocks || [],
       remoteJoinedFlocks: remoteRes?.joinedFlocks || [],
+      cachedFlocks,
     };
+  }
+
+  if (name === "list_flock_members") {
+    return await queryFlockMembershipRegistry(cfg, {
+      flockId: args.flock || null,
+      includeRemoved: Boolean(args.include_removed),
+      refreshBroker: Boolean(args.refresh_broker),
+      syncOwner: Boolean(args.sync_owner),
+    });
   }
 
   if (name === "invite_to_flock") {
@@ -8171,6 +8268,22 @@ async function executeMcpTool(cfg, name, args = {}) {
     });
     if (!res?.ok) {
       throw new Error(res?.error || `Failed to kick member from ${args.flock}`);
+    }
+    if (Array.isArray(res.kickedPeers) && res.kickedPeers.length > 0 && res.flockId) {
+      try {
+        const registry = openFlockMembershipRegistry();
+        if (registry.hasFlock(res.flockId)) {
+          for (const kp of res.kickedPeers) {
+            registry.recordRemovalTombstone(res.flockId, {
+              peerId: kp.peerId,
+              machineId: kp.machineId || null,
+              githubUser: kp.githubUser || null,
+              removedAtEpoch: Number(res.rosterEpoch) || undefined,
+              reason: "kicked",
+            });
+          }
+        }
+      } catch {}
     }
     return res;
   }
@@ -10900,10 +11013,68 @@ export function brokerFreeRuntime(cfg = {}, options = {}) {
 }
 
 function brokerFreeFlockSummaries(runtime) {
-  return Object.values(runtime.read().flocks).map((record) => ({ flockId: record.flockId,
-    peerId: record.localPeerId, role: record.cert.body.role, epoch: record.epoch,
-    ownerFingerprint: ownerFingerprint(record.ownerPublicKey), expiresAt: record.cert.body.expiresAt,
-    departed: record.departed === true, protocol: "broker-free-v34" }));
+  return Object.values(runtime.read().flocks).map((record) => {
+    let registryView = null;
+    if (!record.departed) {
+      try {
+        runtime.ensureRegistrySeeded(record.flockId);
+        if (runtime.registry.hasFlock(record.flockId)) {
+          registryView = runtime.registry.getFlockView(record.flockId);
+        }
+      } catch {}
+    }
+    return {
+      flockId: record.flockId,
+      peerId: record.localPeerId,
+      role: record.cert.body.role,
+      epoch: record.epoch,
+      rosterRevision: registryView?.rosterRevision ?? record.rosterRevision ?? 1,
+      rosterHash: registryView?.rosterHash ?? record.rosterHash ?? null,
+      memberCount: registryView?.totalMembers ?? Object.values(record.members || {}).filter((e) => !e.removed).length,
+      tombstoneCount: registryView?.tombstoneCount ?? Object.values(record.members || {}).filter((e) => e.removed).length,
+      ownerFingerprint: ownerFingerprint(record.ownerPublicKey),
+      expiresAt: record.cert.body.expiresAt,
+      departed: record.departed === true,
+      protocol: "broker-free-v34",
+    };
+  });
+}
+
+export async function queryFlockMembershipRegistry(
+  cfg,
+  {
+    flockId = null,
+    includeRemoved = false,
+    refreshBroker = false,
+    syncOwner = false,
+    customFlocksPath = null,
+  } = {}
+) {
+  if (cfg?.protocol === "broker-free-v34") {
+    const runtime = brokerFreeRuntime(cfg);
+    const selected = runtime.select(flockId || cfg.flockId);
+    if (syncOwner) await runtime.syncRoster(selected.flockId);
+    return runtime.getFlockRegistryView(selected.flockId, { includeRemoved });
+  }
+  const registry = openFlockMembershipRegistry(customFlocksPath);
+  if ((refreshBroker || registry.listFlockIds().length === 0) && cfg?.bootstrapUrl) {
+    try {
+      const remoteRes = callBootstrapV3Endpoint(cfg, "/my-flocks", { method: "GET" });
+      const bootstrapMembers = fetchBootstrapMembers({ bootstrapUrl: cfg.bootstrapUrl });
+      if (remoteRes?.ok) {
+        registry.reconcileV3Broker({ myFlocksResponse: remoteRes, bootstrapMembers });
+      }
+    } catch {}
+  }
+  if (flockId) {
+    const targetFlockId = parseFlockAddress(flockId, cfg?.githubUser).flockId;
+    return registry.getFlockView(targetFlockId, { includeRemoved });
+  }
+  const flockIds = registry.listFlockIds();
+  return {
+    flocks: flockIds.map((fid) => registry.getFlockView(fid, { includeRemoved })),
+    totalFlocks: flockIds.length,
+  };
 }
 
 export function redactFlockSnapshot(text) {
@@ -11381,11 +11552,14 @@ Usage:
   const cfg = loadConfig({ autoFetchAz: true, refreshSpecs: Boolean(flags.refresh) });
   if (flags.flock) cfg.flockId = flags.flock;
   if (cfg.protocol === "broker-free-v34") {
-    if (["members", "enrolled", "flock"].includes(command)) {
-      const record = brokerFreeRuntime(cfg).select(cfg.flockId);
-      console.log(JSON.stringify({ flockId: record.flockId, members: Object.entries(record.members)
-        .map(([peerId, entry]) => ({ peerId, machineId: entry.cert.body.machineId, role: entry.cert.body.role,
-          expiresAt: entry.cert.body.expiresAt, removed: entry.removed === true })) }, null, 2));
+    if (["members", "enrolled", "flock", "registry"].includes(command)) {
+      const runtime = brokerFreeRuntime(cfg);
+      const selected = runtime.select(cfg.flockId);
+      if (flags["sync-owner"]) await runtime.syncRoster(selected.flockId);
+      const view = runtime.getFlockRegistryView(selected.flockId, {
+        includeRemoved: Boolean(flags["include-removed"]),
+      });
+      console.log(JSON.stringify(view, null, 2));
       return;
     }
     const supported = new Set(["daemon", "mcp", "machines", "sessions", "send", "transcript", "broadcast",
@@ -11418,6 +11592,16 @@ Usage:
         2
       )
     );
+    return;
+  }
+
+  if (command === "registry" || ((command === "members" || command === "enrolled" || command === "flock") && (flags["no-ping"] || flags.cached))) {
+    const out = await queryFlockMembershipRegistry(cfg, {
+      flockId: flags.flock || null,
+      includeRemoved: Boolean(flags["include-removed"]),
+      refreshBroker: Boolean(flags.refresh || flags["refresh-broker"]),
+    });
+    console.log(JSON.stringify(out, null, 2));
     return;
   }
 
