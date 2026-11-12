@@ -126,7 +126,55 @@ supports each of the six dimensions, with explicit ascending/descending score
 direction. Unscored items always appear last in either direction. Ties use
 editorial rank ascending, then stable ID in code-point order. Sorting does
 not change the visible editorial rank labels or the source data. Search,
-status and kind filters continue to work; acceptance criteria are searchable.
+status, kind and verification-tier filters continue to work; acceptance
+criteria and structured verification receipt metadata are searchable.
+
+### Candidate-and-host-bound readiness evidence (backward-compatible extension)
+
+Each `TodoIssue` may optionally supply:
+
+- `candidateSha`: hex Git commit SHA (`7`–`64` hex characters, normalized to lowercase)
+- `verificationTier`: `unverified`, `source_reviewed`, `unit_synthetic`, or `live_multi_pc`
+- `deliveryStage`: `proposed`, `approved`, `implemented`, `deployed`, or `verified`
+- `verificationPrompt`: optional copy-only prompt text (never executed by the viewer)
+- `readinessEvidence`: array of structured verification receipts (`<= 200` per item)
+
+Each `readinessEvidence` receipt binds:
+
+| Field | Contract |
+| --- | --- |
+| `candidateSha` | Exact candidate Git SHA verified (`7`–`64` hex chars) |
+| `hostId`, `os` | Nonempty host identifier and operating system label |
+| `command` | Nonempty verification command executed |
+| `capturedAt` | ISO-8601 timestamp with explicit `Z` or `±HH:MM` offset |
+| `passCount`, `failCount`, `skipCount` | Non-negative integers; `failCount > 0` cannot be marked `accepted` |
+| `prerequisites` | Array of nonempty prerequisite strings (`[]` permitted) |
+| `evidenceDigest` | Hex or `sha256:`/`sha384:`/`sha512:` digest string |
+| `confidence` | `reported`, `reproduced`, or `independently_verified` |
+| `verificationTier` | `unverified`, `source_reviewed`, `unit_synthetic`, or `live_multi_pc` |
+| `deliveryStage` *(optional)* | `proposed`, `approved`, `implemented`, `deployed`, or `verified` |
+| `verificationPrompt` *(optional)* | Copy-only prompt string |
+| `disposition` *(optional)* | `accepted`, `rejected`, or `superseded` |
+
+Anti-inflation and history-preservation invariants (`resolveTodoReadiness`,
+`appendTodoReadinessEvidence`, `assertEvidenceHistoryPreserved`):
+
+- `status: "done"` or `deliveryStage: "implemented"` alone never displays as
+  `independently_verified`, `live_multi_pc`, or `verified`.
+- `independently_verified` requires at least one active passing receipt
+  (`failCount === 0`, `passCount >= 1`) matching the active `candidateSha`
+  with no active host failure on that SHA.
+- `live_multi_pc` requires active passing `live_multi_pc` receipts from at
+  least **two distinct hosts** bound to the **same `candidateSha`**, with zero
+  active host failures on that SHA.
+- Results from another host or another `candidateSha` cannot overwrite,
+  delete, or clear rejected/superseded receipt history in memory or via
+  `publishTodos`.
+- **Copy verification prompt** in `TodosView` copies prompt text to the
+  clipboard only; copying never executes commands or starts sessions.
+- Remote Flock callers can generate a redacted, non-executable text/JSON
+  summary with `summarizeTodosForFlock(snapshot, options)` (redacting tokens,
+  private keys, JWTs, credentials, ANSI escapes, and local user paths).
 
 ## Verification and release
 

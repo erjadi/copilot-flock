@@ -6,7 +6,19 @@ import path from "node:path";
 import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { handleTodoRequest } from "../viewer/todo-api.mjs";
-import { TODO_DIMENSIONS, sortTodoIssues, validateTodoSnapshot } from "../viewer/todo-snapshot.mjs";
+import {
+  DELIVERY_STAGES,
+  TODO_DIMENSIONS,
+  VERIFICATION_TIERS,
+  appendTodoReadinessEvidence,
+  assertEvidenceHistoryPreserved,
+  getTodoVerificationPrompt,
+  resolveTodoReadiness,
+  sanitizeTodoText,
+  sortTodoIssues,
+  summarizeTodosForFlock,
+  validateTodoSnapshot,
+} from "../viewer/todo-snapshot.mjs";
 import { publishTodos } from "../viewer/publish-todos.mjs";
 
 const issue = (number, rank = number) => ({
@@ -210,4 +222,356 @@ test("configured LAN access permits only its exact subnet and loopback without t
   for (const cidr of ["192.168.42.1/24", "0.0.0.0/0", "192.168.42.0/33", "192.168.42.0", "192.168.42.0/24,10.0.0.0/8", "::/0"]) {
     assert.equal((await request("127.0.0.1", cidr)).status, 503, cidr);
   }
+});
+
+const receipt = (overrides = {}) => ({
+  candidateSha: "52c9f1a7e513dac0c96afe77fa9219baff5bc7ef",
+  hostId: "DESKTOP-ALPHA",
+  os: "win32-x64",
+  command: "node --test test/viewer-todos.test.mjs",
+  capturedAt: "2026-11-12T01:15:00Z",
+  passCount: 8,
+  failCount: 0,
+  skipCount: 0,
+  prerequisites: ["Node.js >= 22.5"],
+  evidenceDigest: "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+  confidence: "independently_verified",
+  verificationTier: "unit_synthetic",
+  ...overrides,
+});
+
+test("readiness evidence schema is backward-compatible, projects approved fields and rejects malformed receipts", () => {
+  assert.deepEqual(VERIFICATION_TIERS, ["unverified", "source_reviewed", "unit_synthetic", "live_multi_pc"]);
+  assert.deepEqual(DELIVERY_STAGES, ["proposed", "approved", "implemented", "deployed", "verified"]);
+
+  const legacy = validateTodoSnapshot(snapshot()).issues[0];
+  for (const key of ["candidateSha", "verificationTier", "deliveryStage", "verificationPrompt", "readinessEvidence"]) {
+    assert.equal(Object.hasOwn(legacy, key), false, key);
+  }
+
+  const valid = snapshot();
+  Object.assign(valid.issues[0], {
+    candidateSha: "52C9F1A7E513DAC0C96AFE77FA9219BAFF5BC7EF",
+    verificationTier: "live_multi_pc",
+    deliveryStage: "implemented",
+    verificationPrompt: "Run node --test test/viewer-todos.test.mjs on two hosts and record receipts.",
+    readinessEvidence: [
+      { ...receipt({ prerequisites: [], deliveryStage: "implemented", extraSecret: "stripped" }) },
+    ],
+  });
+  const normalized = validateTodoSnapshot(valid).issues.find((item) => item.number === 2);
+  assert.equal(normalized.candidateSha, "52c9f1a7e513dac0c96afe77fa9219baff5bc7ef");
+  assert.equal(normalized.verificationTier, "live_multi_pc");
+  assert.equal(normalized.deliveryStage, "implemented");
+  assert.equal(normalized.readinessEvidence.length, 1);
+  assert.equal(normalized.readinessEvidence[0].extraSecret, undefined);
+  assert.deepEqual(normalized.readinessEvidence[0].prerequisites, []);
+
+  for (const invalidPatch of [
+    { candidateSha: "not-a-sha" },
+    { candidateSha: "123456" },
+    { verificationTier: "fully_tested" },
+    { deliveryStage: "shipped" },
+    { verificationPrompt: "  " },
+    { readinessEvidence: "none" },
+    { readinessEvidence: [receipt({ hostId: "" })] },
+    { readinessEvidence: [receipt({ os: " " })] },
+    { readinessEvidence: [receipt({ command: "bad\u0007cmd" })] },
+    { readinessEvidence: [receipt({ capturedAt: "2026-11-12" })] },
+    { readinessEvidence: [receipt({ passCount: -1 })] },
+    { readinessEvidence: [receipt({ failCount: 1.2 })] },
+    { readinessEvidence: [receipt({ skipCount: -3 })] },
+    { readinessEvidence: [receipt({ prerequisites: [" "] })] },
+    { readinessEvidence: [receipt({ evidenceDigest: "trust-me" })] },
+    { readinessEvidence: [receipt({ failCount: 1, disposition: "accepted" })] },
+    { readinessEvidence: [receipt({ verificationTier: "unverified", confidence: "independently_verified" })] },
+    { readinessEvidence: [receipt({ passCount: 0, failCount: 0, disposition: "accepted" })] },
+    { readinessEvidence: [receipt(), receipt()] },
+  ]) {
+    const bad = snapshot();
+    Object.assign(bad.issues[0], invalidPatch);
+    assert.throws(() => validateTodoSnapshot(bad), /Invalid TODO snapshot/);
+  }
+});
+
+test("done or implemented alone cannot display as independently_verified, live_multi_pc or verified without matching receipts", () => {
+  const doneWithoutReceipts = resolveTodoReadiness({
+    ...issue(5),
+    status: "done",
+    deliveryStage: "verified",
+    evidenceConfidence: "independently_verified",
+    verificationTier: "live_multi_pc",
+    candidateSha: "aaaa1111bbbb2222",
+  });
+  assert.equal(doneWithoutReceipts.effectiveVerificationTier, "unverified");
+  assert.equal(doneWithoutReceipts.effectiveConfidence, "reported");
+  assert.equal(doneWithoutReceipts.effectiveDeliveryStage, "implemented");
+  assert.ok(doneWithoutReceipts.unverifiedCompletionNote);
+  assert.equal(doneWithoutReceipts.downgradeReasons.length, 3);
+
+  const mismatchedSha = resolveTodoReadiness({
+    ...issue(5),
+    status: "done",
+    deliveryStage: "implemented",
+    evidenceConfidence: "independently_verified",
+    verificationTier: "live_multi_pc",
+    candidateSha: "bbbb2222cccc3333",
+    readinessEvidence: [
+      receipt({ candidateSha: "aaaa1111bbbb2222", hostId: "PC-1", verificationTier: "live_multi_pc" }),
+      receipt({
+        candidateSha: "aaaa1111bbbb2222",
+        hostId: "PC-2",
+        os: "linux-x64",
+        verificationTier: "live_multi_pc",
+        evidenceDigest: "sha256:fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210",
+      }),
+    ],
+  });
+  assert.equal(mismatchedSha.effectiveVerificationTier, "unverified");
+  assert.notEqual(mismatchedSha.effectiveConfidence, "independently_verified");
+  assert.equal(mismatchedSha.supersededEntries.length, 2);
+
+  const singleHostClaimingMultiPc = resolveTodoReadiness({
+    ...issue(5),
+    status: "done",
+    deliveryStage: "implemented",
+    evidenceConfidence: "independently_verified",
+    verificationTier: "live_multi_pc",
+    candidateSha: "52c9f1a7e513dac0c96afe77fa9219baff5bc7ef",
+    readinessEvidence: [
+      receipt({ hostId: "DESKTOP-ALPHA", capturedAt: "2026-11-12T01:00:00Z", verificationTier: "live_multi_pc" }),
+      receipt({
+        hostId: "desktop-alpha",
+        capturedAt: "2026-11-12T01:10:00Z",
+        verificationTier: "live_multi_pc",
+        evidenceDigest: "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+      }),
+    ],
+  });
+  assert.equal(singleHostClaimingMultiPc.effectiveVerificationTier, "unit_synthetic");
+  assert.equal(singleHostClaimingMultiPc.effectiveConfidence, "independently_verified");
+  assert.equal(singleHostClaimingMultiPc.acceptedEntries.length, 1);
+  assert.equal(singleHostClaimingMultiPc.supersededEntries.length, 1);
+
+  const splitHostsAcrossDifferentShas = resolveTodoReadiness({
+    ...issue(5),
+    status: "done",
+    verificationTier: "live_multi_pc",
+    evidenceConfidence: "independently_verified",
+    readinessEvidence: [
+      receipt({ candidateSha: "11111111aaaa2222", hostId: "DESKTOP-ALPHA", verificationTier: "live_multi_pc" }),
+      receipt({
+        candidateSha: "33333333bbbb4444",
+        hostId: "DESKTOP-BETA",
+        verificationTier: "live_multi_pc",
+        evidenceDigest: "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+      }),
+    ],
+  });
+  assert.equal(splitHostsAcrossDifferentShas.effectiveVerificationTier, "unverified");
+  assert.notEqual(splitHostsAcrossDifferentShas.effectiveConfidence, "independently_verified");
+
+  const verifiedMultiPc = resolveTodoReadiness({
+    ...issue(5),
+    status: "done",
+    deliveryStage: "verified",
+    evidenceConfidence: "independently_verified",
+    verificationTier: "live_multi_pc",
+    candidateSha: "52c9f1a7e513dac0c96afe77fa9219baff5bc7ef",
+    readinessEvidence: [
+      receipt({ hostId: "DESKTOP-ALPHA", os: "win32-x64", verificationTier: "live_multi_pc" }),
+      receipt({
+        hostId: "VM-LINUX-BETA",
+        os: "linux-x64",
+        verificationTier: "live_multi_pc",
+        evidenceDigest: "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+      }),
+    ],
+  });
+  assert.equal(verifiedMultiPc.effectiveVerificationTier, "live_multi_pc");
+  assert.equal(verifiedMultiPc.effectiveConfidence, "independently_verified");
+  assert.equal(verifiedMultiPc.effectiveDeliveryStage, "verified");
+  assert.deepEqual(verifiedMultiPc.downgradeReasons, []);
+});
+
+test("results from another host or SHA preserve rejected and superseded evidence history across append and publish", async (t) => {
+  let tracked = issue(1);
+  tracked = appendTodoReadinessEvidence(
+    tracked,
+    receipt({
+      candidateSha: "aaaa1111bbbb2222",
+      hostId: "DESKTOP-ALPHA",
+      passCount: 4,
+      failCount: 2,
+      confidence: "reproduced",
+      evidenceDigest: "sha256:aaaa0000aaaa0000aaaa0000aaaa0000aaaa0000aaaa0000aaaa0000aaaa0000",
+    }),
+  );
+  tracked = appendTodoReadinessEvidence(
+    tracked,
+    receipt({
+      candidateSha: "aaaa1111bbbb2222",
+      hostId: "DESKTOP-BETA",
+      os: "linux-x64",
+      passCount: 6,
+      failCount: 0,
+      verificationTier: "live_multi_pc",
+      evidenceDigest: "sha256:bbbb1111bbbb1111bbbb1111bbbb1111bbbb1111bbbb1111bbbb1111bbbb1111",
+    }),
+  );
+  const onSameShaWithFailingPeer = resolveTodoReadiness({
+    ...tracked,
+    status: "done",
+    verificationTier: "live_multi_pc",
+    evidenceConfidence: "independently_verified",
+  });
+  assert.equal(onSameShaWithFailingPeer.rejectedEntries.length, 1);
+  assert.equal(onSameShaWithFailingPeer.effectiveVerificationTier, "unverified");
+  assert.notEqual(onSameShaWithFailingPeer.effectiveConfidence, "independently_verified");
+  assert.deepEqual(onSameShaWithFailingPeer.failingHosts, ["DESKTOP-ALPHA"]);
+
+  tracked = appendTodoReadinessEvidence(
+    tracked,
+    receipt({
+      candidateSha: "cccc3333dddd4444",
+      hostId: "DESKTOP-ALPHA",
+      capturedAt: "2026-11-12T02:00:00Z",
+      passCount: 9,
+      failCount: 0,
+      verificationTier: "unit_synthetic",
+      evidenceDigest: "sha256:cccc2222cccc2222cccc2222cccc2222cccc2222cccc2222cccc2222cccc2222",
+    }),
+    { promoteCandidate: true },
+  );
+  assert.equal(tracked.candidateSha, "cccc3333dddd4444");
+  assert.equal(tracked.readinessEvidence.length, 3);
+  assert.equal(tracked.readinessEvidence[0].disposition, "rejected");
+  assert.equal(tracked.readinessEvidence[1].disposition, "superseded");
+  assert.equal(tracked.readinessEvidence[2].disposition, "accepted");
+
+  const rev1 = { ...snapshot(), revision: 1, updatedAt: "2026-11-12T02:05:00Z", issues: [tracked, issue(2)] };
+  const droppedRejected = {
+    ...rev1,
+    revision: 2,
+    updatedAt: "2026-11-12T02:10:00Z",
+    issues: [{ ...tracked, readinessEvidence: tracked.readinessEvidence.slice(1) }, issue(2)],
+  };
+  assert.throws(() => assertEvidenceHistoryPreserved(rev1, droppedRejected), /overwrite or drop readiness evidence history/);
+
+  const resurrectedSuperseded = {
+    ...rev1,
+    revision: 2,
+    updatedAt: "2026-11-12T02:10:00Z",
+    issues: [
+      {
+        ...tracked,
+        readinessEvidence: tracked.readinessEvidence.map((entry, idx) => (idx === 1 ? { ...entry, disposition: "accepted" } : entry)),
+      },
+      issue(2),
+    ],
+  };
+  assert.throws(() => assertEvidenceHistoryPreserved(rev1, resurrectedSuperseded), /resurrect superseded readiness evidence/);
+
+  const dir = await mkdtemp(path.join(os.tmpdir(), "flock-evidence-history-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const source = path.join(dir, "source.json");
+  const destination = path.join(dir, "runtime.json");
+  await writeFile(source, JSON.stringify(rev1));
+  await publishTodos(source, destination);
+  await writeFile(source, JSON.stringify(droppedRejected));
+  await assert.rejects(publishTodos(source, destination), /overwrite or drop readiness evidence history/);
+
+  const appendedNextHost = appendTodoReadinessEvidence(
+    tracked,
+    receipt({
+      candidateSha: "cccc3333dddd4444",
+      hostId: "DESKTOP-BETA",
+      os: "linux-x64",
+      capturedAt: "2026-11-12T02:15:00Z",
+      passCount: 9,
+      failCount: 0,
+      verificationTier: "live_multi_pc",
+      evidenceDigest: "sha256:dddd3333dddd3333dddd3333dddd3333dddd3333dddd3333dddd3333dddd3333",
+    }),
+  );
+  const rev2 = { ...rev1, revision: 2, updatedAt: "2026-11-12T02:20:00Z", issues: [appendedNextHost, issue(2)] };
+  await writeFile(source, JSON.stringify(rev2));
+  const published = await publishTodos(source, destination);
+  assert.equal(published.issues[0].readinessEvidence.length, 4);
+
+  const lateBackdated = appendTodoReadinessEvidence(
+    appendedNextHost,
+    receipt({
+      candidateSha: "cccc3333dddd4444",
+      hostId: "DESKTOP-BETA",
+      os: "linux-x64",
+      capturedAt: "2026-11-12T02:01:00Z",
+      passCount: 9,
+      failCount: 0,
+      verificationTier: "live_multi_pc",
+      evidenceDigest: "sha256:eeee4444eeee4444eeee4444eeee4444eeee4444eeee4444eeee4444eeee4444",
+    }),
+  );
+  assert.equal(lateBackdated.readinessEvidence.at(-1).disposition, "superseded");
+  assert.equal(lateBackdated.readinessEvidence.at(-2).disposition, "accepted");
+});
+
+test("remote Flock summary helper filters by effective tier, redacts secrets/paths and keeps verification prompts copy-only", async () => {
+  const raw = snapshot();
+  raw.source = "Session export C:\\Users\\ericj\\.copilot\\session-state\\abc\\todos.json Bearer super-secret-token";
+  Object.assign(raw.issues[0], {
+    status: "done",
+    deliveryStage: "implemented",
+    evidenceConfidence: "independently_verified",
+    verificationTier: "live_multi_pc",
+    nextStep: "Inspect /home/erjadi/.copilot/flock/config.json with SharedAccessKey=topsecret123; and ghp_ABCDEF1234567890token",
+    verificationPrompt: "Verify candidate on remote host using api_key=mysecretvalue and ~/.copilot/flock/config.json",
+  });
+  Object.assign(raw.issues[1], {
+    status: "done",
+    deliveryStage: "verified",
+    candidateSha: "52c9f1a7e513dac0c96afe77fa9219baff5bc7ef",
+    verificationTier: "unit_synthetic",
+    evidenceConfidence: "independently_verified",
+    readinessEvidence: [
+      receipt({
+        verificationPrompt: "Receipt fallback prompt eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjMifQ.sigvalue",
+      }),
+    ],
+  });
+
+  assert.match(getTodoVerificationPrompt(raw.issues[1]), /Receipt fallback prompt/);
+  assert.equal(
+    sanitizeTodoText("\u001b[31m-----BEGIN PRIVATE KEY-----\nabc\n-----END PRIVATE KEY-----\u001b[0m"),
+    "[redacted private key]",
+  );
+
+  const { json, text } = summarizeTodosForFlock(raw);
+  assert.equal(json.readOnly, true);
+  assert.equal(json.executable, false);
+  assert.equal(json.counts.byVerificationTier.unit_synthetic, 1);
+  assert.equal(json.counts.byVerificationTier.unverified, 1);
+  assert.equal(json.counts.byVerificationTier.live_multi_pc, 0);
+  assert.equal(Object.hasOwn(json.issues[0], "verificationPrompt"), false);
+  for (const leaked of ["super-secret-token", "C:\\Users\\ericj", "/home/erjadi", "topsecret123", "ghp_ABCDEF", "mysecretvalue"]) {
+    assert.equal(text.includes(leaked), false, leaked);
+    assert.equal(JSON.stringify(json).includes(leaked), false, leaked);
+  }
+
+  const onlyUnit = summarizeTodosForFlock(raw, {
+    format: "json",
+    verificationTier: "unit_synthetic",
+    includeVerificationPrompt: true,
+  });
+  assert.equal(onlyUnit.issues.length, 1);
+  assert.equal(onlyUnit.issues[0].number, 1);
+  assert.match(onlyUnit.issues[0].verificationPrompt, /\[redacted JWT\]/);
+
+  const onlyMultiPc = summarizeTodosForFlock(raw, { format: "json", verificationTier: "live_multi_pc" });
+  assert.equal(onlyMultiPc.issues.length, 0);
+
+  const uiSource = await readFile(new URL("../viewer/src/components/fleet/TodosView.tsx", import.meta.url), "utf8");
+  assert.match(uiSource, /aria-label="TODO verification tier"/);
+  assert.match(uiSource, /Copy verification prompt/);
+  assert.match(uiSource, /navigator\.clipboard\.writeText/);
 });
