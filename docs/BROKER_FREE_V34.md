@@ -110,6 +110,79 @@ destination is never unlinked to bypass a lock. Persistent denial and other
 filesystem errors fail explicitly. Cleanup also rejects junction/path swaps,
 retaining staged evidence rather than deleting through an unsafe path.
 
+## Linux systemd session-preserving activation, reboot and power-loss boundaries
+
+### Daemon restart and activation boundary (session-preserving)
+
+On Linux, `copilot-flock` generates `~/.config/systemd/user/copilot-flock.service`
+with `KillMode=process` so `systemd` only signals `MainPID` during service
+stop/restart, never sweeping active child processes in the unit's control group.
+When the daemon spawns child sessions or background installers while running
+inside a Linux `.service` cgroup, `spawnSessionSafeProcess` places those
+children into independent transient user scopes (`systemd-run --user --scope --collect`)
+outside `copilot-flock.service` whenever `systemd-run --user` is available,
+falling back to `KillMode=process` protection when transient scopes are unavailable.
+
+During Linux daemon activation or restart (`activateLinuxSystemdDaemon`),
+`copilot-flock`:
+
+- Verifies the unit inventory, fragment ownership, unified cgroup v2 containment,
+  active cgroup process inspectability, and exact `daemon-identity.json` creation
+  pin (`pid`, `start`, `executable`, `argv`, `script`) matching `MainPID`.
+- Applies a temporary handoff drop-in (`KillMode=process`, `Restart=no`), reloads
+  `systemd --user`, verifies those properties took effect, signals **only** the
+  pinned daemon PID, waits for `MainPID=0`, and restores the original unit
+  policy (`KillMode` and `Restart`) on **both success and failure** before
+  starting the updated unit.
+- Disables legacy `copilot-signalr-bridge.service` without `--now`, preserving
+  any active child processes with unchanged `PID` and creation `start` time.
+- Refuses disruptive restarts **before sending any signal** whenever child
+  preservation cannot be proven (missing/mismatched daemon pin, overridden
+  `KillMode`, unreadable cgroup/process state, or unconfirmed `MainPID`), unless
+  explicit operator maintenance consent (`--allow-disruptive-restart` /
+  `--maintenance-consent`) is supplied. Unowned third-party/system service
+  cgroups are refused unconditionally.
+
+### OS reboot boundary (separate host lifecycle boundary)
+
+Session-preserving daemon activation applies to user-space daemon restarts and
+upgrades on a running Linux host; it does **not** keep live OS processes running
+across a full host reboot (`systemctl reboot`, kernel update, or graceful OS
+shutdown). During a host reboot, the OS tears down `user@<uid>.service`,
+`app.slice`, and all transient scopes before halting the kernel, so child `PID`
+and process `start` identities necessarily end.
+
+Continuity across graceful or unattended reboots relies on durable state rather
+than live process survival:
+
+- Local Copilot transcripts (`~/.copilot/session-state/*/events.jsonl`),
+  `data.db`, `cli-sessions.json`, and Flock identity/membership files persist on
+  disk.
+- Inbound messages sent while the host is rebooting remain queued in Azure
+  Service Bus (`copilot-bridge-offline`), and once `systemd --user` starts
+  `copilot-flock.service` on boot (requiring `loginctl enable-linger` on
+  headless hosts), queued messages replay subject to certificate/epoch validity.
+
+### Power-loss and kernel-crash boundary (separate crash boundary)
+
+Sudden power loss, kernel panics, or forced VM resets terminate all in-memory
+daemon and child processes immediately without `SIGTERM` or graceful socket
+closure. Neither `KillMode=process` nor transient user scopes can preserve
+in-flight volatile memory across power loss.
+
+Post-power-loss recovery is governed strictly by fsynced on-disk state and
+fail-closed replay quarantine:
+
+- Configuration, membership, epoch-floor, and replay files use `atomicJson`
+  staging with file and parent-directory `fsync` so partial writes do not
+  corrupt committed JSON state.
+- Messages recorded in durable receive quarantine before power loss are **not**
+  automatically re-executed on next boot; ambiguous interrupted dispatches
+  require explicit reconciliation.
+- Stale mutation locks whose recorded `{ pid, start }` creation identity no
+  longer exists are safely recovered after power restoration without stealing
+  live locks.
+
 ## Renewal, removal and availability
 
 Renewal is owner-mediated and preserves device keys, role, allowed sessions

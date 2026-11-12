@@ -213,8 +213,14 @@ Preserve conversations, session-state, chats, data.db, source checkouts and
 backups. Do not promise deletion of transcripts or OS audit logs.
 
 Published 3.4.0 Linux removal can terminate Copilot children through systemd
-`disable --now`; do not run it on a shared active service. The unreleased
-3.4.1 guard retains installation/recovery when unit or daemon-cgroup child
+`disable --now`; do not run it on a shared active service. New Linux unit
+generation uses `KillMode=process`, outside-cgroup transient scope child
+supervision when available, and guarded pinned-PID activation that restores
+original unit policy on success or failure and refuses unproven restarts before
+signalling unless explicit maintenance consent (`--allow-disruptive-restart`) is
+given (OS reboot and power-loss boundaries are separate durable-state boundaries;
+see `docs/BROKER_FREE_V34.md`). The uninstall
+guard retains installation/recovery when unit or daemon-cgroup child
 preservation is unproven. It is not approval for live removal or a universal
 active-service cleanup guarantee. Preserve the immutable 3.4.0 tag/assets.
 

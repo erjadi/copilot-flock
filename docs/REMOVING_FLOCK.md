@@ -25,6 +25,20 @@ This conservative guard is not
 support for uninstalling an active shared Linux service; it does not stop that
 service or change its stop policy. Live uninstall validation remains separate.
 
+The conservative uninstall guard above remains strictly separate from normal
+session-preserving Linux daemon activation/restart (`activateLinuxSystemdDaemon`):
+unit generation sets `KillMode=process`, daemon-spawned child sessions use
+outside-cgroup transient user scopes (`systemd-run --user --scope --collect`)
+when available, controlled restarts apply a temporary `KillMode=process` +
+`Restart=no` handoff drop-in that signals **only** the creation-pinned daemon
+PID and restores original policy on success or failure, and unproven
+child-preservation paths refuse disruptive restart before sending any signal
+unless explicit maintenance consent (`--allow-disruptive-restart`) is supplied.
+OS reboots and sudden power loss remain separate host boundaries where live
+child PIDs cannot persist and recovery relies on fsynced disk state, Service Bus
+subscriptions, and durable replay quarantine; see
+[session-preserving activation, reboot and power-loss boundaries](./BROKER_FREE_V34.md#linux-systemd-session-preserving-activation-reboot-and-power-loss-boundaries).
+
 The agent can run `node flock.mjs uninstall`, `node flock.mjs unenroll --traceless`
 or `node flock.mjs flock unenroll --traceless`. The legacy `bridge.mjs` entrypoint
 supports the same forms. The MCP tool is `unenroll_flock` with `traceless: true`.

@@ -2,7 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import crypto from "node:crypto";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { signLeave } from "./flock-membership.mjs";
 
 const hash = (data) => crypto.createHash("sha256").update(data).digest("hex");
@@ -162,17 +162,141 @@ function commandIsDaemon(identity, scripts) {
   ].includes(identity.command));
 }
 
-export function assertLinuxDaemonCgroupSafe(pid, {
+export function inspectLinuxUnifiedCgroup(pid, {
   read = (filename) => fs.readFileSync(filename, "utf8"), uid = process.getuid?.(),
 } = {}) {
   const rows = read(`/proc/${pid}/cgroup`).trim().split("\n").filter((line) => line.startsWith("0::"));
   const group = rows.length === 1 ? rows[0].slice(3) : "";
   const parts = group.split("/").slice(1);
-  if (pid === 1 || !Number.isSafeInteger(uid) || !group.startsWith("/") || group.includes("\0") ||
-      (group !== "/" && parts.some((part) => !part || part === "." || part === "..")) ||
-      parts.some((part) => part.endsWith(".service") && part !== `user@${uid}.service`)) {
+  const validPath = pid !== 1 && Number.isSafeInteger(uid) && uid >= 0 &&
+    group.startsWith("/") && !group.includes("\0") &&
+    (group === "/" || parts.every((part) => Boolean(part) && part !== "." && part !== ".."));
+  if (!validPath) return { ok: false, group, parts: [], serviceUnits: [], underUserManager: false };
+  const userUnit = `user@${uid}.service`;
+  const serviceUnits = parts.filter((part) => part.endsWith(".service") && part !== userUnit);
+  return {
+    ok: true,
+    group,
+    parts,
+    serviceUnits,
+    underUserManager: parts.includes(userUnit),
+  };
+}
+
+export function assertLinuxDaemonCgroupSafe(pid, {
+  read = (filename) => fs.readFileSync(filename, "utf8"), uid = process.getuid?.(),
+  allowedServices = [],
+} = {}) {
+  const info = inspectLinuxUnifiedCgroup(pid, { read, uid });
+  const allowed = Array.isArray(allowedServices) ? allowedServices : [];
+  const serviceSafe = info.serviceUnits.length === 0 ||
+    (allowed.length > 0 && info.underUserManager && info.serviceUnits.length === 1 &&
+      allowed.includes(info.serviceUnits[0]));
+  if (!info.ok || !serviceSafe) {
     throw new Error("Linux daemon service-cgroup child preservation is unproven; installation retained");
   }
+  return info;
+}
+
+export function buildLinuxSystemdUnit({ home, targetScript, execPath = process.execPath }) {
+  if (!home || !targetScript || !execPath) {
+    throw new Error("Linux systemd unit requires home, targetScript and execPath");
+  }
+  return [
+    "[Unit]",
+    "Description=GitHub Copilot Flock Daemon (copilot-flock)",
+    "After=network-online.target",
+    "Wants=network-online.target",
+    "",
+    "[Service]",
+    "Type=simple",
+    `WorkingDirectory=${home}`,
+    `Environment=PATH=${path.join(home, ".local", "bin")}:/usr/local/bin:/usr/bin:/bin`,
+    `ExecStart=${JSON.stringify(execPath).replace(/%/g, "%%")} ${JSON.stringify(targetScript).replace(/%/g, "%%")} daemon`,
+    "KillMode=process",
+    "Restart=always",
+    "RestartSec=3",
+    "",
+    "[Install]",
+    "WantedBy=default.target",
+    "",
+  ].join("\n");
+}
+
+let cachedTransientScopeSupport = null;
+
+export function probeLinuxTransientScopeSupport({ exec = execFileSync } = {}) {
+  try {
+    exec("systemd-run", ["--user", "--version"], { stdio: "ignore", timeout: 3000 });
+    exec("systemctl", ["--user", "show-environment"], { stdio: "ignore", timeout: 3000 });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function prepareOutsideLinuxServiceCgroupSpawn(command, args = [], {
+  platform = process.platform,
+  pid = process.pid,
+  uid = process.getuid?.(),
+  read = (filename) => fs.readFileSync(filename, "utf8"),
+  probeScope = () => {
+    if (cachedTransientScopeSupport === null) cachedTransientScopeSupport = probeLinuxTransientScopeSupport();
+    return cachedTransientScopeSupport;
+  },
+  unitPrefix = "copilot-flock-session",
+  unitId = crypto.randomUUID(),
+  requireOutsideCgroup = false,
+} = {}) {
+  if (platform !== "linux") {
+    return { command, args: [...args], supervisedOutsideCgroup: false, mode: "non-linux" };
+  }
+  let cgroupInfo = null;
+  try {
+    cgroupInfo = inspectLinuxUnifiedCgroup(pid, { read, uid });
+  } catch {
+    cgroupInfo = { ok: false, group: "", serviceUnits: [] };
+  }
+  if (cgroupInfo.ok && cgroupInfo.serviceUnits.length === 0) {
+    return {
+      command,
+      args: [...args],
+      supervisedOutsideCgroup: true,
+      mode: "already-outside-service-cgroup",
+      cgroup: cgroupInfo.group,
+    };
+  }
+  const safePrefix = String(unitPrefix || "copilot-flock-session").replace(/[^A-Za-z0-9_-]/g, "-") || "copilot-flock-session";
+  const safeId = String(unitId || "").replace(/[^A-Za-z0-9_-]/g, "");
+  if (!safeId) throw new Error("Invalid transient scope unit identifier");
+  if (probeScope()) {
+    const scopeUnit = `${safePrefix}-${safeId}`;
+    return {
+      command: "systemd-run",
+      args: ["--user", "--scope", "--collect", "--quiet", `--unit=${scopeUnit}`, "--", command, ...args],
+      supervisedOutsideCgroup: true,
+      mode: "systemd-transient-scope",
+      scopeUnit: `${scopeUnit}.scope`,
+    };
+  }
+  if (requireOutsideCgroup) {
+    throw new Error("Linux outside-cgroup transient scope supervision is unavailable; refusing unguarded spawn");
+  }
+  return {
+    command,
+    args: [...args],
+    supervisedOutsideCgroup: false,
+    mode: "service-cgroup-fallback",
+    cgroup: cgroupInfo.group || null,
+  };
+}
+
+export function spawnSessionSafeProcess(command, args = [], spawnOptions = {}, supervisionOptions = {}) {
+  const spec = prepareOutsideLinuxServiceCgroupSpawn(command, args, supervisionOptions);
+  const spawnFn = supervisionOptions.spawnImpl || spawn;
+  const child = spawnFn(spec.command, spec.args, spawnOptions);
+  if (child && typeof child === "object") child.outsideCgroupSupervision = spec;
+  return child;
 }
 
 export async function stopPinnedDaemon(root, paths, {
@@ -294,6 +418,534 @@ function queryUserSystemd(args) {
   return execFileSync("systemctl", ["--user", ...args], {
     encoding: "utf8", timeout: 6000, stdio: ["ignore", "pipe", "pipe"],
   });
+}
+
+function parseSystemdProperties(raw, requiredKeys, errorMessage = "Invalid Linux unit properties") {
+  const properties = new Map();
+  const lines = String(raw ?? "").trim().split("\n").filter(Boolean);
+  if (!lines.length) throw new Error(errorMessage);
+  for (const line of lines) {
+    const separator = line.indexOf("=");
+    const key = line.slice(0, separator);
+    if (separator < 1 || properties.has(key)) throw new Error(errorMessage);
+    properties.set(key, line.slice(separator + 1));
+  }
+  for (const key of requiredKeys) {
+    if (!properties.has(key)) throw new Error(errorMessage);
+  }
+  return properties;
+}
+
+export function readLinuxCgroupPids(controlGroup, {
+  cgroupRoot = "/sys/fs/cgroup",
+  read,
+  readdir,
+} = {}) {
+  if (!controlGroup) return [];
+  const parts = String(controlGroup).split("/").slice(1);
+  if (!String(controlGroup).startsWith("/") || String(controlGroup).includes("\0") ||
+      (controlGroup !== "/" && parts.some((part) => !part || part === "." || part === ".."))) {
+    throw new Error("Invalid Linux ControlGroup path");
+  }
+  const readFn = read || ((filename) => fs.readFileSync(filename, "utf8"));
+  const readdirFn = readdir || (read ? () => [] : (dir) => fs.readdirSync(dir, { withFileTypes: true }));
+  const rootPrefix = String(cgroupRoot).replace(/\/+$/, "");
+  const startDir = controlGroup === "/" ? (rootPrefix || "/") : `${rootPrefix}${controlGroup}`;
+  const pids = new Set();
+  const walk = (dir) => {
+    const raw = readFn(`${dir}/cgroup.procs`);
+    for (const line of String(raw).split("\n").map((item) => item.trim()).filter(Boolean)) {
+      if (!/^\d+$/.test(line)) throw new Error("Malformed Linux cgroup.procs entry");
+      const pid = Number(line);
+      if (!Number.isSafeInteger(pid) || pid <= 0) throw new Error("Invalid PID in Linux cgroup.procs");
+      pids.add(pid);
+    }
+    let entries = [];
+    try {
+      entries = readdirFn(dir) || [];
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+    }
+    for (const entry of entries) {
+      if (!entry || typeof entry.isDirectory !== "function" || !entry.isDirectory()) continue;
+      const name = String(entry.name || "");
+      if (!name || name === "." || name === ".." || name.includes("/") || name.includes("\0")) continue;
+      walk(`${dir}/${name}`);
+    }
+  };
+  walk(startDir);
+  return [...pids];
+}
+
+export function configureLinuxSystemdPersistence(targetScript, paths = lifecyclePaths(), {
+  strict = false,
+  execPath = process.execPath,
+  query = queryUserSystemd,
+  checkLinger = (user) => execFileSync("loginctl", ["show-user", user, "-p", "Linger", "--value"], { encoding: "utf8", timeout: 4000 }),
+  enableLinger = (user) => execFileSync("sudo", ["-n", "loginctl", "enable-linger", user], { stdio: "ignore", timeout: 4000 }),
+  username = () => os.userInfo().username,
+} = {}) {
+  if (paths.platform !== "linux") return null;
+  const unitPath = paths.persistence[0];
+  const legacyUnitPath = paths.persistence[1];
+  const systemdDir = path.dirname(unitPath);
+  assertNoLinks(systemdDir);
+  assertNoLinks(unitPath);
+  assertNoLinks(legacyUnitPath);
+  fs.mkdirSync(systemdDir, { recursive: true });
+  const unitContent = buildLinuxSystemdUnit({ home: paths.home, targetScript, execPath });
+  fs.writeFileSync(unitPath, unitContent, "utf8");
+  if (fs.existsSync(legacyUnitPath)) {
+    try {
+      const props = parseSystemdProperties(
+        query(["show", "copilot-signalr-bridge.service",
+          "--property=Id,LoadState,FragmentPath,ActiveState,MainPID,ControlGroup"]),
+        ["Id", "LoadState", "FragmentPath", "ActiveState", "MainPID", "ControlGroup"]
+      );
+      query(["disable", "copilot-signalr-bridge.service"]);
+      if (props.get("ActiveState") === "inactive" && props.get("MainPID") === "0" &&
+          props.get("ControlGroup") === "") {
+        assertNoLinks(legacyUnitPath);
+        fs.unlinkSync(legacyUnitPath);
+      }
+    } catch (error) {
+      if (strict) throw error;
+    }
+  }
+  let systemdReady = false;
+  try {
+    query(["daemon-reload"]);
+    query(["enable", "copilot-flock.service"]);
+    systemdReady = true;
+  } catch (error) {
+    if (strict) throw error;
+  }
+  try {
+    const user = username();
+    if (strict) {
+      const linger = String(checkLinger(user) ?? "").trim();
+      if (linger !== "yes") throw new Error("User lingering is not enabled; obtain explicit approval before enabling it");
+    } else {
+      enableLinger(user);
+    }
+  } catch (error) {
+    if (strict) throw error;
+  }
+  return { platform: "linux", type: "systemd-user", path: unitPath, killMode: "process", systemdReady };
+}
+
+const ACTIVATION_PROPERTIES = [
+  "Id", "LoadState", "FragmentPath", "ActiveState", "MainPID", "ControlGroup", "KillMode", "Restart",
+];
+
+export async function activateLinuxSystemdDaemon({
+  root,
+  paths = lifecyclePaths(),
+  targetUnit = "copilot-flock.service",
+  maintenanceConsent = false,
+  allowDisruptiveRestart = false,
+  uid = process.getuid?.(),
+  query = queryUserSystemd,
+  inspect = inspectProcess,
+  readCgroup = (filename) => fs.readFileSync(filename, "utf8"),
+  readCgroupProcs = (controlGroup) => readLinuxCgroupPids(controlGroup),
+  kill = (pid) => process.kill(pid, "SIGTERM"),
+  delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+  beforeStart = null,
+  waitForReady = null,
+} = {}) {
+  if (paths.platform !== "linux") throw new Error("Linux systemd activation requires a Linux target");
+  const consent = Boolean(maintenanceConsent || allowDisruptiveRestart);
+  if (!root || !paths.roots.includes(path.resolve(root))) {
+    throw new Error("Activation root must be a managed Flock installation root");
+  }
+  root = assertNoLinks(root);
+  for (const filename of paths.persistence) {
+    assertNoLinks(filename);
+    assertNoLinks(`${filename}.d`);
+  }
+  if (!Number.isSafeInteger(uid) || uid < 0) {
+    throw new Error("Cannot establish Linux UID for session-preserving daemon activation");
+  }
+  const expected = new Map(paths.persistence.map((filename) => [path.basename(filename), filename]));
+  if (!expected.has(targetUnit)) throw new Error(`Unsupported Linux target unit: ${targetUnit}`);
+
+  const readUnit = (unit) => parseSystemdProperties(
+    query(["show", unit, `--property=${ACTIVATION_PROPERTIES.join(",")}`]),
+    ACTIVATION_PROPERTIES,
+    `Invalid Linux unit properties for ${unit}`
+  );
+
+  let listedUnits;
+  try {
+    listedUnits = JSON.parse(query([
+      "list-units", "--all", "--output=json", "--no-pager", "--type=service", ...expected.keys(),
+    ]));
+  } catch (error) {
+    throw new Error(`Linux unit inventory unavailable (${error.message}); refusing disruptive restart`);
+  }
+  if (!Array.isArray(listedUnits)) {
+    throw new Error("Linux unit inventory unavailable; refusing disruptive restart");
+  }
+  const unitNames = new Set();
+  for (const entry of listedUnits) {
+    if (!expected.has(entry?.unit) || unitNames.has(entry.unit)) {
+      throw new Error("Unexpected Linux unit inventory; refusing disruptive restart");
+    }
+    unitNames.add(entry.unit);
+  }
+  if (!beforeStart || fs.existsSync(expected.get(targetUnit))) {
+    unitNames.add(targetUnit);
+  }
+
+  const unitPropsMap = new Map();
+  for (const unit of unitNames) {
+    const props = readUnit(unit);
+    if (props.get("Id") !== unit) {
+      throw new Error(`Linux unit identity mismatch for ${unit}; refusing disruptive restart`);
+    }
+    if (props.get("LoadState") === "loaded" && props.get("FragmentPath") !== expected.get(unit)) {
+      throw new Error(`Linux unit ${unit} points to unowned fragment ${props.get("FragmentPath")}; refusing restart`);
+    }
+    unitPropsMap.set(unit, props);
+  }
+
+  const unsafeReasons = [];
+  if (!beforeStart) {
+    const targetProps = unitPropsMap.get(targetUnit);
+    if (!targetProps || targetProps.get("LoadState") !== "loaded" ||
+        targetProps.get("FragmentPath") !== expected.get(targetUnit)) {
+      unsafeReasons.push(`Target unit ${targetUnit} is not loaded from its managed fragment`);
+    } else if (targetProps.get("KillMode") !== "process") {
+      unsafeReasons.push(`Target unit ${targetUnit} has KillMode=${targetProps.get("KillMode")}, expected process`);
+    }
+  }
+
+  const candidateRoots = [root, ...paths.roots.filter((candidate) => candidate !== root)];
+  const runningDaemons = [];
+  for (const candidateRoot of candidateRoots) {
+    const pidPath = assertNoLinks(path.join(candidateRoot, "daemon.pid"));
+    if (!fs.existsSync(pidPath)) continue;
+    const pid = Number(fs.readFileSync(pidPath, "utf8").trim());
+    if (!Number.isSafeInteger(pid) || pid <= 0) {
+      unsafeReasons.push("Malformed daemon PID; child preservation is unproven");
+      continue;
+    }
+    let live;
+    try {
+      live = inspect(pid, "linux");
+    } catch (error) {
+      unsafeReasons.push(`Cannot inspect recorded daemon PID ${pid}: ${error.message}`);
+      continue;
+    }
+    if (!live) continue;
+    const pinPath = assertNoLinks(path.join(candidateRoot, "daemon-identity.json"));
+    const pin = fs.existsSync(pinPath) ? JSON.parse(fs.readFileSync(pinPath, "utf8")) : null;
+    const matchesPin = Boolean(
+      pin && pin.pid === pid && pin.start === live.start && pin.executable === live.executable &&
+      pin.command === live.command && JSON.stringify(pin.argv) === JSON.stringify(live.argv) &&
+      paths.scripts.includes(pin.script) && commandIsDaemon(live, [pin.script])
+    );
+    if (matchesPin) {
+      if (!runningDaemons.some((entry) => entry.pid === pid)) {
+        runningDaemons.push({ root: candidateRoot, pid, live, pin });
+      }
+    } else if (commandIsDaemon(live, paths.scripts)) {
+      unsafeReasons.push("Running Linux daemon lacks a matching creation-identity pin");
+    }
+  }
+  if (runningDaemons.length > 1) {
+    unsafeReasons.push("Multiple pinned Flock daemons are running; child preservation is unproven");
+  }
+  const pinnedDaemon = runningDaemons.length === 1 ? runningDaemons[0] : null;
+  if (pinnedDaemon && pinnedDaemon.pid === process.pid) {
+    throw new Error("Activator cannot terminate its own process");
+  }
+
+  let activeServiceUnit = null;
+  const activeChildren = new Map();
+  for (const [unit, props] of unitPropsMap.entries()) {
+    const activeState = props.get("ActiveState");
+    const mainPidRaw = props.get("MainPID");
+    const controlGroup = props.get("ControlGroup");
+    const isRunningOrTransitioning = activeState !== "inactive" || mainPidRaw !== "0";
+    if (isRunningOrTransitioning) {
+      if (props.get("LoadState") !== "loaded" || props.get("FragmentPath") !== expected.get(unit)) {
+        throw new Error(`Active Linux unit ${unit} is not backed by its managed fragment; refusing restart`);
+      }
+      if (activeServiceUnit && activeServiceUnit !== unit) {
+        unsafeReasons.push("Multiple Linux Flock units are active simultaneously; child preservation is unproven");
+      } else {
+        activeServiceUnit = unit;
+      }
+      const mainPid = Number(mainPidRaw);
+      if (!Number.isSafeInteger(mainPid) || mainPid <= 0) {
+        unsafeReasons.push(`Linux unit ${unit} is ${activeState} without a stable MainPID`);
+      } else if (!pinnedDaemon || pinnedDaemon.pid !== mainPid) {
+        unsafeReasons.push(`Active Linux unit ${unit} MainPID ${mainPid} does not match pinned daemon identity`);
+      }
+    }
+    if (controlGroup !== "") {
+      try {
+        const cgroupPids = readCgroupProcs(controlGroup);
+        for (const cgroupPid of cgroupPids) {
+          if (pinnedDaemon && cgroupPid === pinnedDaemon.pid) continue;
+          const childLive = inspect(cgroupPid, "linux");
+          if (childLive) activeChildren.set(cgroupPid, childLive);
+        }
+      } catch (error) {
+        unsafeReasons.push(`Cannot inspect cgroup processes for ${unit}: ${error.message}`);
+      }
+    }
+  }
+
+  let daemonCgroupInfo = null;
+  if (pinnedDaemon) {
+    try {
+      daemonCgroupInfo = inspectLinuxUnifiedCgroup(pinnedDaemon.pid, { read: readCgroup, uid });
+    } catch (error) {
+      unsafeReasons.push(`Cannot inspect daemon cgroup: ${error.message}`);
+    }
+    if (daemonCgroupInfo) {
+      if (!daemonCgroupInfo.ok) {
+        unsafeReasons.push("Linux daemon unified cgroup v2 path is unavailable or malformed");
+      } else if (daemonCgroupInfo.serviceUnits.some((svc) => !expected.has(svc)) ||
+          (daemonCgroupInfo.serviceUnits.length > 0 && !daemonCgroupInfo.underUserManager) ||
+          daemonCgroupInfo.serviceUnits.length > 1) {
+        // Never disrupt a third-party or system service unit even if maintenanceConsent is supplied.
+        throw new Error("Linux daemon resides in an unowned service cgroup; refusing restart");
+      } else if (daemonCgroupInfo.serviceUnits.length === 1 &&
+          daemonCgroupInfo.serviceUnits[0] !== activeServiceUnit) {
+        unsafeReasons.push(`Daemon cgroup service ${daemonCgroupInfo.serviceUnits[0]} disagrees with systemd active unit state`);
+      }
+    }
+  }
+
+  const signaledPids = [];
+
+  if (unsafeReasons.length > 0) {
+    if (!consent) {
+      throw new Error(`${unsafeReasons[0]}; refusing disruptive Linux daemon restart without explicit maintenance consent`);
+    }
+    if (pinnedDaemon && !activeServiceUnit) {
+      if (JSON.stringify(inspect(pinnedDaemon.pid, "linux")) !== JSON.stringify(pinnedDaemon.live)) {
+        throw new Error("Daemon process identity changed");
+      }
+      signaledPids.push(pinnedDaemon.pid);
+      kill(pinnedDaemon.pid);
+    }
+    if (activeServiceUnit === "copilot-signalr-bridge.service" && targetUnit !== "copilot-signalr-bridge.service") {
+      query(["stop", "copilot-signalr-bridge.service"]);
+      query(["disable", "copilot-signalr-bridge.service"]);
+    }
+    if (beforeStart) await beforeStart();
+    const refreshedTarget = readUnit(targetUnit);
+    if (refreshedTarget.get("LoadState") !== "loaded" ||
+        refreshedTarget.get("FragmentPath") !== expected.get(targetUnit)) {
+      throw new Error(`Target unit ${targetUnit} is not loaded from its managed fragment`);
+    }
+    query(["restart", targetUnit]);
+    let startedPid = 0;
+    for (let attempt = 0; attempt < 30; attempt++) {
+      const current = readUnit(targetUnit);
+      const pid = Number(current.get("MainPID"));
+      if (current.get("ActiveState") === "active" && Number.isSafeInteger(pid) && pid > 0) {
+        startedPid = pid;
+        break;
+      }
+      await delay(100);
+    }
+    if (!startedPid) throw new Error(`Linux unit ${targetUnit} did not report an active MainPID after restart`);
+    if (waitForReady) await waitForReady({ pid: startedPid, unit: targetUnit });
+    return {
+      activated: true,
+      mode: "maintenance-restart",
+      unit: targetUnit,
+      pid: startedPid,
+      maintenanceConsentUsed: true,
+      signaledPids,
+      policyRestored: true,
+      preservedChildren: [...activeChildren.values()].filter((child) => {
+        try {
+          const after = inspect(child.pid, "linux");
+          return Boolean(after && after.start === child.start);
+        } catch {
+          return false;
+        }
+      }).map((child) => ({ pid: child.pid, start: child.start })),
+    };
+  }
+
+  let policyRestored = true;
+  if (pinnedDaemon && activeServiceUnit) {
+    const activeUnitPath = expected.get(activeServiceUnit);
+    const activeProps = unitPropsMap.get(activeServiceUnit);
+    const originalPolicy = {
+      KillMode: activeProps.get("KillMode"),
+      Restart: activeProps.get("Restart"),
+    };
+    const dropInDir = `${activeUnitPath}.d`;
+    const dropInPath = path.join(dropInDir, "90-flock-session-handoff.conf");
+    assertNoLinks(dropInDir);
+    assertNoLinks(dropInPath);
+    const hadDropInDir = fs.existsSync(dropInDir);
+    const previousDropIn = fs.existsSync(dropInPath) ? fs.readFileSync(dropInPath) : null;
+    policyRestored = false;
+
+    const restoreOriginalPolicy = () => {
+      if (policyRestored) return;
+      assertNoLinks(dropInDir);
+      assertNoLinks(dropInPath);
+      if (previousDropIn === null) {
+        if (fs.existsSync(dropInPath)) fs.unlinkSync(dropInPath);
+        if (!hadDropInDir && fs.existsSync(dropInDir) && fs.readdirSync(dropInDir).length === 0) {
+          fs.rmdirSync(dropInDir);
+        }
+      } else {
+        fs.mkdirSync(dropInDir, { recursive: true });
+        fs.writeFileSync(dropInPath, previousDropIn);
+      }
+      query(["daemon-reload"]);
+      if (fs.existsSync(activeUnitPath)) {
+        const restoredProps = readUnit(activeServiceUnit);
+        if (restoredProps.get("KillMode") !== originalPolicy.KillMode ||
+            restoredProps.get("Restart") !== originalPolicy.Restart) {
+          throw new Error(
+            `Failed to restore original policy on ${activeServiceUnit} (got KillMode=${restoredProps.get("KillMode")}, Restart=${restoredProps.get("Restart")})`
+          );
+        }
+      }
+      policyRestored = true;
+    };
+
+    let primaryError = null;
+    try {
+      fs.mkdirSync(dropInDir, { recursive: true });
+      fs.writeFileSync(dropInPath, "[Service]\nKillMode=process\nRestart=no\n", { encoding: "utf8", mode: 0o600 });
+      query(["daemon-reload"]);
+      const handoffProps = readUnit(activeServiceUnit);
+      if (handoffProps.get("KillMode") !== "process" || handoffProps.get("Restart") !== "no") {
+        throw new Error(
+          `Linux unit ${activeServiceUnit} did not adopt session-preserving handoff policy (KillMode=${handoffProps.get("KillMode")}, Restart=${handoffProps.get("Restart")}); refusing disruptive Linux daemon restart without explicit maintenance consent`
+        );
+      }
+      if (handoffProps.get("MainPID") !== String(pinnedDaemon.pid)) {
+        throw new Error("Daemon MainPID changed before signalling; refusing restart");
+      }
+      assertLinuxDaemonCgroupSafe(pinnedDaemon.pid, {
+        read: readCgroup,
+        uid,
+        allowedServices: [activeServiceUnit],
+      });
+      if (JSON.stringify(inspect(pinnedDaemon.pid, "linux")) !== JSON.stringify(pinnedDaemon.live)) {
+        throw new Error("Daemon process identity changed");
+      }
+      signaledPids.push(pinnedDaemon.pid);
+      kill(pinnedDaemon.pid);
+      let stoppedUnitProps = null;
+      for (let attempt = 0; attempt < 30; attempt++) {
+        const afterProc = inspect(pinnedDaemon.pid, "linux");
+        const procExited = !afterProc || afterProc.start !== pinnedDaemon.live.start;
+        if (procExited) {
+          const currentUnit = readUnit(activeServiceUnit);
+          if (currentUnit.get("MainPID") === "0" &&
+              ["inactive", "failed"].includes(currentUnit.get("ActiveState"))) {
+            stoppedUnitProps = currentUnit;
+            break;
+          }
+        }
+        await delay(100);
+      }
+      if (!stoppedUnitProps) {
+        throw new Error("Pinned Linux daemon did not stop cleanly; aborting activation");
+      }
+      restoreOriginalPolicy();
+      if (stoppedUnitProps.get("ActiveState") === "failed") {
+        try { query(["reset-failed", activeServiceUnit]); } catch {}
+      }
+      if (activeServiceUnit === "copilot-signalr-bridge.service" &&
+          targetUnit !== "copilot-signalr-bridge.service") {
+        query(["disable", "copilot-signalr-bridge.service"]);
+        if (stoppedUnitProps.get("ControlGroup") === "" && fs.existsSync(activeUnitPath)) {
+          assertNoLinks(activeUnitPath);
+          fs.unlinkSync(activeUnitPath);
+          query(["daemon-reload"]);
+        }
+      }
+    } catch (error) {
+      primaryError = error;
+      throw error;
+    } finally {
+      if (!policyRestored) {
+        try {
+          restoreOriginalPolicy();
+        } catch (restoreError) {
+          if (!primaryError) throw restoreError;
+          primaryError.restoreError = restoreError;
+          primaryError.message = `${primaryError.message} (policy restore also failed: ${restoreError.message})`;
+        }
+      }
+    }
+  } else if (pinnedDaemon) {
+    await stopPinnedDaemon(pinnedDaemon.root, paths, {
+      inspect: (pid) => inspect(pid, "linux"),
+      kill: (pid) => { signaledPids.push(pid); kill(pid); },
+      delay,
+      checkLinuxCgroup: (pid) => assertLinuxDaemonCgroupSafe(pid, { read: readCgroup, uid }),
+    });
+  }
+
+  if (beforeStart) await beforeStart();
+
+  const finalTargetProps = readUnit(targetUnit);
+  if (finalTargetProps.get("LoadState") !== "loaded" ||
+      finalTargetProps.get("FragmentPath") !== expected.get(targetUnit)) {
+    throw new Error(`Target unit ${targetUnit} is not loaded from its managed fragment`);
+  }
+  if (finalTargetProps.get("KillMode") !== "process") {
+    throw new Error(
+      `Target unit ${targetUnit} has KillMode=${finalTargetProps.get("KillMode")}, expected process; refusing activation`
+    );
+  }
+
+  query(["start", targetUnit]);
+  let newMainPid = 0;
+  for (let attempt = 0; attempt < 30; attempt++) {
+    const current = readUnit(targetUnit);
+    const pid = Number(current.get("MainPID"));
+    if (current.get("ActiveState") === "active" && Number.isSafeInteger(pid) && pid > 0 &&
+        (!pinnedDaemon || pid !== pinnedDaemon.pid ||
+          inspect(pid, "linux")?.start !== pinnedDaemon.live.start)) {
+      newMainPid = pid;
+      break;
+    }
+    await delay(100);
+  }
+  if (!newMainPid) {
+    throw new Error(`Linux unit ${targetUnit} did not report an active new MainPID`);
+  }
+  if (waitForReady) {
+    await waitForReady({ pid: newMainPid, unit: targetUnit });
+  }
+
+  const preservedChildren = [];
+  for (const [childPid, beforeChild] of activeChildren.entries()) {
+    const afterChild = inspect(childPid, "linux");
+    if (afterChild && afterChild.pid === beforeChild.pid && afterChild.start === beforeChild.start) {
+      preservedChildren.push({ pid: childPid, start: afterChild.start });
+    }
+  }
+
+  return {
+    activated: true,
+    mode: pinnedDaemon ? "restarted-session-preserving" : "started",
+    unit: targetUnit,
+    pid: newMainPid,
+    maintenanceConsentUsed: false,
+    signaledPids,
+    policyRestored,
+    preservedChildren,
+  };
 }
 
 export function assertLinuxUnitsQuiescent(paths, {

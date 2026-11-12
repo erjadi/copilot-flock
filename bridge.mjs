@@ -18,7 +18,7 @@ import https from "node:https";
 import crypto from "node:crypto";
 import { spawn, execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { uninstallFlock, lifecyclePaths, recordInstalledArtifact, pinDaemonIdentity, atomicJson, assertNoLinks, stopPinnedDaemon, inspectProcess } from "./flock-lifecycle.mjs";
+import { uninstallFlock, lifecyclePaths, recordInstalledArtifact, pinDaemonIdentity, atomicJson, assertNoLinks, stopPinnedDaemon, inspectProcess, assertLinuxDaemonCgroupSafe, configureLinuxSystemdPersistence, activateLinuxSystemdDaemon, spawnSessionSafeProcess } from "./flock-lifecycle.mjs";
 import { BrokerFreeRuntime } from "./flock-broker-free.mjs";
 import { authorizeAction, ownerFingerprint } from "./flock-protocol.mjs";
 
@@ -3588,11 +3588,11 @@ async function injectHeadlessCliSessionMessage({
   if (waitForReply) {
     const replyText = await new Promise((resolve, reject) => {
       assertAuthorized();
-      const child = spawn(copilotBin, cliArgs, {
+      const child = spawnSessionSafeProcess(copilotBin, cliArgs, {
         cwd: sessionCwd,
         stdio: ["ignore", "pipe", "pipe"],
         windowsHide: true,
-      });
+      }, { unitPrefix: "copilot-flock-session", unitId: requestId });
       let stdout = "";
       let stderr = "";
       const timer = setTimeout(() => {
@@ -3679,12 +3679,12 @@ async function injectHeadlessCliSessionMessage({
   if (notifyOnIdle && fromMachine) {
     assertAuthorized();
     assertAuthorized();
-    const bgChild = spawn(copilotBin, cliArgs, {
+    const bgChild = spawnSessionSafeProcess(copilotBin, cliArgs, {
       cwd: sessionCwd,
       detached: true,
       stdio: ["ignore", "pipe", "pipe"],
       windowsHide: true,
-    });
+    }, { unitPrefix: "copilot-flock-session", unitId: requestId });
     let bgStdout = "";
     bgChild.stdout?.on("data", (d) => {
       if (bgStdout.length < 256 * 1024) bgStdout += d.toString("utf8");
@@ -3733,12 +3733,12 @@ async function injectHeadlessCliSessionMessage({
     };
   }
 
-  const bgChild = spawn(copilotBin, cliArgs, {
+  const bgChild = spawnSessionSafeProcess(copilotBin, cliArgs, {
     cwd: sessionCwd,
     detached: true,
     stdio: "ignore",
     windowsHide: true,
-  });
+  }, { unitPrefix: "copilot-flock-session", unitId: requestId });
   bgChild.unref();
 
   return {
@@ -5725,7 +5725,7 @@ export async function handleRpcAction(cfg, req) {
     // Spawn `node flock.mjs install` detached after 300ms so the RPC reply returns first
     setTimeout(() => {
       try {
-        const child = spawn(
+        const child = spawnSessionSafeProcess(
           process.execPath,
           [
             targetScript,
@@ -5738,7 +5738,8 @@ export async function handleRpcAction(cfg, req) {
             detached: true,
             stdio: "ignore",
             windowsHide: true,
-          }
+          },
+          { unitPrefix: "copilot-flock-install", unitId: crypto.randomUUID() }
         );
         child.unref();
       } catch {}
@@ -6419,6 +6420,13 @@ export async function runDaemon(cfg) {
   });
 
   let reconnectAttempt = 0;
+  let activeSignalRClient = null;
+  const shutdownLegacyDaemon = () => {
+    try { activeSignalRClient?.close(); } catch {}
+    process.exit(0);
+  };
+  process.once("SIGTERM", shutdownLegacyDaemon);
+  process.once("SIGINT", shutdownLegacyDaemon);
 
   while (true) {
     const connectedStartedAt = Date.now();
@@ -6483,6 +6491,7 @@ export async function runDaemon(cfg) {
         },
       });
 
+      activeSignalRClient = client;
       logDaemon(`Connected to SignalR hub '${cfg.hub}' as '${cfg.machineId}'`);
       updateStateFile("connected");
 
@@ -6513,6 +6522,7 @@ export async function runDaemon(cfg) {
       await disconnectPromise;
       clearInterval(presenceTimer);
       client.close();
+      if (activeSignalRClient === client) activeSignalRClient = null;
       if (fs.existsSync(pidPath)) {
         const activePid = Number(fs.readFileSync(pidPath, "utf8").trim());
         if (activePid && activePid !== process.pid) {
@@ -6564,11 +6574,25 @@ export function isLocalDaemonRunning() {
       try {
         const st = JSON.parse(fs.readFileSync(statePath, "utf8"));
         const updatedMs = st?.updatedAt ? Date.parse(st.updatedAt) : 0;
-        if (updatedMs > 0 && Date.now() - updatedMs > 120000) {
-          try {
-            process.kill(pid);
-          } catch {}
-          return { running: false, pid: null, killedStalePid: pid };
+        if (st?.protocol !== "broker-free-v34" && updatedMs > 0 && Date.now() - updatedMs > 120000) {
+          let canSignalStale = process.platform !== "linux";
+          if (process.platform === "linux") {
+            try {
+              const pinPath = assertNoLinks(path.join(getBridgeHome(), "daemon-identity.json"));
+              const pin = fs.existsSync(pinPath) ? JSON.parse(fs.readFileSync(pinPath, "utf8")) : null;
+              const live = inspectProcess(pid);
+              if (pin && live && pin.pid === pid && pin.start === live.start) {
+                assertLinuxDaemonCgroupSafe(pid);
+                canSignalStale = true;
+              }
+            } catch {}
+          }
+          if (canSignalStale) {
+            try {
+              process.kill(pid);
+            } catch {}
+            return { running: false, pid: null, killedStalePid: pid };
+          }
         }
       } catch {}
     }
@@ -6607,7 +6631,7 @@ export async function ensureDaemonStarted(cfg) {
 
   const sandboxMode = isSandboxV3Mode();
   const daemonArgs = sandboxMode ? [scriptToRun, "daemon", "--sandbox", "v3"] : [scriptToRun, "daemon"];
-  const child = spawn(process.execPath, daemonArgs, {
+  const child = spawnSessionSafeProcess(process.execPath, daemonArgs, {
     detached: true,
     stdio: "ignore",
     windowsHide: true,
@@ -6622,7 +6646,7 @@ export async function ensureDaemonStarted(cfg) {
       COPILOT_BRIDGE_HUB: cfg.hub,
       ...(sandboxMode ? { COPILOT_FLOCK_SANDBOX: "v3", COPILOT_BRIDGE_SANDBOX: "v3" } : {}),
     },
-  });
+  }, { unitPrefix: "copilot-flock-daemon", unitId: crypto.randomUUID() });
   child.unref();
   const spawnedPid = child.pid;
   const statePath = getStatePath();
@@ -9234,52 +9258,11 @@ export async function updateFleetMachines(
 export function configureBootPersistence(targetScript, { strict = false } = {}) {
   try {
     if (process.platform === "linux") {
-      const systemdDir = path.join(HOME_DIR, ".config", "systemd", "user");
-      fs.mkdirSync(systemdDir, { recursive: true });
-      const legacyUnitPath = path.join(systemdDir, "copilot-signalr-bridge.service");
-      const unitPath = path.join(systemdDir, "copilot-flock.service");
-      const unitContent = `[Unit]
-Description=GitHub Copilot Flock Daemon (copilot-flock)
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-WorkingDirectory=${HOME_DIR}
-Environment=PATH=${path.join(HOME_DIR, ".local", "bin")}:/usr/local/bin:/usr/bin:/bin
-ExecStart=${JSON.stringify(process.execPath).replace(/%/g, "%%")} ${JSON.stringify(targetScript).replace(/%/g, "%%")} daemon
-Restart=always
-RestartSec=3
-
-[Install]
-WantedBy=default.target
-`;
-      fs.writeFileSync(unitPath, unitContent, "utf8");
-      // Keep legacy unit pointing to targetScript or migrate cleanly
-      if (fs.existsSync(legacyUnitPath)) {
-        try {
-          execFileSync("systemctl", ["--user", "disable", "--now", "copilot-signalr-bridge.service"], {
-            stdio: "ignore",
-            timeout: 4000,
-          });
-          fs.unlinkSync(legacyUnitPath);
-        } catch (error) { if (strict) throw error; }
-      }
-      try {
-        execFileSync("systemctl", ["--user", "daemon-reload"], { stdio: "ignore", timeout: 4000 });
-        execFileSync("systemctl", ["--user", "enable", "copilot-flock.service"], {
-          stdio: "ignore",
-          timeout: 4000,
-        });
-      } catch (error) { if (strict) throw error; }
-      try {
-        const user = os.userInfo().username;
-        if (strict) {
-          const linger = execFileSync("loginctl", ["show-user", user, "-p", "Linger", "--value"], { encoding: "utf8", timeout: 4000 });
-          if (linger.trim() !== "yes") throw new Error("User lingering is not enabled; obtain explicit approval before enabling it");
-        } else execFileSync("sudo", ["-n", "loginctl", "enable-linger", user], { stdio: "ignore", timeout: 4000 });
-      } catch (error) { if (strict) throw error; }
-      return { platform: "linux", type: "systemd-user", path: unitPath };
+      return configureLinuxSystemdPersistence(
+        targetScript,
+        lifecyclePaths({ home: HOME_DIR, copilotHome: getCopilotDir() }),
+        { strict, execPath: process.execPath }
+      );
     }
 
     if (process.platform === "win32" && process.env.APPDATA) {
@@ -9547,7 +9530,7 @@ export async function reprovisionLocalBridge(cfg, { syncInstall = false } = {}) 
 
   setTimeout(() => {
     try {
-      const child = spawn(
+      const child = spawnSessionSafeProcess(
         process.execPath,
         [
           targetScript,
@@ -9560,7 +9543,8 @@ export async function reprovisionLocalBridge(cfg, { syncInstall = false } = {}) 
           detached: true,
           stdio: "ignore",
           windowsHide: true,
-        }
+        },
+        { unitPrefix: "copilot-flock-install", unitId: crypto.randomUUID() }
       );
       child.unref();
     } catch {}
@@ -10498,6 +10482,7 @@ export async function installBridge({
   hubArg,
   protocolArg, welcomeTicketArg, ownerFingerprintArg, flockIdArg,
   serviceBusSendConnectionStringArg, serviceBusListenConnectionStringArg,
+  maintenanceConsentArg = false,
 } = {}) {
   ensureBridgeDir();
   const activeConfigPath = getConfigPath();
@@ -10534,7 +10519,8 @@ export async function installBridge({
       enrollment = { enrolled: true, flockId: record.flockId };
     }
     return installBrokerFreeLocal({ ...existing, protocol: "broker-free-v34", machineId: runtime.select(enrollment.flockId).cert.body.machineId,
-      scope: scopeArg || runtime.select(enrollment.flockId).cert.body.scope, flockId: enrollment.flockId }, enrollment);
+      scope: scopeArg || runtime.select(enrollment.flockId).cert.body.scope, flockId: enrollment.flockId }, enrollment,
+      { maintenanceConsent: Boolean(maintenanceConsentArg) });
   }
 
   let parsedEnrollmentJson = null;
@@ -10793,26 +10779,25 @@ export async function installBridge({
   }
 
   // 5. Restart existing daemon(s) if running so only a single latest daemon runs.
-  // On Linux with systemd user unit enabled, let `systemctl --user restart` manage the process
-  // so systemd and manual spawn never compete.
-  let systemdManaged = false;
-  if (process.platform === "linux" && bootPersistence?.type === "systemd-user") {
-    try {
-      execFileSync("systemctl", ["--user", "restart", "copilot-flock.service"], {
-        stdio: "ignore",
-        timeout: 6000,
-      });
-      await new Promise((r) => setTimeout(r, 800));
-      const st = isLocalDaemonRunning();
-      if (st.running && st.pid) {
-        systemdManaged = true;
-      }
-    } catch {}
-  }
-
+  // On Linux with systemd user unit enabled, perform guarded session-preserving activation
+  // so only the pinned daemon PID is signaled and active child processes survive.
   let daemonInfo;
-  if (systemdManaged) {
-    daemonInfo = isLocalDaemonRunning();
+  if (!sandboxMode && process.platform === "linux" && bootPersistence?.type === "systemd-user") {
+    const linuxPaths = lifecyclePaths({ home: HOME_DIR, copilotHome: getCopilotDir() });
+    if (bootPersistence.systemdReady) {
+      const activated = await activateLinuxSystemdDaemon({
+        root: getBridgeHome(),
+        paths: linuxPaths,
+        maintenanceConsent: Boolean(maintenanceConsentArg),
+      });
+      daemonInfo = { running: true, pid: activated.pid };
+    } else {
+      await stopPinnedDaemon(getBridgeHome(), linuxPaths);
+      daemonInfo = await ensureDaemonStarted({
+        ...cfg,
+        installedScriptPath: targetScript,
+      });
+    }
   } else {
     // Ping our own machineId with collectAll=true to discover and kill any orphaned
     // legacy v1.0.0-pre daemon PIDs that may not be recorded in daemon.pid.
@@ -10963,11 +10948,11 @@ export async function dispatchBrokerFreeRpc(cfg, { member, payload, action, asse
   throw new Error(`Unsupported broker-free RPC action: ${action}; no legacy dispatch fallback`);
 }
 
-async function installBrokerFreeLocal(config, enrollment) {
+async function installBrokerFreeLocal(config, enrollment, { maintenanceConsent = false } = {}) {
   const root = assertNoLinks(getBridgeHome());
   if (fs.existsSync(path.join(root, ".git"))) throw new Error("Refusing to overwrite a source checkout");
   fs.mkdirSync(root, { recursive: true });
-  const paths = lifecyclePaths();
+  const paths = lifecyclePaths({ home: HOME_DIR, copilotHome: getCopilotDir() });
   const manifestPath = path.join(root, "installation.json");
   const manifest = fs.existsSync(manifestPath) ? JSON.parse(fs.readFileSync(assertNoLinks(manifestPath), "utf8")) : { artifacts: {} };
   for (const artifact of [...paths.persistence, ...paths.skills]) {
@@ -10976,24 +10961,24 @@ async function installBrokerFreeLocal(config, enrollment) {
       throw new Error(`Unowned/modified installation artifact retained: ${artifact}`);
     }
   }
-  await stopPinnedDaemon(root, paths);
-  for (const name of ["flock.mjs", "bridge.mjs"]) {
-    const target = assertNoLinks(path.join(root, name));
-    if (path.resolve(__filename) !== target) fs.copyFileSync(__filename, target);
-  }
-  copyRuntimeModules(__dirname, root, ["flock.mjs", "bridge.mjs"]);
-  atomicJson(getConfigPath(), config);
-  const mcpPath = path.join(getCopilotDir(), "mcp-config.json");
-  assertNoLinks(mcpPath);
-  const mcp = fs.existsSync(mcpPath) ? JSON.parse(fs.readFileSync(mcpPath, "utf8")) : {};
-  mcp.mcpServers ||= {};
   const targetScript = path.join(root, "flock.mjs");
-  const previous = mcp.mcpServers["copilot-flock"];
-  if (previous && !(previous.command === process.execPath && previous.args?.length === 2 &&
-      previous.args[0] === targetScript && previous.args[1] === "mcp")) throw new Error("MCP name is owned by another command; retained");
-  mcp.mcpServers["copilot-flock"] = { type: "stdio", command: process.execPath, args: [targetScript, "mcp"], tools: ["*"] };
-  atomicJson(mcpPath, mcp);
-  const skill = `---
+  const stageLocalArtifacts = () => {
+    for (const name of ["flock.mjs", "bridge.mjs"]) {
+      const target = assertNoLinks(path.join(root, name));
+      if (path.resolve(__filename) !== target) fs.copyFileSync(__filename, target);
+    }
+    copyRuntimeModules(__dirname, root, ["flock.mjs", "bridge.mjs"]);
+    atomicJson(getConfigPath(), config);
+    const mcpPath = path.join(getCopilotDir(), "mcp-config.json");
+    assertNoLinks(mcpPath);
+    const mcp = fs.existsSync(mcpPath) ? JSON.parse(fs.readFileSync(mcpPath, "utf8")) : {};
+    mcp.mcpServers ||= {};
+    const previous = mcp.mcpServers["copilot-flock"];
+    if (previous && !(previous.command === process.execPath && previous.args?.length === 2 &&
+        previous.args[0] === targetScript && previous.args[1] === "mcp")) throw new Error("MCP name is owned by another command; retained");
+    mcp.mcpServers["copilot-flock"] = { type: "stdio", command: process.execPath, args: [targetScript, "mcp"], tools: ["*"] };
+    atomicJson(mcpPath, mcp);
+    const skill = `---
 name: copilot-flock
 description: Device-bound broker-free cross-machine Copilot Flock messaging and safe removal.
 ---
@@ -11011,17 +10996,46 @@ Pending owner acknowledgment retains recovery. Never erase Copilot conversations
 session-state, data.db, source checkouts or backups. Traceless excludes audit logs and backups.
 Owner removal ends that owner's renewal service; it does not delegate authority or erase peers.
 `;
-  for (const filename of paths.skills.filter((filename) => path.basename(path.dirname(filename)) === "copilot-flock")) {
-    fs.mkdirSync(path.dirname(filename), { recursive: true });
-    fs.writeFileSync(filename, skill, "utf8");
-    recordInstalledArtifact(root, filename, paths);
+    for (const filename of paths.skills.filter((filename) => path.basename(path.dirname(filename)) === "copilot-flock")) {
+      fs.mkdirSync(path.dirname(filename), { recursive: true });
+      fs.writeFileSync(filename, skill, "utf8");
+      recordInstalledArtifact(root, filename, paths);
+    }
+    const persistence = configureBootPersistence(targetScript, { strict: true });
+    if (!persistence?.path) throw new Error("Boot persistence was not confirmed; enrollment remains recoverable");
+    recordInstalledArtifact(root, persistence.path, paths);
+  };
+  let daemonPid;
+  if (paths.platform === "linux") {
+    const statePath = getStatePath();
+    const activated = await activateLinuxSystemdDaemon({
+      root,
+      paths,
+      maintenanceConsent: Boolean(maintenanceConsent),
+      beforeStart: async () => { stageLocalArtifacts(); },
+      waitForReady: async ({ pid }) => {
+        const deadline = Date.now() + 4000;
+        while (Date.now() < deadline) {
+          if (fs.existsSync(statePath)) {
+            try {
+              const st = JSON.parse(fs.readFileSync(statePath, "utf8"));
+              if (st.pid === pid && st.status === "connected") return st;
+            } catch {}
+          }
+          await new Promise((r) => setTimeout(r, 200));
+        }
+        throw new Error("Broker-free daemon readiness unconfirmed; enrollment retained for retry");
+      },
+    });
+    daemonPid = activated.pid;
+  } else {
+    await stopPinnedDaemon(root, paths);
+    stageLocalArtifacts();
+    const daemon = await ensureDaemonStarted(config);
+    if (!daemon.state || daemon.state.status !== "connected") throw new Error("Broker-free daemon readiness unconfirmed; enrollment retained for retry");
+    daemonPid = daemon.pid;
   }
-  const persistence = configureBootPersistence(targetScript, { strict: true });
-  if (!persistence?.path) throw new Error("Boot persistence was not confirmed; enrollment remains recoverable");
-  recordInstalledArtifact(root, persistence.path, paths);
-  const daemon = await ensureDaemonStarted(config);
-  if (!daemon.state || daemon.state.status !== "connected") throw new Error("Broker-free daemon readiness unconfirmed; enrollment retained for retry");
-  return { protocol: config.protocol, enrollment, installedScript: targetScript, daemonPid: daemon.pid,
+  return { protocol: config.protocol, enrollment, installedScript: targetScript, daemonPid,
     liveAzureScopeGates: "NOT RUN: disposable-namespace positive/negative JWT and SAS isolation tests required before merge/release" };
 }
 
@@ -11344,6 +11358,7 @@ Usage:
       flockIdArg: flags.flock,
       serviceBusSendConnectionStringArg: flags["servicebus-send-connection-string"],
       serviceBusListenConnectionStringArg: flags["servicebus-listen-connection-string"],
+      maintenanceConsentArg: Boolean(flags["allow-disruptive-restart"] || flags["maintenance-consent"]),
     });
     console.log(JSON.stringify(res, null, 2));
     return;
@@ -11362,6 +11377,7 @@ Usage:
       scopeArg: flags.scope || flags.profile,
       machineIdArg: flags["machine-id"],
       githubUserArg: flags["github-user"] || flags.user,
+      maintenanceConsentArg: Boolean(flags["allow-disruptive-restart"] || flags["maintenance-consent"]),
     });
     console.log(JSON.stringify(res, null, 2));
     return;
@@ -11370,7 +11386,11 @@ Usage:
   if (command === "stop-daemon") {
     const st = isLocalDaemonRunning();
     if (st.running && st.pid) {
-      process.kill(st.pid);
+      if (process.platform === "linux" && !flags["allow-disruptive-restart"] && !flags["maintenance-consent"]) {
+        await stopPinnedDaemon(getBridgeHome(), lifecyclePaths({ home: HOME_DIR, copilotHome: getCopilotDir() }));
+      } else {
+        process.kill(st.pid);
+      }
       console.log(JSON.stringify({ stopped: true, pid: st.pid }, null, 2));
     } else {
       console.log(JSON.stringify({ stopped: false, reason: "Daemon not running" }, null, 2));
