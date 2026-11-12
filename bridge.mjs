@@ -33,6 +33,7 @@ import {
   spawnSessionSafeProcess,
   RUNTIME_MANIFEST_FILENAME,
   RUNTIME_STATE_FILENAME,
+  RUNTIME_CUTOVER_JOURNAL_FILENAME,
   REQUIRED_RUNTIME_ENTRYPOINTS,
   REQUIRED_COMPANION_MODULES,
   REQUIRED_RUNTIME_MODULES,
@@ -45,16 +46,17 @@ import {
   loadRuntimeManifest,
   verifyStagedRuntimeClosure,
   readRuntimeState,
+  recoverInterruptedRuntimeCutover,
   inspectRuntimeGenerations,
   inspectRuntimeGenerationsAsync,
   stageRuntimeRelease,
   activateStagedRuntime,
   stageAndActivateRuntime,
 } from "./flock-lifecycle.mjs";
-import { isSyntheticBuiltInFlock, hasVerifiedOwnerAuthority, verifyAuthoritativeFlockRecord } from "./flock-membership.mjs";
-import { BrokerFreeRuntime } from "./flock-broker-free.mjs";
-import { authorizeAction, ownerFingerprint } from "./flock-protocol.mjs";
 import {
+  isSyntheticBuiltInFlock,
+  hasVerifiedOwnerAuthority,
+  verifyAuthoritativeFlockRecord,
   FlockMembershipRegistry,
   createSignedRosterSnapshot,
   verifySignedRosterSnapshot,
@@ -64,7 +66,9 @@ import {
   resolveMemberIdentityKey,
   deriveKeyFingerprint,
   compareRosterVersion,
-} from "./flock-registry.mjs";
+} from "./flock-membership.mjs";
+import { BrokerFreeRuntime } from "./flock-broker-free.mjs";
+import { authorizeAction, ownerFingerprint } from "./flock-protocol.mjs";
 
 export {
   FlockMembershipRegistry,
@@ -81,6 +85,7 @@ export {
 export {
   RUNTIME_MANIFEST_FILENAME,
   RUNTIME_STATE_FILENAME,
+  RUNTIME_CUTOVER_JOURNAL_FILENAME,
   REQUIRED_RUNTIME_ENTRYPOINTS,
   REQUIRED_COMPANION_MODULES,
   REQUIRED_RUNTIME_MODULES,
@@ -93,6 +98,7 @@ export {
   loadRuntimeManifest,
   verifyStagedRuntimeClosure,
   readRuntimeState,
+  recoverInterruptedRuntimeCutover,
   inspectRuntimeGenerations,
   inspectRuntimeGenerationsAsync,
   stageRuntimeRelease,
@@ -162,7 +168,6 @@ const RUNTIME_SIBLING_MODULES = [
   "flock-protocol.mjs",
   "flock-azure.mjs",
   "flock-broker-free.mjs",
-  "flock-registry.mjs",
 ];
 
 function copyRuntimeModules(sourceDirectory, destinationDirectory, installedEntrypoints) {
@@ -268,6 +273,11 @@ export function computeRuntimeCodeDigest(entryFile = __filename) {
   try {
     if (!entryFile || !fs.existsSync(entryFile)) return null;
     const dir = path.dirname(entryFile);
+    if (fs.existsSync(path.join(dir, RUNTIME_CUTOVER_JOURNAL_FILENAME))) {
+      try {
+        recoverInterruptedRuntimeCutover(dir);
+      } catch {}
+    }
     const hash = crypto.createHash("sha256");
     const entryBytes = fs.readFileSync(entryFile);
     hash.update(`entry:${entryBytes.length}\n`);
@@ -8068,11 +8078,13 @@ export async function discoverMachines(
     passive = false,
   } = {}
 ) {
+  const effectiveTimeoutMs =
+    process.env.BRIDGE_FAST_VOTE_TEST === "1" ? Math.min(timeoutMs, 150) : timeoutMs;
   const replies = await invokeRemoteRpc(cfg, {
     toMachine: "*",
     action: "ping",
     params: passive ? { passive: true } : {},
-    timeoutMs,
+    timeoutMs: effectiveTimeoutMs,
     collectAll: true,
     flockId,
     passive,
@@ -13827,6 +13839,12 @@ export async function reviewReleaseCandidate(cfg, params = {}, internalOptions =
     isolatedEnv.HOME = isolatedHome;
     isolatedEnv.USERPROFILE = isolatedHome;
     isolatedEnv.COPILOT_HOME = isolatedCopilotHome;
+    isolatedEnv.XDG_CONFIG_HOME = path.join(isolatedHome, ".config");
+    isolatedEnv.XDG_STATE_HOME = path.join(isolatedHome, ".local", "state");
+    isolatedEnv.XDG_CACHE_HOME = path.join(isolatedHome, ".cache");
+    isolatedEnv.XDG_DATA_HOME = path.join(isolatedHome, ".local", "share");
+    isolatedEnv.APPDATA = path.join(isolatedHome, "AppData", "Roaming");
+    isolatedEnv.LOCALAPPDATA = path.join(isolatedHome, "AppData", "Local");
     isolatedEnv.BRIDGE_FAST_VOTE_TEST = "1";
 
     const entrypointsToVerify = [];
@@ -13915,6 +13933,9 @@ export async function reviewReleaseCandidate(cfg, params = {}, internalOptions =
       recordStepDiagnostics(testRes);
 
       if (!testRes.ok) {
+        if (!capturedStderr && testRes.stdout) {
+          capturedStderr = truncateUtf8Bounded(testRes.stdout, maxOutputBytes);
+        }
         if (testRes.spawnError) {
           failureCategory = "fixture_infrastructure_error";
           issues.push(`candidate unit test runner failed to start: ${testRes.spawnError.message}`);
@@ -15535,7 +15556,7 @@ export async function diagnoseFleetMachines(
         action: "ping",
         params: effectivePassive ? { passive: true } : {},
         collectAll: true,
-        timeoutMs: 2500,
+        timeoutMs: process.env.BRIDGE_FAST_VOTE_TEST === "1" ? 150 : 2500,
         passive: effectivePassive,
       }),
       fetchBootstrapMembers({ bootstrapUrl: cfg?.bootstrapUrl || DEFAULT_BOOTSTRAP_URL }),
@@ -17926,6 +17947,11 @@ export function resolveCliMessage(flags = {}, positional = []) {
 }
 
 async function main() {
+  try {
+    if (fs.existsSync(getBridgeHome())) {
+      recoverInterruptedRuntimeCutover(getBridgeHome());
+    }
+  } catch {}
   const { command, positional, flags } = parseCliArgs(process.argv.slice(2));
   if (command === "join-request") {
     if (fs.existsSync(getConfigPath()) && JSON.parse(fs.readFileSync(getConfigPath(), "utf8")).protocol !== "broker-free-v34") {

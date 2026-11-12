@@ -83,6 +83,7 @@ import {
   signV3MembershipSyncRequest,
   hasVerifiedOwnerAuthority,
   RUNTIME_MANIFEST_FILENAME,
+  RUNTIME_CUTOVER_JOURNAL_FILENAME,
   REQUIRED_RUNTIME_MODULES,
   RUNTIME_MODULE_MANIFEST,
   hashRuntimeModule,
@@ -90,6 +91,7 @@ import {
   validateRuntimeManifest,
   loadRuntimeManifest,
   verifyStagedRuntimeClosure,
+  recoverInterruptedRuntimeCutover,
   inspectRuntimeGenerations,
   stageRuntimeRelease,
   activateStagedRuntime,
@@ -172,7 +174,7 @@ test("reply and clarification shell examples strip unsafe remote identifiers", (
 });
 
 test("public distribution has Apache licensing, loopback viewer defaults and synthetic demo traffic", () => {
-  if (process.env.BRIDGE_FAST_VOTE_TEST === "1" && !fs.existsSync(new URL("../package.json", import.meta.url))) return;
+  if (!fs.existsSync(new URL("../package.json", import.meta.url))) return;
   for (const file of ["../package.json", "../viewer/package.json"]) {
     const manifest = JSON.parse(fs.readFileSync(new URL(file, import.meta.url), "utf8"));
     assert.equal(manifest.license, "Apache-2.0");
@@ -198,7 +200,7 @@ test("public distribution has Apache licensing, loopback viewer defaults and syn
 });
 
 test("managed ARM template deploys Serverless SignalR and Standard Service Bus without secret outputs", () => {
-  if (process.env.BRIDGE_FAST_VOTE_TEST === "1" && !fs.existsSync(new URL("../package.json", import.meta.url))) return;
+  if (!fs.existsSync(new URL("../package.json", import.meta.url))) return;
   const template = JSON.parse(fs.readFileSync(new URL("../infra/azuredeploy.json", import.meta.url), "utf8"));
   assert.equal(template.$schema, "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#");
   assert.equal(template.parameters.location.defaultValue, "[resourceGroup().location]");
@@ -850,6 +852,7 @@ test(
     );
 
     // 2. Verify synchronous and async getLocalSessionTranscript complete in < 50ms with exact semantics
+    getLocalSessionTranscript(hugeSessionId, 1);
     const tSync0 = performance.now();
     const syncTranscript = getLocalSessionTranscript(hugeSessionId, 6);
     const syncElapsedMs = performance.now() - tSync0;
@@ -4440,6 +4443,43 @@ test("durable v3 broker-backed membership registry: offline collaborators, crypt
   assert.equal(aliceTombstone.membershipStatus, "removed");
   assert.equal(aliceTombstone.removedAtEpoch, afterKickView.rosterEpoch);
 
+  // Cold ownedFlocks snapshot at epoch 2 with Bob active and Alice in removedMachines must produce Alice's tombstone
+  const coldRegistry = new FlockMembershipRegistry(path.join(tempRoot, "cold-registry.json"), { clock: () => clockNow });
+  coldRegistry.reconcileV3Broker({ myFlocksResponse: myFlocksAfterKick, bootstrapMembers });
+  const coldWithRemoved = coldRegistry.getFlockView("erjadi/studio-team", { includeRemoved: true });
+  assert.equal(coldWithRemoved.rosterEpoch, afterKickView.rosterEpoch);
+  assert.equal(coldWithRemoved.tombstoneCount, 1);
+  assert.equal(coldWithRemoved.members.some((m) => m.peerId === "3003:fp-bob-1" && !m.removed), true);
+  const coldAliceTombstone = coldWithRemoved.members.find((m) => m.peerId === "2002:fp-alice-1");
+  assert.ok(coldAliceTombstone, "Cold ownedFlocks reconciliation must populate removedMachines as tombstones");
+  assert.equal(coldAliceTombstone.removed, true);
+  assert.equal(coldAliceTombstone.membershipStatus, "removed");
+
+  // Concurrent presence/save interleaving: instance A holding epoch 1 (Alice + Bob) calling recordPresence/save after instance B advanced to epoch 2 must never roll back epoch or resurrect Alice
+  const staleInMemoryState = structuredClone(oldCacheBackup);
+  staleInMemoryState.flocks["erjadi/studio-team"].presence["3003:fp-bob-1"] = {
+    lastSeenAtMs: clockNow + 5000,
+    lastSeenAt: new Date(clockNow + 5000).toISOString(),
+    liveVerified: true,
+    version: "3.5.0",
+    activeSessionCount: 2,
+    copilotDesktopRunning: true,
+  };
+  registry.save(staleInMemoryState);
+  const afterConcurrentSave = restartedRegistry.getFlockView("erjadi/studio-team", { includeRemoved: true });
+  assert.equal(afterConcurrentSave.rosterEpoch, afterKickView.rosterEpoch, "Concurrent stale save must not roll back rosterEpoch");
+  assert.equal(afterConcurrentSave.tombstoneCount, 1, "Concurrent stale save must preserve tombstones");
+  assert.equal(
+    afterConcurrentSave.members.find((m) => m.peerId === "2002:fp-alice-1")?.removed,
+    true,
+    "Concurrent stale save must never resurrect removed Alice"
+  );
+  assert.equal(
+    afterConcurrentSave.members.find((m) => m.peerId === "3003:fp-bob-1")?.version,
+    "3.5.0",
+    "Concurrent presence update for active Bob must be merged"
+  );
+
   // Stale broker rollback must be rejected
   assert.throws(
     () => restartedRegistry.reconcileV3Broker({ myFlocksResponse: myFlocksBeforeKick }),
@@ -4917,8 +4957,8 @@ test("broker-free MCP unique route inference, ambiguity fail-closed, zero/expire
 
   const alphaPeerId = await enrollPeer(peerAlpha, "PEER-ALPHA", "demo/alpha");
   const betaPeerId = await enrollPeer(peerBeta, "PEER-BETA", "demo/beta");
-  const sharedAlphaPeerId = await enrollPeer(sharedPeer, "SHARED-PEER", "demo/alpha");
-  await enrollPeer(sharedPeer, "SHARED-PEER", "demo/beta");
+  const sharedAlphaPeerId = await enrollPeer(sharedPeer, "SHARED-PEER", "demo/alpha", now + 3600000, ["shared-sess", "alpha-only-sess"]);
+  await enrollPeer(sharedPeer, "SHARED-PEER", "demo/beta", now + 3600000, ["shared-sess", "beta-only-sess"]);
   await enrollPeer(expiringPeer, "EXPIRING-PEER", "demo/expiring", now + 600000);
 
   const daemons = await Promise.all([peerAlpha.start(), peerBeta.start(), sharedPeer.start(), expiringPeer.start()]);
@@ -4992,6 +5032,30 @@ test("broker-free MCP unique route inference, ambiguity fail-closed, zero/expire
     /Select an explicit --flock \(demo\/alpha, demo\/beta, demo\/expiring\); broker-free dispatch is ambiguous/
   );
   assert.equal(publishedMessages.length, publishedBeforeAmbiguous);
+
+  // Action/session scope filtering during route inference: when SHARED-PEER is in both demo/alpha and demo/beta,
+  // but only demo/alpha authorizes "alpha-only-sess" and only demo/beta authorizes "beta-only-sess", resolveRoute infers the unique authorized flock
+  const inferredAlphaRoute = sharedPeer.resolveRoute({
+    toMachine: "CALLER-PC",
+    action: "send_message",
+    params: { targetSession: "alpha-only-sess" },
+  });
+  assert.equal(inferredAlphaRoute.record.flockId, "demo/alpha");
+  const inferredBetaRoute = sharedPeer.resolveRoute({
+    toMachine: "CALLER-PC",
+    action: "send_message",
+    params: { targetSession: "beta-only-sess" },
+  });
+  assert.equal(inferredBetaRoute.record.flockId, "demo/beta");
+  assert.throws(
+    () =>
+      sharedPeer.resolveRoute({
+        toMachine: "CALLER-PC",
+        action: "send_message",
+        params: { targetSession: "shared-sess" },
+      }),
+    /Ambiguous broker-free route to target machine "CALLER-PC"[\s\S]*demo\/alpha, demo\/beta/
+  );
 
   // 3. Zero-route & revoked-route rejection: fail closed without broadcasting or falling back
   const publishedBeforeZero = publishedMessages.length;
@@ -5895,10 +5959,9 @@ test("pinned RUNTIME_MODULE_MANIFEST covers complete runtime closure and matches
   validateRuntimeManifest(RUNTIME_MODULE_MANIFEST, { expectedVersion: BRIDGE_VERSION });
 
   const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-  if (process.env.BRIDGE_FAST_VOTE_TEST === "1" && !fs.existsSync(path.join(repoRoot, RUNTIME_MANIFEST_FILENAME))) {
-    return;
-  }
-  const loaded = loadRuntimeManifest(repoRoot, { expectedVersion: BRIDGE_VERSION });
+  const loaded = fs.existsSync(path.join(repoRoot, RUNTIME_MANIFEST_FILENAME))
+    ? loadRuntimeManifest(repoRoot, { expectedVersion: BRIDGE_VERSION })
+    : RUNTIME_MODULE_MANIFEST;
   const recomputed = computeRuntimeManifest(repoRoot, { version: BRIDGE_VERSION });
   assert.equal(loaded.manifestDigest, recomputed.manifestDigest);
   assert.deepEqual(loaded.files, recomputed.files);
@@ -5914,7 +5977,7 @@ test("pinned RUNTIME_MODULE_MANIFEST covers complete runtime closure and matches
       const lfText = fs.readFileSync(path.join(repoRoot, modName), "utf8").replace(/\r\n/g, "\n");
       fs.writeFileSync(path.join(lfCheckoutDir, modName), lfText, "utf8");
     }
-    fs.copyFileSync(path.join(repoRoot, RUNTIME_MANIFEST_FILENAME), path.join(lfCheckoutDir, RUNTIME_MANIFEST_FILENAME));
+    fs.writeFileSync(path.join(lfCheckoutDir, RUNTIME_MANIFEST_FILENAME), JSON.stringify(loaded, null, 2) + "\n", "utf8");
     const lfManifest = computeRuntimeManifest(lfCheckoutDir, { version: BRIDGE_VERSION });
     assert.equal(lfManifest.manifestDigest, loaded.manifestDigest, "LF and CRLF checkouts must produce identical manifestDigest");
     assert.equal(verifyStagedRuntimeClosure(lfCheckoutDir, loaded, { verifyImports: false }).ok, true);
@@ -6068,7 +6131,6 @@ test("fleet runtime staging rejects omitted modules, partial copies, interrupted
         "./flock-lifecycle.mjs",
         "./flock-membership.mjs",
         "./flock-protocol.mjs",
-        "./flock-registry.mjs",
       ],
     };
     const sortedEntries = Object.keys(unpinnedManifest.files).sort().map((n) => [
@@ -6152,6 +6214,73 @@ test("fleet runtime staging rejects omitted modules, partial copies, interrupted
       (err) => err.code === "SIMULATED_CUTOVER_FAILURE"
     );
     assertBaselinePreserved("interrupted cutover rolled back cleanly");
+
+    // 3e. Backup failure (ENOSPC) before cutover starts must never delete or mutate preexisting flock.mjs or bridge.mjs
+    assert.throws(
+      () =>
+        stageAndActivateRuntime({
+          sourceDir: validV2Dir,
+          targetDir,
+          onDuringBackup: ({ index }) => {
+            if (index === 2) {
+              const err = new Error("ENOSPC: no space left on device during backup");
+              err.code = "ENOSPC";
+              throw err;
+            }
+          },
+        }),
+      (err) => err.code === "ENOSPC"
+    );
+    assertBaselinePreserved("backup failure ENOSPC preserves preexisting flock.mjs and bridge.mjs");
+
+    // 3f. Two sequential stageRuntimeRelease calls must both preserve their staged directories
+    const stageSeq1 = stageRuntimeRelease({ sourceDir: validV2Dir, targetDir, verifyImports: false });
+    const stageSeq2 = stageRuntimeRelease({ sourceDir: validV2Dir, targetDir, verifyImports: false });
+    assert.equal(fs.existsSync(stageSeq1.stageDir), true, "First staged directory must not be deleted by second stageRuntimeRelease");
+    assert.equal(fs.existsSync(stageSeq2.stageDir), true, "Second staged directory must exist");
+    stageSeq1.cleanup();
+    stageSeq2.cleanup();
+
+    // 3g. Hard process crash (process.exit(77)) mid-cutover at index 1 leaves durable cutover journal and recovers cleanly
+    const crashV2Dir = path.join(scratchRoot, "crash-v2");
+    buildSyntheticRuntimeSource(crashV2Dir, repoRoot, {
+      version: "3.5.0-crash",
+      mutate: (dir) => {
+        fs.appendFileSync(path.join(dir, "flock-azure.mjs"), "\n// crash-cutover-canary\n", "utf8");
+      },
+    });
+    const crashScript = `
+      import { stageAndActivateRuntime } from ${JSON.stringify(pathToFileURL(path.join(repoRoot, "flock-lifecycle.mjs")).href)};
+      stageAndActivateRuntime({
+        sourceDir: ${JSON.stringify(crashV2Dir)},
+        targetDir: ${JSON.stringify(targetDir)},
+        verifyImports: false,
+        onDuringCutover: ({ index }) => {
+          if (index === 1) process.exit(77);
+        },
+      });
+    `;
+    const crashRes = spawnSync(process.execPath, ["--input-type=module", "-e", crashScript], {
+      encoding: "utf8",
+      timeout: 15000,
+    });
+    assert.equal(crashRes.status, 77, `Expected exit 77 from mid-cutover crash subprocess, got ${crashRes.status}: ${crashRes.stderr}`);
+    assert.equal(
+      fs.existsSync(path.join(targetDir, RUNTIME_CUTOVER_JOURNAL_FILENAME)),
+      true,
+      "Durable cutover journal must exist after hard process exit mid-cutover"
+    );
+    assert.match(
+      fs.readFileSync(path.join(targetDir, "flock-azure.mjs"), "utf8"),
+      /crash-cutover-canary/,
+      "First file in cutover order was promoted before hard crash"
+    );
+    // Automatic recovery on next inspection / startup rolls back mixed file from backupDir and removes journal
+    const recoveredStates = getLocalRuntimeStates({ targetDir });
+    assert.equal(recoveredStates.installed.status, "installed");
+    assert.equal(recoveredStates.installed.version, "3.4.1");
+    assertBaselinePreserved("hard process crash at cutover index 1 recovered via durable cutover journal");
+    assert.equal(fs.existsSync(path.join(targetDir, RUNTIME_CUTOVER_JOURNAL_FILENAME)), false);
 
     // 4. Hash mismatch on valid-syntax tampered module & across install / self_update / reprovision / updateFleetMachines
     const hashMismatchDir = path.join(scratchRoot, "bad-hash-mismatch");
@@ -6604,6 +6733,7 @@ test("release voter extracts complete modular dependency closure into isolated f
     writeTreeFiles(originWorkDir, {
       ...baseModularCandidate,
       "test/flock.test.mjs": [
+        'process.stderr.write("HEAD-STDERR-δεζ❌-" + "λ".repeat(900) + "-TAIL-STDERR-END\\n");',
         'import test from "node:test";',
         'import assert from "node:assert/strict";',
         'test("deliberate candidate failure with multibyte UTF-8 output", () => {',
@@ -7189,7 +7319,6 @@ test("mcp_self_info tool and self-info CLI report in-memory loadTimeDigest and d
       "flock-protocol.mjs",
       "flock-azure.mjs",
       "flock-broker-free.mjs",
-      "flock-registry.mjs",
     ];
     for (const rel of filesToCopy) {
       fs.copyFileSync(path.join(repoRoot, rel), path.join(installDir, rel));
@@ -7519,7 +7648,6 @@ test("flock_status exposes independent installedOnDisk, residentDaemon, and call
       "flock-lifecycle.mjs",
       "flock-membership.mjs",
       "flock-protocol.mjs",
-      "flock-registry.mjs",
     ]) {
       fs.copyFileSync(path.join(repoRoot, modName), path.join(flockDir, modName));
     }

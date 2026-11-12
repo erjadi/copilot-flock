@@ -11,6 +11,7 @@ const hash = (data) => crypto.createHash("sha256").update(data).digest("hex");
 const names = ["copilot-flock", "copilot-signalr-bridge"];
 export const RUNTIME_MANIFEST_FILENAME = "runtime-manifest.json";
 export const RUNTIME_STATE_FILENAME = "runtime-state.json";
+export const RUNTIME_CUTOVER_JOURNAL_FILENAME = ".runtime-cutover-journal.json";
 export const REQUIRED_RUNTIME_ENTRYPOINTS = Object.freeze(["flock.mjs", "bridge.mjs"]);
 export const REQUIRED_COMPANION_MODULES = Object.freeze([
   "flock-lifecycle.mjs",
@@ -18,7 +19,6 @@ export const REQUIRED_COMPANION_MODULES = Object.freeze([
   "flock-protocol.mjs",
   "flock-azure.mjs",
   "flock-broker-free.mjs",
-  "flock-registry.mjs",
 ]);
 export const REQUIRED_RUNTIME_MODULES = Object.freeze([
   ...REQUIRED_RUNTIME_ENTRYPOINTS,
@@ -1743,6 +1743,77 @@ export function loadRuntimeManifest(dir, options = {}) {
   return validateRuntimeManifest(parsed, options);
 }
 
+const EMBEDDED_RUNTIME_MANIFEST_FALLBACK = (() => {
+  let selfSha = "0".repeat(64);
+  try {
+    selfSha = hashRuntimeModule(fs.readFileSync(fileURLToPath(import.meta.url)));
+  } catch {}
+  const entrypointSha = "e8dc5a8926afdae2313de84106af4853ccdf32cee5af0654d3239891800e8cee";
+  const fallback = {
+    type: "copilot-flock-runtime-manifest-v1",
+    schema: 1,
+    version: "3.5.0",
+    entrypoints: ["flock.mjs", "bridge.mjs"],
+    files: {
+      "bridge.mjs": {
+        role: "entrypoint",
+        sha256: entrypointSha,
+        imports: [
+          "./flock-broker-free.mjs",
+          "./flock-lifecycle.mjs",
+          "./flock-membership.mjs",
+          "./flock-protocol.mjs",
+        ],
+      },
+      "flock-azure.mjs": {
+        role: "companion",
+        sha256: "10cb6cc02c0be5cff5ff9a2849ee0bc96b3113dd3ff19381771ec791fac1ec33",
+        imports: ["./flock-protocol.mjs"],
+      },
+      "flock-broker-free.mjs": {
+        role: "companion",
+        sha256: "3f651ae4404fe6efa2b6ea37d6eddf925803de60380e156b8c8f7002fafd1bdd",
+        imports: [
+          "./flock-azure.mjs",
+          "./flock-lifecycle.mjs",
+          "./flock-membership.mjs",
+          "./flock-protocol.mjs",
+        ],
+      },
+      "flock-lifecycle.mjs": {
+        role: "companion",
+        sha256: selfSha,
+        imports: ["./flock-membership.mjs"],
+      },
+      "flock-membership.mjs": {
+        role: "companion",
+        sha256: "cac836dc08a0b5b6891507d6f7510bd5756aaabd79f167bebf5ef1b50f2b4242",
+        imports: [
+          "./flock-lifecycle.mjs",
+          "./flock-protocol.mjs",
+        ],
+      },
+      "flock-protocol.mjs": {
+        role: "companion",
+        sha256: "4292997940c5b36d6873a00b9ad6aa248ae58e897df98cffd937aeb34a44c8f3",
+        imports: ["./flock-lifecycle.mjs"],
+      },
+      "flock.mjs": {
+        role: "entrypoint",
+        sha256: entrypointSha,
+        imports: [
+          "./flock-broker-free.mjs",
+          "./flock-lifecycle.mjs",
+          "./flock-membership.mjs",
+          "./flock-protocol.mjs",
+        ],
+      },
+    },
+  };
+  fallback.manifestDigest = computeManifestDigest(fallback);
+  return freezeManifest(fallback);
+})();
+
 function loadInitialRuntimeManifest(dir) {
   try {
     const manifestPath = path.join(dir, RUNTIME_MANIFEST_FILENAME);
@@ -1775,7 +1846,7 @@ function loadInitialRuntimeManifest(dir) {
       return freezeManifest(full);
     }
   } catch {}
-  return null;
+  return EMBEDDED_RUNTIME_MANIFEST_FALLBACK;
 }
 
 export const RUNTIME_MODULE_MANIFEST = loadInitialRuntimeManifest(__lifecycleDir);
@@ -1999,15 +2070,31 @@ function cleanupDirectorySafe(dirPath) {
   } catch {}
 }
 
-function cleanOrphanedStagingDirs(targetDir) {
+function cleanOrphanedStagingDirs(targetDir, { maxAgeMs = 3600000, now = Date.now() } = {}) {
   const cleaned = [];
   if (!fs.existsSync(targetDir)) return cleaned;
+  let activeRecordedStageDir = null;
+  try {
+    activeRecordedStageDir = readRuntimeState(targetDir).staged?.stageDir || null;
+  } catch {}
   for (const name of fs.readdirSync(targetDir)) {
-    if (name.startsWith(".runtime-stage-")) {
-      const full = path.join(targetDir, name);
-      cleanupDirectorySafe(full);
-      cleaned.push(name);
+    if (!name.startsWith(".runtime-stage-")) continue;
+    const full = path.join(targetDir, name);
+    if (activeRecordedStageDir && path.resolve(full) === path.resolve(activeRecordedStageDir)) {
+      continue;
     }
+    try {
+      const st = fs.lstatSync(full);
+      if (st.isDirectory()) {
+        const hasCompletedManifest = fs.existsSync(path.join(full, RUNTIME_MANIFEST_FILENAME));
+        const ageMs = now - st.mtimeMs;
+        if (hasCompletedManifest || ageMs < maxAgeMs) {
+          continue;
+        }
+      }
+    } catch {}
+    cleanupDirectorySafe(full);
+    cleaned.push(name);
   }
   return cleaned;
 }
@@ -2039,6 +2126,88 @@ function updateRuntimeState(targetDir, patch) {
   };
   atomicJson(path.join(resolvedTarget, RUNTIME_STATE_FILENAME), next);
   return next;
+}
+
+export function recoverInterruptedRuntimeCutover(targetDir) {
+  let resolvedTarget;
+  try {
+    resolvedTarget = assertNoLinks(targetDir);
+  } catch {
+    return { recovered: false };
+  }
+  if (!fs.existsSync(resolvedTarget)) return { recovered: false };
+  const journalPath = path.join(resolvedTarget, RUNTIME_CUTOVER_JOURNAL_FILENAME);
+  try {
+    assertNoLinks(journalPath);
+  } catch {
+    return { recovered: false };
+  }
+  if (!fs.existsSync(journalPath)) return { recovered: false };
+  let journal;
+  try {
+    if (!fs.lstatSync(journalPath).isFile()) return { recovered: false };
+    journal = JSON.parse(fs.readFileSync(journalPath, "utf8"));
+  } catch {
+    return { recovered: false };
+  }
+  if (!journal || journal.type !== "copilot-flock-cutover-journal-v1") {
+    return { recovered: false };
+  }
+  let backupDir = null;
+  let stageDir = null;
+  try {
+    if (journal.backupDir) backupDir = assertNoLinks(path.resolve(journal.backupDir));
+  } catch {}
+  try {
+    if (journal.stageDir) stageDir = assertNoLinks(path.resolve(journal.stageDir));
+  } catch {}
+
+  const managedNames = Array.isArray(journal.managedNames)
+    ? journal.managedNames
+    : [...REQUIRED_RUNTIME_MODULES, RUNTIME_MANIFEST_FILENAME, "installation.json"];
+  const existedBefore = new Set(Array.isArray(journal.existedBefore) ? journal.existedBefore : []);
+  const backedUpFiles = new Set(Array.isArray(journal.backedUpFiles) ? journal.backedUpFiles : []);
+
+  for (const name of managedNames) {
+    const activeFile = path.join(resolvedTarget, name);
+    const backupFile = backupDir ? path.join(backupDir, name) : null;
+    try {
+      assertNoLinks(activeFile);
+      if (existedBefore.has(name) && backedUpFiles.has(name) && backupFile && fs.existsSync(backupFile)) {
+        atomicReplaceFile(backupFile, activeFile);
+      } else if (!existedBefore.has(name) && fs.existsSync(activeFile)) {
+        fs.unlinkSync(activeFile);
+      }
+    } catch {}
+  }
+
+  try {
+    updateRuntimeState(resolvedTarget, {
+      staged: {
+        status: "failed",
+        version: journal.targetVersion || null,
+        manifestDigest: journal.targetManifestDigest || null,
+        stageDir: null,
+        closureVerified: false,
+        importVerified: false,
+        error: "Recovered interrupted runtime cutover by rolling back to previous generation",
+        code: "RUNTIME_CUTOVER_INTERRUPTED_RECOVERED",
+        updatedAt: new Date().toISOString(),
+      },
+    });
+  } catch {}
+
+  if (stageDir) cleanupDirectorySafe(stageDir);
+  if (backupDir) cleanupDirectorySafe(backupDir);
+  try {
+    if (fs.existsSync(journalPath)) fs.unlinkSync(assertNoLinks(journalPath));
+  } catch {}
+
+  return {
+    recovered: true,
+    rolledBackToDigest: journal.previousManifestDigest || null,
+    abortedTargetDigest: journal.targetManifestDigest || null,
+  };
 }
 
 export function inspectRuntimeGenerations(targetDir, { resident = null } = {}) {
@@ -2100,6 +2269,11 @@ export function inspectRuntimeGenerations(targetDir, { resident = null } = {}) {
   }
 
   const targetExists = fs.existsSync(resolvedTarget);
+  if (targetExists) {
+    try {
+      recoverInterruptedRuntimeCutover(resolvedTarget);
+    } catch {}
+  }
   const assertDirectChildSafe = (childPath) => {
     const st = fs.lstatSync(childPath);
     if (st.isSymbolicLink()) throw new Error(`Unsafe link or junction: ${childPath}`);
@@ -2364,6 +2538,11 @@ export async function inspectRuntimeGenerationsAsync(targetDir, { resident = nul
     const dirSt = await fs.promises.lstat(resolvedTarget);
     targetExists = dirSt.isDirectory();
   } catch {}
+  if (targetExists) {
+    try {
+      recoverInterruptedRuntimeCutover(resolvedTarget);
+    } catch {}
+  }
 
   const assertChildSafeAsync = async (childPath) => {
     const st = await fs.promises.lstat(childPath);
@@ -2569,6 +2748,9 @@ export function stageRuntimeRelease({
     throw runtimeError("RUNTIME_UNSAFE_TARGET", `Refusing to stage runtime into source checkout: ${resolvedTarget}`);
   }
   const targetExistedBefore = fs.existsSync(resolvedTarget);
+  if (targetExistedBefore) {
+    recoverInterruptedRuntimeCutover(resolvedTarget);
+  }
   fs.mkdirSync(resolvedTarget, { recursive: true });
 
   const recordStageFailure = (err, candidateManifest) => {
@@ -2683,6 +2865,7 @@ export function activateStagedRuntime({
   targetDir,
   manifest = null,
   verifyBeforeCutover = true,
+  onDuringBackup = null,
   onDuringCutover = null,
   resident = null,
 } = {}) {
@@ -2690,6 +2873,9 @@ export function activateStagedRuntime({
   const resolvedTarget = assertNoLinks(targetDir);
   if (fs.existsSync(path.join(resolvedTarget, ".git"))) {
     throw runtimeError("RUNTIME_UNSAFE_TARGET", `Refusing to activate runtime into source checkout: ${resolvedTarget}`);
+  }
+  if (fs.existsSync(resolvedTarget)) {
+    recoverInterruptedRuntimeCutover(resolvedTarget);
   }
 
   const resolvedManifest = manifest ? validateRuntimeManifest(manifest) : loadRuntimeManifest(resolvedStage);
@@ -2708,10 +2894,31 @@ export function activateStagedRuntime({
     ]),
   ];
 
-  const backupDir = path.join(resolvedTarget, `.runtime-backup-${process.pid}-${crypto.randomUUID()}`);
-  assertNoLinks(backupDir);
-  fs.mkdirSync(backupDir, { mode: 0o700 });
   const existedBefore = new Set();
+  for (const name of managedNames) {
+    const currentPath = assertNoLinks(path.join(resolvedTarget, name));
+    if (fs.existsSync(currentPath) && fs.lstatSync(currentPath).isFile()) {
+      existedBefore.add(name);
+    }
+  }
+
+  let previousManifestDigest = null;
+  try {
+    const existingManifestPath = path.join(resolvedTarget, RUNTIME_MANIFEST_FILENAME);
+    if (fs.existsSync(existingManifestPath)) {
+      const parsedPrev = JSON.parse(fs.readFileSync(existingManifestPath, "utf8"));
+      previousManifestDigest = parsedPrev?.manifestDigest || null;
+    }
+  } catch {}
+
+  const backupDir = path.join(resolvedTarget, `.runtime-backup-${process.pid}-${crypto.randomUUID()}`);
+  const journalPath = path.join(resolvedTarget, RUNTIME_CUTOVER_JOURNAL_FILENAME);
+  assertNoLinks(backupDir);
+  assertNoLinks(journalPath);
+  fs.mkdirSync(backupDir, { mode: 0o700 });
+  const backedUpFiles = new Set();
+  const touchedDuringCutover = new Set();
+  let cutoverStarted = false;
 
   const companionsOrder = Object.keys(resolvedManifest.files)
     .filter((name) => !resolvedManifest.entrypoints.includes(name))
@@ -2720,18 +2927,38 @@ export function activateStagedRuntime({
   const cutoverFilesOrder = [...companionsOrder, RUNTIME_MANIFEST_FILENAME, ...entrypointsOrder];
 
   try {
+    let backupIndex = 0;
     for (const name of managedNames) {
+      if (!existedBefore.has(name)) continue;
       const currentPath = assertNoLinks(path.join(resolvedTarget, name));
-      if (fs.existsSync(currentPath) && fs.lstatSync(currentPath).isFile()) {
-        writeBinarySecure(path.join(backupDir, name), fs.readFileSync(currentPath));
-        existedBefore.add(name);
+      backupIndex++;
+      if (typeof onDuringBackup === "function") {
+        onDuringBackup({ filename: name, index: backupIndex, targetDir: resolvedTarget, backupDir });
       }
+      writeBinarySecure(path.join(backupDir, name), fs.readFileSync(currentPath));
+      backedUpFiles.add(name);
     }
 
+    atomicJson(journalPath, {
+      type: "copilot-flock-cutover-journal-v1",
+      pid: process.pid,
+      backupDir,
+      stageDir: resolvedStage,
+      targetVersion: resolvedManifest.version,
+      targetManifestDigest: resolvedManifest.manifestDigest,
+      previousManifestDigest,
+      managedNames,
+      existedBefore: [...existedBefore],
+      backedUpFiles: [...backedUpFiles],
+      startedAt: new Date().toISOString(),
+    });
+
+    cutoverStarted = true;
     let stepIndex = 0;
     for (const name of cutoverFilesOrder) {
       const stagedFile = assertNoLinks(path.join(resolvedStage, name));
       const activeFile = assertNoLinks(path.join(resolvedTarget, name));
+      touchedDuringCutover.add(name);
       atomicReplaceFile(stagedFile, activeFile);
       stepIndex++;
       if (typeof onDuringCutover === "function") {
@@ -2760,6 +2987,7 @@ export function activateStagedRuntime({
       const activeFile = path.join(resolvedTarget, name);
       installationManifest.artifacts[activeFile] = hash(fs.readFileSync(activeFile));
     }
+    touchedDuringCutover.add("installation.json");
     atomicJson(installationPath, installationManifest);
 
     const nowIso = new Date().toISOString();
@@ -2796,20 +3024,28 @@ export function activateStagedRuntime({
         verifiedAt: nowIso,
       },
     });
-  } catch (err) {
-    // Roll back to previous working generation atomically without touching protected identity/protocol/credential files
-    for (const name of managedNames) {
-      const activeFile = path.join(resolvedTarget, name);
-      const backupFile = path.join(backupDir, name);
-      try {
-        assertNoLinks(activeFile);
-        if (existedBefore.has(name) && fs.existsSync(backupFile)) {
-          atomicReplaceFile(backupFile, activeFile);
-        } else if (!existedBefore.has(name) && fs.existsSync(activeFile)) {
-          fs.unlinkSync(activeFile);
-        }
-      } catch {}
+    if (fs.existsSync(journalPath)) {
+      fs.unlinkSync(assertNoLinks(journalPath));
     }
+  } catch (err) {
+    // Only roll back target files if cutover actually started; backup failures must never delete or mutate preexisting files
+    if (cutoverStarted) {
+      for (const name of touchedDuringCutover) {
+        const activeFile = path.join(resolvedTarget, name);
+        const backupFile = path.join(backupDir, name);
+        try {
+          assertNoLinks(activeFile);
+          if (existedBefore.has(name) && backedUpFiles.has(name) && fs.existsSync(backupFile)) {
+            atomicReplaceFile(backupFile, activeFile);
+          } else if (!existedBefore.has(name) && fs.existsSync(activeFile)) {
+            fs.unlinkSync(activeFile);
+          }
+        } catch {}
+      }
+    }
+    try {
+      if (fs.existsSync(journalPath)) fs.unlinkSync(assertNoLinks(journalPath));
+    } catch {}
     try {
       updateRuntimeState(resolvedTarget, {
         staged: {
@@ -2829,6 +3065,9 @@ export function activateStagedRuntime({
   } finally {
     cleanupDirectorySafe(resolvedStage);
     cleanupDirectorySafe(backupDir);
+    try {
+      if (fs.existsSync(journalPath)) fs.unlinkSync(assertNoLinks(journalPath));
+    } catch {}
   }
 
   const states = inspectRuntimeGenerations(resolvedTarget, { resident });
@@ -2851,6 +3090,7 @@ export function stageAndActivateRuntime({
   runImportCheck = defaultRunImportCheck,
   onBeforeStageFile = null,
   onAfterStageFile = null,
+  onDuringBackup = null,
   onDuringCutover = null,
   resident = null,
 } = {}) {
@@ -2882,6 +3122,7 @@ export function stageAndActivateRuntime({
     stageDir: stagedResult.stageDir,
     targetDir,
     manifest: stagedResult.manifest,
+    onDuringBackup,
     onDuringCutover,
     resident,
   });

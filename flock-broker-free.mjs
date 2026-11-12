@@ -7,7 +7,7 @@ import { createDeviceIdentity, createOwnerState, createJoinCode, approveJoin, ac
   ownerFingerprint, canonical, encryptEnvelope, decryptEnvelope, DurableReceiver,
   createRotation, applyRotation, signedControl, verifyControl, renewOwnerCert, validateCert,
   verifyRosterMemberCert, verifyJoinCode, peerSubscription, authorizeAction } from "./flock-protocol.mjs";
-import { FlockMembershipRegistry, createSignedRosterSnapshot, createSignedRosterDelta } from "./flock-registry.mjs";
+import { FlockMembershipRegistry, createSignedRosterSnapshot, createSignedRosterDelta } from "./flock-membership.mjs";
 
 const hash = (value) => crypto.createHash("sha256").update(typeof value === "string" ? value : canonical(value)).digest("hex");
 function isExplicitTargetMachine(toMachine) {
@@ -199,6 +199,7 @@ export class BrokerFreeRuntime {
         }
       }
       const eligible = [];
+      const unauthorized = [];
       const stale = [];
       for (const [candidateId, raw] of Object.entries(data.flocks).sort(([a], [b]) => a.localeCompare(b))) {
         const mentionsTarget = Object.values(raw?.members || {}).some(
@@ -217,6 +218,14 @@ export class BrokerFreeRuntime {
         }
         const match = this.findAuthorizedMember(activeRecord, target, { allowLoopback, now });
         if (match.ok) {
+          if (action) {
+            try {
+              authorizeAction(activeRecord.cert.body, action, { params });
+            } catch (error) {
+              unauthorized.push({ record: activeRecord, error });
+              continue;
+            }
+          }
           eligible.push({ record: activeRecord, peerId: match.peerId, member: match.member });
         } else if (match.reason !== "absent") {
           stale.push(`${candidateId} (${match.reason})`);
@@ -229,21 +238,23 @@ export class BrokerFreeRuntime {
         );
       }
       if (eligible.length === 0) {
+        if (unauthorized.length === 1 && stale.length === 0) {
+          throw new Error(
+            `No authorized broker-free route to target machine "${target}" in flock "${unauthorized[0].record.flockId}": ${unauthorized[0].error.message}`
+          );
+        }
+        if (unauthorized.length > 0) {
+          const unauthDetail = unauthorized.map((u) => `${u.record.flockId} (${u.error.message})`).join("; ");
+          throw new Error(
+            `No authorized broker-free route to target machine "${target}" (${unauthDetail})`
+          );
+        }
         const detail = stale.length > 0 ? ` (stale, expired, or revoked membership evidence: ${stale.join("; ")})` : "";
         throw new Error(
           `No active, non-expired authorized broker-free route reaches target machine "${target}"${detail}; refusing broadcast or fallback`
         );
       }
       const chosen = eligible[0];
-      if (action) {
-        try {
-          authorizeAction(chosen.record.cert.body, action, { params });
-        } catch (error) {
-          throw new Error(
-            `No authorized broker-free route to target machine "${target}" in flock "${chosen.record.flockId}": ${error.message}`
-          );
-        }
-      }
       return { record: chosen.record, targetPeerId: chosen.peerId, toMachine: chosen.member.machineId };
     }
     const activeCandidates = Object.values(this.read().flocks).filter((record) => !record.departed && !record.leaveOperationId);

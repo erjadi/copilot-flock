@@ -1465,6 +1465,9 @@ export async function kickV3FlockMember(
             githubUser: m.githubUser,
             machineId: m.machineId,
             peerId: m.peerId,
+            deviceId: m.deviceId || null,
+            keyFingerprint: m.keyFingerprint || m.deviceId || null,
+            removedAtEpoch: f.rosterEpoch,
             removedAt: new Date().toISOString(),
           };
         }
@@ -1583,6 +1586,9 @@ export async function leaveV3Device(request, {
           githubUser: member.githubUser,
           machineId: member.machineId,
           peerId: member.peerId,
+          deviceId: member.deviceId || null,
+          keyFingerprint: member.keyFingerprint || member.deviceId || null,
+          removedAtEpoch: flock.rosterEpoch,
           removedAt: new Date().toISOString(),
         };
       }

@@ -9,13 +9,12 @@
   "files": {
     "bridge.mjs": {
       "role": "entrypoint",
-      "sha256": "7f82cd35745dba5f2fed0f3df30c328cab8e37080ff24959962b9a96e98b2a4a",
+      "sha256": "e8dc5a8926afdae2313de84106af4853ccdf32cee5af0654d3239891800e8cee",
       "imports": [
         "./flock-broker-free.mjs",
         "./flock-lifecycle.mjs",
         "./flock-membership.mjs",
-        "./flock-protocol.mjs",
-        "./flock-registry.mjs"
+        "./flock-protocol.mjs"
       ]
     },
     "flock-azure.mjs": {
@@ -27,25 +26,28 @@
     },
     "flock-broker-free.mjs": {
       "role": "companion",
-      "sha256": "afc86e643e4d35248ff485f32027f7858c8867ca25de5fee2f2dd11ab5b7aedf",
+      "sha256": "3f651ae4404fe6efa2b6ea37d6eddf925803de60380e156b8c8f7002fafd1bdd",
       "imports": [
         "./flock-azure.mjs",
         "./flock-lifecycle.mjs",
-        "./flock-protocol.mjs",
-        "./flock-registry.mjs"
+        "./flock-membership.mjs",
+        "./flock-protocol.mjs"
       ]
     },
     "flock-lifecycle.mjs": {
       "role": "companion",
-      "sha256": "81c9fd8c51a60155b603643f78e9ccdce332eefa69d681000405c8b5435b8295",
+      "sha256": "f34060eebaf1a9ab49f2f9f05c415184f22e28563a502ce3dba5f20b30aaa579",
       "imports": [
         "./flock-membership.mjs"
       ]
     },
     "flock-membership.mjs": {
       "role": "companion",
-      "sha256": "7e9fd66a15094ab2d7d67cdd62814d92a2c8ab817c237a25488014a8067c7107",
-      "imports": []
+      "sha256": "cac836dc08a0b5b6891507d6f7510bd5756aaabd79f167bebf5ef1b50f2b4242",
+      "imports": [
+        "./flock-lifecycle.mjs",
+        "./flock-protocol.mjs"
+      ]
     },
     "flock-protocol.mjs": {
       "role": "companion",
@@ -54,25 +56,16 @@
         "./flock-lifecycle.mjs"
       ]
     },
-    "flock-registry.mjs": {
-      "role": "companion",
-      "sha256": "2f2d3d0ca9e45545a87dbcfaffe202b019f6871f5e6af965de88beca1c7fe1f4",
-      "imports": [
-        "./flock-lifecycle.mjs",
-        "./flock-protocol.mjs"
-      ]
-    },
     "flock.mjs": {
       "role": "entrypoint",
-      "sha256": "7f82cd35745dba5f2fed0f3df30c328cab8e37080ff24959962b9a96e98b2a4a",
+      "sha256": "e8dc5a8926afdae2313de84106af4853ccdf32cee5af0654d3239891800e8cee",
       "imports": [
         "./flock-broker-free.mjs",
         "./flock-lifecycle.mjs",
         "./flock-membership.mjs",
-        "./flock-protocol.mjs",
-        "./flock-registry.mjs"
+        "./flock-protocol.mjs"
       ]
     }
   },
-  "manifestDigest": "917f071b23a12bc66aed805335e9adbaa2d03d9382d4fe2deac01fb3271d36dd"
+  "manifestDigest": "a7b34163e391451fe55677f856dc625eb054c13b81dbd4b7b7991066741816fa"
 }
