@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Command, Plus, RefreshCw, Settings2, Network, Server, MessagesSquare, Radio, Activity, ShieldCheck, Layers, Sun, Moon } from "lucide-react";
+import { Command, Plus, RefreshCw, Settings2, Network, Server, MessagesSquare, Radio, Activity, ShieldCheck, Layers, Sun, Moon, ListTodo } from "lucide-react";
 import { resolveTheme, THEME_KEY, type Theme } from "@/lib/fleet/theme";
 import { fetchOverview, getSeed, normalizeLegacyScopes, type Mode } from "@/lib/fleet/api";
 import { fakeEvent } from "@/lib/fleet/seed";
@@ -11,9 +11,10 @@ import { BroadcastView } from "./BroadcastView";
 import { WireView } from "./WireView";
 import { TopologyView } from "./TopologyView";
 import { GovernanceView } from "./GovernanceView";
+import { TodosView } from "./TodosView";
 import { FlocksView } from "./FlocksView";
 import { NewSessionModal, InspectDrawer } from "./Modals";
-import { fetchFlocks, filterFlock, seedFlocks, type FlockState } from "@/lib/fleet/flocks";
+import { currentFlocks, fetchFlocks, filterFlock, seedFlocks, type FlockSnapshot, type FlockState } from "@/lib/fleet/flocks";
 
 export type ScopeFilter = "all" | "personal" | "work";
 export interface Ctx {
@@ -23,6 +24,7 @@ export interface Ctx {
 
 const TABS = [
   { id: "topology", label: "Topology", icon: Network },
+  { id: "todos", label: "TODOs", icon: ListTodo },
   { id: "flocks", label: "Flocks", icon: Layers },
   { id: "fleet", label: "Fleet", icon: Server },
   { id: "sessions", label: "Sessions", icon: MessagesSquare },
@@ -48,31 +50,45 @@ export function Console() {
     try { localStorage.setItem(THEME_KEY, next); } catch { /* The toggle still works without storage. */ }
   };
   const [flockId, setFlockId] = useState("erjadi");
-  const [flocks, setFlocks] = useState<FlockState>(() => seedFlocks(getSeed().members));
-  const [flockError, setFlockError] = useState<string | null>(null);
+  const [flockSnapshot, setFlockSnapshot] = useState<FlockSnapshot | null>(null);
   const [clock, setClock] = useState(Date.now());
   const [base, setBase] = useState("");
   const [baseDraft, setBaseDraft] = useState("");
   const [mode, setMode] = useState<Mode>("seed");
+  const [overviewBase, setOverviewBase] = useState<string | null>(null);
   const [data, setData] = useState<Overview>(() => getSeed());
   const [events, setEvents] = useState<WireEvent[]>(() => getSeed().events);
   const [scope, setScope] = useState<ScopeFilter>("all");
   const [auto, setAuto] = useState(true);
   const [loading, setLoading] = useState(false);
-  const [tab, setTab] = useState<(typeof TABS)[number]["id"]>("topology");
+  const [tab, setTab] = useState<(typeof TABS)[number]["id"]>(() => window.location.hash === "#todos" ? "todos" : "topology");
+  useEffect(() => {
+    if (tab === "todos" || window.location.hash === "#todos") {
+      window.history.replaceState(null, "", `${window.location.pathname}${window.location.search}${tab === "todos" ? "#todos" : ""}`);
+    }
+  }, [tab]);
   const [selected, setSelected] = useState<Session | null>(null);
   const [inspectId, setInspectId] = useState<string | null>(null);
   const [newOpen, setNewOpen] = useState(false);
   const [settings, setSettings] = useState(false);
   const [sse, setSse] = useState<"connected" | "simulated" | "connecting">("connecting");
   const dataRef = useRef(data); dataRef.current = data;
+  const modeRef = useRef(mode); modeRef.current = mode;
+  const overviewRequest = useRef(0);
+  const flockRequest = useRef(0);
+  const { state: flocks, error: flockError } = useMemo(() => currentFlocks(flockSnapshot, base, mode, overviewBase), [flockSnapshot, base, mode, overviewBase]);
+  const setFlocks = (state: FlockState) => setFlockSnapshot({ base, mode, state, error: null });
 
   const pushEvents = useCallback((e: WireEvent[]) => setEvents((p) => [...e, ...p].slice(0, 500)), []);
   const refresh = useCallback(async () => {
+    const request = ++overviewRequest.current;
     setLoading(true);
     const r = await fetchOverview(base);
-    setMode(r.mode); setData(r.data);
-    if (r.mode === "live") setEvents((p) => { const ids = new Set(p.map((x) => x.id)); return [...r.data.events.filter((x) => !ids.has(x.id)), ...p].slice(0, 500); });
+    if (request !== overviewRequest.current) return;
+    if (r.mode !== modeRef.current) { ++flockRequest.current; setFlockSnapshot(null); }
+    setMode(r.mode); setData(r.data); setOverviewBase(base);
+    if (r.mode !== modeRef.current) setEvents(r.data.events);
+    else if (r.mode === "live") setEvents((p) => { const ids = new Set(p.map((x) => x.id)); return [...r.data.events.filter((x) => !ids.has(x.id)), ...p].slice(0, 500); });
     setLoading(false);
   }, [base]);
 
@@ -107,12 +123,21 @@ export function Console() {
   }, [mode, base, pushEvents]);
 
   const refreshFlocks = useCallback(async () => {
-    if (mode === "seed") { setFlockError(null); return; }
-    try { const next = await fetchFlocks(base); setFlocks(next); setFlockError(null); setFlockId((current) => next.flocks.some((f) => f.flockId === current) ? current : next.flocks[0]?.flockId ?? ""); }
-    catch (error) { setFlocks(seedFlocks(dataRef.current.members)); setFlockError(`v3 flock data fallback: ${error instanceof Error ? error.message : "request failed"}`); }
-  }, [base, mode]);
-  useEffect(() => { void refreshFlocks(); }, [refreshFlocks]);
-  useEffect(() => { if (mode === "seed") setFlocks(seedFlocks(getSeed().members)); }, [mode, base]);
+    if (overviewBase !== base) return;
+    const request = ++flockRequest.current;
+    if (mode === "seed") { setFlockSnapshot({ base, mode, state: seedFlocks(getSeed().members), error: null }); return; }
+    try {
+      const next = await fetchFlocks(base);
+      if (request !== flockRequest.current) return;
+      setFlockSnapshot({ base, mode, state: next, error: null });
+      setFlockId((current) => next.flocks.some((f) => f.flockId === current) ? current : next.flocks[0]?.flockId ?? "");
+    } catch (error) {
+      if (request !== flockRequest.current) return;
+      setFlockSnapshot({ base, mode, state: { flocks: [], sharedThreads: [], maintainer: {} },
+        error: `Flock authority unavailable: ${error instanceof Error ? error.message : "request failed"}` });
+    }
+  }, [base, mode, overviewBase]);
+  useEffect(() => { void refreshFlocks(); return () => { ++flockRequest.current; }; }, [refreshFlocks]);
   useEffect(() => { const timer = setInterval(() => { setClock(Date.now()); if (auto) void refreshFlocks(); }, 10000); return () => clearInterval(timer); }, [auto, refreshFlocks]);
   const view = useMemo<Overview>(() => {
     const active = filterFlock(data, flocks.flocks.find((f) => f.flockId === flockId) ?? flocks.flocks[0], flocks.sharedThreads, clock);
@@ -148,8 +173,8 @@ export function Console() {
           </div>
 
           <div className="order-3 col-span-2 min-w-0 pb-2 lg:order-none lg:pb-0">
-            <Select className="w-full lg:w-48" aria-label="Active flock" value={flockId} onChange={(e) => { setFlockId(e.target.value); setSelected(null); setInspectId(null); }}>
-              {!flocks.flocks.length && <option value={flockId}>Flocks unavailable</option>}
+            <Select className="w-full lg:w-48" aria-label="Active flock" value={flockId} disabled={!flocks.flocks.length} onChange={(e) => { setFlockId(e.target.value); setSelected(null); setInspectId(null); }}>
+              {!flocks.flocks.length && <option value={flockId}>{flockError === "Loading flock authority..." ? flockError : "Flocks unavailable"}</option>}
               {flocks.flocks.map((f) => <option key={f.flockId} value={f.flockId}>{f.flockId}{f.kind === "owner_root" ? " · All PCs" : ""}</option>)}
             </Select>
           </div>
@@ -161,7 +186,7 @@ export function Console() {
                 <button className="fixed inset-0 z-10 cursor-default" onClick={() => setSettings(false)} aria-label="Close settings" />
                 <div className="glass enter-up fixed right-3 top-[68px] z-20 max-h-[calc(100dvh-152px)] w-[min(320px,calc(100vw-24px))] overflow-y-auto rounded-xl p-4 md:absolute md:right-0 md:top-10">
                   <div className="mb-4 flex items-center justify-between"><div><div className="text-sm font-medium">Connection</div><div className="mt-0.5 text-[11px] text-muted-foreground">{mode === "live" ? "Live hub" : "Preview seed"} · SSE {sse}</div></div><Dot pulse={mode === "live"} tone={mode === "live" ? "online" : "muted"} /></div>
-                  <form onSubmit={(e) => { e.preventDefault(); setBase(baseDraft.trim()); setSettings(false); }}>
+                  <form onSubmit={(e) => { e.preventDefault(); const next = baseDraft.trim(); if (next !== base) { ++overviewRequest.current; ++flockRequest.current; setOverviewBase(null); setFlockSnapshot(null); setFlockId(""); setSelected(null); setInspectId(null); setEvents([]); setBase(next); } setSettings(false); }}>
                     <label className="mb-1.5 block text-[10px] uppercase tracking-widest text-muted-foreground" htmlFor="api-base">API base</label>
                     <div className="flex gap-2"><Input id="api-base" placeholder="Relative to this app" value={baseDraft} onChange={(e) => setBaseDraft(e.target.value)} /><Btn variant="outline" type="submit">Set</Btn></div>
                   </form>
@@ -177,12 +202,13 @@ export function Console() {
         </div>
       </header>
 
-      <nav className="fixed inset-x-0 bottom-0 z-40 grid grid-cols-7 border-t border-border/60 bg-background/95 px-1 pt-1 pb-[calc(4px+env(safe-area-inset-bottom))] backdrop-blur-xl xl:hidden" aria-label="Mobile console views">
+      <nav className="fixed inset-x-0 bottom-0 z-40 grid grid-cols-8 border-t border-border/60 bg-background/95 px-1 pt-1 pb-[calc(4px+env(safe-area-inset-bottom))] backdrop-blur-xl xl:hidden" aria-label="Mobile console views">
         {TABS.map(({ id, label, icon: Icon }) => <Btn key={id} onClick={() => { setTab(id); setSettings(false); }} aria-current={tab === id ? "page" : undefined} className={`h-14 min-w-0 flex-col gap-1 px-0 text-[8px] ${tab === id ? "text-foreground" : "text-muted-foreground"}`}><Icon className={`h-4 w-4 shrink-0 ${tab === id ? "text-busy" : ""}`} /><span>{label}</span></Btn>)}
       </nav>
 
       <main className={tab === "topology" ? "p-2 md:p-3 lg:p-4" : "mx-auto min-w-0 max-w-[1500px] px-3 py-5 sm:px-5 lg:px-8 lg:py-9"}>
         {tab === "topology" && <TopologyView key={flockId} ctx={ctx} flocks={flocks.flocks} flockError={flockError} />}
+        {tab === "todos" && <TodosView />}
         {tab === "flocks" && <FlocksView ctx={ctx} state={flocks} setState={setFlocks} refresh={refreshFlocks} error={flockError} />}
         {tab === "fleet" && <FleetView ctx={ctx} />}
         {tab === "sessions" && <SessionsView key={flockId} ctx={ctx} selected={selected} setSelected={setSelected} />}

@@ -282,7 +282,8 @@ Sharing a GPU server or cloud VM with a teammate or guest **never** exposes your
 
 `copilot-flock` also includes a full interactive React + Vite + Tailwind **Fleet Console UI** in [`viewer/`](./viewer/) (`npm run dev` or `node viewer/viewer-server.mjs`):
 - **Flocks View & Header Switcher**: Inspect `<owner>`, `<owner>/personal`, `<owner>/work`, collaborator teams, and guest passes with live countdown badges.
-- **Interactive Topology & Overlap Matrix (`TopologyView.tsx` & `FlockOverlap.tsx`)**: Switch between Orbital, Mesh, Bipartite Ribbon Graph, and Matrix views in both Dark and Warm-Alabaster Light themes.
+- **Authoritative live memberships**: The live membership endpoint projects only the authority's owned/joined rosters, including empty flocks. It never creates teams, guest passes, or memberships from machine discovery; missing or incomplete authority data is reported as unavailable. While live authority is loading or unavailable, selectors, active-flock cards and membership-filtered views remain empty rather than using preview memberships. Responses from a previous API source are discarded; fixtures are used only in preview mode.
+- **Interactive Topology & Overlap Matrix (`TopologyView.tsx` & `FlockOverlap.tsx`)**: Switch between Orbital, Mesh, spatial Flocks, and Matrix views in both Dark and Warm-Alabaster Light themes. The Flocks field encloses machine nodes with membership contours; separate outlines avoid enclosing nonmembers when groups overlap. Numbered legend entries and machine badges identify exact memberships, with keyboard selection and a scrollable field on narrow screens. The separate Flocks membership table remains available for an exact matrix.
 - **1-Click Invite Generator, Shared Thread Audit & Instant Kick**: Generate copy-pasteable `copilot-flock-invite-v3` prompts, audit opted-in threads, and inspect 7/7 Ed25519 governance votes.
 
 ---

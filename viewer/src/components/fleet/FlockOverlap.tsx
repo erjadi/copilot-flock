@@ -1,6 +1,7 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Layers, ShieldCheck, X } from "lucide-react";
 import { flockMemberships, type Flock } from "@/lib/fleet/flocks";
+import { membershipField } from "@/lib/fleet/membership-layout";
 import { Btn, IconBtn } from "./ui";
 
 const tones = { owner_root: "flock-root", owner_scope: "flock-personal", collaborator: "flock-team", guest: "flock-guest" };
@@ -27,32 +28,49 @@ export function FlockOverlapMatrix({ flocks, error }: { flocks: Flock[]; error?:
   </section>;
 }
 
-export function FlockMembershipGraph({ flocks, W, H, portrait, error }: { flocks: Flock[]; W: number; H: number; portrait: boolean; error?: string | null }) {
-  const [selected, setSelected] = useState<string | null>(null);
+export function FlockMembershipGraph({ flocks, error }: { flocks: Flock[]; error?: string | null }) {
+  const [selected, setSelected] = useState<{ kind: "machine" | "flock"; id: string } | null>(null);
+  const fieldRef = useRef<HTMLDivElement>(null);
+  const [width, setWidth] = useState(900);
+  useEffect(() => {
+    const el = fieldRef.current;
+    if (!el) return;
+    const observer = new ResizeObserver(([entry]) => { if (entry?.contentRect.width) setWidth(entry.contentRect.width); });
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, []);
   const rows = flockMemberships(flocks);
-  const scopes = flocks.filter((f) => f.kind !== "owner_root");
-  const roots = flocks.filter((f) => f.kind === "owner_root");
-  const left = portrait ? 30 : 110, right = portrait ? W - 185 : W - 320;
-  const top = portrait ? 205 : 180, bottom = H - (portrait ? 240 : 145);
-  const y = (i: number, n: number) => top + i * (bottom - top) / Math.max(1, n - 1);
-  const machine = rows.find((r) => r.machineId === selected);
-  const flock = flocks.find((f) => f.flockId === selected);
-  if (error || !rows.length) return <div className="grid h-full place-items-center px-6 text-center text-xs text-muted-foreground" role="status">{error ? "Flock membership unavailable." : "No active memberships"}</div>;
-  return <>
-    <svg viewBox={`0 0 ${W} ${H}`} className="h-full w-full" role="img" aria-label="All flocks and overlapping machine memberships">
-      <g transform={`translate(${portrait ? 24 : 90},105)`}><text className="fill-muted-foreground font-mono text-[11px]">ALL FLOCKS / MEMBERSHIP</text>{roots.map((f, i) => <g key={f.flockId} role="button" tabIndex={0} aria-label={`Highlight flock ${f.flockId}`} onClick={() => setSelected(f.flockId)} onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") setSelected(f.flockId); }} className="cursor-pointer"><rect y={17 + i * 32} width={W - (portrait ? 48 : 180)} height={30} rx={6} fill="var(--panel)" stroke="var(--border)" /><text x={12} y={37 + i * 32} className="fill-foreground font-mono text-[12px]">{f.flockId} · owner root · {rows.filter((r) => r.memberships.includes(f)).length} machines</text></g>)}</g>
-      {scopes.flatMap((f, i) => rows.flatMap((r, j) => {
-        if (!r.memberships.includes(f)) return [];
-        const focused = !selected || selected === f.flockId || selected === r.machineId || (flock?.kind === "owner_root" && r.memberships.includes(flock));
-        return <path key={`${f.flockId}:${r.machineId}`} d={`M ${left + 12} ${y(i, scopes.length)} C ${W * 0.43} ${y(i, scopes.length)}, ${W * 0.43} ${y(j, rows.length)}, ${right} ${y(j, rows.length)}`} fill="none" stroke={color(f)} strokeWidth={selected && focused ? 2.5 : 1.3} strokeOpacity={focused ? 0.5 : 0.07} />;
-      }))}
-      {scopes.map((f, i) => <g key={f.flockId} transform={`translate(${left},${y(i, scopes.length)})`} role="button" tabIndex={0} aria-label={`Highlight flock ${f.flockId}`} onClick={() => setSelected(selected === f.flockId ? null : f.flockId)} onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") setSelected(f.flockId); }} className="cursor-pointer outline-none"><title>{f.flockId}</title><rect x={-12} y={-22} width={portrait ? 125 : 200} height={64} rx={6} fill="var(--panel)" stroke={color(f)} strokeOpacity={selected === f.flockId ? 1 : 0.25} /><circle r={4} fill={color(f)} /><text x={12} y={4} className={`fill-foreground font-mono ${portrait ? "text-[14px]" : "text-[14px]"}`}>{f.kind === "guest" ? "Guest pass" : shortName(f)}</text><text x={12} y={23} className="fill-muted-foreground font-mono text-[10px]">{f.kind === "guest" ? shortName(f) : portrait ? f.trustTier : `${rows.filter((r) => r.memberships.includes(f)).length} machines · ${f.trustTier}`}</text></g>)}
-      {rows.map((r, i) => {
-        const groups = r.memberships.filter((f) => f.kind !== "owner_root");
-        const focused = !selected || selected === r.machineId || r.memberships.some((f) => f.flockId === selected);
-        return <g key={r.machineId} transform={`translate(${right},${y(i, rows.length)})`} opacity={focused ? 1 : 0.25} role="button" tabIndex={0} aria-label={`Highlight memberships for ${r.machineId}`} onClick={() => setSelected(selected === r.machineId ? null : r.machineId)} onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") setSelected(r.machineId); }} className="cursor-pointer outline-none"><title>{r.memberships.map((f) => f.flockId).join(" · ")}</title><circle r={portrait ? 13 : 12} fill="var(--panel)" stroke="var(--border)" />{groups.map((f, k) => <circle key={f.flockId} r={portrait ? 16 : 15} fill="none" stroke={color(f)} strokeWidth={3} strokeDasharray={`${2 * Math.PI * (portrait ? 16 : 15) / groups.length - 3} ${2 * Math.PI * (portrait ? 16 : 15)}`} transform={`rotate(${k * 360 / groups.length - 90})`} />)}<circle r={3} fill={r.overlap ? "var(--busy)" : "var(--muted-foreground)"} /><text x={24} y={2} className={`fill-foreground font-mono ${portrait ? "text-[14px]" : "text-[13px]"}`}>{r.machineId}</text><text x={24} y={18} className="fill-muted-foreground font-mono text-[9px]">{groups.length} {groups.length === 1 ? "scope" : "scopes"}{r.overlap ? " · overlap" : ""}</text></g>;
-      })}
-    </svg>
-    <div className="absolute inset-x-4 bottom-4 flex min-w-0 items-start gap-3 rounded-lg border border-border/60 bg-glass p-3 text-[11px] leading-5 md:inset-x-8 md:bottom-6" role="status"><ShieldCheck className="mt-1 h-4 w-4 shrink-0 text-online" /><div className="min-w-0 flex-1">{selected ? <><div className="break-all font-mono font-medium">{selected}</div><div className="break-words text-muted-foreground">{machine ? machine.memberships.map((f) => f.flockId).join(" · ") : rows.filter((r) => r.memberships.includes(flock as Flock)).map((r) => r.machineId).join(" · ")}</div></> : <div><span className="font-medium">{rows.filter((r) => r.overlap).length} overlap machines</span><span className="text-muted-foreground"> · {flocks.length} flocks · {rows.length} machines</span></div>}<div className="text-muted-foreground">Membership ≠ thread sharing · explicit opt-in for external flocks</div></div>{selected && <IconBtn aria-label="Clear membership selection" onClick={() => setSelected(null)}><X className="h-3.5 w-3.5" /></IconBtn>}</div>
-  </>;
+  const machine = selected?.kind === "machine" ? rows.find((r) => r.machineId === selected.id) : undefined;
+  const flock = selected?.kind === "flock" ? flocks.find((f) => f.flockId === selected.id) : undefined;
+  const active = machine || flock ? selected : null;
+  const field = membershipField(rows, flocks.map((f) => f.flockId), width);
+  const toggle = (kind: "machine" | "flock", id: string) => setSelected(active?.kind === kind && active.id === id ? null : { kind, id });
+  const focusedFlock = (id: string) => !active || flock?.flockId === id || !!machine?.memberships.some((f) => f.flockId === id);
+  return <div className="absolute inset-x-3 bottom-3 top-[76px] flex min-h-0 flex-col gap-3 md:inset-x-6 md:bottom-5" aria-label="Spatial flock memberships">
+    <div ref={fieldRef} className="min-h-0 flex-1 overflow-auto overscroll-contain rounded-lg focus-visible:outline-2 focus-visible:outline-ring" role="region" aria-label="Flock membership field and legend" tabIndex={0}>
+      {error || !rows.length ? <p role="status" className="p-6 text-center text-xs text-muted-foreground">{error ? "Flock membership unavailable." : "No active memberships"}</p> : <>
+        <div className="flex flex-wrap gap-2 p-1" aria-label="Flock legend">
+          {flocks.map((f, i) => <button key={f.flockId} type="button" aria-pressed={flock === f} aria-label={`Highlight flock ${f.flockId}`} onClick={() => toggle("flock", f.flockId)} className="min-w-0 max-w-full rounded-lg border bg-panel px-3 py-2 text-left text-[11px] focus-visible:outline-2 focus-visible:outline-ring" style={{ borderColor: color(f), opacity: focusedFlock(f.flockId) ? 1 : 0.45 }}>
+            <span className="flex items-start gap-2"><span className="font-mono font-semibold" style={{ color: color(f) }}>{i + 1}</span><span className="min-w-0"><span className="block break-all font-mono">{f.flockId}</span><span className="text-muted-foreground">{rows.filter((r) => r.memberships.includes(f)).length} machines · {f.kind === "owner_root" ? "owner root" : f.trustTier}</span></span></span>
+          </button>)}
+        </div>
+        <p className="px-1 pt-2 text-[10px] leading-4 text-muted-foreground">Contours and numbered badges show membership. Separate outlines keep nonmembers outside a flock.</p>
+        <div className="relative" style={{ width: field.width, height: field.height }}>
+          <svg width={field.width} height={field.height} className="pointer-events-none absolute inset-0" aria-hidden="true">
+            {field.contours.map((contour, i) => <g key={contour.flockId} opacity={focusedFlock(contour.flockId) ? 1 : 0.12}>{contour.paths.map((d, j) => <path key={j} d={d} fill={color(flocks[i])} fillOpacity={0.035} stroke={color(flocks[i])} strokeWidth={active && focusedFlock(contour.flockId) ? 2.5 : 1.4} strokeOpacity={0.65} strokeLinejoin="round" strokeDasharray={flocks[i].kind === "owner_root" ? "5 5" : undefined} />)}</g>)}
+          </svg>
+          {field.nodes.map((n) => {
+            const row = rows.find((r) => r.machineId === n.machineId)!;
+            const focused = !active || machine?.machineId === n.machineId || !!flock && row.memberships.includes(flock);
+            return <button key={n.machineId} type="button" aria-pressed={machine?.machineId === n.machineId} aria-label={`Highlight memberships for ${n.machineId}: ${row.memberships.map((f) => f.flockId).join(", ")}`} onClick={() => toggle("machine", n.machineId)} className="absolute flex flex-col items-center justify-center gap-1 rounded-2xl border border-border bg-panel px-2 text-center focus-visible:outline-2 focus-visible:outline-ring" style={{ left: n.x, top: n.y, width: n.width, height: n.height, opacity: focused ? 1 : 0.35 }}>
+              <span className="w-full break-all font-mono text-[11px] leading-4">{n.machineId}</span>
+              <span className="flex max-w-full flex-wrap justify-center gap-1" aria-hidden="true">{row.memberships.map((f) => <span key={f.flockId} className="rounded border px-1 font-mono text-[9px]" style={{ color: color(f), borderColor: color(f) }}>{flocks.indexOf(f) + 1}</span>)}</span>
+              {row.overlap && <span className="text-[9px] text-muted-foreground">Overlapping memberships</span>}
+            </button>;
+          })}
+        </div>
+      </>}
+    </div>
+    {!error && rows.length > 0 && <div className="flex max-h-[35%] shrink-0 items-start gap-3 overflow-auto rounded-lg border border-border/60 bg-glass p-3 text-[11px] leading-5" role="status"><ShieldCheck className="mt-1 h-4 w-4 shrink-0 text-online" /><div className="min-w-0 flex-1">{active ? <><div className="break-all font-mono font-medium">{active.id}</div><div className="break-words text-muted-foreground">{machine ? machine.memberships.map((f) => f.flockId).join(" · ") : rows.filter((r) => flock && r.memberships.includes(flock)).map((r) => r.machineId).join(" · ") || "No active memberships"}</div></> : <div><span className="font-medium">{rows.filter((r) => r.overlap).length} overlap machines</span><span className="text-muted-foreground"> · {flocks.length} flocks · {rows.length} machines</span></div>}<div className="text-muted-foreground">Membership ≠ thread sharing · explicit opt-in for external flocks</div></div>{active && <IconBtn aria-label="Clear membership selection" onClick={() => setSelected(null)}><X className="h-3.5 w-3.5" /></IconBtn>}</div>}
+  </div>;
 }

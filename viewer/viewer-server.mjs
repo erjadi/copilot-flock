@@ -12,6 +12,8 @@ import path from "node:path";
 import http from "node:http";
 import crypto from "node:crypto";
 import { fileURLToPath } from "node:url";
+import { handleTodoRequest } from "./todo-api.mjs";
+import { authoritativeFlocks } from "./flock-roster.mjs";
 
 import {
   BRIDGE_VERSION,
@@ -714,6 +716,7 @@ const MIME_TYPES = {
 };
 
 const server = http.createServer(async (req, res) => {
+  if (await handleTodoRequest(req, res)) return;
   if (req.method === "OPTIONS") {
     res.writeHead(204, {
       "Access-Control-Allow-Origin": "*",
@@ -1400,127 +1403,8 @@ const server = http.createServer(async (req, res) => {
   // 8d. GET /api/v3/my-flocks — Multi-Flock Roster & Hierarchy
   if (url.pathname === "/api/v3/my-flocks" && req.method === "GET") {
     try {
-      if (fleetCache.members.length === 0) {
-        await refreshFleetState();
-      }
-      const raw = callBootstrapV3Endpoint(cfg, "/my-flocks", { method: "GET" }) || {};
-      const byId = new Map();
-      for (const f of [...(raw.ownedFlocks || []), ...(raw.joinedFlocks || [])]) {
-        if (!f || !f.flockId || byId.has(f.flockId)) continue;
-        const kind =
-          f.flockType === "owner_root"
-            ? "owner_root"
-            : f.flockType === "owner_scope"
-            ? "owner_scope"
-            : f.targetMachineId
-            ? "guest"
-            : "collaborator";
-        const trustTier =
-          f.ownerGitHubUser?.toLowerCase() === (cfg.githubUser || "erjadi").toLowerCase() &&
-          (kind === "owner_root" || kind === "owner_scope")
-            ? "owner"
-            : kind === "guest"
-            ? "guest"
-            : "collaborator";
-        byId.set(f.flockId, {
-          flockId: f.flockId,
-          flockUuid: f.flockUuid,
-          hubName: f.hubName,
-          rosterEpoch: Number(f.rosterEpoch) || 1,
-          kind,
-          trustTier,
-          sessionVisibility: trustTier === "owner" ? "all" : "explicit_opt_in_only",
-          members: Array.isArray(f.members)
-            ? f.members.map((m) => ({
-                machineId: m.machineId,
-                peerId: m.peerId,
-                membershipExpiresAt: m.membershipExpiresAt || null,
-              }))
-            : [],
-        });
-      }
-      const owner = (cfg.githubUser || "erjadi").toLowerCase();
-      const toMember = (m, expiresAt = null) => ({
-        machineId: m.machineId,
-        peerId: `${owner}:${m.specs?.keyFingerprint || crypto.createHash("sha256").update(m.machineId).digest("hex").slice(0, 32)}`,
-        membershipExpiresAt: expiresAt,
-      });
-      const gpuOrWorkMembers = fleetCache.members.filter(
-        (m) =>
-          m.scope === "work" ||
-          (Array.isArray(m.specs?.gpus) && m.specs.gpus.some((g) => (Number(g.vramGb) || 0) >= 8))
-      );
-      const guestTargetMachine =
-        fleetCache.members.find((m) => m.scope === "work" && m.online) ||
-        fleetCache.members.find((m) => m.scope === "work") ||
-        fleetCache.members[0];
-      const guestMachineId = guestTargetMachine?.machineId || "CLOUD-DEV-VM";
-      const builtIns = [
-        {
-          flockId: owner,
-          flockUuid: "00000000-0000-4000-8000-000000000001",
-          hubName: "v3_flock_00000000000040008000000000000001",
-          rosterEpoch: 7,
-          kind: "owner_root",
-          trustTier: "owner",
-          sessionVisibility: "all",
-          members: fleetCache.members.map((m) => toMember(m)),
-        },
-        {
-          flockId: `${owner}/personal`,
-          flockUuid: "00000000-0000-4000-8000-000000000002",
-          hubName: "v3_flock_00000000000040008000000000000002",
-          rosterEpoch: 5,
-          kind: "owner_scope",
-          trustTier: "owner",
-          sessionVisibility: "all",
-          members: fleetCache.members.filter((m) => m.scope === "personal").map((m) => toMember(m)),
-        },
-        {
-          flockId: `${owner}/work`,
-          flockUuid: "00000000-0000-4000-8000-000000000003",
-          hubName: "v3_flock_00000000000040008000000000000003",
-          rosterEpoch: 3,
-          kind: "owner_scope",
-          trustTier: "owner",
-          sessionVisibility: "all",
-          members: fleetCache.members.filter((m) => m.scope === "work").map((m) => toMember(m)),
-        },
-        {
-          flockId: `${owner}/studio-team`,
-          flockUuid: "00000000-0000-4000-8000-000000000004",
-          hubName: "v3_flock_00000000000040008000000000000004",
-          rosterEpoch: 2,
-          kind: "collaborator",
-          trustTier: "collaborator",
-          sessionVisibility: "explicit_opt_in_only",
-          members: gpuOrWorkMembers.map((m) => toMember(m)),
-        },
-        {
-          flockId: `${owner}/work/${guestMachineId}`,
-          flockUuid: "00000000-0000-4000-8000-000000000005",
-          hubName: "v3_flock_00000000000040008000000000000005",
-          rosterEpoch: 1,
-          kind: "guest",
-          trustTier: "guest",
-          sessionVisibility: "explicit_opt_in_only",
-          members: fleetCache.members
-            .filter((m) => m.machineId === guestMachineId)
-            .map((m) => toMember(m, new Date(Date.now() + 120 * 60000).toISOString())),
-        },
-      ];
-      for (const bf of builtIns) {
-        if (!byId.has(bf.flockId)) {
-          byId.set(bf.flockId, bf);
-        } else {
-          const existing = byId.get(bf.flockId);
-          const haveIds = new Set(existing.members.map((m) => m.machineId));
-          for (const m of bf.members) {
-            if (!haveIds.has(m.machineId)) existing.members.push(m);
-          }
-        }
-      }
-      sendJson(res, 200, { ok: true, flocks: Array.from(byId.values()) });
+      const raw = callBootstrapV3Endpoint(cfg, "/my-flocks", { method: "GET" });
+      sendJson(res, 200, { ok: true, flocks: authoritativeFlocks(raw, cfg.githubUser) });
     } catch (err) {
       sendJson(res, 502, { ok: false, error: err.message });
     }
