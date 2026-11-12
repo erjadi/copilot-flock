@@ -52,6 +52,7 @@ function runAz(args) {
       : args;
     return execFileSync(command, argv, {
       encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: 600000,
+      windowsHide: true,
       maxBuffer: 1024 * 1024,
       env: { ...process.env, COPILOT_FLOCK_AZ_ARGS: JSON.stringify(args) },
     });

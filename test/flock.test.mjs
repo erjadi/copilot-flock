@@ -6549,6 +6549,53 @@ test("fleet runtime staging rejects omitted modules, partial copies, interrupted
   }
 });
 
+test("canonical and compatibility release extraction hide native git subprocesses", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "flock-hidden-review-"));
+  const repo = path.join(root, "repo");
+  fs.mkdirSync(repo);
+  const git = (args) => execFileSync("git", args, {
+    cwd: repo, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], windowsHide: true,
+  }).trim();
+  try {
+    git(["init", "--quiet"]);
+    fs.writeFileSync(path.join(repo, "candidate.mjs"), "export const candidate = true;\n");
+    git(["add", "candidate.mjs"]);
+    git(["-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+      "-c", "commit.gpgsign=false", "commit", "--quiet", "-m", "synthetic candidate"]);
+    const commit = git(["rev-parse", "HEAD"]);
+    const script = `
+import assert from "node:assert/strict";
+import cp from "node:child_process";
+import { syncBuiltinESMExports } from "node:module";
+const spawn = cp.spawn;
+const calls = [];
+cp.spawn = (command, args, options) => {
+  assert.equal(options.windowsHide, true);
+  calls.push([command, args]);
+  return spawn(command, args, options);
+};
+syncBuiltinESMExports();
+for (const [index, entry] of ${JSON.stringify([
+      new URL("../flock.mjs", import.meta.url).href,
+      new URL("../bridge.mjs", import.meta.url).href,
+    ])}.entries()) {
+  const { extractCandidateFixtureFromGit } = await import(entry);
+  await extractCandidateFixtureFromGit(${JSON.stringify(repo)}, ${JSON.stringify(commit)},
+    ${JSON.stringify(path.join(root, "fixture-"))} + index);
+}
+assert.equal(calls.length, 4);
+assert.ok(calls.every(([command]) => command === "git"));
+assert.deepEqual(calls.map(([, args]) => args[2]), ["ls-tree", "cat-file", "ls-tree", "cat-file"]);
+`;
+    const result = spawnSync(process.execPath, ["--input-type=module", "-e", script], {
+      encoding: "utf8", timeout: 15000, windowsHide: true,
+    });
+    assert.equal(result.status, 0, result.stderr);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("release voter extracts complete modular dependency closure into isolated fixture and produces signed machine-readable ballots across pass, missing-module, failure, timeout, and infrastructure errors", async () => {
   const env = setupTempCopilotEnv();
   const prevCopilotHome = process.env.COPILOT_HOME;

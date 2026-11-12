@@ -39,6 +39,38 @@ function adapters(overrides = {}) {
   };
 }
 
+test("managed Azure native helper hides every credential subprocess without provisioning", () => {
+  const script = `
+import assert from "node:assert/strict";
+import cp from "node:child_process";
+import { syncBuiltinESMExports } from "node:module";
+let calls = 0;
+cp.execFileSync = (command, argv, options) => {
+  assert.equal(options.windowsHide, true);
+  assert.deepEqual(options.stdio, ["ignore", "pipe", "pipe"]);
+  const args = process.platform === "win32" ? JSON.parse(options.env.COPILOT_FLOCK_AZ_ARGS) : argv;
+  assert.equal(command, process.platform === "win32" ? "powershell.exe" : "az");
+  calls++;
+  return JSON.stringify({ primaryConnectionString: args[0] === "signalr"
+    ? ${JSON.stringify(signalr)}
+    : ${JSON.stringify(serviceBus)}.replace("RootManageSharedAccessKey", args[args.indexOf("--name") + 1]) });
+};
+syncBuiltinESMExports();
+const { runManagedSetup } = await import(${JSON.stringify(new URL("../managed-azure-setup.mjs", import.meta.url).href)});
+let installed = false;
+await runManagedSetup(${JSON.stringify(outputs({ webAppName: "", bootstrapUrl: "" }))},
+  ${JSON.stringify({ ...options, legacyBroker: false })}, {
+    install: async () => { installed = true; return {}; },
+  });
+assert.equal(calls, 4);
+assert.equal(installed, true);
+`;
+  const result = spawnSync(process.execPath, ["--input-type=module", "-e", script], {
+    encoding: "utf8", timeout: 15000, windowsHide: true,
+  });
+  assert.equal(result.status, 0, result.stderr);
+});
+
 test("complete conditional ARM stack wires runtime, credentials, persistent storage, identity and namespace role", () => {
   const template = JSON.parse(fs.readFileSync(path.join(root, "infra", "azuredeploy.json"), "utf8"));
   assert.equal(template.parameters.deployTokenBroker.defaultValue, false);

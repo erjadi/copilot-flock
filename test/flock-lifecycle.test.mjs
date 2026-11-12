@@ -879,6 +879,29 @@ test("Linux systemd unit generation sets KillMode=process and persistence avoids
   } finally { f.close(); }
 });
 
+test("background session spawns enforce windowsHide after caller options without mutating them", () => {
+  for (const platform of ["win32", "linux", "darwin"]) {
+    for (const supplied of [undefined, false, true]) {
+      const options = Object.freeze({ cwd: os.tmpdir(), detached: true,
+        stdio: "ignore", env: { SYNTHETIC: "yes" }, windowsHide: supplied });
+      let actual;
+      const child = spawnSessionSafeProcess("synthetic-command", ["argument"], options, {
+        platform, uid: 1000,
+        read: () => "0::/user.slice/user-1000.slice/user@1000.service/app.slice/terminal.scope\n",
+        spawnImpl: (command, args, received) => {
+          actual = { command, args, received };
+          return { pid: 123 };
+        },
+      });
+      assert.equal(child.pid, 123);
+      assert.equal(actual.command, "synthetic-command");
+      assert.deepEqual(actual.args, ["argument"]);
+      assert.deepEqual(actual.received, { ...options, windowsHide: true });
+      assert.equal(options.windowsHide, supplied);
+    }
+  }
+});
+
 test("outside-cgroup child supervision wraps Linux service children in transient user scopes", () => {
   const serviceCgroup = "0::/user.slice/user-1000.slice/user@1000.service/app.slice/copilot-flock.service\n";
   const scopeCgroup = "0::/user.slice/user-1000.slice/user@1000.service/app.slice/terminal.scope\n";
@@ -915,6 +938,7 @@ test("outside-cgroup child supervision wraps Linux service children in transient
     },
   });
   assert.equal(spawnedCall.cmd, "systemd-run");
+  assert.equal(spawnedCall.opts.windowsHide, true);
   assert.equal(child.outsideCgroupSupervision.mode, "systemd-transient-scope");
 
   const alreadyOutside = prepareOutsideLinuxServiceCgroupSpawn("/usr/bin/copilot", ["-p", "hello"], {

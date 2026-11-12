@@ -2986,7 +2986,7 @@ export function collectLocalMachineSpecs() {
       const nvOut = execFileSync(
         "nvidia-smi",
         ["--query-gpu=name,memory.total", "--format=csv,noheader,nounits"],
-        { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 4000 }
+        { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 4000, windowsHide: true }
       ).trim();
       if (nvOut) {
         for (const line of nvOut.split(/\r?\n/)) {
@@ -3005,6 +3005,7 @@ export function collectLocalMachineSpecs() {
           encoding: "utf8",
           stdio: ["ignore", "pipe", "ignore"],
           timeout: 3000,
+          windowsHide: true,
         });
         for (const line of lspciOut.split(/\r?\n/)) {
           if (/VGA compatible controller|3D controller|Display controller/i.test(line)) {
@@ -3021,6 +3022,7 @@ export function collectLocalMachineSpecs() {
         encoding: "utf8",
         stdio: ["ignore", "pipe", "ignore"],
         timeout: 3000,
+        windowsHide: true,
       }).trim();
       const disks = [];
       for (const line of dfOut.split(/\r?\n/).slice(1)) {
@@ -6088,6 +6090,7 @@ function listCandidateDesktopLoopbackPorts({ excludePort = null } = {}) {
         encoding: "utf8",
         stdio: ["ignore", "pipe", "ignore"],
         timeout: 1500,
+        windowsHide: true,
       });
       for (const line of lsofOut.split(/\r?\n/)) {
         if (!/\b(github|copilot)/i.test(line)) continue;
@@ -16094,7 +16097,7 @@ export function checkBootPersistenceStatus({ passive = false } = {}) {
           const out = execFileSync(
             "systemctl",
             ["--user", "is-active", unitName],
-            { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 3000 }
+            { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 3000, windowsHide: true }
           ).trim();
           active = out === "active";
         } catch {}

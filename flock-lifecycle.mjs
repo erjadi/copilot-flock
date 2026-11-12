@@ -154,7 +154,7 @@ export function inspectProcess(pid, platform = process.platform) {
       return text ? JSON.parse(text) : null;
     }
     const text = execFileSync("ps", ["-p", String(pid), "-o", "lstart=", "-o", "command="],
-      { encoding: "utf8", timeout: 5000, stdio: ["ignore", "pipe", "pipe"] }).trim();
+      { encoding: "utf8", timeout: 5000, stdio: ["ignore", "pipe", "pipe"], windowsHide: true }).trim();
     return text ? { pid, start: text.slice(0, 24), executable: process.execPath,
       command: text.slice(25).trim() } : null;
   } catch (error) {
@@ -245,8 +245,8 @@ let cachedTransientScopeSupport = null;
 
 export function probeLinuxTransientScopeSupport({ exec = execFileSync } = {}) {
   try {
-    exec("systemd-run", ["--user", "--version"], { stdio: "ignore", timeout: 3000 });
-    exec("systemctl", ["--user", "show-environment"], { stdio: "ignore", timeout: 3000 });
+    exec("systemd-run", ["--user", "--version"], { stdio: "ignore", timeout: 3000, windowsHide: true });
+    exec("systemctl", ["--user", "show-environment"], { stdio: "ignore", timeout: 3000, windowsHide: true });
     return true;
   } catch {
     return false;
@@ -312,7 +312,7 @@ export function prepareOutsideLinuxServiceCgroupSpawn(command, args = [], {
 export function spawnSessionSafeProcess(command, args = [], spawnOptions = {}, supervisionOptions = {}) {
   const spec = prepareOutsideLinuxServiceCgroupSpawn(command, args, supervisionOptions);
   const spawnFn = supervisionOptions.spawnImpl || spawn;
-  const child = spawnFn(spec.command, spec.args, spawnOptions);
+  const child = spawnFn(spec.command, spec.args, { ...spawnOptions, windowsHide: true });
   if (child && typeof child === "object") child.outsideCgroupSupervision = spec;
   return child;
 }
@@ -434,7 +434,7 @@ function removeEmptyParents(filename, stop) {
 
 function queryUserSystemd(args) {
   return execFileSync("systemctl", ["--user", ...args], {
-    encoding: "utf8", timeout: 6000, stdio: ["ignore", "pipe", "pipe"],
+    encoding: "utf8", timeout: 6000, stdio: ["ignore", "pipe", "pipe"], windowsHide: true,
   });
 }
 
@@ -499,8 +499,8 @@ export function configureLinuxSystemdPersistence(targetScript, paths = lifecycle
   strict = false,
   execPath = process.execPath,
   query = queryUserSystemd,
-  checkLinger = (user) => execFileSync("loginctl", ["show-user", user, "-p", "Linger", "--value"], { encoding: "utf8", timeout: 4000 }),
-  enableLinger = (user) => execFileSync("sudo", ["-n", "loginctl", "enable-linger", user], { stdio: "ignore", timeout: 4000 }),
+  checkLinger = (user) => execFileSync("loginctl", ["show-user", user, "-p", "Linger", "--value"], { encoding: "utf8", timeout: 4000, windowsHide: true }),
+  enableLinger = (user) => execFileSync("sudo", ["-n", "loginctl", "enable-linger", user], { stdio: "ignore", timeout: 4000, windowsHide: true }),
   username = () => os.userInfo().username,
 } = {}) {
   if (paths.platform !== "linux") return null;
@@ -1011,7 +1011,7 @@ export async function disablePersistence(filename, paths, { query = queryUserSys
     query(["disable", path.basename(filename)]);
   } else if (paths.platform === "darwin") {
     execFileSync("launchctl", ["bootout", `gui/${process.getuid()}`, filename],
-      { timeout: 6000, stdio: ["ignore", "pipe", "pipe"] });
+      { timeout: 6000, stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
   }
 }
 
@@ -1074,7 +1074,7 @@ ConvertTo-Json -InputObject @($found) -Compress`], {
   }
   if (!Number.isSafeInteger(uid) || uid < 0) throw new Error("Cannot establish process ownership for runtime cleanup");
   const pids = paths.platform === "linux" ? readdir("/proc").filter((id) => /^\d+$/.test(id)).map(Number)
-    : execFileSync("ps", ["-axo", "uid=,pid="], { encoding: "utf8", timeout: 5000 }).split("\n")
+    : execFileSync("ps", ["-axo", "uid=,pid="], { encoding: "utf8", timeout: 5000, windowsHide: true }).split("\n")
       .map((line) => /^\s*(\d+)\s+(\d+)\s*$/.exec(line)).filter((match) => match && Number(match[1]) === uid)
       .map((match) => Number(match[2]));
   const results = [];

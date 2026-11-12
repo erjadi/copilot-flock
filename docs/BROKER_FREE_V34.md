@@ -121,6 +121,12 @@ skill and boot persistence; it does not automatically create privileged
 coordinator sessions or install the legacy topology skill. Strict Linux
 installation requires previously approved user lingering.
 
+Background native subprocesses, including Azure setup helpers, use
+`windowsHide: true`. The shared session/daemon spawn wrapper enforces this
+after caller options, without changing stdio, detachment or Linux supervision.
+This hides console windows, not application UI: explicitly requested Azure
+browser/device-code sign-in and installer consent remain interactive.
+
 Queue persistence precedes SignalR delivery. Durable replay admission records
 quarantine before effects, checks authorization before and after awaits,
 and does not automatically repeat ambiguous dispatch. A crashed receive lock
