@@ -1,6 +1,6 @@
 {
   "name": "copilot-flock",
-  "version": "3.4.1",
+  "version": "3.5.0",
   "license": "Apache-2.0",
   "description": "Zero-dependency cross-machine multi-flock platform for GitHub Copilot Desktop & CLI over Azure SignalR Service (copilot-flock)",
   "type": "module",

@@ -177,7 +177,7 @@ function copyRuntimeModules(sourceDirectory, destinationDirectory, installedEntr
   }
 }
 
-export const BRIDGE_VERSION = "3.4.1";
+export const BRIDGE_VERSION = "3.5.0";
 
 function buildInProcessResidentRuntime() {
   const digest = RUNTIME_MODULE_MANIFEST?.manifestDigest || null;
@@ -3040,7 +3040,6 @@ export function loadConfig({ autoFetchAz = true, refreshSpecs = false, passive =
       configurable: true,
     });
     return brokerFreeResult;
-  }
   }
   if (fs.existsSync(path.join(getBridgeHome(), "broker-free.json"))) {
     throw new Error("Broker-free state requires its explicit protocol config; refusing legacy credential fallback");
@@ -12046,6 +12045,14 @@ export async function executeMcpTool(cfg, name, args = {}, options = {}) {
     const targetFlock = args.flock || cfg.boundFlockId || null;
     if (targetFlock) {
       parseFlockAddress(targetFlock, cfg.githubUser || "erjadi");
+    }
+    if (!options.fetchV3MyFlocks && !options.fetchLegacyMembers) {
+      const hasCfgBootstrap = Boolean(cfg && Object.prototype.hasOwnProperty.call(cfg, "bootstrapUrl"));
+      const baseBoot = hasCfgBootstrap ? cfg.bootstrapUrl : DEFAULT_BOOTSTRAP_URL || undefined;
+      validatePinnedBootstrapOrigin(baseBoot, null, {
+        configPath: cfg?.configPath || null,
+        fieldName: "bootstrapUrl",
+      });
     }
     let onlineMachines = null;
     let liveSignalRSource = null;

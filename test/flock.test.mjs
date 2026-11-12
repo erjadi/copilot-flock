@@ -772,7 +772,7 @@ test(
 
   let wsServer = null;
   try {
-    assert.equal(BRIDGE_VERSION, "3.4.1");
+    assert.equal(BRIDGE_VERSION, "3.5.0");
 
     const hugeSessionId = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
     const eventsPath = env.insertSession({
@@ -6062,7 +6062,14 @@ test("fleet runtime staging rejects omitted modules, partial copies, interrupted
     unpinnedManifest.files["flock.mjs"] = {
       role: "entrypoint",
       sha256: hashRuntimeModule(mutatedFlock),
-      imports: ["./extra-helper.mjs", "./flock-broker-free.mjs", "./flock-lifecycle.mjs", "./flock-protocol.mjs"],
+      imports: [
+        "./extra-helper.mjs",
+        "./flock-broker-free.mjs",
+        "./flock-lifecycle.mjs",
+        "./flock-membership.mjs",
+        "./flock-protocol.mjs",
+        "./flock-registry.mjs",
+      ],
     };
     const sortedEntries = Object.keys(unpinnedManifest.files).sort().map((n) => [
       n, unpinnedManifest.files[n].role, unpinnedManifest.files[n].sha256, [...unpinnedManifest.files[n].imports].sort(),
@@ -6250,7 +6257,7 @@ test("fleet runtime staging rejects omitted modules, partial copies, interrupted
     }
 
     // Diagnose surfaces pending resident restart when resident digest != installed digest
-    const diagBeforeRestart = await diagnoseLocalBridgeState(testCfg, { fix: false });
+    const diagBeforeRestart = await diagnoseLocalBridgeState(testCfg, { fix: false, inDaemonRpc: true });
     assert.equal(diagBeforeRestart.installed.version, "3.5.0-rc1");
     assert.equal(diagBeforeRestart.resident.version, BRIDGE_VERSION);
     assert.equal(diagBeforeRestart.verified.status, "pending_daemon_restart");
@@ -7182,6 +7189,7 @@ test("mcp_self_info tool and self-info CLI report in-memory loadTimeDigest and d
       "flock-protocol.mjs",
       "flock-azure.mjs",
       "flock-broker-free.mjs",
+      "flock-registry.mjs",
     ];
     for (const rel of filesToCopy) {
       fs.copyFileSync(path.join(repoRoot, rel), path.join(installDir, rel));
@@ -7511,6 +7519,7 @@ test("flock_status exposes independent installedOnDisk, residentDaemon, and call
       "flock-lifecycle.mjs",
       "flock-membership.mjs",
       "flock-protocol.mjs",
+      "flock-registry.mjs",
     ]) {
       fs.copyFileSync(path.join(repoRoot, modName), path.join(flockDir, modName));
     }

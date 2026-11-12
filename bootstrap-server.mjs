@@ -1944,7 +1944,7 @@ export function createBootstrapServer({
     sendJson(res, 200, {
       ok: true,
       service: "copilot-flock-bootstrap",
-      version: "3.4.0",
+      version: "3.5.0",
       allowedRepo: ALLOWED_REPO,
       hub: DEFAULT_HUB,
       serviceBusNamespace: SERVICEBUS_NAMESPACE,

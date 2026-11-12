@@ -1,7 +1,7 @@
 {
   "type": "copilot-flock-runtime-manifest-v1",
   "schema": 1,
-  "version": "3.4.1",
+  "version": "3.5.0",
   "entrypoints": [
     "flock.mjs",
     "bridge.mjs"
@@ -9,7 +9,7 @@
   "files": {
     "bridge.mjs": {
       "role": "entrypoint",
-      "sha256": "20be79c87ca9a877671da2f38c914a3f3f3991e5c40bcda4787755bee73c47e4",
+      "sha256": "7f82cd35745dba5f2fed0f3df30c328cab8e37080ff24959962b9a96e98b2a4a",
       "imports": [
         "./flock-broker-free.mjs",
         "./flock-lifecycle.mjs",
@@ -64,7 +64,7 @@
     },
     "flock.mjs": {
       "role": "entrypoint",
-      "sha256": "20be79c87ca9a877671da2f38c914a3f3f3991e5c40bcda4787755bee73c47e4",
+      "sha256": "7f82cd35745dba5f2fed0f3df30c328cab8e37080ff24959962b9a96e98b2a4a",
       "imports": [
         "./flock-broker-free.mjs",
         "./flock-lifecycle.mjs",
@@ -74,5 +74,5 @@
       ]
     }
   },
-  "manifestDigest": "50e2e0521c97fae6bc44196c149f7ee7c39d8ef9cab607baebc689d8a20eff87"
+  "manifestDigest": "917f071b23a12bc66aed805335e9adbaa2d03d9382d4fe2deac01fb3271d36dd"
 }

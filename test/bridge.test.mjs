@@ -709,7 +709,7 @@ test(
 
   let wsServer = null;
   try {
-    assert.equal(BRIDGE_VERSION, "3.4.1");
+    assert.equal(BRIDGE_VERSION, "3.5.0");
 
     const hugeSessionId = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
     const eventsPath = env.insertSession({
@@ -3009,6 +3009,7 @@ test("mcp_self_info tool and self-info CLI report in-memory loadTimeDigest and d
       "flock-protocol.mjs",
       "flock-azure.mjs",
       "flock-broker-free.mjs",
+      "flock-registry.mjs",
     ];
     for (const rel of filesToCopy) {
       fs.copyFileSync(path.join(repoRoot, rel), path.join(installDir, rel));
