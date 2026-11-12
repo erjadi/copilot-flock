@@ -17,7 +17,7 @@ import path from "node:path";
 import https from "node:https";
 import crypto from "node:crypto";
 import { spawn, execFileSync } from "node:child_process";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import {
   uninstallFlock,
   lifecyclePaths,
@@ -7161,172 +7161,7 @@ export async function handleRpcAction(cfg, req) {
   }
 
   if (action === "review_release") {
-    const branch = String(params.branch || "main").trim();
-    if (!/^[A-Za-z0-9._/-]+$/.test(branch) || branch.includes("..")) {
-      throw new Error(`Invalid branch name for review_release: ${branch}`);
-    }
-    const repoDir = resolveOrFindBridgeGitRepo();
-    if (!repoDir) {
-      throw new Error(`Could not locate copilot-signalr-bridge git repo on ${cfg.machineId}`);
-    }
-    execFileSync(
-      "git",
-      ["-C", repoDir, "fetch", "--force", "--no-write-fetch-head", "origin", "+refs/heads/main:refs/remotes/origin/main"],
-      {
-        stdio: ["ignore", "pipe", "pipe"],
-        timeout: 20000,
-        windowsHide: true,
-      }
-    );
-    execFileSync(
-      "git",
-      ["-C", repoDir, "fetch", "--force", "origin", branch],
-      {
-        stdio: ["ignore", "pipe", "pipe"],
-        timeout: 20000,
-        windowsHide: true,
-      }
-    );
-    const candidateCommit = execFileSync("git", ["-C", repoDir, "rev-parse", "FETCH_HEAD"], {
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "ignore"],
-      timeout: 5000,
-      windowsHide: true,
-    }).trim();
-    const candidateSha = candidateCommit.slice(0, 7);
-    let diffStat = "";
-    try {
-      diffStat = execFileSync("git", ["-C", repoDir, "diff", "--stat", `origin/main..FETCH_HEAD`], {
-        encoding: "utf8",
-        stdio: ["ignore", "pipe", "ignore"],
-        timeout: 5000,
-        windowsHide: true,
-      }).trim();
-    } catch {
-      diffStat = candidateSha;
-    }
-
-    // Extract candidate bridge.mjs, bootstrap-server.mjs, and test/bridge.test.mjs to temp files,
-    // validate syntax (`node --check`), and run the fast unit test suite (`BRIDGE_FAST_VOTE_TEST=1`)
-    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-vote-"));
-    const checks = { bridgeSyntaxOk: false, bootstrapSyntaxOk: false, unitTestsOk: false };
-    const issues = [];
-    try {
-      const candidateBridge = execFileSync("git", ["-C", repoDir, "show", "FETCH_HEAD:bridge.mjs"], {
-        encoding: "utf8",
-        maxBuffer: 10 * 1024 * 1024,
-        stdio: ["ignore", "pipe", "pipe"],
-        timeout: 5000,
-        windowsHide: true,
-      });
-      const tmpBridge = path.join(tmpDir, "bridge.mjs");
-      fs.writeFileSync(tmpBridge, candidateBridge, "utf8");
-      execFileSync(process.execPath, ["--check", tmpBridge], {
-        stdio: ["ignore", "pipe", "pipe"],
-        timeout: 5000,
-        windowsHide: true,
-      });
-      checks.bridgeSyntaxOk = true;
-    } catch (err) {
-      issues.push(`bridge.mjs check failed: ${err.message}`);
-    }
-
-    try {
-      const candidateBootstrap = execFileSync(
-        "git",
-        ["-C", repoDir, "show", "FETCH_HEAD:bootstrap-server.mjs"],
-        {
-          encoding: "utf8",
-          maxBuffer: 5 * 1024 * 1024,
-          stdio: ["ignore", "pipe", "pipe"],
-          timeout: 5000,
-          windowsHide: true,
-        }
-      );
-      const tmpBoot = path.join(tmpDir, "bootstrap-server.mjs");
-      fs.writeFileSync(tmpBoot, candidateBootstrap, "utf8");
-      execFileSync(process.execPath, ["--check", tmpBoot], {
-        stdio: ["ignore", "pipe", "pipe"],
-        timeout: 5000,
-        windowsHide: true,
-      });
-      checks.bootstrapSyntaxOk = true;
-    } catch (err) {
-      issues.push(`bootstrap-server.mjs check failed: ${err.message}`);
-    }
-
-    try {
-      for (const module of ["flock.mjs", "flock-lifecycle.mjs", "flock-membership.mjs", "flock-protocol.mjs", "flock-azure.mjs", "flock-broker-free.mjs", "flock-registry.mjs", RUNTIME_MANIFEST_FILENAME]) {
-        try {
-          const content = execFileSync("git", ["-C", repoDir, "show", `${candidateCommit}:${module}`], {
-            encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: 5000,
-          });
-          fs.writeFileSync(path.join(tmpDir, module), content, "utf8");
-        } catch (showErr) {
-          if (module !== "flock.mjs" && module !== "flock-registry.mjs" && module !== RUNTIME_MANIFEST_FILENAME) throw showErr;
-        }
-      }
-      if (fs.existsSync(path.join(tmpDir, RUNTIME_MANIFEST_FILENAME))) {
-        const candidateManifest = loadRuntimeManifest(tmpDir);
-        verifyStagedRuntimeClosure(tmpDir, candidateManifest);
-        checks.runtimeManifestOk = true;
-      }
-      const candidateTest = execFileSync(
-        "git",
-        ["-C", repoDir, "show", "FETCH_HEAD:test/bridge.test.mjs"],
-        {
-          encoding: "utf8",
-          maxBuffer: 5 * 1024 * 1024,
-          stdio: ["ignore", "pipe", "pipe"],
-          timeout: 5000,
-          windowsHide: true,
-        }
-      );
-      const tmpTestDir = path.join(tmpDir, "test");
-      fs.mkdirSync(tmpTestDir, { recursive: true });
-      const tmpTest = path.join(tmpTestDir, "bridge.test.mjs");
-      fs.writeFileSync(tmpTest, candidateTest, "utf8");
-      execFileSync(process.execPath, ["--test", tmpTest], {
-        stdio: ["ignore", "pipe", "pipe"],
-        timeout: 15000,
-        windowsHide: true,
-        env: { ...process.env, BRIDGE_FAST_VOTE_TEST: "1" },
-      });
-      checks.unitTestsOk = true;
-    } catch (err) {
-      issues.push(`unit tests failed: ${err.message}`);
-    } finally {
-      try {
-        fs.rmSync(tmpDir, { recursive: true, force: true });
-      } catch {}
-    }
-
-    const vote = issues.length === 0 ? "ACCEPT" : "REJECT";
-    const idKey = ensureMachineIdentityKeypair();
-    const votePayload = `vote|${cfg.machineId}|${branch}|${candidateCommit}|${vote}`;
-    const voteSignature = crypto
-      .sign(null, Buffer.from(votePayload, "utf8"), idKey.privateKey)
-      .toString("base64");
-
-    return {
-      machineId: cfg.machineId,
-      scope: cfg.scope,
-      githubUser: cfg.githubUser || null,
-      platform: `${process.platform}-${os.arch()}`,
-      branch,
-      candidateCommit,
-      candidateSha,
-      diffStat,
-      checks,
-      verificationLevel: "daemon_syntax_unit_tests_and_ed25519_signature",
-      issues,
-      vote,
-      votePayload,
-      publicKey: idKey.publicKey,
-      keyFingerprint: idKey.fingerprint,
-      voteSignature,
-      votedAt: new Date().toISOString(),
-    };
+    return await reviewReleaseCandidate(cfg, params);
   }
 
   throw new Error(`Unsupported bridge RPC action: ${action}`);
@@ -8441,7 +8276,7 @@ const MCP_TOOLS = [
   {
     name: "vote_bridge_release",
     description:
-      "Pre-merge flock governance check: ask every online member of the flock to fetch a candidate git branch, validate bridge.mjs + bootstrap-server.mjs syntax on their OS/arch, and return an Ed25519-signed ACCEPT/REJECT vote before merging to main.",
+      "Pre-merge flock governance check: ask every online member of the flock to fetch a candidate git branch, extract its complete repository/runtime dependency closure into an isolated fixture, run syntax and unit tests on their OS/arch, and return an Ed25519-signed ACCEPT/REJECT ballot with bounded diagnostics before merging to main.",
     inputSchema: {
       type: "object",
       properties: {
@@ -10903,23 +10738,944 @@ export async function syncRemoteGitBranch(
   }
 }
 
+const DEFAULT_BALLOT_STREAM_MAX_BYTES = 16384;
+const FIXTURE_VERIFICATION_LEVEL = "complete_repo_closure_isolated_fixture";
+
+function trimValidUtf8End(buf, maxLen) {
+  let end = Math.min(buf.length, Math.max(0, maxLen));
+  if (end === 0 || end >= buf.length) return buf.subarray(0, end);
+  let lead = end - 1;
+  while (lead >= 0 && end - lead <= 4 && (buf[lead] & 0xc0) === 0x80) {
+    lead -= 1;
+  }
+  if (lead >= 0 && end - lead <= 4) {
+    const b = buf[lead];
+    const expectedLen =
+      (b & 0x80) === 0
+        ? 1
+        : (b & 0xe0) === 0xc0
+          ? 2
+          : (b & 0xf0) === 0xe0
+            ? 3
+            : (b & 0xf8) === 0xf0
+              ? 4
+              : 1;
+    if (lead + expectedLen > end) {
+      end = lead;
+    }
+  }
+  return buf.subarray(0, end);
+}
+
+function trimValidUtf8Start(buf, startOffset) {
+  let start = Math.min(buf.length, Math.max(0, startOffset));
+  while (start < buf.length && (buf[start] & 0xc0) === 0x80) {
+    start += 1;
+  }
+  return buf.subarray(start);
+}
+
+export function truncateUtf8Bounded(input, maxBytes = DEFAULT_BALLOT_STREAM_MAX_BYTES) {
+  const limit = Math.max(64, Number(maxBytes) || DEFAULT_BALLOT_STREAM_MAX_BYTES);
+  const buf = Buffer.isBuffer(input) ? input : Buffer.from(String(input ?? ""), "utf8");
+  if (buf.length <= limit) {
+    return buf.toString("utf8");
+  }
+  const omittedEstimate = buf.length - limit + 48;
+  const marker = `\n...[truncated ${omittedEstimate} bytes]...\n`;
+  const markerBytes = Buffer.byteLength(marker, "utf8");
+  const available = Math.max(16, limit - markerBytes);
+  const headBudget = Math.max(8, Math.floor(available * 0.4));
+  const tailBudget = Math.max(8, available - headBudget);
+  const headBuf = trimValidUtf8End(buf, headBudget);
+  const tailBuf = trimValidUtf8Start(buf, buf.length - tailBudget);
+  const exactMarker = `\n...[truncated ${buf.length - headBuf.length - tailBuf.length} bytes]...\n`;
+  let combined = headBuf.toString("utf8") + exactMarker + tailBuf.toString("utf8");
+  if (Buffer.byteLength(combined, "utf8") > limit) {
+    combined = trimValidUtf8End(Buffer.from(combined, "utf8"), limit).toString("utf8");
+  }
+  return combined;
+}
+
+function appendBoundedChunks(state, chunk) {
+  const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk), "utf8");
+  if (buf.length === 0) return;
+  state.totalBytes += buf.length;
+  if (state.binary) {
+    if (state.totalBytes > state.maxBytes) {
+      state.overflowed = true;
+      return;
+    }
+    state.chunks.push(buf);
+    return;
+  }
+  const half = Math.max(1024, Math.floor(state.maxBytes / 2));
+  if (state.headBytes < half) {
+    const take = Math.min(buf.length, half - state.headBytes);
+    state.headChunks.push(buf.subarray(0, take));
+    state.headBytes += take;
+    if (take < buf.length) {
+      const rest = buf.subarray(take);
+      state.tailChunks.push(rest);
+      state.tailBytes += rest.length;
+    }
+  } else {
+    state.tailChunks.push(buf);
+    state.tailBytes += buf.length;
+  }
+  while (state.tailBytes > half && state.tailChunks.length > 0) {
+    const first = state.tailChunks[0];
+    const excess = state.tailBytes - half;
+    if (first.length <= excess) {
+      state.tailChunks.shift();
+      state.tailBytes -= first.length;
+    } else {
+      state.tailChunks[0] = first.subarray(excess);
+      state.tailBytes -= excess;
+    }
+  }
+}
+
+function finalizeCapturedStream(state, maxOutputBytes) {
+  if (state.binary) {
+    const full = Buffer.concat(state.chunks);
+    return {
+      buffer: full,
+      text: truncateUtf8Bounded(full, maxOutputBytes),
+      overflowed: state.overflowed,
+    };
+  }
+  const combined = Buffer.concat([...state.headChunks, ...state.tailChunks]);
+  return {
+    buffer: combined,
+    text: truncateUtf8Bounded(combined, maxOutputBytes),
+    overflowed: state.totalBytes > state.maxBytes,
+  };
+}
+
+function runBoundedSubprocess(
+  command,
+  args,
+  {
+    cwd = undefined,
+    env = undefined,
+    input = null,
+    timeoutMs = 15000,
+    maxOutputBytes = DEFAULT_BALLOT_STREAM_MAX_BYTES,
+    maxCaptureBytes = 256 * 1024,
+    binaryStdout = false,
+  } = {}
+) {
+  return new Promise((resolve) => {
+    const outState = {
+      binary: binaryStdout,
+      maxBytes: maxCaptureBytes,
+      totalBytes: 0,
+      overflowed: false,
+      chunks: [],
+      headChunks: [],
+      tailChunks: [],
+      headBytes: 0,
+      tailBytes: 0,
+    };
+    const errState = {
+      binary: false,
+      maxBytes: Math.min(maxCaptureBytes, 512 * 1024),
+      totalBytes: 0,
+      overflowed: false,
+      chunks: [],
+      headChunks: [],
+      tailChunks: [],
+      headBytes: 0,
+      tailBytes: 0,
+    };
+
+    const isPosix = process.platform !== "win32";
+    let child;
+    try {
+      child = spawn(command, args, {
+        cwd,
+        env,
+        stdio: [input !== null ? "pipe" : "ignore", "pipe", "pipe"],
+        windowsHide: true,
+        detached: isPosix,
+      });
+    } catch (spawnErr) {
+      resolve({
+        ok: false,
+        exitCode: null,
+        signal: null,
+        timedOut: false,
+        spawnError: spawnErr,
+        stdoutBuffer: Buffer.alloc(0),
+        stdout: "",
+        stderr: truncateUtf8Bounded(spawnErr?.message || String(spawnErr), maxOutputBytes),
+      });
+      return;
+    }
+
+    let settled = false;
+    let timedOut = false;
+    let recordedSignal = null;
+    let spawnError = null;
+    let forceKillTimer = null;
+    let pipeDestroyTimer = null;
+
+    const killChildGroup = (sig) => {
+      if (isPosix && child.pid) {
+        try {
+          process.kill(-child.pid, sig);
+        } catch {}
+      }
+      try {
+        child.kill(sig);
+      } catch {}
+    };
+
+    const finish = (exitCode, signal) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeoutTimer);
+      clearTimeout(forceKillTimer);
+      clearTimeout(pipeDestroyTimer);
+      const outFinal = finalizeCapturedStream(outState, maxOutputBytes);
+      const errFinal = finalizeCapturedStream(errState, maxOutputBytes);
+      const effectiveSignal = signal || recordedSignal || (timedOut ? "SIGTERM" : null);
+      const effectiveExitCode = typeof exitCode === "number" ? exitCode : null;
+      resolve({
+        ok:
+          !spawnError &&
+          !outFinal.overflowed &&
+          !timedOut &&
+          effectiveExitCode === 0 &&
+          !effectiveSignal,
+        exitCode: effectiveExitCode,
+        signal: effectiveSignal,
+        timedOut,
+        spawnError,
+        stdoutOverflowed: outFinal.overflowed,
+        stdoutBuffer: outFinal.buffer,
+        stdout: outFinal.text,
+        stderr:
+          errFinal.text ||
+          (spawnError
+            ? truncateUtf8Bounded(spawnError.message || String(spawnError), maxOutputBytes)
+            : ""),
+      });
+    };
+
+    const timeoutTimer = setTimeout(() => {
+      timedOut = true;
+      recordedSignal = "SIGTERM";
+      killChildGroup("SIGTERM");
+      forceKillTimer = setTimeout(() => {
+        if (!settled) {
+          recordedSignal = recordedSignal || "SIGKILL";
+          killChildGroup("SIGKILL");
+        }
+      }, 200);
+      forceKillTimer.unref?.();
+      pipeDestroyTimer = setTimeout(() => {
+        if (!settled) {
+          try {
+            child.stdout?.destroy();
+          } catch {}
+          try {
+            child.stderr?.destroy();
+          } catch {}
+          finish(null, recordedSignal || "SIGKILL");
+        }
+      }, 450);
+      pipeDestroyTimer.unref?.();
+    }, Math.max(50, Number(timeoutMs) || 15000));
+    timeoutTimer.unref?.();
+
+    child.stdout?.on("data", (chunk) => appendBoundedChunks(outState, chunk));
+    child.stderr?.on("data", (chunk) => appendBoundedChunks(errState, chunk));
+
+    child.on("error", (err) => {
+      spawnError = err;
+      finish(null, null);
+    });
+
+    child.on("close", (code, sig) => {
+      finish(code, sig);
+    });
+
+    if (input !== null && child.stdin) {
+      child.stdin.on("error", () => {});
+      child.stdin.end(Buffer.isBuffer(input) ? input : Buffer.from(String(input), "utf8"));
+    }
+  });
+}
+
+function isSafeRelativeRepoPath(relPath) {
+  if (!relPath || typeof relPath !== "string") return false;
+  if (relPath.includes("\\") || relPath.includes("\0") || path.isAbsolute(relPath)) return false;
+  if (/^[A-Za-z]:/.test(relPath)) return false;
+  const parts = relPath.split("/");
+  for (const seg of parts) {
+    if (!seg || seg === "." || seg === ".." || seg.toLowerCase() === ".git") {
+      return false;
+    }
+  }
+  return true;
+}
+
+const CODE_OR_TEST_EXT_RE = /\.(?:mjs|js|cjs|json|md|svg|ps1|sh|ts|tsx|css|html|yml|yaml|txt)$/i;
+const MAX_NON_CODE_BLOB_BYTES = 8 * 1024 * 1024;
+
+export async function extractCandidateFixtureFromGit(
+  repoDir,
+  candidateCommit,
+  fixtureDir,
+  { maxOutputBytes = DEFAULT_BALLOT_STREAM_MAX_BYTES } = {}
+) {
+  const lsRes = await runBoundedSubprocess(
+    "git",
+    ["-C", repoDir, "ls-tree", "-r", "-l", "-z", candidateCommit],
+    {
+      timeoutMs: 10000,
+      maxOutputBytes,
+      maxCaptureBytes: 16 * 1024 * 1024,
+      binaryStdout: true,
+    }
+  );
+  if (!lsRes.ok) {
+    throw Object.assign(
+      new Error(
+        `Failed to enumerate candidate git tree for ${candidateCommit}: ${
+          lsRes.stderr || `exitCode=${lsRes.exitCode}`
+        }`
+      ),
+      { isFixtureInfraError: true, stepResult: lsRes }
+    );
+  }
+
+  const rawEntries = lsRes.stdoutBuffer.toString("utf8").split("\0").filter(Boolean);
+  const trackedPaths = new Set();
+  const blobsToExtract = [];
+
+  for (const raw of rawEntries) {
+    const tabIdx = raw.indexOf("\t");
+    if (tabIdx === -1) {
+      throw Object.assign(new Error(`Malformed git ls-tree entry in ${candidateCommit}`), {
+        isFixtureInfraError: true,
+      });
+    }
+    const meta = raw.slice(0, tabIdx).trim().split(/\s+/);
+    const relPath = raw.slice(tabIdx + 1);
+    const [mode, type, sha, sizeRaw] = meta;
+    if (!isSafeRelativeRepoPath(relPath)) {
+      throw Object.assign(
+        new Error(`Unsafe relative path in candidate git tree: ${relPath}`),
+        { isFixtureInfraError: true }
+      );
+    }
+    if (mode === "120000") {
+      throw Object.assign(
+        new Error(`Symlink entries are rejected in isolated review fixtures: ${relPath}`),
+        { isFixtureInfraError: true }
+      );
+    }
+    if (type !== "blob") continue;
+    const size = Number(sizeRaw);
+    if (!Number.isInteger(size) || size < 0) {
+      throw Object.assign(new Error(`Invalid blob size in git ls-tree for ${relPath}`), {
+        isFixtureInfraError: true,
+      });
+    }
+    trackedPaths.add(relPath);
+    const isCodeOrConfig =
+      CODE_OR_TEST_EXT_RE.test(relPath) ||
+      relPath === "LICENSE" ||
+      relPath === ".gitignore";
+    if (!isCodeOrConfig && size > MAX_NON_CODE_BLOB_BYTES) {
+      continue;
+    }
+    blobsToExtract.push({ mode, sha, size, relPath });
+  }
+
+  if (blobsToExtract.length === 0) {
+    throw Object.assign(
+      new Error(`Candidate commit ${candidateCommit} contains no extractable tracked files`),
+      { isFixtureInfraError: true }
+    );
+  }
+
+  fs.mkdirSync(fixtureDir, { recursive: true });
+  const fixtureRealDir = fs.realpathSync(fixtureDir);
+
+  const batchInput = blobsToExtract.map((b) => b.sha).join("\n") + "\n";
+  const catRes = await runBoundedSubprocess(
+    "git",
+    ["-C", repoDir, "cat-file", "--batch"],
+    {
+      input: batchInput,
+      timeoutMs: 20000,
+      maxOutputBytes,
+      maxCaptureBytes: 64 * 1024 * 1024,
+      binaryStdout: true,
+    }
+  );
+  if (!catRes.ok) {
+    throw Object.assign(
+      new Error(
+        `Failed to extract candidate blobs via git cat-file --batch: ${
+          catRes.stderr || `exitCode=${catRes.exitCode}`
+        }`
+      ),
+      { isFixtureInfraError: true, stepResult: catRes }
+    );
+  }
+
+  const batchBuf = catRes.stdoutBuffer;
+  let offset = 0;
+  for (const entry of blobsToExtract) {
+    const nlIdx = batchBuf.indexOf(0x0a, offset);
+    if (nlIdx === -1) {
+      throw Object.assign(
+        new Error(`Truncated git cat-file --batch header for ${entry.relPath}`),
+        { isFixtureInfraError: true }
+      );
+    }
+    const header = batchBuf.subarray(offset, nlIdx).toString("utf8");
+    const [gotSha, gotType, gotSizeStr] = header.split(" ");
+    const gotSize = Number(gotSizeStr);
+    if (gotSha !== entry.sha || gotType !== "blob" || gotSize !== entry.size) {
+      throw Object.assign(
+        new Error(`Mismatched git cat-file --batch header for ${entry.relPath}: ${header}`),
+        { isFixtureInfraError: true }
+      );
+    }
+    const bodyStart = nlIdx + 1;
+    const bodyEnd = bodyStart + gotSize;
+    if (bodyEnd > batchBuf.length || batchBuf[bodyEnd] !== 0x0a) {
+      throw Object.assign(
+        new Error(`Corrupt git cat-file --batch payload framing for ${entry.relPath}`),
+        { isFixtureInfraError: true }
+      );
+    }
+    const destPath = path.resolve(fixtureRealDir, ...entry.relPath.split("/"));
+    const relCheck = path.relative(fixtureRealDir, destPath);
+    if (!relCheck || relCheck.startsWith("..") || path.isAbsolute(relCheck)) {
+      throw Object.assign(
+        new Error(`Fixture path escaped isolated root: ${entry.relPath}`),
+        { isFixtureInfraError: true }
+      );
+    }
+    fs.mkdirSync(path.dirname(destPath), { recursive: true });
+    fs.writeFileSync(
+      destPath,
+      batchBuf.subarray(bodyStart, bodyEnd),
+      entry.mode === "100755" ? { mode: 0o755 } : undefined
+    );
+    offset = bodyEnd + 1;
+  }
+
+  return {
+    extractedFileCount: blobsToExtract.length,
+    trackedPaths,
+  };
+}
+
+export function buildCanonicalVoteBallotPayload(ballot) {
+  return JSON.stringify({
+    v: 2,
+    machineId: String(ballot?.machineId || ""),
+    branch: String(ballot?.branch || "main"),
+    candidateCommit: ballot?.candidateCommit ? String(ballot.candidateCommit) : null,
+    vote: String(ballot?.vote || ""),
+    voterVersion: String(ballot?.voterVersion || ""),
+    fixtureVerificationLevel: String(ballot?.fixtureVerificationLevel || ""),
+    keyFingerprint: String(ballot?.keyFingerprint || ""),
+    failureCategory: String(ballot?.failureCategory || ""),
+    exitCode: typeof ballot?.exitCode === "number" ? ballot.exitCode : null,
+    signal: ballot?.signal ? String(ballot.signal) : null,
+    timedOut: Boolean(ballot?.timedOut),
+    stdout: String(ballot?.stdout ?? ""),
+    stderr: String(ballot?.stderr ?? ""),
+  });
+}
+
+export async function reviewReleaseCandidate(cfg, params = {}, internalOptions = {}) {
+  const branch = String(params?.branch || "main").trim();
+  if (!/^[A-Za-z0-9._/-]+$/.test(branch) || branch.includes("..")) {
+    throw new Error(`Invalid branch name for review_release: ${branch}`);
+  }
+
+  const maxOutputBytes =
+    Number(internalOptions.maxOutputBytes) > 0
+      ? Number(internalOptions.maxOutputBytes)
+      : DEFAULT_BALLOT_STREAM_MAX_BYTES;
+  const checkTimeoutMs =
+    Number(internalOptions.checkTimeoutMs) > 0 ? Number(internalOptions.checkTimeoutMs) : 15000;
+  const testTimeoutMs =
+    Number(internalOptions.testTimeoutMs) > 0 ? Number(internalOptions.testTimeoutMs) : 45000;
+  const fetchTimeoutMs =
+    Number(internalOptions.fetchTimeoutMs) > 0 ? Number(internalOptions.fetchTimeoutMs) : 20000;
+
+  const idKey = ensureMachineIdentityKeypair();
+  let candidateCommit = null;
+  let candidateSha = null;
+  let diffStat = "";
+  const checks = {
+    fixtureExtractedOk: false,
+    dependencyClosureOk: false,
+    flockSyntaxOk: false,
+    bridgeSyntaxOk: false,
+    bootstrapSyntaxOk: false,
+    unitTestsOk: false,
+    extractedFileCount: 0,
+    verifiedEntrypoints: [],
+  };
+  const issues = [];
+  let failureCategory = "passed";
+  let capturedStdout = "";
+  let capturedStderr = "";
+  let capturedExitCode = null;
+  let capturedSignal = null;
+  let capturedTimedOut = false;
+
+  const recordStepDiagnostics = (stepRes) => {
+    if (!stepRes) return;
+    if (stepRes.stdout) {
+      capturedStdout = capturedStdout
+        ? truncateUtf8Bounded(`${capturedStdout}\n${stepRes.stdout}`, maxOutputBytes)
+        : truncateUtf8Bounded(stepRes.stdout, maxOutputBytes);
+    }
+    if (stepRes.stderr) {
+      capturedStderr = capturedStderr
+        ? truncateUtf8Bounded(`${capturedStderr}\n${stepRes.stderr}`, maxOutputBytes)
+        : truncateUtf8Bounded(stepRes.stderr, maxOutputBytes);
+    }
+    capturedExitCode = typeof stepRes.exitCode === "number" ? stepRes.exitCode : null;
+    capturedSignal = stepRes.signal || null;
+    capturedTimedOut = Boolean(stepRes.timedOut);
+  };
+
+  let tmpRoot = null;
+  try {
+    const resolveRepo =
+      typeof internalOptions.resolveRepoFn === "function"
+        ? internalOptions.resolveRepoFn
+        : () => internalOptions.repoDir || resolveOrFindBridgeGitRepo();
+    const repoDir = resolveRepo();
+    if (!repoDir || !fs.existsSync(repoDir)) {
+      throw Object.assign(
+        new Error(`Could not locate copilot-flock git repo on ${cfg.machineId}`),
+        { isFixtureInfraError: true }
+      );
+    }
+
+    if (internalOptions.fetchFromOrigin !== false) {
+      await runBoundedSubprocess(
+        "git",
+        [
+          "-C",
+          repoDir,
+          "fetch",
+          "--force",
+          "--no-write-fetch-head",
+          "origin",
+          "+refs/heads/main:refs/remotes/origin/main",
+        ],
+        { timeoutMs: fetchTimeoutMs, maxOutputBytes }
+      );
+
+      const fetchBranchRes = await runBoundedSubprocess(
+        "git",
+        ["-C", repoDir, "fetch", "--force", "origin", branch],
+        { timeoutMs: fetchTimeoutMs, maxOutputBytes }
+      );
+      if (!fetchBranchRes.ok) {
+        throw Object.assign(
+          new Error(
+            `git fetch origin ${branch} failed: ${
+              fetchBranchRes.stderr ||
+              (fetchBranchRes.timedOut
+                ? `timed out after ${fetchTimeoutMs}ms`
+                : `exitCode=${fetchBranchRes.exitCode}`)
+            }`
+          ),
+          { isFixtureInfraError: true, stepResult: fetchBranchRes }
+        );
+      }
+    }
+
+    const revRef = internalOptions.fetchFromOrigin === false ? branch : "FETCH_HEAD";
+    const revRes = await runBoundedSubprocess(
+      "git",
+      ["-C", repoDir, "rev-parse", "--verify", `${revRef}^{commit}`],
+      { timeoutMs: 5000, maxOutputBytes }
+    );
+    if (!revRes.ok || !revRes.stdout.trim()) {
+      throw Object.assign(
+        new Error(
+          `git rev-parse ${revRef} failed: ${revRes.stderr || `exitCode=${revRes.exitCode}`}`
+        ),
+        { isFixtureInfraError: true, stepResult: revRes }
+      );
+    }
+    candidateCommit = revRes.stdout.trim();
+    candidateSha = candidateCommit.slice(0, 7);
+
+    const diffRes = await runBoundedSubprocess(
+      "git",
+      ["-C", repoDir, "diff", "--stat", `origin/main..${candidateCommit}`],
+      { timeoutMs: 5000, maxOutputBytes }
+    );
+    diffStat = diffRes.ok && diffRes.stdout.trim() ? diffRes.stdout.trim() : candidateSha;
+
+    tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "flock-vote-"));
+    const tmpRootReal = fs.realpathSync(tmpRoot);
+    const fixtureDir = path.join(tmpRootReal, "fixture");
+    const isolatedHome = path.join(tmpRootReal, "home");
+    const isolatedCopilotHome = path.join(isolatedHome, ".copilot");
+    fs.mkdirSync(isolatedCopilotHome, { recursive: true });
+
+    const extractor =
+      typeof internalOptions.extractFixtureFn === "function"
+        ? internalOptions.extractFixtureFn
+        : extractCandidateFixtureFromGit;
+    const extraction = await extractor(repoDir, candidateCommit, fixtureDir, { maxOutputBytes });
+    const trackedPaths = extraction?.trackedPaths instanceof Set ? extraction.trackedPaths : new Set();
+
+    const missingTrackedModules = [...trackedPaths].filter(
+      (rel) => rel.endsWith(".mjs") && !fs.existsSync(path.join(fixtureDir, ...rel.split("/")))
+    );
+    if (missingTrackedModules.length > 0) {
+      throw Object.assign(
+        new Error(
+          `Incomplete candidate fixture extraction; missing tracked module(s): ${missingTrackedModules.join(", ")}`
+        ),
+        { isFixtureInfraError: true }
+      );
+    }
+
+    const hasFlockMjs = fs.existsSync(path.join(fixtureDir, "flock.mjs"));
+    const hasBridgeMjs = fs.existsSync(path.join(fixtureDir, "bridge.mjs"));
+    const hasBootstrapMjs = fs.existsSync(path.join(fixtureDir, "bootstrap-server.mjs"));
+    const candidateTestRel = fs.existsSync(path.join(fixtureDir, "test", "flock.test.mjs"))
+      ? "test/flock.test.mjs"
+      : fs.existsSync(path.join(fixtureDir, "test", "bridge.test.mjs"))
+        ? "test/bridge.test.mjs"
+        : null;
+
+    if (!hasFlockMjs && !hasBridgeMjs) {
+      throw Object.assign(
+        new Error("Candidate fixture is missing required runtime entrypoint (flock.mjs or bridge.mjs)"),
+        { isFixtureInfraError: true }
+      );
+    }
+    if (!hasBootstrapMjs) {
+      throw Object.assign(
+        new Error("Candidate fixture is missing required bootstrap-server.mjs"),
+        { isFixtureInfraError: true }
+      );
+    }
+    if (!candidateTestRel) {
+      throw Object.assign(
+        new Error("Candidate fixture is missing required unit test suite (test/flock.test.mjs or test/bridge.test.mjs)"),
+        { isFixtureInfraError: true }
+      );
+    }
+
+    checks.fixtureExtractedOk = true;
+    checks.extractedFileCount = Number(extraction?.extractedFileCount) || 0;
+
+    const normalizeComparableDir = (dirPath) => {
+      if (!dirPath) return null;
+      try {
+        const resolved = fs.existsSync(dirPath) ? fs.realpathSync(dirPath) : path.resolve(dirPath);
+        return process.platform === "win32" ? resolved.toLowerCase() : resolved;
+      } catch {
+        const resolved = path.resolve(dirPath);
+        return process.platform === "win32" ? resolved.toLowerCase() : resolved;
+      }
+    };
+
+    const allowedRoots = [normalizeComparableDir(fixtureDir), normalizeComparableDir(tmpRootReal)].filter(Boolean);
+    const forbiddenRoots = [
+      normalizeComparableDir(getCopilotDir()),
+      normalizeComparableDir(getBridgeHome()),
+      normalizeComparableDir(getLegacyBridgeHome()),
+      normalizeComparableDir(repoDir),
+    ].filter(Boolean);
+
+    const guardScriptPath = path.join(tmpRootReal, "isolation-guard.mjs");
+    const guardSource = [
+      `import fs from "node:fs";`,
+      `import path from "node:path";`,
+      `import Module from "node:module";`,
+      `import { fileURLToPath } from "node:url";`,
+      `const allowedRoots = ${JSON.stringify(allowedRoots)};`,
+      `const forbiddenRoots = ${JSON.stringify(forbiddenRoots)};`,
+      `const sep = path.sep;`,
+      `const norm = (p) => {`,
+      `  try { p = fs.existsSync(p) ? fs.realpathSync(p) : path.resolve(p); } catch { p = path.resolve(p); }`,
+      `  return process.platform === "win32" ? p.toLowerCase() : p;`,
+      `};`,
+      `const isUnder = (p, root) => p === root || p.startsWith(root.endsWith(sep) ? root : root + sep);`,
+      `if (typeof Module.registerHooks === "function") {`,
+      `  Module.registerHooks({`,
+      `    resolve(specifier, context, nextResolve) {`,
+      `      const resolved = nextResolve(specifier, context);`,
+      `      if (resolved?.url?.startsWith("file:")) {`,
+      `        const target = norm(fileURLToPath(resolved.url));`,
+      `        const inAllowed = allowedRoots.some((r) => isUnder(target, r));`,
+      `        if (!inAllowed && forbiddenRoots.some((r) => isUnder(target, r))) {`,
+      `          const err = new Error(\`Fixture isolation violation: candidate resolved stale host module outside isolated fixture: \${target}\`);`,
+      `          err.code = "ERR_FLOCK_FIXTURE_ISOLATION_VIOLATION";`,
+      `          throw err;`,
+      `        }`,
+      `      }`,
+      `      return resolved;`,
+      `    },`,
+      `  });`,
+      `}`,
+    ].join("\n");
+    fs.writeFileSync(guardScriptPath, guardSource, "utf8");
+
+    const isolatedEnv = { ...process.env };
+    delete isolatedEnv.NODE_PATH;
+    delete isolatedEnv.NODE_OPTIONS;
+    for (const envKey of Object.keys(isolatedEnv)) {
+      if (envKey.startsWith("NODE_TEST_")) {
+        delete isolatedEnv[envKey];
+      }
+    }
+    isolatedEnv.HOME = isolatedHome;
+    isolatedEnv.USERPROFILE = isolatedHome;
+    isolatedEnv.COPILOT_HOME = isolatedCopilotHome;
+    isolatedEnv.BRIDGE_FAST_VOTE_TEST = "1";
+
+    const entrypointsToVerify = [];
+    if (hasFlockMjs) entrypointsToVerify.push("flock.mjs");
+    if (hasBridgeMjs) {
+      const identicalToFlock =
+        hasFlockMjs &&
+        fs
+          .readFileSync(path.join(fixtureDir, "flock.mjs"))
+          .equals(fs.readFileSync(path.join(fixtureDir, "bridge.mjs")));
+      if (!identicalToFlock) {
+        entrypointsToVerify.push("bridge.mjs");
+      }
+    }
+    entrypointsToVerify.push("bootstrap-server.mjs");
+    if (fs.existsSync(path.join(fixtureDir, "managed-azure-setup.mjs"))) {
+      entrypointsToVerify.push("managed-azure-setup.mjs");
+    }
+
+    const preflightScriptPath = path.join(tmpRootReal, "verify-closure.mjs");
+    const preflightSource = [
+      `import ${JSON.stringify(pathToFileURL(guardScriptPath).href)};`,
+      `const targets = ${JSON.stringify(
+        entrypointsToVerify.map((rel) => ({
+          rel,
+          href: pathToFileURL(path.join(fixtureDir, ...rel.split("/"))).href,
+        }))
+      )};`,
+      `for (const target of targets) {`,
+      `  await import(target.href);`,
+      `}`,
+    ].join("\n");
+    fs.writeFileSync(preflightScriptPath, preflightSource, "utf8");
+
+    const preflightExecutable = internalOptions.nodeExecPath || process.execPath;
+    const preflightRes = await runBoundedSubprocess(
+      preflightExecutable,
+      [preflightScriptPath],
+      {
+        cwd: fixtureDir,
+        env: isolatedEnv,
+        timeoutMs: checkTimeoutMs,
+        maxOutputBytes,
+      }
+    );
+
+    if (!preflightRes.ok) {
+      recordStepDiagnostics(preflightRes);
+      if (preflightRes.spawnError) {
+        failureCategory = "fixture_infrastructure_error";
+        issues.push(
+          `runtime dependency preflight failed to start: ${preflightRes.spawnError.message}`
+        );
+      } else {
+        failureCategory = "candidate_test_failure";
+        const reason = preflightRes.timedOut
+          ? `candidate entrypoint/dependency check timed out after ${checkTimeoutMs}ms`
+          : `candidate entrypoint/dependency check failed (exitCode=${preflightRes.exitCode}, signal=${preflightRes.signal})`;
+        issues.push(
+          preflightRes.stderr
+            ? `${reason}: ${preflightRes.stderr.split(/\r?\n/).find(Boolean) || ""}`.trim()
+            : reason
+        );
+      }
+    } else {
+      checks.dependencyClosureOk = true;
+      checks.flockSyntaxOk = hasFlockMjs;
+      checks.bridgeSyntaxOk = hasBridgeMjs || hasFlockMjs;
+      checks.bootstrapSyntaxOk = true;
+      checks.verifiedEntrypoints = entrypointsToVerify;
+
+      const testArgs = ["--import", pathToFileURL(guardScriptPath).href, "--test"];
+      if (process.allowedNodeEnvironmentFlags?.has?.("--test-isolation")) {
+        testArgs.push("--test-isolation=none");
+      } else if (process.allowedNodeEnvironmentFlags?.has?.("--experimental-test-isolation")) {
+        testArgs.push("--experimental-test-isolation=none");
+      }
+      testArgs.push(path.join(fixtureDir, ...candidateTestRel.split("/")));
+
+      const testRes = await runBoundedSubprocess(preflightExecutable, testArgs, {
+        cwd: fixtureDir,
+        env: isolatedEnv,
+        timeoutMs: testTimeoutMs,
+        maxOutputBytes,
+      });
+      recordStepDiagnostics(testRes);
+
+      if (!testRes.ok) {
+        if (testRes.spawnError) {
+          failureCategory = "fixture_infrastructure_error";
+          issues.push(`candidate unit test runner failed to start: ${testRes.spawnError.message}`);
+        } else {
+          failureCategory = "candidate_test_failure";
+          issues.push(
+            testRes.timedOut
+              ? `unit tests timed out after ${testTimeoutMs}ms`
+              : `unit tests failed (exitCode=${testRes.exitCode}, signal=${testRes.signal})`
+          );
+        }
+      } else {
+        checks.unitTestsOk = true;
+        failureCategory = "passed";
+      }
+    }
+  } catch (err) {
+    if (err?.stepResult) {
+      recordStepDiagnostics(err.stepResult);
+    }
+    failureCategory = err?.isFixtureInfraError
+      ? "fixture_infrastructure_error"
+      : "fixture_infrastructure_error";
+    const errMsg = err?.message || String(err);
+    issues.push(errMsg);
+    if (!capturedStderr) {
+      capturedStderr = truncateUtf8Bounded(errMsg, maxOutputBytes);
+    }
+  } finally {
+    if (tmpRoot) {
+      try {
+        fs.rmSync(tmpRoot, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+      } catch {}
+    }
+  }
+
+  // Never allow infrastructure or test errors to be swallowed as ACCEPT
+  if (
+    failureCategory !== "passed" ||
+    issues.length > 0 ||
+    !checks.fixtureExtractedOk ||
+    !checks.dependencyClosureOk ||
+    !checks.unitTestsOk
+  ) {
+    if (failureCategory === "passed") {
+      failureCategory = !checks.fixtureExtractedOk
+        ? "fixture_infrastructure_error"
+        : "candidate_test_failure";
+    }
+  }
+
+  const vote = failureCategory === "passed" && issues.length === 0 ? "ACCEPT" : "REJECT";
+  const commitToken = candidateCommit || "unresolved";
+  const votePayload = `vote|${cfg.machineId}|${branch}|${commitToken}|${vote}`;
+  const voteSignature = crypto
+    .sign(null, Buffer.from(votePayload, "utf8"), idKey.privateKey)
+    .toString("base64");
+
+  const ballotBase = {
+    machineId: cfg.machineId,
+    voterVersion: BRIDGE_VERSION,
+    scope: cfg.scope,
+    githubUser: cfg.githubUser || null,
+    platform: `${process.platform}-${os.arch()}`,
+    branch,
+    candidateCommit,
+    candidateSha,
+    diffStat,
+    checks,
+    verificationLevel: "daemon_syntax_unit_tests_and_ed25519_signature",
+    fixtureVerificationLevel: FIXTURE_VERIFICATION_LEVEL,
+    failureCategory,
+    stdout: capturedStdout,
+    stderr: capturedStderr,
+    exitCode: capturedExitCode,
+    signal: capturedSignal,
+    timedOut: capturedTimedOut,
+    issues,
+    vote,
+    votePayload,
+    publicKey: idKey.publicKey,
+    keyFingerprint: idKey.fingerprint,
+  };
+  const ballotPayload = buildCanonicalVoteBallotPayload(ballotBase);
+  const ballotSignature = crypto
+    .sign(null, Buffer.from(ballotPayload, "utf8"), idKey.privateKey)
+    .toString("base64");
+
+  return {
+    ...ballotBase,
+    ballotPayload,
+    voteSignature,
+    ballotSignature,
+    votedAt: new Date().toISOString(),
+  };
+}
+
 export function verifyVoteBallotSignature(ballot, registeredPublicKey = null) {
   if (!ballot || !ballot.voteSignature || !ballot.machineId || !ballot.vote) {
     return false;
   }
   const pubKey = registeredPublicKey || ballot.publicKey || null;
   if (!pubKey) return false;
+
+  if (ballot.keyFingerprint) {
+    try {
+      const normalizedPem = crypto
+        .createPublicKey(pubKey)
+        .export({ type: "spki", format: "pem" })
+        .toString()
+        .trim();
+      const expectedFp = crypto
+        .createHash("sha256")
+        .update(normalizedPem)
+        .digest("hex")
+        .slice(0, 32);
+      if (String(ballot.keyFingerprint) !== expectedFp) {
+        return false;
+      }
+    } catch {
+      return false;
+    }
+  }
+
   const payloadsToTry = [];
   if (ballot.candidateCommit) {
     payloadsToTry.push(
       `vote|${ballot.machineId}|${ballot.branch || "main"}|${ballot.candidateCommit}|${ballot.vote}`
     );
-  }
-  if (ballot.candidateSha && !ballot.candidateCommit) {
+  } else if (ballot.candidateSha) {
     payloadsToTry.push(
       `vote|${ballot.machineId}|${ballot.branch || "main"}|${ballot.candidateSha}|${ballot.vote}`
     );
+  } else if (ballot.vote === "REJECT") {
+    payloadsToTry.push(
+      `vote|${ballot.machineId}|${ballot.branch || "main"}|unresolved|REJECT`
+    );
   }
+
+  let v1Verified = false;
   for (const p of payloadsToTry) {
     try {
       const ok = crypto.verify(
@@ -10928,16 +11684,57 @@ export function verifyVoteBallotSignature(ballot, registeredPublicKey = null) {
         pubKey,
         Buffer.from(String(ballot.voteSignature), "base64")
       );
-      if (ok) return true;
+      if (ok) {
+        v1Verified = true;
+        break;
+      }
     } catch {}
   }
-  return false;
+  if (!v1Verified) return false;
+
+  const hasV2Metadata =
+    ballot.ballotSignature !== undefined ||
+    ballot.ballotPayload !== undefined ||
+    ballot.failureCategory !== undefined ||
+    ballot.voterVersion !== undefined ||
+    ballot.fixtureVerificationLevel !== undefined;
+
+  if (hasV2Metadata) {
+    if (!ballot.ballotSignature) return false;
+    try {
+      const expectedPayload = buildCanonicalVoteBallotPayload(ballot);
+      if (ballot.ballotPayload !== undefined && ballot.ballotPayload !== expectedPayload) {
+        return false;
+      }
+      const v2Ok = crypto.verify(
+        null,
+        Buffer.from(expectedPayload, "utf8"),
+        pubKey,
+        Buffer.from(String(ballot.ballotSignature), "base64")
+      );
+      if (!v2Ok) return false;
+    } catch {
+      return false;
+    }
+  }
+
+  return true;
 }
 
-export async function voteReleaseAcrossFlock(cfg, { branch = "main", machines = "*" } = {}) {
+export async function voteReleaseAcrossFlock(
+  cfg,
+  { branch = "main", machines = "*" } = {},
+  internalDeps = {}
+) {
+  const discoverFn = internalDeps.discoverFn || discoverMachines;
+  const membersMapFn =
+    internalDeps.membersMapFn ||
+    ((c) => getCachedBootstrapMembersMap(c, { forceRefresh: true }));
+  const rpcBatchFn = internalDeps.rpcBatchFn || invokeRemoteRpcBatch;
+
   const [discovered, membersMap] = await Promise.all([
-    discoverMachines(cfg, { includeSelf: true, timeoutMs: 2500 }),
-    Promise.resolve().then(() => getCachedBootstrapMembersMap(cfg, { forceRefresh: true })),
+    discoverFn(cfg, { includeSelf: true, timeoutMs: 2500 }),
+    Promise.resolve().then(() => membersMapFn(cfg)),
   ]);
   const targets = filterBroadcastTargets(discovered, {
     localMachineId: cfg.machineId,
@@ -10953,7 +11750,7 @@ export async function voteReleaseAcrossFlock(cfg, { branch = "main", machines = 
   }));
 
   const outcomes =
-    batchItems.length > 0 ? await invokeRemoteRpcBatch(cfg, batchItems, 30000) : [];
+    batchItems.length > 0 ? await rpcBatchFn(cfg, batchItems, 75000) : [];
 
   const votes = outcomes.map((o) => {
     const mId = o.item.target.machineId;
@@ -10967,22 +11764,37 @@ export async function voteReleaseAcrossFlock(cfg, { branch = "main", machines = 
         ballot.publicKey ||
         null;
       const signatureVerified = verifyVoteBallotSignature(ballot, regPubKey);
+      const infraBlocked =
+        ballot.failureCategory !== undefined && ballot.failureCategory !== "passed";
       return {
         ...ballot,
+        vote: infraBlocked && ballot.vote === "ACCEPT" ? "REJECT" : ballot.vote,
         signatureVerified,
       };
     }
     return {
       machineId: mId,
       vote: "ERROR",
+      failureCategory: "fixture_infrastructure_error",
       signatureVerified: false,
       error: o.error || "Unknown error",
     };
   });
 
-  const acceptCount = votes.filter((v) => v.vote === "ACCEPT" && v.signatureVerified).length;
-  const rejectCount = votes.filter((v) => v.vote !== "ACCEPT" || !v.signatureVerified).length;
+  const acceptCount = votes.filter(
+    (v) =>
+      v.vote === "ACCEPT" &&
+      v.signatureVerified &&
+      (!v.failureCategory || v.failureCategory === "passed")
+  ).length;
+  const rejectCount = votes.length - acceptCount;
   const verifiedSignatureCount = votes.filter((v) => v.signatureVerified).length;
+  const infrastructureFailureCount = votes.filter(
+    (v) => v.failureCategory === "fixture_infrastructure_error"
+  ).length;
+  const candidateFailureCount = votes.filter(
+    (v) => v.failureCategory === "candidate_test_failure"
+  ).length;
 
   const commitSet = new Set(
     votes.map((v) => v.candidateCommit || v.candidateSha).filter(Boolean)
@@ -10990,6 +11802,7 @@ export async function voteReleaseAcrossFlock(cfg, { branch = "main", machines = 
   const unanimousCommit = commitSet.size === 1 ? [...commitSet][0] : null;
   const approvedForMerge =
     votes.length > 0 &&
+    acceptCount === votes.length &&
     rejectCount === 0 &&
     verifiedSignatureCount === votes.length &&
     Boolean(unanimousCommit);
@@ -10999,9 +11812,12 @@ export async function voteReleaseAcrossFlock(cfg, { branch = "main", machines = 
     branch,
     unanimousCommit,
     verificationScope: "daemon_syntax_unit_tests_and_ed25519_signature",
+    fixtureVerificationLevel: FIXTURE_VERIFICATION_LEVEL,
     onlineVoterCount: votes.length,
     acceptCount,
     rejectCount,
+    infrastructureFailureCount,
+    candidateFailureCount,
     verifiedSignatureCount,
     daemonChecksPassed: approvedForMerge,
     approvedForMerge,
