@@ -1,6 +1,6 @@
 import { open } from "node:fs/promises";
 import { isIPv4 } from "node:net";
-import { validateTodoSnapshot } from "./todo-snapshot.mjs";
+import { parseTodoStaleAfterMinutes, validateTodoSnapshot } from "./todo-snapshot.mjs";
 
 function permittedSocket(address, lanCidr) {
   let network, mask;
@@ -22,6 +22,7 @@ function permittedSocket(address, lanCidr) {
 export async function handleTodoRequest(req, res, {
   snapshotPath = process.env.VIEWER_TODOS_PATH,
   lanCidr = process.env.VIEWER_TODOS_LAN_CIDR || "",
+  staleAfterMinutes = process.env.VIEWER_TODOS_STALE_AFTER_MINUTES || "",
   log = console.error,
 } = {}) {
   if (new URL(req.url || "/", "http://localhost").pathname !== "/api/todos") return false;
@@ -54,12 +55,19 @@ export async function handleTodoRequest(req, res, {
   if (!permitted) {
     return reply(403, { error: "TODO access is restricted to loopback, authenticated SSH, or the explicitly configured LAN subnet" });
   }
+  let configuredStaleAfterMinutes;
+  try { configuredStaleAfterMinutes = parseTodoStaleAfterMinutes(staleAfterMinutes); }
+  catch {
+    log("[viewer] Invalid TODO freshness threshold configuration");
+    return reply(503, { error: "TODO freshness policy configuration is invalid" });
+  }
   let file;
   try {
     file = await open(snapshotPath, "r");
     const stat = await file.stat();
     if (!stat.isFile() || stat.size > 1024 * 1024) throw new Error("Invalid snapshot file");
     const snapshot = validateTodoSnapshot(JSON.parse(await file.readFile("utf8")));
+    if (configuredStaleAfterMinutes !== null) snapshot.staleAfterMinutes = configuredStaleAfterMinutes;
     return reply(200, snapshot);
   } catch (error) {
     const missing = error?.code === "ENOENT";
