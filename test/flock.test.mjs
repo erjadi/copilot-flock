@@ -8652,3 +8652,96 @@ test("TODO #14: wall-clock time-skip detector triggers immediate ws.port re-disc
     env.cleanup();
   }
 });
+
+test("TODO #15 & #16: ping uses non-blocking cached specs skipping network mounts, and share_thread auto-resolves human-readable titles and supports batch session_ids / '*'", async () => {
+  const env = setupTempCopilotEnv();
+  const prevCopilotHome = process.env.COPILOT_HOME;
+  process.env.COPILOT_HOME = env.tempRoot;
+
+  try {
+    const sess1Id = "15151515-1111-4111-8111-111111111111";
+    const sess2Id = "16161616-2222-4222-8222-222222222222";
+    const sess3Id = "17171717-3333-4333-8333-333333333333";
+    env.insertSession({ id: sess1Id, title: "SignalR Reconnect Investigation" });
+    env.insertSession({ id: sess2Id, title: "Azure Service Bus Dead-Letter Audit" });
+    env.insertSession({ id: sess3Id, title: "GPU Topology SVG Renderer" });
+
+    const flocksPath = path.join(env.tempRoot, "flock", "flocks.json");
+    const cfg = {
+      machineId: "DESKTOP-7E16MBO",
+      scope: "personal",
+      githubUser: "erjadi",
+      specs: {
+        model: "Workstation",
+        gpus: [{ name: "NVIDIA GeForce RTX 4070", vramGb: 12 }],
+        disks: [
+          { mount: "C:", label: "OS", type: "fixed", totalGb: 1000, freeGb: 450 },
+          { mount: "\\\\unreachable-nas\\share", label: "OfflineSMB", type: "network", totalGb: 4000, freeGb: 2000 },
+        ],
+      },
+    };
+
+    // 1. Single share_thread without title auto-resolves human-readable title from local DB
+    const singleShare = shareThreadWithFlock(
+      cfg,
+      {
+        flockId: "erjadi/studio-team",
+        sessionId: sess1Id,
+        summarySnapshot: "Approved summary for SignalR reconnect",
+      },
+      flocksPath
+    );
+    assert.equal(singleShare.ok, true);
+    assert.equal(singleShare.sessionId, sess1Id);
+    assert.equal(singleShare.sharedEntry.title, "SignalR Reconnect Investigation");
+
+    // 2. Batch share_thread via session_ids array auto-resolves titles for each session
+    const batchShare = await executeMcpTool(cfg, "share_thread", {
+      flock: "erjadi/studio-team",
+      session_ids: [sess2Id, sess3Id],
+      summary_snapshot: "Approved batch summary",
+    });
+    assert.equal(batchShare.ok, true);
+    assert.equal(batchShare.sharedCount, 2);
+    assert.deepEqual(batchShare.sessionIds, [sess2Id, sess3Id]);
+    assert.equal(batchShare.sharedEntries[0].title, "Azure Service Bus Dead-Letter Audit");
+    assert.equal(batchShare.sharedEntries[1].title, "GPU Topology SVG Renderer");
+
+    // 3. Wildcard share_thread (session_id: '*') shares all local sessions with resolved titles
+    const wildcardShare = await executeMcpTool(cfg, "share_thread", {
+      flock: "erjadi/all-hands",
+      session_id: "*",
+      summary_snapshot: "Approved wildcard summary",
+    });
+    assert.equal(wildcardShare.ok, true);
+    assert.equal(wildcardShare.sharedCount, 3);
+    const allTitles = wildcardShare.sharedEntries.map((e) => e.title).sort();
+    assert.deepEqual(
+      allTitles,
+      [
+        "Azure Service Bus Dead-Letter Audit",
+        "GPU Topology SVG Renderer",
+        "SignalR Reconnect Investigation",
+      ]
+    );
+
+    const listed = listSharedThreadsForMachine(cfg);
+    assert.equal(listed.sharedCount, 6);
+    assert.ok(listed.sharedThreads.every((t) => t.title !== t.sessionId));
+
+    // 4. ping uses cached non-blocking specs and skips network mounts
+    const pingStart = performance.now();
+    const ping1 = await handleRpcAction(cfg, { action: "ping", params: {} });
+    const ping2 = await handleRpcAction(cfg, { action: "ping", params: {} });
+    const pingElapsed = performance.now() - pingStart;
+    assert.ok(pingElapsed < 500, `Expected 2 cached pings < 500ms, took ${Math.round(pingElapsed)}ms`);
+    assert.equal(ping1.machineId, "DESKTOP-7E16MBO");
+    assert.equal(ping2.machineId, "DESKTOP-7E16MBO");
+    const netDisk = ping1.specs.disks.find((d) => d.type === "network");
+    assert.equal(netDisk?.totalGb, 4000);
+  } finally {
+    if (prevCopilotHome === undefined) delete process.env.COPILOT_HOME;
+    else process.env.COPILOT_HOME = prevCopilotHome;
+    env.cleanup();
+  }
+});

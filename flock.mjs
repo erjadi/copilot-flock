@@ -1530,11 +1530,13 @@ const THERMAL_TELEMETRY_MAX_READINGS = 16;
 const NVML_THERMAL_POWER_THROTTLE_MASK = 0xecn;
 
 let defaultThermalTelemetryCache = null;
+let defaultLiveSpecsCache = null;
 let win32ThermalScriptSeq = 0;
 let win32AsyncProbeInFlight = false;
 
 export function resetThermalTelemetryCache() {
   defaultThermalTelemetryCache = null;
+  defaultLiveSpecsCache = null;
 }
 
 const WIN32_THERMAL_JSCRIPT_SOURCE = [
@@ -2680,6 +2682,32 @@ export function sanitizeSpecsForFlockPolicy(specs, flockPolicy = null, senderIde
 
 export function refreshLiveSpecs(baseSpecs = null, options = {}) {
   const passive = Boolean(options?.passive);
+  const useCache = Boolean(options?.useCache);
+  const cacheTtlMs = Math.max(250, Number(options?.cacheTtlMs) || 10000);
+  const includeThermalOpt = options?.includeThermal !== false && (!passive || options?.includeThermal === true);
+  const cacheKey = useCache
+    ? `${getCopilotDir()}|${passive ? 1 : 0}|${includeThermalOpt ? 1 : 0}|${
+        baseSpecs
+          ? `${baseSpecs.model || ""}:${(baseSpecs.gpus || []).length}:${(baseSpecs.disks || []).length}:${baseSpecs.publicKey || ""}`
+          : "null"
+      }`
+    : null;
+  if (
+    useCache &&
+    defaultLiveSpecsCache &&
+    defaultLiveSpecsCache.key === cacheKey &&
+    Date.now() < defaultLiveSpecsCache.expiresAtMs
+  ) {
+    const cached = defaultLiveSpecsCache.value;
+    return {
+      ...cached,
+      cpu: cached.cpu ? { ...cached.cpu } : null,
+      memory: cached.memory ? { ...cached.memory } : null,
+      gpus: Array.isArray(cached.gpus) ? cached.gpus.map((g) => ({ ...g })) : [],
+      disks: Array.isArray(cached.disks) ? cached.disks.map((d) => ({ ...d })) : [],
+    };
+  }
+
   const refreshStartedAt = performance.now();
   const cpus = os.cpus() || [];
   const totalRamGb = round1(os.totalmem() / 1073741824);
@@ -2739,6 +2767,15 @@ export function refreshLiveSpecs(baseSpecs = null, options = {}) {
       }
     }
     for (const d of specs.disks) {
+      const mountStr = String(d?.mount || "");
+      const isNetworkMount =
+        d?.type === "network" || mountStr.startsWith("\\\\") || mountStr.startsWith("//");
+      if (isNetworkMount && !options?.probeNetworkDisks) {
+        continue;
+      }
+      if (performance.now() - refreshStartedAt > 180) {
+        break;
+      }
       try {
         const targetPath =
           process.platform === "win32" && /^[A-Za-z]:$/.test(d.mount) ? `${d.mount}\\` : d.mount;
@@ -2753,7 +2790,7 @@ export function refreshLiveSpecs(baseSpecs = null, options = {}) {
     }
   }
 
-  if (options?.includeThermal !== false && (!passive || options?.includeThermal === true)) {
+  if (includeThermalOpt) {
     const remainingBudgetMs = Math.max(
       20,
       THERMAL_TELEMETRY_MAX_BUDGET_MS - Math.ceil(performance.now() - refreshStartedAt)
@@ -2770,6 +2807,14 @@ export function refreshLiveSpecs(baseSpecs = null, options = {}) {
             )
           : remainingBudgetMs,
     });
+  }
+
+  if (useCache && cacheKey) {
+    defaultLiveSpecsCache = {
+      key: cacheKey,
+      expiresAtMs: Date.now() + cacheTtlMs,
+      value: specs,
+    };
   }
 
   return specs;
@@ -3727,20 +3772,104 @@ export function shareThreadWithFlock(
   cfg,
   {
     flockId,
-    sessionId,
+    sessionId = null,
+    sessionIds = null,
     title = null,
     summarySnapshot = null,
     mode = "approved-snapshot",
   },
   customPath = getFlocksConfigPath()
 ) {
+  const rawTargets = [];
+  if (Array.isArray(sessionIds)) {
+    for (const item of sessionIds) {
+      const trimmed = String(item || "").trim();
+      if (trimmed && !rawTargets.includes(trimmed)) rawTargets.push(trimmed);
+    }
+  }
+  if (sessionId !== null && sessionId !== undefined) {
+    const trimmedSingle = String(sessionId).trim();
+    if (trimmedSingle && !rawTargets.includes(trimmedSingle)) {
+      rawTargets.unshift(trimmedSingle);
+    }
+  }
+  if (rawTargets.length === 0) {
+    throw new Error("Missing sessionId for shareThreadWithFlock");
+  }
+
+  let localSessions = [];
+  try {
+    localSessions = queryLocalSessionsFromDb({ limit: 200, runningOnly: false });
+  } catch {}
+
+  const findLocalSessionMeta = (selector) => {
+    const selLower = String(selector || "").trim().toLowerCase();
+    if (!selLower || selLower === "*") return null;
+    const exact = localSessions.find(
+      (s) =>
+        String(s.session_id || "").toLowerCase() === selLower ||
+        (s.workspace_id && String(s.workspace_id).toLowerCase() === selLower)
+    );
+    if (exact) return exact;
+    if (selLower.length >= 6) {
+      const prefix = localSessions.find(
+        (s) =>
+          String(s.session_id || "").toLowerCase().startsWith(selLower) ||
+          (s.workspace_id && String(s.workspace_id).toLowerCase().startsWith(selLower))
+      );
+      if (prefix) return prefix;
+    }
+    const byTitle = localSessions.find(
+      (s) => String(s.title || "").trim().toLowerCase() === selLower
+    );
+    if (byTitle) return byTitle;
+    try {
+      const resolved = resolveLocalSession(selector);
+      if (
+        resolved &&
+        resolved.session_id &&
+        (resolved.workspace_id !== null ||
+          localSessions.some(
+            (s) =>
+              String(s.session_id || "").toLowerCase() ===
+              String(resolved.session_id).toLowerCase()
+          ))
+      ) {
+        return resolved;
+      }
+    } catch {}
+    return null;
+  };
+
+  const expandedTargets = [];
+  for (const raw of rawTargets) {
+    if (raw === "*") {
+      if (localSessions.length === 0) {
+        throw new Error("No local sessions found to share for wildcard '*'");
+      }
+      for (const s of localSessions) {
+        const sid = String(s.session_id || "").trim();
+        if (sid && !expandedTargets.includes(sid)) expandedTargets.push(sid);
+      }
+    } else if (!expandedTargets.includes(raw)) {
+      expandedTargets.push(raw);
+    }
+  }
+
   if (cfg?.protocol === "broker-free-v34") {
     brokerFreeRuntime(cfg).record(flockId);
-    if (typeof summarySnapshot !== "string" || !summarySnapshot.trim()) throw new Error("Broker-free sharing requires an explicitly approved summary snapshot, not an automatic live transcript");
-    const resolved = resolveLocalSession(sessionId);
-    if (resolved.session_id !== sessionId) throw new Error("Share the exact local session ID");
+    if (typeof summarySnapshot !== "string" || !summarySnapshot.trim()) {
+      throw new Error(
+        "Broker-free sharing requires an explicitly approved summary snapshot, not an automatic live transcript"
+      );
+    }
+    for (const target of expandedTargets) {
+      const resolved = resolveLocalSession(target);
+      if (resolved.session_id !== target) throw new Error("Share the exact local session ID");
+    }
     summarySnapshot = redactFlockSnapshot(summarySnapshot);
   }
+
   const parsed = parseFlockAddress(flockId, cfg?.githubUser);
   const fCfg = loadLocalFlocksConfig(cfg, customPath);
   if (!fCfg.flocks[parsed.flockId]) {
@@ -3761,7 +3890,11 @@ export function shareThreadWithFlock(
   }
   const flockEntry = fCfg.flocks[parsed.flockId];
   if (cfg?.protocol === "broker-free-v34") {
-    if (fCfg.threadBindings?.[sessionId] && fCfg.threadBindings[sessionId] !== parsed.flockId) throw new Error("Thread is bound to another flock");
+    for (const target of expandedTargets) {
+      if (fCfg.threadBindings?.[target] && fCfg.threadBindings[target] !== parsed.flockId) {
+        throw new Error("Thread is bound to another flock");
+      }
+    }
     flockEntry.trustTier = "collaborator";
     flockEntry.sessionVisibility = "explicit_opt_in_only";
   }
@@ -3770,25 +3903,53 @@ export function shareThreadWithFlock(
     ? flockEntry.sharedSessionIds
     : [];
 
-  const cleanSid = String(sessionId || "").trim();
-  if (!cleanSid) throw new Error("Missing sessionId for shareThreadWithFlock");
-  if (!flockEntry.sharedSessionIds.includes(cleanSid)) {
-    flockEntry.sharedSessionIds.push(cleanSid);
+  const sharedEntries = [];
+  const sharedAt = new Date().toISOString();
+  const explicitTitle =
+    title !== null && title !== undefined && String(title).trim() !== ""
+      ? String(title).trim()
+      : null;
+
+  for (const target of expandedTargets) {
+    const meta = findLocalSessionMeta(target);
+    const cleanSid =
+      cfg?.protocol === "broker-free-v34"
+        ? String(target).trim()
+        : String(meta?.session_id || target).trim();
+    if (!cleanSid) throw new Error("Missing sessionId for shareThreadWithFlock");
+    if (!flockEntry.sharedSessionIds.includes(cleanSid)) {
+      flockEntry.sharedSessionIds.push(cleanSid);
+    }
+    const existingTitle = flockEntry.sharedSnapshots[cleanSid]?.title;
+    const resolvedTitle =
+      (expandedTargets.length === 1 ? explicitTitle : null) ||
+      (meta?.title && String(meta.title).trim()) ||
+      (existingTitle && existingTitle !== cleanSid ? existingTitle : null) ||
+      explicitTitle ||
+      cleanSid;
+    flockEntry.sharedSnapshots[cleanSid] = {
+      sessionId: cleanSid,
+      title: resolvedTitle,
+      ...(meta?.repo ? { repo: meta.repo } : {}),
+      ...(meta?.session_type ? { sessionType: meta.session_type } : {}),
+      mode,
+      summarySnapshot: summarySnapshot || null,
+      sharedAt,
+    };
+    sharedEntries.push(flockEntry.sharedSnapshots[cleanSid]);
   }
-  flockEntry.sharedSnapshots[cleanSid] = {
-    sessionId: cleanSid,
-    title: title || cleanSid,
-    mode,
-    summarySnapshot: summarySnapshot || null,
-    sharedAt: new Date().toISOString(),
-  };
+
   saveLocalFlocksConfig(fCfg, customPath);
+  const firstEntry = sharedEntries[0];
   return {
     ok: true,
     flockId: parsed.flockId,
-    sessionId: cleanSid,
+    sessionId: firstEntry.sessionId,
+    sessionIds: sharedEntries.map((e) => e.sessionId),
+    sharedCount: sharedEntries.length,
     mode,
-    sharedEntry: flockEntry.sharedSnapshots[cleanSid],
+    sharedEntry: firstEntry,
+    sharedEntries,
   };
 }
 
@@ -3829,15 +3990,32 @@ export function unshareThreadFromFlock(
 
 export function listSharedThreadsForMachine(cfg, customPath = getFlocksConfigPath()) {
   const fCfg = loadLocalFlocksConfig(cfg, customPath);
+  let localById = null;
+  const getLocalMeta = (sid) => {
+    if (!localById) {
+      localById = new Map();
+      try {
+        for (const s of queryLocalSessionsFromDb({ limit: 200, runningOnly: false })) {
+          if (s?.session_id) localById.set(String(s.session_id).toLowerCase(), s);
+        }
+      } catch {}
+    }
+    return localById.get(String(sid || "").toLowerCase()) || null;
+  };
   const shared = [];
   for (const [fKey, fEntry] of Object.entries(fCfg.flocks || {})) {
     if (fEntry.trustTier === "owner") continue;
     for (const [sid, snap] of Object.entries(fEntry.sharedSnapshots || {})) {
+      const storedTitle = snap?.title ? String(snap.title).trim() : "";
+      const resolvedTitle =
+        storedTitle && storedTitle !== sid
+          ? storedTitle
+          : getLocalMeta(sid)?.title || storedTitle || sid;
       shared.push({
         flockId: fKey,
         trustTier: fEntry.trustTier,
         sessionId: sid,
-        title: snap.title || sid,
+        title: resolvedTitle,
         mode: snap.mode || "approved-snapshot",
         sharedAt: snap.sharedAt || null,
       });
@@ -9044,6 +9222,8 @@ export async function handleRpcAction(cfg, req) {
     const rawSpecs = refreshLiveSpecs(cfg.specs, {
       passive: Boolean(params.passive),
       includeThermal: Boolean(params.passive) ? false : allowFullSpecs,
+      useCache: !params.forceRefreshSpecs,
+      cacheTtlMs: Number(params.specsCacheTtlMs) || 10000,
     });
     const specs = sanitizeSpecsForFlockPolicy(rawSpecs, flockPolicy, senderIdentity);
     const runtimeStates = await getLocalRuntimeStatesAsync({ inDaemonProcess: true });
@@ -10630,22 +10810,77 @@ export async function ensureDaemonStarted(cfg) {
 
   const sandboxMode = isSandboxV3Mode();
   const daemonArgs = sandboxMode ? [scriptToRun, "daemon", "--sandbox", "v3"] : [scriptToRun, "daemon"];
-  const child = spawnSessionSafeProcess(process.execPath, daemonArgs, {
-    detached: true,
-    stdio: "ignore",
-    windowsHide: true,
-    env: {
-      ...process.env,
-      SIGNALR_CONNECTION_STRING: cfg.connectionString,
-      COPILOT_FLOCK_MACHINE_ID: cfg.machineId,
-      COPILOT_BRIDGE_MACHINE_ID: cfg.machineId,
-      COPILOT_FLOCK_SCOPE: cfg.scope,
-      COPILOT_BRIDGE_SCOPE: cfg.scope,
-      COPILOT_FLOCK_HUB: cfg.hub,
-      COPILOT_BRIDGE_HUB: cfg.hub,
-      ...(sandboxMode ? { COPILOT_FLOCK_SANDBOX: "v3", COPILOT_BRIDGE_SANDBOX: "v3" } : {}),
-    },
-  }, { unitPrefix: "copilot-flock-daemon", unitId: crypto.randomUUID() });
+  const daemonEnv = {
+    ...process.env,
+    SIGNALR_CONNECTION_STRING: cfg.connectionString,
+    COPILOT_FLOCK_MACHINE_ID: cfg.machineId,
+    COPILOT_BRIDGE_MACHINE_ID: cfg.machineId,
+    COPILOT_FLOCK_SCOPE: cfg.scope,
+    COPILOT_BRIDGE_SCOPE: cfg.scope,
+    COPILOT_FLOCK_HUB: cfg.hub,
+    COPILOT_BRIDGE_HUB: cfg.hub,
+    ...(sandboxMode ? { COPILOT_FLOCK_SANDBOX: "v3", COPILOT_BRIDGE_SANDBOX: "v3" } : {}),
+  };
+
+  let vbsCandidate = null;
+  if (
+    process.platform === "win32" &&
+    !sandboxMode &&
+    cfg.protocol !== "broker-free-v34" &&
+    cfg?.preferWscriptVbs !== false &&
+    (!process.env.NODE_TEST_CONTEXT || cfg?.preferWscriptVbs === true)
+  ) {
+    const candidatePath =
+      cfg?.vbsPath ||
+      (process.env.APPDATA
+        ? path.join(
+            process.env.APPDATA,
+            "Microsoft",
+            "Windows",
+            "Start Menu",
+            "Programs",
+            "Startup",
+            "copilot-flock.vbs"
+          )
+        : null);
+    if (candidatePath && fs.existsSync(candidatePath)) {
+      try {
+        const vbsText = fs.readFileSync(candidatePath, "utf8");
+        if (cfg?.preferWscriptVbs === true || vbsText.toLowerCase().includes(scriptToRun.toLowerCase())) {
+          vbsCandidate = candidatePath;
+        }
+      } catch {}
+    }
+  }
+
+  let launchedViaWscript = false;
+  let child;
+  if (vbsCandidate) {
+    launchedViaWscript = true;
+    child = spawnSessionSafeProcess(
+      "wscript.exe",
+      ["//B", "//NoLogo", vbsCandidate],
+      {
+        detached: true,
+        stdio: "ignore",
+        windowsHide: true,
+        env: daemonEnv,
+      },
+      { unitPrefix: "copilot-flock-daemon", unitId: crypto.randomUUID() }
+    );
+  } else {
+    child = spawnSessionSafeProcess(
+      process.execPath,
+      daemonArgs,
+      {
+        detached: true,
+        stdio: "ignore",
+        windowsHide: true,
+        env: daemonEnv,
+      },
+      { unitPrefix: "copilot-flock-daemon", unitId: crypto.randomUUID() }
+    );
+  }
   child.unref();
   const spawnedPid = child.pid;
   const statePath = getStatePath();
@@ -10657,10 +10892,24 @@ export async function ensureDaemonStarted(cfg) {
     if (fs.existsSync(statePath)) {
       try {
         const st = JSON.parse(fs.readFileSync(statePath, "utf8"));
-        if (st.pid === spawnedPid && st.status === "connected") {
-          return { running: true, pid: spawnedPid, state: st };
+        if (st.status === "connected") {
+          if (st.pid === spawnedPid) {
+            return { running: true, pid: spawnedPid, state: st };
+          }
+          if (launchedViaWscript) {
+            const liveDaemon = isLocalDaemonRunning();
+            if (liveDaemon.running && liveDaemon.pid && st.pid === liveDaemon.pid) {
+              return { running: true, pid: liveDaemon.pid, state: st, launchedVia: "startup-vbs" };
+            }
+          }
         }
       } catch {}
+    }
+  }
+  if (launchedViaWscript) {
+    const liveDaemon = isLocalDaemonRunning();
+    if (liveDaemon.running && liveDaemon.pid) {
+      return { running: true, pid: liveDaemon.pid, launchedVia: "startup-vbs" };
     }
   }
   if (cfg.protocol === "broker-free-v34") throw new Error("Broker-free daemon connection readiness not confirmed; inspect retained daemon log and enrollment");
@@ -11446,7 +11695,7 @@ const MCP_TOOLS = [
   {
     name: "share_thread",
     description:
-      "Share a local Copilot thread (via an approved summary snapshot or clean collaborator thread) with a specific flock (<owner>/<flock>).",
+      "Share one or more local Copilot threads (via an approved summary snapshot or clean collaborator thread) with a specific flock (<owner>/<flock>). Supports a single session_id, session_id: '*' for all local sessions, or session_ids array.",
     inputSchema: {
       type: "object",
       properties: {
@@ -11456,14 +11705,24 @@ const MCP_TOOLS = [
         },
         session_id: {
           type: "string",
-          description: "Local session ID or title to share.",
+          description: "Local session ID, title, or '*' to share all local sessions.",
+        },
+        session_ids: {
+          type: "array",
+          items: { type: "string" },
+          description: "Optional list of local session IDs (or ['*']) to share in batch.",
+        },
+        title: {
+          type: "string",
+          description:
+            "Optional human-readable thread title override (auto-resolved from local session DB when omitted).",
         },
         summary_snapshot: {
           type: "string",
           description: "Approved clean summary snapshot to expose to the flock.",
         },
       },
-      required: ["flock", "session_id"],
+      required: ["flock"],
     },
   },
   {
@@ -12927,6 +13186,8 @@ export async function executeMcpTool(cfg, name, args = {}, options = {}) {
     return shareThreadWithFlock(cfg, {
       flockId: args.flock,
       sessionId: args.session_id,
+      sessionIds: args.session_ids,
+      title: args.title || null,
       summarySnapshot: args.summary_snapshot || null,
       mode: "approved-snapshot",
     });
@@ -19122,6 +19383,13 @@ Usage:
     const out = await executeMcpTool(cfg, "share_thread", {
       flock: flags.flock || positional[0],
       session_id: flags.session || flags["session-id"] || positional[1],
+      session_ids: flags.sessions
+        ? String(flags.sessions)
+            .split(",")
+            .map((s) => s.trim())
+            .filter(Boolean)
+        : undefined,
+      title: flags.title || null,
       summary_snapshot: flags.summary || flags.snapshot || null,
     });
     console.log(JSON.stringify(out, null, 2));
