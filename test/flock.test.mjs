@@ -38,6 +38,11 @@ import {
   releaseLocalResourceLock,
   listLocalResourceLocks,
   verifyVoteBallotSignature,
+  buildCanonicalVoteBallotPayload,
+  truncateUtf8Bounded,
+  extractCandidateFixtureFromGit,
+  reviewReleaseCandidate,
+  voteReleaseAcrossFlock,
   drainAndProcessOfflineQueue,
   loadProcessedOfflineState,
   saveProcessedOfflineState,
@@ -2341,3 +2346,408 @@ test("v3.0.0 multi-flock platform: universal <owner>/<flock>[/<machineId>] addre
     env.cleanup();
   }
 });
+
+test("release voter extracts complete modular dependency closure into isolated fixture and produces signed machine-readable ballots across pass, missing-module, failure, timeout, and infrastructure errors", async () => {
+  const env = setupTempCopilotEnv();
+  const prevCopilotHome = process.env.COPILOT_HOME;
+  process.env.COPILOT_HOME = env.tempRoot;
+
+  const gitRun = (cwd, args) =>
+    execFileSync("git", args, {
+      cwd,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+      windowsHide: true,
+    }).trim();
+
+  const writeTreeFiles = (rootDir, filesMap) => {
+    for (const fileName of fs.readdirSync(rootDir)) {
+      if (fileName === ".git") continue;
+      fs.rmSync(path.join(rootDir, fileName), { recursive: true, force: true });
+    }
+    for (const [relPath, content] of Object.entries(filesMap)) {
+      const dest = path.join(rootDir, ...relPath.split("/"));
+      fs.mkdirSync(path.dirname(dest), { recursive: true });
+      fs.writeFileSync(dest, content, "utf8");
+    }
+  };
+
+  try {
+    // Plant poisoned/stale modules in ~/.copilot/flock to prove isolated candidate fixtures never read host installations
+    const hostFlockDir = path.join(env.tempRoot, "flock");
+    fs.writeFileSync(
+      path.join(hostFlockDir, "flock-lifecycle.mjs"),
+      'throw new Error("STALE_HOST_FLOCK_LIFECYCLE_IMPORTED");\n',
+      "utf8"
+    );
+    fs.writeFileSync(
+      path.join(hostFlockDir, "custom-modular-feature.mjs"),
+      'export const FEATURE_TAG = "stale-host-copy";\n',
+      "utf8"
+    );
+    fs.writeFileSync(
+      path.join(hostFlockDir, "config.json"),
+      JSON.stringify({ machineId: "POISONED-HOST-CONFIG" }),
+      "utf8"
+    );
+
+    const voterKey = ensureMachineIdentityKeypair();
+    const voterCfg = {
+      machineId: "VOTER-WIN-PC",
+      scope: "personal",
+      githubUser: "erjadi",
+    };
+
+    // Create a local origin git repository and a voter clone so real git fetch + ls-tree + cat-file run offline
+    const originWorkDir = path.join(env.tempRoot, "origin-repo");
+    const voterCloneDir = path.join(env.tempRoot, "voter-clone");
+    fs.mkdirSync(originWorkDir, { recursive: true });
+    gitRun(originWorkDir, ["init", "-b", "main"]);
+    gitRun(originWorkDir, ["config", "user.email", "voter-test@example.invalid"]);
+    gitRun(originWorkDir, ["config", "user.name", "Voter Test"]);
+
+    const baseModularCandidate = {
+      "package.json": JSON.stringify({ name: "copilot-flock", version: "3.5.0-test", type: "module" }, null, 2),
+      "flock-lifecycle.mjs": 'export const LIFECYCLE_STATE = "fresh-candidate-lifecycle";\n',
+      "modules/deep-helper.mjs": 'export function computeDeepTag(x) { return `deep:${x}`; }\n',
+      "custom-modular-feature.mjs": [
+        'import { computeDeepTag } from "./modules/deep-helper.mjs";',
+        'export const FEATURE_TAG = computeDeepTag("modular-v35");',
+      ].join("\n"),
+      "flock.mjs": [
+        'import { LIFECYCLE_STATE } from "./flock-lifecycle.mjs";',
+        'import { FEATURE_TAG } from "./custom-modular-feature.mjs";',
+        'export function summarizeCandidate() { return `${LIFECYCLE_STATE}|${FEATURE_TAG}`; }',
+      ].join("\n"),
+      "bridge.mjs": 'export { summarizeCandidate } from "./flock.mjs";\n',
+      "bootstrap-server.mjs": [
+        'import { FEATURE_TAG } from "./custom-modular-feature.mjs";',
+        'export const BOOTSTRAP_READY = FEATURE_TAG;',
+      ].join("\n"),
+      "test/flock.test.mjs": [
+        'import test from "node:test";',
+        'import assert from "node:assert/strict";',
+        'import os from "node:os";',
+        'import fs from "node:fs";',
+        'import path from "node:path";',
+        'import { summarizeCandidate } from "../flock.mjs";',
+        'import { BOOTSTRAP_READY } from "../bootstrap-server.mjs";',
+        `const hostTempRoot = ${JSON.stringify(env.tempRoot)};`,
+        'test("modular candidate runs in isolated fixture without reading ~/.copilot/flock", () => {',
+        '  assert.equal(summarizeCandidate(), "fresh-candidate-lifecycle|deep:modular-v35");',
+        '  assert.equal(BOOTSTRAP_READY, "deep:modular-v35");',
+        '  assert.notEqual(path.resolve(process.env.COPILOT_HOME || ""), path.resolve(hostTempRoot));',
+        '  assert.equal(fs.existsSync(path.join(os.homedir(), ".copilot", "flock", "config.json")), false);',
+        '  console.log("modular-candidate-stdout-ok");',
+        '});',
+      ].join("\n"),
+    };
+
+    writeTreeFiles(originWorkDir, baseModularCandidate);
+    gitRun(originWorkDir, ["add", "-A"]);
+    gitRun(originWorkDir, ["commit", "-m", "initial modular main"]);
+
+    // Clone voter repo from local originWorkDir
+    gitRun(env.tempRoot, ["clone", originWorkDir, voterCloneDir]);
+
+    // Branch 1: passing modular candidate (`rc-modular-pass`)
+    gitRun(originWorkDir, ["checkout", "-b", "rc-modular-pass"]);
+    writeTreeFiles(originWorkDir, {
+      ...baseModularCandidate,
+      "modules/extra-leaf.mjs": 'export const EXTRA_LEAF = "leaf-ok";\n',
+      "custom-modular-feature.mjs": [
+        'import { computeDeepTag } from "./modules/deep-helper.mjs";',
+        'import { EXTRA_LEAF } from "./modules/extra-leaf.mjs";',
+        'export const FEATURE_TAG = `${computeDeepTag("modular-v35")}:${EXTRA_LEAF}`;',
+      ].join("\n"),
+      "test/flock.test.mjs": baseModularCandidate["test/flock.test.mjs"].replaceAll(
+        "deep:modular-v35",
+        "deep:modular-v35:leaf-ok"
+      ),
+    });
+    gitRun(originWorkDir, ["add", "-A"]);
+    gitRun(originWorkDir, ["commit", "-m", "add extra nested module"]);
+    const passCommit = gitRun(originWorkDir, ["rev-parse", "HEAD"]);
+
+    const passBallot = await reviewReleaseCandidate(
+      voterCfg,
+      { branch: "rc-modular-pass" },
+      { repoDir: voterCloneDir }
+    );
+    assert.equal(passBallot.vote, "ACCEPT");
+    assert.equal(passBallot.failureCategory, "passed");
+    assert.equal(passBallot.candidateCommit, passCommit);
+    assert.equal(passBallot.voterVersion, BRIDGE_VERSION);
+    assert.equal(passBallot.fixtureVerificationLevel, "complete_repo_closure_isolated_fixture");
+    assert.equal(passBallot.keyFingerprint, voterKey.fingerprint);
+    assert.equal(passBallot.exitCode, 0);
+    assert.equal(passBallot.signal, null);
+    assert.equal(passBallot.timedOut, false);
+    assert.equal(passBallot.checks.fixtureExtractedOk, true);
+    assert.equal(passBallot.checks.dependencyClosureOk, true);
+    assert.equal(passBallot.checks.unitTestsOk, true);
+    assert.ok(passBallot.stdout.includes("modular-candidate-stdout-ok"));
+    assert.equal(verifyVoteBallotSignature(passBallot, voterKey.publicKey), true);
+
+    // Tampering with any signed v2 ballot metadata field must invalidate verifyVoteBallotSignature
+    for (const tampered of [
+      { ...passBallot, failureCategory: "candidate_test_failure" },
+      { ...passBallot, stdout: `${passBallot.stdout}\nforged` },
+      { ...passBallot, stderr: "forged-stderr" },
+      { ...passBallot, exitCode: 1 },
+      { ...passBallot, timedOut: true },
+      { ...passBallot, voterVersion: "0.0.0-forged" },
+      { ...passBallot, fixtureVerificationLevel: "three_file_legacy" },
+      { ...passBallot, keyFingerprint: "0".repeat(32) },
+      { ...passBallot, ballotSignature: undefined },
+    ]) {
+      assert.equal(verifyVoteBallotSignature(tampered, voterKey.publicKey), false);
+    }
+
+    // Branch 2: missing-module failure diagnostics (`rc-missing-module`)
+    gitRun(originWorkDir, ["checkout", "-b", "rc-missing-module", "main"]);
+    writeTreeFiles(originWorkDir, {
+      ...baseModularCandidate,
+      "flock.mjs": [
+        'import { MISSING_SYM } from "./uncommitted-missing-module.mjs";',
+        'export function summarizeCandidate() { return MISSING_SYM; }',
+      ].join("\n"),
+    });
+    gitRun(originWorkDir, ["add", "-A"]);
+    gitRun(originWorkDir, ["commit", "-m", "broken missing module import"]);
+    const missingModCommit = gitRun(originWorkDir, ["rev-parse", "HEAD"]);
+
+    const missingModBallot = await reviewReleaseCandidate(
+      voterCfg,
+      { branch: "rc-missing-module" },
+      { repoDir: originWorkDir, fetchFromOrigin: false }
+    );
+    assert.equal(missingModBallot.vote, "REJECT");
+    assert.equal(missingModBallot.failureCategory, "candidate_test_failure");
+    assert.equal(missingModBallot.candidateCommit, missingModCommit);
+    assert.notEqual(missingModBallot.exitCode, 0);
+    assert.equal(missingModBallot.timedOut, false);
+    assert.match(missingModBallot.stderr, /ERR_MODULE_NOT_FOUND/);
+    assert.match(missingModBallot.stderr, /uncommitted-missing-module\.mjs/);
+    assert.equal(verifyVoteBallotSignature(missingModBallot, voterKey.publicKey), true);
+
+    // Branch 3: nonzero test failure with bounded multi-byte UTF-8 stdout/stderr (`rc-failing-test`)
+    gitRun(originWorkDir, ["checkout", "-b", "rc-failing-test", "main"]);
+    writeTreeFiles(originWorkDir, {
+      ...baseModularCandidate,
+      "test/flock.test.mjs": [
+        'import test from "node:test";',
+        'import assert from "node:assert/strict";',
+        'test("deliberate candidate failure with multibyte UTF-8 output", () => {',
+        '  console.log("HEAD-STDOUT-αβγ🚀-" + "ω".repeat(900) + "-TAIL-STDOUT-END");',
+        '  console.error("HEAD-STDERR-δεζ❌-" + "λ".repeat(900) + "-TAIL-STDERR-END");',
+        '  assert.equal("broken-candidate", "expected-behavior");',
+        '});',
+      ].join("\n"),
+    });
+    gitRun(originWorkDir, ["add", "-A"]);
+    gitRun(originWorkDir, ["commit", "-m", "failing test candidate"]);
+    const failTestCommit = gitRun(originWorkDir, ["rev-parse", "HEAD"]);
+
+    const maxBytes = 768;
+    const failBallot = await reviewReleaseCandidate(
+      voterCfg,
+      { branch: "rc-failing-test" },
+      { repoDir: originWorkDir, fetchFromOrigin: false, maxOutputBytes: maxBytes }
+    );
+    assert.equal(failBallot.vote, "REJECT");
+    assert.equal(failBallot.failureCategory, "candidate_test_failure");
+    assert.equal(failBallot.candidateCommit, failTestCommit);
+    assert.equal(failBallot.exitCode, 1);
+    assert.equal(failBallot.signal, null);
+    assert.equal(failBallot.timedOut, false);
+    assert.ok(Buffer.byteLength(failBallot.stdout, "utf8") <= maxBytes);
+    assert.ok(Buffer.byteLength(failBallot.stderr, "utf8") <= maxBytes);
+    assert.equal(failBallot.stdout.includes("\uFFFD"), false);
+    assert.equal(failBallot.stderr.includes("\uFFFD"), false);
+    assert.match(failBallot.stdout, /HEAD-STDOUT-αβγ🚀/);
+    assert.match(failBallot.stderr, /HEAD-STDERR-δεζ❌/);
+    assert.match(failBallot.stderr, /TAIL-STDERR-END|expected-behavior/);
+    assert.equal(verifyVoteBallotSignature(failBallot, voterKey.publicKey), true);
+
+    // Direct UTF-8 multi-byte boundary check on truncateUtf8Bounded
+    const emojiWall = "🚀🎉🔥✨".repeat(120);
+    const boundedEmoji = truncateUtf8Bounded(emojiWall, 180);
+    assert.ok(Buffer.byteLength(boundedEmoji, "utf8") <= 180);
+    assert.equal(boundedEmoji.includes("\uFFFD"), false);
+
+    // Branch 4: candidate unit test timeout (`rc-timeout-test`)
+    gitRun(originWorkDir, ["checkout", "-b", "rc-timeout-test", "main"]);
+    writeTreeFiles(originWorkDir, {
+      ...baseModularCandidate,
+      "test/flock.test.mjs": [
+        'process.stdout.write("STDOUT-BEFORE-TIMEOUT\\n");',
+        'process.stderr.write("STDERR-BEFORE-TIMEOUT\\n");',
+        'import test from "node:test";',
+        'test("hanging candidate test", async () => {',
+        '  await new Promise(() => {});',
+        '});',
+      ].join("\n"),
+    });
+    gitRun(originWorkDir, ["add", "-A"]);
+    gitRun(originWorkDir, ["commit", "-m", "hanging timeout candidate"]);
+    const timeoutCommit = gitRun(originWorkDir, ["rev-parse", "HEAD"]);
+
+    const timeoutBallot = await reviewReleaseCandidate(
+      voterCfg,
+      { branch: "rc-timeout-test" },
+      { repoDir: originWorkDir, fetchFromOrigin: false, testTimeoutMs: 1500 }
+    );
+    assert.equal(timeoutBallot.vote, "REJECT");
+    assert.equal(timeoutBallot.failureCategory, "candidate_test_failure");
+    assert.equal(timeoutBallot.candidateCommit, timeoutCommit);
+    assert.equal(timeoutBallot.timedOut, true);
+    assert.ok(timeoutBallot.signal === "SIGTERM" || timeoutBallot.signal === "SIGKILL");
+    assert.match(timeoutBallot.stdout, /STDOUT-BEFORE-TIMEOUT/);
+    assert.match(timeoutBallot.stderr, /STDERR-BEFORE-TIMEOUT/);
+    assert.equal(verifyVoteBallotSignature(timeoutBallot, voterKey.publicKey), true);
+
+    // Scenario 5: Fixture infrastructure errors must always REJECT with failureCategory: "fixture_infrastructure_error"
+    const missingRepoBallot = await reviewReleaseCandidate(
+      voterCfg,
+      { branch: "rc-modular-pass" },
+      { resolveRepoFn: () => null }
+    );
+    assert.equal(missingRepoBallot.vote, "REJECT");
+    assert.equal(missingRepoBallot.failureCategory, "fixture_infrastructure_error");
+    assert.equal(missingRepoBallot.candidateCommit, null);
+    assert.match(missingRepoBallot.stderr, /Could not locate copilot-flock git repo/);
+    assert.equal(verifyVoteBallotSignature(missingRepoBallot, voterKey.publicKey), true);
+
+    const badBranchBallot = await reviewReleaseCandidate(
+      voterCfg,
+      { branch: "nonexistent-branch-xyz" },
+      { repoDir: voterCloneDir }
+    );
+    assert.equal(badBranchBallot.vote, "REJECT");
+    assert.equal(badBranchBallot.failureCategory, "fixture_infrastructure_error");
+    assert.notEqual(badBranchBallot.exitCode, 0);
+    assert.ok(badBranchBallot.stderr.length > 0);
+    assert.equal(verifyVoteBallotSignature(badBranchBallot, voterKey.publicKey), true);
+
+    // Partial/incomplete extraction omitting a tracked .mjs module must fail closed as fixture_infrastructure_error
+    const incompleteExtractionBallot = await reviewReleaseCandidate(
+      voterCfg,
+      { branch: "rc-modular-pass" },
+      {
+        repoDir: originWorkDir,
+        fetchFromOrigin: false,
+        extractFixtureFn: async (rDir, commit, fDir, opts) => {
+          const res = await extractCandidateFixtureFromGit(rDir, commit, fDir, opts);
+          fs.unlinkSync(path.join(fDir, "modules", "extra-leaf.mjs"));
+          return res;
+        },
+      }
+    );
+    assert.equal(incompleteExtractionBallot.vote, "REJECT");
+    assert.equal(incompleteExtractionBallot.failureCategory, "fixture_infrastructure_error");
+    assert.match(incompleteExtractionBallot.stderr, /modules\/extra-leaf\.mjs/);
+    assert.equal(verifyVoteBallotSignature(incompleteExtractionBallot, voterKey.publicKey), true);
+
+    // Scenario 6: voteReleaseAcrossFlock aggregates passing ballots and strictly blocks infrastructure errors from acceptance
+    const membersMap = new Map([
+      ["voter-win-pc", { publicKey: voterKey.publicKey }],
+    ]);
+    const approvedReport = await voteReleaseAcrossFlock(
+      voterCfg,
+      { branch: "rc-modular-pass", machines: "*" },
+      {
+        discoverFn: async () => [{ machineId: "VOTER-WIN-PC", online: true }],
+        membersMapFn: () => membersMap,
+        rpcBatchFn: async (_c, items) =>
+          items.map((item) => ({ item, ok: true, response: { result: passBallot } })),
+      }
+    );
+    assert.equal(approvedReport.approvedForMerge, true);
+    assert.equal(approvedReport.acceptCount, 1);
+    assert.equal(approvedReport.rejectCount, 0);
+    assert.equal(approvedReport.unanimousCommit, passCommit);
+
+    const blockedInfraReport = await voteReleaseAcrossFlock(
+      voterCfg,
+      { branch: "rc-modular-pass", machines: "*" },
+      {
+        discoverFn: async () => [{ machineId: "VOTER-WIN-PC", online: true }],
+        membersMapFn: () => membersMap,
+        rpcBatchFn: async (_c, items) =>
+          items.map((item) => ({
+            item,
+            ok: true,
+            response: { result: incompleteExtractionBallot },
+          })),
+      }
+    );
+    assert.equal(blockedInfraReport.approvedForMerge, false);
+    assert.equal(blockedInfraReport.acceptCount, 0);
+    assert.equal(blockedInfraReport.rejectCount, 1);
+    assert.equal(blockedInfraReport.infrastructureFailureCount, 1);
+    assert.equal(blockedInfraReport.votes[0].failureCategory, "fixture_infrastructure_error");
+
+    // Even if a buggy/malformed ballot claimed vote: "ACCEPT" alongside fixture_infrastructure_error, it must never be accepted
+    const forgedInfraAcceptBallot = {
+      ...incompleteExtractionBallot,
+      vote: "ACCEPT",
+    };
+    const forgedInfraReport = await voteReleaseAcrossFlock(
+      voterCfg,
+      { branch: "rc-modular-pass", machines: "*" },
+      {
+        discoverFn: async () => [{ machineId: "VOTER-WIN-PC", online: true }],
+        membersMapFn: () => membersMap,
+        rpcBatchFn: async (_c, items) =>
+          items.map((item) => ({
+            item,
+            ok: true,
+            response: { result: forgedInfraAcceptBallot },
+          })),
+      }
+    );
+    assert.equal(forgedInfraReport.approvedForMerge, false);
+    assert.equal(forgedInfraReport.acceptCount, 0);
+    assert.equal(forgedInfraReport.rejectCount, 1);
+    assert.equal(forgedInfraReport.votes[0].vote, "REJECT");
+
+    // Scenario 7: Direct ESM import targeting host ~/.copilot/flock is actively blocked by fixture isolation hooks
+    if (typeof (await import("node:module")).default.registerHooks === "function") {
+      gitRun(originWorkDir, ["checkout", "-b", "rc-escape-attempt", "main"]);
+      const staleHostModuleHref = pathToFileURL(
+        path.join(hostFlockDir, "custom-modular-feature.mjs")
+      ).href;
+      writeTreeFiles(originWorkDir, {
+        ...baseModularCandidate,
+        "test/flock.test.mjs": [
+          'import test from "node:test";',
+          `test("attempt stale host import", async () => { await import(${JSON.stringify(staleHostModuleHref)}); });`,
+        ].join("\n"),
+      });
+      gitRun(originWorkDir, ["add", "-A"]);
+      gitRun(originWorkDir, ["commit", "-m", "attempt host flock import"]);
+
+      const escapeBallot = await reviewReleaseCandidate(
+        voterCfg,
+        { branch: "rc-escape-attempt" },
+        { repoDir: originWorkDir, fetchFromOrigin: false }
+      );
+      assert.equal(escapeBallot.vote, "REJECT");
+      assert.equal(escapeBallot.failureCategory, "candidate_test_failure");
+      assert.match(`${escapeBallot.stdout}\n${escapeBallot.stderr}`, /Fixture isolation violation/);
+      assert.equal(verifyVoteBallotSignature(escapeBallot, voterKey.publicKey), true);
+    }
+
+    assert.equal(buildCanonicalVoteBallotPayload(passBallot), passBallot.ballotPayload);
+    await assert.rejects(
+      () => handleRpcAction(voterCfg, { action: "review_release", params: { branch: "../bad" } }),
+      /Invalid branch name/
+    );
+  } finally {
+    if (prevCopilotHome === undefined) delete process.env.COPILOT_HOME;
+    else process.env.COPILOT_HOME = prevCopilotHome;
+    env.cleanup();
+  }
+});
+
