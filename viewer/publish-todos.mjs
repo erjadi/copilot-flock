@@ -2,7 +2,7 @@ import { readFile, realpath, rename, unlink, writeFile } from "node:fs/promises"
 import path from "node:path";
 import crypto from "node:crypto";
 import { fileURLToPath } from "node:url";
-import { validateTodoSnapshot } from "./todo-snapshot.mjs";
+import { assertEvidenceHistoryPreserved, validateTodoSnapshot } from "./todo-snapshot.mjs";
 
 export async function publishTodos(sourcePath, destinationPath) {
   const source = validateTodoSnapshot(JSON.parse(await readFile(sourcePath, "utf8")));
@@ -26,6 +26,7 @@ export async function publishTodos(sourcePath, destinationPath) {
       return source;
     }
     if (Date.parse(source.updatedAt) < Date.parse(previous.updatedAt)) throw new Error("Refusing an older TODO timestamp");
+    assertEvidenceHistoryPreserved(previous, source);
   }
   const temporary = `${target}.${crypto.randomUUID()}.tmp`;
   await writeFile(temporary, content, { flag: "wx", mode: 0o600 });
