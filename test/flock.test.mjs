@@ -6,8 +6,11 @@ import net from "node:net";
 import http from "node:http";
 import path from "node:path";
 import crypto from "node:crypto";
+import https from "node:https";
 import {
   execFileSync,
+  spawn,
+  spawnSync,
 } from "node:child_process";
 import {
   pathToFileURL,
@@ -102,6 +105,11 @@ import {
   extractCandidateFixtureFromGit,
   reviewReleaseCandidate,
   voteReleaseAcrossFlock,
+  RawWebSocketClient,
+  loadConfig,
+  diagnoseFleetMachines,
+  inspectLocalDaemonPassive,
+  getMcpSelfInfo,
 } from "../flock.mjs";
 import {
   verifyGitHubRepoAccess,
@@ -6787,5 +6795,528 @@ test("release voter extracts complete modular dependency closure into isolated f
     if (prevCopilotHome === undefined) delete process.env.COPILOT_HOME;
     else process.env.COPILOT_HOME = prevCopilotHome;
     env.cleanup();
+  }
+});
+
+function snapshotTreeDigests(rootDir) {
+  const out = {};
+  if (!fs.existsSync(rootDir)) return out;
+  const walk = (dir) => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name);
+      const rel = path.relative(rootDir, full).replace(/\\/g, "/");
+      if (entry.isDirectory()) {
+        out[`dir:${rel}`] = "dir";
+        walk(full);
+      } else {
+        const bytes = fs.readFileSync(full);
+        out[`file:${rel}`] = crypto.createHash("sha256").update(bytes).digest("hex");
+      }
+    }
+  };
+  walk(rootDir);
+  return out;
+}
+
+test("passive diagnostics keep stopped and unavailable daemons non-mutating without spawning processes or fabricating success", async (t) => {
+  const env = setupTempCopilotEnv();
+  const prevCopilotHome = process.env.COPILOT_HOME;
+  const prevAppData = process.env.APPDATA;
+  const fakeAppData = path.join(env.tempRoot, "appdata");
+  fs.mkdirSync(fakeAppData, { recursive: true });
+  process.env.COPILOT_HOME = env.tempRoot;
+  process.env.APPDATA = fakeAppData;
+
+  let sleeper = null;
+  try {
+    const flockDir = path.join(env.tempRoot, "flock");
+    fs.mkdirSync(flockDir, { recursive: true });
+    // Deliberately use legacy scope "private" and omit specs + identity.json so any non-passive path would back up/rewrite files
+    const configPath = path.join(flockDir, "config.json");
+    const rawInitialConfig = JSON.stringify(
+      {
+        machineId: "PASSIVE-STOPPED-PC",
+        scope: "private",
+        githubUser: "erjadi",
+        hub: "copilotbridge",
+        connectionString:
+          "Endpoint=https://passive-fixture.service.signalr.net;AccessKey=MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=;Version=1.0;",
+      },
+      null,
+      2
+    );
+    fs.writeFileSync(configPath, rawInitialConfig, "utf8");
+
+    const beforeHomeSnapshot = snapshotTreeDigests(env.tempRoot);
+    const beforeAppDataSnapshot = snapshotTreeDigests(fakeAppData);
+
+    const cfg = loadConfig({ autoFetchAz: false, refreshSpecs: false, passive: true });
+    assert.equal(cfg.machineId, "PASSIVE-STOPPED-PC");
+
+    const flockStatusStopped = await executeMcpTool(cfg, "flock_status", { passive: true });
+    assert.equal(flockStatusStopped.status, "unavailable");
+    assert.equal(flockStatusStopped.passive, true);
+    assert.equal(flockStatusStopped.daemon.status, "stopped");
+    assert.equal(flockStatusStopped.daemon.running, false);
+    assert.equal(flockStatusStopped.daemon.pid, null);
+    assert.equal(flockStatusStopped.daemon.passive, true);
+    assert.deepEqual(flockStatusStopped.onlineMachines, []);
+    assert.equal(flockStatusStopped.onlineMachinesStatus, "unavailable");
+
+    const bridgeStatusStopped = await executeMcpTool(cfg, "bridge_status", { passive: true });
+    assert.equal(bridgeStatusStopped.status, "unavailable");
+    assert.equal(bridgeStatusStopped.daemon.status, "stopped");
+    assert.equal(bridgeStatusStopped.daemon.passive, true);
+
+    // Default fix=false on diagnose_bridge_fleet inspects passively without starting daemon or fabricating healthy=true
+    const diagInspectDefault = await executeMcpTool(cfg, "diagnose_bridge_fleet", {});
+    assert.equal(diagInspectDefault.ok, false);
+    assert.equal(diagInspectDefault.status, "unavailable");
+    assert.equal(diagInspectDefault.healthy, false);
+    assert.equal(diagInspectDefault.passive, true);
+    assert.equal(diagInspectDefault.fix, false);
+    assert.equal(diagInspectDefault.daemon.status, "stopped");
+    assert.equal(diagInspectDefault.daemon.passive, true);
+    assert.deepEqual(diagInspectDefault.members, []);
+
+    const diagPassiveOverrideFix = await executeMcpTool(cfg, "diagnose_bridge_fleet", {
+      passive: true,
+      fix: true,
+    });
+    assert.equal(diagPassiveOverrideFix.ok, false);
+    assert.equal(diagPassiveOverrideFix.status, "unavailable");
+    assert.equal(diagPassiveOverrideFix.fix, false);
+    assert.equal(diagPassiveOverrideFix.daemon.status, "stopped");
+
+    const localPassiveDiag = await diagnoseLocalBridgeState(cfg, { fix: false });
+    assert.equal(localPassiveDiag.healthy, false);
+    assert.equal(localPassiveDiag.daemon.status, "stopped");
+    assert.equal(localPassiveDiag.daemon.passive, true);
+
+    // Also verify CLI passive status and default inspect diagnose do not mutate files or spawn a daemon
+    const scriptUnderTest = fileURLToPath(new URL("../flock.mjs", import.meta.url));
+    const childEnv = { ...process.env, COPILOT_HOME: env.tempRoot, APPDATA: fakeAppData };
+    for (const k of Object.keys(childEnv)) {
+      if (k.startsWith("NODE_TEST_") || k === "NODE_OPTIONS") delete childEnv[k];
+    }
+    const cliStatus = spawnSync(process.execPath, [scriptUnderTest, "status", "--passive"], {
+      env: childEnv,
+      encoding: "utf8",
+      timeout: 10000,
+    });
+    assert.equal(cliStatus.status, 0, cliStatus.stderr);
+    const cliStatusJson = JSON.parse(cliStatus.stdout);
+    assert.equal(cliStatusJson.status, "unavailable");
+    assert.equal(cliStatusJson.daemon.status, "stopped");
+    assert.equal(cliStatusJson.daemon.passive, true);
+
+    const cliDiagnose = spawnSync(process.execPath, [scriptUnderTest, "diagnose"], {
+      env: childEnv,
+      encoding: "utf8",
+      timeout: 10000,
+    });
+    assert.equal(cliDiagnose.status, 0, cliDiagnose.stderr);
+    const cliDiagJson = JSON.parse(cliDiagnose.stdout);
+    assert.equal(cliDiagJson.status, "unavailable");
+    assert.equal(cliDiagJson.healthy, false);
+    assert.equal(cliDiagJson.daemon.status, "stopped");
+    assert.equal(cliDiagJson.daemon.passive, true);
+
+    // Verify ZERO files/dirs were created, backed up, or rewritten
+    assert.equal(fs.existsSync(path.join(flockDir, "identity.json")), false);
+    assert.equal(fs.existsSync(`${configPath}.v2.bak.json`), false);
+    assert.equal(fs.existsSync(path.join(flockDir, "daemon.pid")), false);
+    assert.equal(fs.readFileSync(configPath, "utf8"), rawInitialConfig);
+    assert.deepEqual(snapshotTreeDigests(env.tempRoot), beforeHomeSnapshot);
+    assert.deepEqual(snapshotTreeDigests(fakeAppData), beforeAppDataSnapshot);
+
+    // Verify stale-heartbeat / error daemon reports status="unavailable", passive=true WITHOUT killing the live PID
+    sleeper = spawn(process.execPath, ["-e", "setTimeout(() => {}, 30000)"], { stdio: "ignore" });
+    fs.writeFileSync(path.join(flockDir, "daemon.pid"), String(sleeper.pid), "utf8");
+    fs.writeFileSync(
+      path.join(flockDir, "state.json"),
+      JSON.stringify({
+        pid: sleeper.pid,
+        status: "connected",
+        updatedAt: new Date(Date.now() - 300000).toISOString(),
+      }),
+      "utf8"
+    );
+
+    const staleStatus = await executeMcpTool(cfg, "flock_status", { passive: true });
+    assert.equal(staleStatus.status, "unavailable");
+    assert.equal(staleStatus.daemon.status, "unavailable");
+    assert.equal(staleStatus.daemon.passive, true);
+    assert.equal(staleStatus.daemon.staleHeartbeat, true);
+    // Passive inspection must not have killed the stale PID
+    process.kill(sleeper.pid, 0);
+
+    const staleDiag = await executeMcpTool(cfg, "diagnose_bridge_fleet", { passive: true });
+    assert.equal(staleDiag.ok, false);
+    assert.equal(staleDiag.status, "unavailable");
+    assert.equal(staleDiag.daemon.status, "unavailable");
+    assert.equal(staleDiag.daemon.passive, true);
+    process.kill(sleeper.pid, 0);
+  } finally {
+    if (sleeper?.pid) {
+      try {
+        process.kill(sleeper.pid);
+      } catch {}
+    }
+    if (prevCopilotHome === undefined) delete process.env.COPILOT_HOME;
+    else process.env.COPILOT_HOME = prevCopilotHome;
+    if (prevAppData === undefined) delete process.env.APPDATA;
+    else process.env.APPDATA = prevAppData;
+    env.cleanup();
+  }
+});
+
+test("passive diagnostics report live fleet when daemon is running while non-passive operations preserve explicit daemon start", async (t) => {
+  const env = setupTempCopilotEnv();
+  const prevCopilotHome = process.env.COPILOT_HOME;
+  process.env.COPILOT_HOME = env.tempRoot;
+
+  let spawnedDaemonChild = null;
+  try {
+    const flockDir = path.join(env.tempRoot, "flock");
+    fs.mkdirSync(flockDir, { recursive: true });
+    const cfg = {
+      machineId: "PASSIVE-RUNNING-PC",
+      scope: "personal",
+      githubUser: "erjadi",
+      hub: "copilotbridge",
+      endpoint: "https://running-fixture.service.signalr.net",
+      host: "running-fixture.service.signalr.net",
+      accessKey: Buffer.from("0123456789abcdef0123456789abcdef").toString("base64"),
+      connectionString:
+        "Endpoint=https://running-fixture.service.signalr.net;AccessKey=MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=;Version=1.0;",
+      specs: null,
+    };
+
+    // Simulate a live connected local daemon in daemon.pid + state.json
+    fs.writeFileSync(path.join(flockDir, "daemon.pid"), String(process.pid), "utf8");
+    fs.writeFileSync(
+      path.join(flockDir, "state.json"),
+      JSON.stringify({
+        pid: process.pid,
+        status: "connected",
+        updatedAt: new Date().toISOString(),
+      }),
+      "utf8"
+    );
+
+    // Wire an in-memory SignalR loopback bus so discoverMachines and diagnoseFleetMachines exercise real RPC handlers
+    const clientsByUser = new Map();
+    t.mock.method(RawWebSocketClient.prototype, "connect", async function () {
+      const u = new URL(this.url.toString());
+      const token = u.searchParams.get("access_token") || "";
+      const payloadSeg = token.split(".")[1] || "";
+      const claims = payloadSeg
+        ? JSON.parse(Buffer.from(payloadSeg, "base64url").toString("utf8"))
+        : {};
+      this._mockUserId = claims.sub || `anon-${crypto.randomUUID()}`;
+      clientsByUser.set(this._mockUserId, this);
+    });
+    t.mock.method(RawWebSocketClient.prototype, "sendText", function (frame) {
+      if (String(frame).includes('"protocol":"json"') && this.onTextMessage) {
+        setImmediate(() => this.onTextMessage("{}\x1e"));
+      }
+    });
+    t.mock.method(RawWebSocketClient.prototype, "close", function () {
+      this.closed = true;
+      if (this._mockUserId) clientsByUser.delete(this._mockUserId);
+    });
+    t.mock.method(https, "request", (options, cb) => {
+      const reqChunks = [];
+      const fakeReq = {
+        on() {
+          return this;
+        },
+        write(chunk) {
+          reqChunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+        },
+        end() {
+          const rawBody = Buffer.concat(reqChunks).toString("utf8");
+          setImmediate(async () => {
+            try {
+              const msg = JSON.parse(rawBody);
+              if (msg.target === "bridgeRpcRequest" && msg.arguments?.[0]) {
+                const rpcReq = msg.arguments[0];
+                const result = await handleRpcAction(cfg, {
+                  ...rpcReq,
+                  senderVerified: true,
+                });
+                const replyClient = clientsByUser.get(rpcReq.replyUserId);
+                if (replyClient?.onTextMessage) {
+                  const frame =
+                    JSON.stringify({
+                      type: 1,
+                      target: "bridgeRpcResponse",
+                      arguments: [
+                        {
+                          requestId: rpcReq.requestId,
+                          fromMachine: cfg.machineId,
+                          result,
+                        },
+                      ],
+                    }) + "\x1e";
+                  replyClient.onTextMessage(frame);
+                }
+              }
+            } catch {}
+            const fakeRes = new net.Socket();
+            fakeRes.statusCode = 202;
+            cb(fakeRes);
+            fakeRes.emit("data", Buffer.from(""));
+            fakeRes.emit("end");
+          });
+        },
+        destroy() {},
+      };
+      return fakeReq;
+    });
+
+    const runningStatus = await executeMcpTool(cfg, "flock_status", { passive: true });
+    assert.equal(runningStatus.status, "ok");
+    assert.equal(runningStatus.passive, true);
+    assert.equal(runningStatus.daemon.status, "running");
+    assert.equal(runningStatus.daemon.running, true);
+    assert.equal(runningStatus.daemon.pid, process.pid);
+    assert.equal(runningStatus.daemon.passive, true);
+    assert.equal(runningStatus.onlineMachines.length, 1);
+    assert.equal(runningStatus.onlineMachines[0].machineId, "PASSIVE-RUNNING-PC");
+    assert.equal(fs.existsSync(path.join(flockDir, "identity.json")), false);
+
+    const runningDiag = await executeMcpTool(cfg, "diagnose_bridge_fleet", { passive: true });
+    assert.equal(runningDiag.ok, true);
+    assert.equal(runningDiag.status, "ok");
+    assert.equal(runningDiag.passive, true);
+    assert.equal(runningDiag.fix, false);
+    assert.equal(runningDiag.daemon.status, "running");
+    assert.equal(runningDiag.daemon.passive, true);
+    assert.equal(runningDiag.onlineCount, 1);
+    assert.equal(runningDiag.members[0].machineId, "PASSIVE-RUNNING-PC");
+    assert.equal(runningDiag.members[0].online, true);
+    assert.equal(fs.existsSync(path.join(flockDir, "identity.json")), false);
+
+    // Now stop the simulated daemon and verify explicit non-passive calls still auto-start the daemon
+    fs.unlinkSync(path.join(flockDir, "daemon.pid"));
+    fs.unlinkSync(path.join(flockDir, "state.json"));
+    const stubDaemonPath = path.join(flockDir, "flock.mjs");
+    fs.writeFileSync(
+      stubDaemonPath,
+      `import fs from "node:fs";
+import path from "node:path";
+const home = process.env.COPILOT_HOME;
+const dir = path.join(home, "flock");
+fs.writeFileSync(path.join(dir, "daemon.pid"), String(process.pid), "utf8");
+fs.writeFileSync(path.join(dir, "state.json"), JSON.stringify({ pid: process.pid, status: "connected", updatedAt: new Date().toISOString() }), "utf8");
+setTimeout(() => process.exit(0), 2500);
+`,
+      "utf8"
+    );
+
+    const activeStatus = await executeMcpTool(cfg, "flock_status", {});
+    assert.equal(activeStatus.daemon.running, true);
+    assert.ok(activeStatus.daemon.pid && activeStatus.daemon.pid !== process.pid);
+    spawnedDaemonChild = activeStatus.daemon.pid;
+    try {
+      process.kill(spawnedDaemonChild);
+    } catch {}
+    spawnedDaemonChild = null;
+    if (fs.existsSync(path.join(flockDir, "daemon.pid"))) {
+      fs.unlinkSync(path.join(flockDir, "daemon.pid"));
+    }
+    if (fs.existsSync(path.join(flockDir, "state.json"))) {
+      fs.unlinkSync(path.join(flockDir, "state.json"));
+    }
+
+    const activeDiag = await executeMcpTool(cfg, "diagnose_bridge_fleet", { passive: false });
+    assert.equal(fs.existsSync(path.join(flockDir, "daemon.pid")), true);
+    spawnedDaemonChild = Number(fs.readFileSync(path.join(flockDir, "daemon.pid"), "utf8").trim());
+    assert.ok(spawnedDaemonChild > 0);
+    assert.equal(activeDiag.onlineCount, 1);
+  } finally {
+    if (spawnedDaemonChild) {
+      try {
+        process.kill(spawnedDaemonChild);
+      } catch {}
+    }
+    if (prevCopilotHome === undefined) delete process.env.COPILOT_HOME;
+    else process.env.COPILOT_HOME = prevCopilotHome;
+    env.cleanup();
+  }
+});
+
+test("mcp_self_info tool and self-info CLI report in-memory loadTimeDigest and detect reload-pending drift after on-disk replacement", async () => {
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "flock-self-info-"));
+  const emptyCopilotHome = path.join(tempRoot, "empty-copilot-home");
+  const installDir = path.join(tempRoot, "installed-runtime");
+  fs.mkdirSync(emptyCopilotHome, { recursive: true });
+  fs.mkdirSync(installDir, { recursive: true });
+
+  let mcpProc = null;
+  try {
+    const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+    const entryFilename = path.basename(
+      fileURLToPath(new URL("../flock.mjs", import.meta.url))
+    );
+    const filesToCopy = [
+      entryFilename,
+      "flock-lifecycle.mjs",
+      "flock-membership.mjs",
+      "flock-protocol.mjs",
+      "flock-azure.mjs",
+      "flock-broker-free.mjs",
+    ];
+    for (const rel of filesToCopy) {
+      fs.copyFileSync(path.join(repoRoot, rel), path.join(installDir, rel));
+    }
+    const installedEntry = path.join(installDir, entryFilename);
+
+    const cleanEnv = { ...process.env, COPILOT_HOME: emptyCopilotHome };
+    for (const k of Object.keys(cleanEnv)) {
+      if (k.startsWith("NODE_TEST_") || k === "NODE_OPTIONS") delete cleanEnv[k];
+    }
+
+    // 1. CLI self-info works with stopped daemon and empty COPILOT_HOME without creating flock directory
+    const cliInitial = spawnSync(process.execPath, [installedEntry, "self-info"], {
+      env: cleanEnv,
+      encoding: "utf8",
+      timeout: 10000,
+    });
+    assert.equal(cliInitial.status, 0, cliInitial.stderr);
+    assert.equal(fs.existsSync(path.join(emptyCopilotHome, "flock")), false);
+    const cliInfo1 = JSON.parse(cliInitial.stdout);
+    assert.equal(cliInfo1.version, BRIDGE_VERSION);
+    assert.equal(cliInfo1.nodeVersion, process.version);
+    assert.match(cliInfo1.loadTimeDigest, /^[0-9a-f]{64}$/);
+    assert.equal(cliInfo1.currentDiskDigest, cliInfo1.loadTimeDigest);
+    assert.equal(cliInfo1.reloadPending, false);
+    assert.equal(cliInfo1.daemon.status, "stopped");
+    assert.equal(cliInfo1.daemon.passive, true);
+
+    // 2. Spawn a live MCP server child process (--passive) with stopped daemon
+    mcpProc = spawn(process.execPath, [installedEntry, "mcp", "--passive"], {
+      env: cleanEnv,
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+
+    let stdoutBuf = "";
+    const pendingById = new Map();
+    mcpProc.stdout.setEncoding("utf8");
+    mcpProc.stdout.on("data", (chunk) => {
+      stdoutBuf += chunk;
+      let nl;
+      while ((nl = stdoutBuf.indexOf("\n")) >= 0) {
+        const line = stdoutBuf.slice(0, nl).trim();
+        stdoutBuf = stdoutBuf.slice(nl + 1);
+        if (!line) continue;
+        const parsed = JSON.parse(line);
+        if (parsed.id !== undefined && pendingById.has(parsed.id)) {
+          const resolve = pendingById.get(parsed.id);
+          pendingById.delete(parsed.id);
+          resolve(parsed);
+        }
+      }
+    });
+
+    let nextId = 1;
+    const callJsonRpc = (method, params = {}) =>
+      new Promise((resolve, reject) => {
+        const id = nextId++;
+        const timer = setTimeout(
+          () => reject(new Error(`MCP JSON-RPC timeout for ${method}`)),
+          8000
+        );
+        pendingById.set(id, (msg) => {
+          clearTimeout(timer);
+          resolve(msg);
+        });
+        mcpProc.stdin.write(JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n");
+      });
+
+    const initResp = await callJsonRpc("initialize", {});
+    assert.equal(initResp.result.serverInfo.name, "copilot-flock");
+
+    const listResp = await callJsonRpc("tools/list", {});
+    const tools = listResp.result.tools;
+    assert.ok(tools.some((t) => t.name === "mcp_self_info"));
+    assert.ok(tools.find((t) => t.name === "flock_status")?.inputSchema?.properties?.passive);
+    assert.ok(tools.find((t) => t.name === "bridge_status")?.inputSchema?.properties?.passive);
+    assert.ok(
+      tools.find((t) => t.name === "diagnose_bridge_fleet")?.inputSchema?.properties?.passive
+    );
+
+    const callSelfInfo = async () => {
+      const res = await callJsonRpc("tools/call", { name: "mcp_self_info", arguments: {} });
+      return JSON.parse(res.result.content[0].text);
+    };
+
+    const mcpBefore = await callSelfInfo();
+    assert.equal(mcpBefore.pid, mcpProc.pid);
+    assert.ok(!Number.isNaN(Date.parse(mcpBefore.startedAt)));
+    assert.equal(mcpBefore.version, BRIDGE_VERSION);
+    assert.equal(mcpBefore.nodeVersion, process.version);
+    assert.equal(mcpBefore.loadTimeDigest, cliInfo1.loadTimeDigest);
+    assert.equal(mcpBefore.currentDiskDigest, mcpBefore.loadTimeDigest);
+    assert.equal(mcpBefore.reloadPending, false);
+    assert.equal(mcpBefore.daemon.status, "stopped");
+    assert.equal(mcpBefore.daemon.passive, true);
+
+    // 3. Replace the entrypoint file on disk while MCP child stays loaded in memory
+    const originalSource = fs.readFileSync(installedEntry, "utf8");
+    const replacedSource =
+      originalSource.replace(
+        `export const BRIDGE_VERSION = "${BRIDGE_VERSION}";`,
+        `export const BRIDGE_VERSION = "9.9.9-disk-replaced";`
+      ) + "\n// simulated on-disk upgrade while MCP stays resident\n";
+    fs.writeFileSync(installedEntry, replacedSource, "utf8");
+
+    const mcpAfterEntryReplace = await callSelfInfo();
+    assert.equal(mcpAfterEntryReplace.pid, mcpBefore.pid);
+    assert.equal(mcpAfterEntryReplace.startedAt, mcpBefore.startedAt);
+    assert.equal(mcpAfterEntryReplace.version, BRIDGE_VERSION);
+    assert.equal(mcpAfterEntryReplace.loadTimeDigest, mcpBefore.loadTimeDigest);
+    assert.notEqual(mcpAfterEntryReplace.currentDiskDigest, mcpBefore.loadTimeDigest);
+    assert.equal(mcpAfterEntryReplace.reloadPending, true);
+
+    // 4. Also replace a sibling module on disk and confirm currentDiskDigest advances again while loadTimeDigest stays pinned
+    const siblingPath = path.join(installDir, "flock-protocol.mjs");
+    fs.appendFileSync(siblingPath, "\n// sibling module update\n", "utf8");
+
+    const mcpAfterSiblingReplace = await callSelfInfo();
+    assert.equal(mcpAfterSiblingReplace.loadTimeDigest, mcpBefore.loadTimeDigest);
+    assert.notEqual(
+      mcpAfterSiblingReplace.currentDiskDigest,
+      mcpAfterEntryReplace.currentDiskDigest
+    );
+    assert.equal(mcpAfterSiblingReplace.reloadPending, true);
+
+    // 5. Fresh CLI process loads the replaced code and matches mcpAfterSiblingReplace.currentDiskDigest
+    const cliReloaded = spawnSync(process.execPath, [installedEntry, "self-info"], {
+      env: cleanEnv,
+      encoding: "utf8",
+      timeout: 10000,
+    });
+    assert.equal(cliReloaded.status, 0, cliReloaded.stderr);
+    const cliInfo2 = JSON.parse(cliReloaded.stdout);
+    assert.equal(cliInfo2.version, "9.9.9-disk-replaced");
+    assert.equal(cliInfo2.loadTimeDigest, mcpAfterSiblingReplace.currentDiskDigest);
+    assert.equal(cliInfo2.currentDiskDigest, cliInfo2.loadTimeDigest);
+    assert.equal(cliInfo2.reloadPending, false);
+
+    // Confirm emptyCopilotHome remained untouched throughout all self-info calls
+    assert.equal(fs.existsSync(path.join(emptyCopilotHome, "flock")), false);
+  } finally {
+    if (mcpProc) {
+      try {
+        mcpProc.stdin.end();
+        mcpProc.kill();
+      } catch {}
+    }
+    try {
+      fs.rmSync(tempRoot, { recursive: true, force: true });
+    } catch {}
   }
 });

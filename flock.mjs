@@ -156,8 +156,17 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const PROCESS_STARTED_AT = new Date().toISOString();
 
+const RUNTIME_SIBLING_MODULES = [
+  "flock-lifecycle.mjs",
+  "flock-membership.mjs",
+  "flock-protocol.mjs",
+  "flock-azure.mjs",
+  "flock-broker-free.mjs",
+  "flock-registry.mjs",
+];
+
 function copyRuntimeModules(sourceDirectory, destinationDirectory, installedEntrypoints) {
-  for (const module of ["flock-lifecycle.mjs", "flock-membership.mjs", "flock-protocol.mjs", "flock-azure.mjs", "flock-broker-free.mjs", "flock-registry.mjs"]) {
+  for (const module of RUNTIME_SIBLING_MODULES) {
     const source = path.join(sourceDirectory, module);
     const destination = assertNoLinks(path.join(destinationDirectory, module));
     if (path.resolve(source) !== path.resolve(destination)) fs.copyFileSync(source, destination);
@@ -255,6 +264,44 @@ export async function getLocalRuntimeStatesAsync({
   return await inspectRuntimeGenerationsAsync(targetDir, { resident });
 }
 
+export function computeRuntimeCodeDigest(entryFile = __filename) {
+  try {
+    if (!entryFile || !fs.existsSync(entryFile)) return null;
+    const dir = path.dirname(entryFile);
+    const hash = crypto.createHash("sha256");
+    const entryBytes = fs.readFileSync(entryFile);
+    hash.update(`entry:${entryBytes.length}\n`);
+    hash.update(entryBytes);
+    for (const rel of RUNTIME_SIBLING_MODULES) {
+      const modPath = path.join(dir, rel);
+      if (fs.existsSync(modPath)) {
+        const modBytes = fs.readFileSync(modPath);
+        hash.update(`\nmodule:${rel}:${modBytes.length}\n`);
+        hash.update(modBytes);
+      }
+    }
+    return hash.digest("hex");
+  } catch {
+    return null;
+  }
+}
+
+const LOAD_TIME_DIGEST = computeRuntimeCodeDigest(__filename);
+
+export function getMcpSelfInfo(cfg = null) {
+  const currentDiskDigest = computeRuntimeCodeDigest(__filename);
+  return {
+    pid: process.pid,
+    startedAt: PROCESS_STARTED_AT,
+    version: BRIDGE_VERSION,
+    nodeVersion: process.version,
+    scriptPath: __filename,
+    loadTimeDigest: LOAD_TIME_DIGEST,
+    currentDiskDigest,
+    reloadPending: currentDiskDigest !== LOAD_TIME_DIGEST,
+    daemon: inspectLocalDaemonPassive(cfg),
+  };
+}
 const DEFAULT_AZURE_SUBSCRIPTION = process.env.COPILOT_FLOCK_SUBSCRIPTION || "";
 const DEFAULT_AZURE_RESOURCE_GROUP = process.env.COPILOT_FLOCK_RESOURCE_GROUP || "";
 const DEFAULT_AZURE_SIGNALR_NAME = process.env.COPILOT_FLOCK_SIGNALR_NAME || "";
@@ -349,6 +396,22 @@ export function buildCanonicalRpcSigningString({
   ).toLowerCase()}|${String(toMachine || "*").toLowerCase()}|${String(action || "")}|${paramsHash}`;
 }
 
+export function readMachineIdentityKeypairPassive() {
+  const keyPath = getIdentityKeyPath();
+  if (cachedIdentityKeypair && cachedIdentityKeyPath === keyPath) {
+    return cachedIdentityKeypair;
+  }
+  if (fs.existsSync(keyPath)) {
+    try {
+      const parsed = JSON.parse(fs.readFileSync(keyPath, "utf8"));
+      if (parsed?.publicKey && parsed?.privateKey && parsed?.fingerprint) {
+        return parsed;
+      }
+    } catch {}
+  }
+  return null;
+}
+
 export function signRpcRequest({
   requestId,
   sentAt,
@@ -357,8 +420,10 @@ export function signRpcRequest({
   action,
   params = {},
   identity = null,
+  passive = false,
 }) {
-  const idKey = identity || ensureMachineIdentityKeypair();
+  const idKey = identity || (passive ? readMachineIdentityKeypairPassive() : ensureMachineIdentityKeypair());
+  if (!idKey) return null;
   const canonical = buildCanonicalRpcSigningString({
     requestId,
     sentAt,
@@ -945,17 +1010,20 @@ function probeLiveNvidiaGpuMetrics() {
   return lastNvidiaLiveMetrics;
 }
 
-export function refreshLiveSpecs(baseSpecs = null) {
+export function refreshLiveSpecs(baseSpecs = null, { passive = false } = {}) {
   const cpus = os.cpus() || [];
   const totalRamGb = round1(os.totalmem() / 1073741824);
   const freeRamGb = round1(os.freemem() / 1073741824);
   let idKey = null;
   try {
-    idKey = ensureMachineIdentityKeypair();
+    idKey = passive ? readMachineIdentityKeypairPassive() : ensureMachineIdentityKeypair();
   } catch {}
 
   const baseGpus = Array.isArray(baseSpecs?.gpus) ? baseSpecs.gpus.map((g) => ({ ...g })) : [];
-  if (baseGpus.some((g) => /nvidia|geforce|rtx|gtx|quadro|tesla/i.test(String(g?.name || "")))) {
+  if (
+    !passive &&
+    baseGpus.some((g) => /nvidia|geforce|rtx|gtx|quadro|tesla/i.test(String(g?.name || "")))
+  ) {
     const liveNv = probeLiveNvidiaGpuMetrics();
     if (liveNv.length > 0) {
       for (const g of baseGpus) {
@@ -1248,8 +1316,10 @@ export function collectLocalMachineSpecs() {
 
   return base;
 }
-export function loadConfig({ autoFetchAz = true, refreshSpecs = false } = {}) {
-  ensureBridgeDir();
+export function loadConfig({ autoFetchAz = true, refreshSpecs = false, passive = false } = {}) {
+  if (!passive) {
+    ensureBridgeDir();
+  }
   const activeConfigPath = getConfigPath();
   let cfg = {};
   if (fs.existsSync(activeConfigPath)) {
@@ -1263,7 +1333,12 @@ export function loadConfig({ autoFetchAz = true, refreshSpecs = false } = {}) {
   }
 
   if (cfg.protocol === "broker-free-v34") {
-    const activeFlocks = Object.values(brokerFreeRuntime(cfg).read().flocks).filter((record) => !record.departed);
+    let activeFlocks = [];
+    try {
+      activeFlocks = Object.values(brokerFreeRuntime(cfg).read().flocks).filter((record) => !record.departed);
+    } catch (err) {
+      if (!passive) throw err;
+    }
     return { ...cfg, flockId: activeFlocks.length === 1 ? activeFlocks[0].flockId : undefined,
       autoFlockId: activeFlocks.length === 1 && !cfg.explicitFlock,
       hub: DEFAULT_HUB, bootstrapUrl: null, connectionString: null,
@@ -1274,7 +1349,7 @@ export function loadConfig({ autoFetchAz = true, refreshSpecs = false } = {}) {
   }
 
   // Automatic v2 -> v3 backup when migrating legacy "private" scope to "personal"
-  if (cfg.scope === "private" && fs.existsSync(activeConfigPath)) {
+  if (!passive && cfg.scope === "private" && fs.existsSync(activeConfigPath)) {
     const bakPath = `${activeConfigPath}.v2.bak.json`;
     try {
       if (!fs.existsSync(bakPath)) {
@@ -1297,7 +1372,7 @@ export function loadConfig({ autoFetchAz = true, refreshSpecs = false } = {}) {
   let githubUser = normalizeGitHubUser(
     process.env.COPILOT_BRIDGE_GITHUB_USER ||
       cfg.githubUser ||
-      resolveLocalGitHubUser({ allowCli: refreshSpecs })
+      resolveLocalGitHubUser({ allowCli: !passive && refreshSpecs })
   );
 
   const hub =
@@ -1313,7 +1388,7 @@ export function loadConfig({ autoFetchAz = true, refreshSpecs = false } = {}) {
   let specs = cfg.specs || null;
   const needsSpecsProbe = refreshSpecs || !specs || !specs.cpu;
   if (needsSpecsProbe) {
-    specs = collectLocalMachineSpecs();
+    specs = passive ? refreshLiveSpecs(specs, { passive: true }) : collectLocalMachineSpecs();
   }
 
   let connectionString =
@@ -1321,7 +1396,7 @@ export function loadConfig({ autoFetchAz = true, refreshSpecs = false } = {}) {
     cfg.connectionString ||
     null;
 
-  if (!connectionString && autoFetchAz) {
+  if (!passive && !connectionString && autoFetchAz) {
     const bootRes = fetchConnectionStringViaGitHubBootstrap({
       bootstrapUrl,
       machineId,
@@ -1364,9 +1439,10 @@ export function loadConfig({ autoFetchAz = true, refreshSpecs = false } = {}) {
       writeConfigFileSecure(cfg);
     }
   } else if (
-    cfg.scope !== scope ||
-    (githubUser && cfg.githubUser !== githubUser) ||
-    needsSpecsProbe
+    !passive &&
+    (cfg.scope !== scope ||
+      (githubUser && cfg.githubUser !== githubUser) ||
+      needsSpecsProbe)
   ) {
     cfg = {
       ...cfg,
@@ -1383,6 +1459,24 @@ export function loadConfig({ autoFetchAz = true, refreshSpecs = false } = {}) {
   }
 
   if (!connectionString) {
+    if (passive) {
+      return {
+        machineId,
+        scope,
+        githubUser,
+        specs,
+        bootstrapUrl,
+        hub,
+        connectionString: null,
+        endpoint: null,
+        host: null,
+        accessKey: null,
+        unconfigured: true,
+        installedScriptPath: fs.existsSync(path.join(getBridgeHome(), "bridge.mjs"))
+          ? path.join(getBridgeHome(), "bridge.mjs")
+          : __filename,
+      };
+    }
     throw new Error(
       `Missing SignalR connection configuration. Either:\n` +
         `  1. (Invited to an existing flock): Paste your Enrollment JSON or pass --bootstrap-url "https://<your-bootstrap-host>/api/bootstrap" to 'node flock.mjs install', OR\n` +
@@ -5679,6 +5773,7 @@ export async function invokeRemoteRpc(
     collectAll = false,
     flockId = cfg.protocol === "broker-free-v34" && cfg.autoFlockId && !cfg.explicitFlock ? undefined : cfg.flockId,
     allowLoopback = false,
+    passive = false,
   }
 ) {
   const hasExplicitFlockId = flockId !== undefined && flockId !== null;
@@ -5753,6 +5848,7 @@ export async function invokeRemoteRpc(
       action,
       params: effectiveParams,
       identity: cfg.identity || null,
+      passive,
     });
   } catch {}
   const rpcPayload = {
@@ -5842,11 +5938,11 @@ export async function invokeRemoteRpc(
   }
 }
 
-export async function invokeRemoteRpcBatch(cfg, items, timeoutMs = 18000) {
+export async function invokeRemoteRpcBatch(cfg, items, timeoutMs = 18000, { passive = false } = {}) {
   if (!items || items.length === 0) return [];
   if (cfg.protocol === "broker-free-v34" || typeof cfg?.rpcTransport === "function") {
     return Promise.all(items.map(async (item) => {
-      try { return { item, ok: true, response: await invokeRemoteRpc(cfg, { ...item, timeoutMs }) }; }
+      try { return { item, ok: true, response: await invokeRemoteRpc(cfg, { ...item, timeoutMs, passive }) }; }
       catch (error) { return { item, ok: false, error: error.message }; }
     }));
   }
@@ -5901,6 +5997,7 @@ export async function invokeRemoteRpcBatch(cfg, items, timeoutMs = 18000) {
           action: item.action,
           params: itemParams,
           identity: cfg.identity || null,
+          passive,
         });
       } catch {}
       const rpcPayload = {
@@ -6065,15 +6162,17 @@ export async function discoverMachines(
     minFreeDiskGb = null,
     timeoutMs = 2500,
     flockId = cfg.flockId,
+    passive = false,
   } = {}
 ) {
   const replies = await invokeRemoteRpc(cfg, {
     toMachine: "*",
     action: "ping",
-    params: {},
+    params: passive ? { passive: true } : {},
     timeoutMs,
     collectAll: true,
     flockId,
+    passive,
   });
 
   const byMachine = new Map();
@@ -6572,7 +6671,7 @@ export async function handleRpcAction(cfg, req) {
         .slice(0, sessionLimit);
     }
     const githubUser = normalizeGitHubUser(cfg.githubUser || resolveLocalGitHubUser());
-    const specs = refreshLiveSpecs(cfg.specs);
+    const specs = refreshLiveSpecs(cfg.specs, { passive: Boolean(params.passive) });
     if (isRestrictedFlock && flockPolicy.shareSpecs === "summary" && Array.isArray(specs?.disks)) {
       specs.disks = specs.disks
         .filter((d) => d.type !== "network")
@@ -7055,8 +7154,11 @@ export async function handleRpcAction(cfg, req) {
   }
 
   if (action === "diagnose") {
+    const fix = params.passive ? false : Boolean(params.fix);
     return await diagnoseLocalBridgeState(cfg, {
-      fix: Boolean(params.fix),
+      fix,
+      passive: Boolean(params.passive) || !fix,
+      inDaemonRpc: true,
     });
   }
 
@@ -7716,6 +7818,126 @@ export async function runDaemon(cfg) {
   }
 }
 
+export function inspectLocalDaemonPassive(cfg = null) {
+  const pidPath = getDaemonPidPath();
+  const statePath = getStatePath();
+  let stateObj = null;
+  if (fs.existsSync(statePath)) {
+    try {
+      stateObj = JSON.parse(fs.readFileSync(statePath, "utf8"));
+    } catch {}
+  }
+  if (!fs.existsSync(pidPath)) {
+    return { status: "stopped", running: false, pid: null, passive: true };
+  }
+  let pid = null;
+  try {
+    pid = Number(fs.readFileSync(pidPath, "utf8").trim());
+  } catch {
+    return {
+      status: "unavailable",
+      running: false,
+      pid: null,
+      reason: "unreadable_pid_file",
+      passive: true,
+    };
+  }
+  if (!Number.isInteger(pid) || pid <= 0) {
+    return { status: "stopped", running: false, pid: null, passive: true };
+  }
+  try {
+    process.kill(pid, 0);
+  } catch (err) {
+    if (err && err.code === "EPERM") {
+      return {
+        status: "unavailable",
+        running: false,
+        pid,
+        reason: "daemon_pid_inaccessible",
+        passive: true,
+      };
+    }
+    return { status: "stopped", running: false, pid: null, stalePid: pid, passive: true };
+  }
+
+  if (cfg?.protocol === "broker-free-v34") {
+    try {
+      const pinPath = assertNoLinks(path.join(getBridgeHome(), "daemon-identity.json"));
+      const pin = fs.existsSync(pinPath) ? JSON.parse(fs.readFileSync(pinPath, "utf8")) : null;
+      const live = inspectProcess(pid);
+      if (!live) {
+        return { status: "stopped", running: false, pid: null, stalePid: pid, passive: true };
+      }
+      if (
+        !pin ||
+        pin.pid !== pid ||
+        pin.start !== live.start ||
+        pin.executable !== live.executable ||
+        pin.command !== live.command ||
+        JSON.stringify(pin.argv) !== JSON.stringify(live.argv) ||
+        !lifecyclePaths().scripts.includes(pin.script)
+      ) {
+        if (
+          lifecyclePaths().scripts.some(
+            (script) => live.argv?.includes(script) || live.command?.includes(script)
+          )
+        ) {
+          return {
+            status: "unavailable",
+            running: false,
+            pid,
+            reason: "unverified_daemon_identity",
+            passive: true,
+          };
+        }
+        return { status: "stopped", running: false, pid: null, stalePid: pid, passive: true };
+      }
+    } catch (err) {
+      return {
+        status: "unavailable",
+        running: false,
+        pid,
+        reason: formatErrorDetail(err),
+        passive: true,
+      };
+    }
+  }
+
+  if (stateObj && pid !== process.pid) {
+    const updatedMs = stateObj.updatedAt ? Date.parse(stateObj.updatedAt) : 0;
+    if (updatedMs > 0 && Date.now() - updatedMs > 120000) {
+      return {
+        status: "unavailable",
+        running: false,
+        pid,
+        staleHeartbeat: true,
+        reason: "stale_daemon_heartbeat",
+        passive: true,
+        state: stateObj,
+      };
+    }
+  }
+
+  if (stateObj && (stateObj.status === "error" || stateObj.status === "reconnecting")) {
+    return {
+      status: "unavailable",
+      running: false,
+      pid,
+      reason: stateObj.lastError || `daemon_${stateObj.status}`,
+      passive: true,
+      state: stateObj,
+    };
+  }
+
+  return {
+    status: "running",
+    running: true,
+    pid,
+    passive: true,
+    ...(stateObj ? { state: stateObj } : {}),
+  };
+}
+
 export function isLocalDaemonRunning() {
   const pidPath = getDaemonPidPath();
   const statePath = getStatePath();
@@ -7844,6 +8066,15 @@ const MCP_TOOLS = [
   { name: "renew_membership", description: "Request owner-mediated renewal before credential expiry; expired devices need a new Join Code.",
     inputSchema: { type: "object", properties: { flock: { type: "string" } } } },
   {
+    name: "mcp_self_info",
+    description:
+      "Inspect the currently loaded MCP child process in memory (pid, startedAt, version, nodeVersion, immutable loadTimeDigest, currentDiskDigest, and reloadPending drift) passively without starting or requiring a running daemon.",
+    inputSchema: {
+      type: "object",
+      properties: {},
+    },
+  },
+  {
     name: "flock_status",
     description:
       "Check local Copilot Flock daemon status, machine ID, local WebSocket status, live online machines, and authenticated flock roster (including offline shared-flock/collaborator machines).",
@@ -7854,6 +8085,11 @@ const MCP_TOOLS = [
           type: "string",
           description:
             "Optional flock address (<owner>/<flock>) to scope status and roster without cross-flock disclosure; required in broker-free mode when enrolled in multiple flocks.",
+        },
+        passive: {
+          type: "boolean",
+          description:
+            "If true, inspect passively without spawning a daemon process or mutating config, identity, enrollment, or startup files.",
         },
       },
     },
@@ -7869,6 +8105,11 @@ const MCP_TOOLS = [
           type: "string",
           description:
             "Optional flock address (<owner>/<flock>) to scope status and roster without cross-flock disclosure; required in broker-free mode when enrolled in multiple flocks.",
+        },
+        passive: {
+          type: "boolean",
+          description:
+            "If true, inspect passively without spawning a daemon process or mutating config, identity, enrollment, or startup files.",
         },
       },
     },
@@ -8166,7 +8407,12 @@ const MCP_TOOLS = [
         fix: {
           type: "boolean",
           description:
-            "If true, automatically create missing coordinator/tracker threads and enforce mode='autopilot' + permission_mode='allow-all' on each online machine.",
+            "If true, automatically create missing coordinator/tracker threads and enforce mode='autopilot' + permission_mode='allow-all' on each online machine (default: false).",
+        },
+        passive: {
+          type: "boolean",
+          description:
+            "If true, inspect passively (forces fix=false) without spawning a daemon process or mutating config, identity, enrollment, or startup files.",
         },
       },
     },
@@ -8693,6 +8939,9 @@ Object.assign(MCP_TOOLS.find((tool) => tool.name === "kick_flock_member").inputS
 });
 
 export async function executeMcpTool(cfg, name, args = {}, options = {}) {
+  if (name === "mcp_self_info") {
+    return getMcpSelfInfo(cfg);
+  }
   const ensureDaemon = options.ensureDaemon || ensureDaemonStarted;
   const discoverOnlineMachines = options.discoverOnlineMachines || discoverMachines;
   if (options.runtimeOptions) {
@@ -8814,15 +9063,49 @@ export async function executeMcpTool(cfg, name, args = {}, options = {}) {
     if (!supported.has(name)) throw new Error(`Tool ${name} is not a broker-free operation; legacy broker fallback is forbidden`);
 
     if (name === "flock_status" || name === "bridge_status") {
+      if (args.passive === true) {
+        const daemonStatus = inspectLocalDaemonPassive(cfg);
+        const localSpecs = refreshLiveSpecs(cfg?.specs || null, { passive: true });
+        const localMachineId = cfg?.machineId || os.hostname();
+        const scope = cfg?.scope ? normalizeScope(cfg.scope, "work") : "work";
+        const localCopilotWs = getLocalWsConnectionInfo() ? "online" : "offline";
+        if (!daemonStatus.running) {
+          return {
+            status: "unavailable",
+            passive: true,
+            reason:
+              daemonStatus.reason ||
+              (daemonStatus.status === "stopped"
+                ? "Local Copilot Flock daemon is stopped (passive mode did not start it)"
+                : "Local Copilot Flock daemon is unavailable"),
+            localMachineId,
+            protocol: "broker-free-v34",
+            version: BRIDGE_VERSION,
+            scope,
+            githubUser: null,
+            specs: localSpecs,
+            hub: cfg?.hub || DEFAULT_HUB,
+            endpoint: cfg?.endpoint || null,
+            daemon: daemonStatus,
+            localCopilotWs,
+            onlineMachines: [],
+            onlineMachinesStatus: "unavailable",
+          };
+        }
+      }
       const selected = runtime.select(explicitFlock);
       const scopedCfg = { ...cfg, flockId: selected.flockId, explicitFlock: true, autoFlockId: false };
-      const daemonStatus = await ensureDaemon(scopedCfg);
+      const daemonStatus = args.passive === true ? inspectLocalDaemonPassive(scopedCfg) : await ensureDaemon(scopedCfg);
       let machines = [];
       let liveSignalRSource = null;
       const [liveOutcome, rosterOut] = await Promise.all([
         (async () => {
           try {
-            const list = await discoverOnlineMachines(scopedCfg, { includeSelf: true, timeoutMs: 2200 });
+            const list = await discoverOnlineMachines(scopedCfg, {
+              includeSelf: true,
+              timeoutMs: 2200,
+              ...(args.passive === true ? { passive: true } : {}),
+            });
             return {
               machines: list,
               source: {
@@ -8865,6 +9148,7 @@ export async function executeMcpTool(cfg, name, args = {}, options = {}) {
       });
       const merged = applyLivePresenceToBrokerFreeRoster(rosterOut, machines, liveSignalRSource);
       return {
+        ...(args.passive === true ? { status: "ok", passive: true } : {}),
         localMachineId: scopedCfg.machineId,
         protocol: "broker-free-v34",
         flockId: selected.flockId,
@@ -8877,7 +9161,7 @@ export async function executeMcpTool(cfg, name, args = {}, options = {}) {
         verified: runtimeStates.verified,
         scope: scopedCfg.scope,
         githubUser: null,
-        specs: options.skipSpecsRefresh ? (scopedCfg.specs || null) : refreshLiveSpecs(scopedCfg.specs),
+        specs: options.skipSpecsRefresh ? (scopedCfg.specs || null) : refreshLiveSpecs(scopedCfg.specs, args.passive === true ? { passive: true } : {}),
         hub: selected.endpoints?.signalrEndpoint ? "copilotbridge" : (scopedCfg.hub || "copilotbridge"),
         endpoint: selected.endpoints?.signalrEndpoint || scopedCfg.endpoint || null,
         daemon: daemonStatus,
@@ -8951,6 +9235,90 @@ export async function executeMcpTool(cfg, name, args = {}, options = {}) {
     }
   }
   if (name === "flock_status" || name === "bridge_status") {
+    if (args.passive === true) {
+      const daemonStatus = inspectLocalDaemonPassive(cfg);
+      const localSpecs = refreshLiveSpecs(cfg?.specs || null, { passive: true });
+      const localMachineId = cfg?.machineId || os.hostname();
+      const scope = cfg?.scope ? normalizeScope(cfg.scope, "work") : "work";
+      const githubUser = cfg?.githubUser || null;
+      const hub = cfg?.hub || DEFAULT_HUB;
+      const endpoint = cfg?.endpoint || null;
+      const localCopilotWs = getLocalWsConnectionInfo() ? "online" : "offline";
+      const hasTransport =
+        cfg?.protocol === "broker-free-v34" || Boolean(cfg?.connectionString);
+
+      if (!daemonStatus.running || !hasTransport) {
+        const effectiveDaemon = !daemonStatus.running
+          ? daemonStatus
+          : {
+              ...daemonStatus,
+              status: "unavailable",
+              running: false,
+              reason: "missing_transport_config",
+            };
+        return {
+          status: "unavailable",
+          passive: true,
+          reason:
+            effectiveDaemon.reason ||
+            (effectiveDaemon.status === "stopped"
+              ? "Local Copilot Flock daemon is stopped (passive mode did not start it)"
+              : "Local Copilot Flock daemon is unavailable"),
+          localMachineId,
+          version: BRIDGE_VERSION,
+          scope,
+          githubUser,
+          specs: localSpecs,
+          hub,
+          endpoint,
+          daemon: effectiveDaemon,
+          localCopilotWs,
+          onlineMachines: [],
+          onlineMachinesStatus: "unavailable",
+        };
+      }
+
+      try {
+        const machines = await discoverOnlineMachines(cfg, {
+          includeSelf: true,
+          timeoutMs: 2200,
+          passive: true,
+        });
+        return {
+          status: "ok",
+          passive: true,
+          localMachineId,
+          version: BRIDGE_VERSION,
+          scope,
+          githubUser,
+          specs: localSpecs,
+          hub,
+          endpoint,
+          daemon: daemonStatus,
+          localCopilotWs,
+          onlineMachines: machines,
+        };
+      } catch (err) {
+        const reason = formatErrorDetail(err);
+        return {
+          status: "unavailable",
+          passive: true,
+          reason,
+          localMachineId,
+          version: BRIDGE_VERSION,
+          scope,
+          githubUser,
+          specs: localSpecs,
+          hub,
+          endpoint,
+          daemon: { ...daemonStatus, status: "unavailable", transportError: reason },
+          localCopilotWs,
+          onlineMachines: [],
+          onlineMachinesStatus: "unavailable",
+        };
+      }
+    }
+
     const targetFlock = args.flock || cfg.boundFlockId || null;
     if (targetFlock) {
       parseFlockAddress(targetFlock, cfg.githubUser || "erjadi");
@@ -9605,11 +9973,17 @@ export async function executeMcpTool(cfg, name, args = {}, options = {}) {
   }
 
   if (name === "diagnose_flock_fleet" || name === "diagnose_bridge_fleet") {
-    await ensureDaemonStarted(cfg);
+    const requestedFix = Boolean(args.fix);
+    const passive = args.passive !== undefined ? Boolean(args.passive) : !requestedFix;
+    const fix = passive ? false : requestedFix;
+    if (!passive) {
+      await ensureDaemonStarted(cfg);
+    }
     return await diagnoseFleetMachines(cfg, {
       machines: args.machines || "*",
       scope: args.scope || null,
-      fix: Boolean(args.fix),
+      fix,
+      passive,
     });
   }
 
@@ -10435,9 +10809,11 @@ export async function generateFlockTopologyDiagram(
   };
 }
 
-export async function runMcpServer(cfg) {
-  // Start local daemon in background if not already running
-  ensureDaemonStarted(cfg).catch(() => {});
+export async function runMcpServer(cfg, { passive = false } = {}) {
+  // Start local daemon in background if not already running (unless passive)
+  if (!passive) {
+    ensureDaemonStarted(cfg).catch(() => {});
+  }
 
   let framingMode = null; // "newline" | "content-length"
   let rawBuffer = Buffer.alloc(0);
@@ -12756,7 +13132,7 @@ export async function queryWsPermissionModes(wsInfo, sessionIds = []) {
   return result;
 }
 
-export function checkBootPersistenceStatus() {
+export function checkBootPersistenceStatus({ passive = false } = {}) {
   try {
     if (process.platform === "linux") {
       const unitPath = path.join(HOME_DIR, ".config", "systemd", "user", "copilot-flock.service");
@@ -12765,7 +13141,7 @@ export function checkBootPersistenceStatus() {
       const exists = fs.existsSync(activePath);
       const unitName = fs.existsSync(unitPath) ? "copilot-flock.service" : "copilot-signalr-bridge.service";
       let active = false;
-      if (exists) {
+      if (exists && !passive) {
         try {
           const out = execFileSync(
             "systemctl",
@@ -12811,7 +13187,12 @@ export function checkBootPersistenceStatus() {
   return { platform: process.platform, type: "unknown", path: null, configured: false, active: false };
 }
 
-export async function diagnoseLocalBridgeState(cfg, { fix = false } = {}) {
+export async function diagnoseLocalBridgeState(
+  cfg,
+  { fix = false, passive = !fix, inDaemonRpc = false } = {}
+) {
+  const effectiveFix = passive ? false : Boolean(fix);
+  const effectivePassive = Boolean(passive) || !effectiveFix;
   const targetScript = path.join(getBridgeHome(), "flock.mjs");
   const fallbackScript = path.join(getBridgeHome(), "bridge.mjs");
   const scriptToUse = fs.existsSync(targetScript)
@@ -12821,7 +13202,7 @@ export async function diagnoseLocalBridgeState(cfg, { fix = false } = {}) {
     : __filename;
   let repairedActions = [];
 
-  if (fix) {
+  if (effectiveFix) {
     const reaped = reapOrphanedMcpProcesses();
     if (reaped.length > 0) repairedActions.push(`reaped_orphaned_mcp_pids:${reaped.join(",")}`);
     const bp = configureBootPersistence(scriptToUse);
@@ -12834,7 +13215,11 @@ export async function diagnoseLocalBridgeState(cfg, { fix = false } = {}) {
 
   let sessions = queryLocalSessionsFromDb({ limit: 150, runningOnly: false });
   const wsInfo = getLocalWsConnectionInfo();
-  const copilotCliBin = resolveCopilotCliBin();
+  const copilotCliBin = effectivePassive && !inDaemonRpc
+    ? process.env.COPILOT_CLI_PATH && fs.existsSync(process.env.COPILOT_CLI_PATH)
+      ? process.env.COPILOT_CLI_PATH
+      : null
+    : resolveCopilotCliBin();
 
   const isCoordMatch = (s) => {
     const tl = String(s.title || "").trim().toLowerCase();
@@ -12851,7 +13236,7 @@ export async function diagnoseLocalBridgeState(cfg, { fix = false } = {}) {
   let coordSession = sessions.find(isCoordMatch);
   let trackerSession = sessions.find(isTrackerMatch);
 
-  if (fix) {
+  if (effectiveFix) {
     if (!coordSession) {
       if (!wsInfo) {
         const saved = saveHeadlessCliSession({
@@ -12933,9 +13318,12 @@ export async function diagnoseLocalBridgeState(cfg, { fix = false } = {}) {
 
   const coordinatorStatus = evaluateThread(coordSession, COORDINATOR_TITLE);
   const threadTrackerStatus = evaluateThread(trackerSession, THREAD_TRACKER_TITLE);
-  const bootPersistence = checkBootPersistenceStatus();
-  const daemonState = isLocalDaemonRunning();
+  const bootPersistence = checkBootPersistenceStatus({ passive: effectivePassive && !inDaemonRpc });
+  const daemonState = effectivePassive
+    ? inspectLocalDaemonPassive(cfg)
+    : isLocalDaemonRunning();
   const offlineReplay = getOfflineReplaySummary();
+  const activeConfigPath = getConfigPath();
 
   const issues = [];
   if (!cfg.githubUser) issues.push("Missing githubUser in bridge config");
@@ -12946,12 +13334,12 @@ export async function diagnoseLocalBridgeState(cfg, { fix = false } = {}) {
   if (!bootPersistence.configured) {
     issues.push(`Boot persistence (${bootPersistence.type}) is not configured`);
   }
-  if (process.platform !== "win32" && fs.existsSync(CONFIG_PATH)) {
+  if (process.platform !== "win32" && fs.existsSync(activeConfigPath)) {
     try {
-      const st = fs.statSync(CONFIG_PATH);
+      const st = fs.statSync(activeConfigPath);
       if ((st.mode & 0o077) !== 0) {
-        if (fix) {
-          fs.chmodSync(CONFIG_PATH, 0o600);
+        if (effectiveFix) {
+          fs.chmodSync(activeConfigPath, 0o600);
           repairedActions.push("tightened_config_json_mode_0600");
         } else {
           issues.push(`config.json file permissions (${(st.mode & 0o777).toString(8)}) allow group/other access (expected 0600)`);
@@ -12996,26 +13384,50 @@ export async function diagnoseLocalBridgeState(cfg, { fix = false } = {}) {
     }
   }
 
-  if (fix || !cfg.specs || !cfg.specs.cpu || !cfg.specs.publicKey) {
+  if (effectiveFix) {
     try {
       cfg.specs = collectLocalMachineSpecs();
-      if (fs.existsSync(CONFIG_PATH)) {
-        const updatedCfg = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf8"));
+      if (fs.existsSync(activeConfigPath)) {
+        const updatedCfg = JSON.parse(fs.readFileSync(activeConfigPath, "utf8"));
         updatedCfg.specs = cfg.specs;
         writeConfigFileSecure(updatedCfg);
       }
-      if (fix) {
-        try {
-          registerWithBootstrapServer(cfg);
-        } catch {}
-        repairedActions.push("refreshed_system_specs_and_identity_key");
-      }
+      try {
+        registerWithBootstrapServer(cfg);
+      } catch {}
+      repairedActions.push("refreshed_system_specs_and_identity_key");
     } catch {}
   }
 
-  const liveSpecs = refreshLiveSpecs(cfg.specs);
-  const idKey = ensureMachineIdentityKeypair();
-  const runtimeStates = await getLocalRuntimeStatesAsync({ daemonStatus: daemonState, inDaemonProcess: true });
+  const liveSpecs = refreshLiveSpecs(cfg.specs, { passive: effectivePassive });
+  const idKey = effectivePassive
+    ? readMachineIdentityKeypairPassive()
+    : ensureMachineIdentityKeypair();
+  if (!idKey) {
+    issues.push("Missing machine identity keypair (identity.json)");
+  }
+
+  const daemonReport = inDaemonRpc
+    ? {
+        status: "running",
+        pid: daemonState.pid || process.pid,
+        running: true,
+        ...(effectivePassive ? { passive: true } : {}),
+      }
+    : effectivePassive
+    ? daemonState
+    : {
+        status: daemonState.running ? "running" : "stopped",
+        pid: daemonState.pid || null,
+        running: Boolean(daemonState.running),
+      };
+  if (!daemonReport.running) {
+    issues.push(`Local daemon is ${daemonReport.status}`);
+  }
+
+  const runtimeStates = effectivePassive
+    ? getLocalRuntimeStates({ daemonStatus: daemonReport, inDaemonProcess: inDaemonRpc })
+    : await getLocalRuntimeStatesAsync({ daemonStatus: daemonReport, inDaemonProcess: inDaemonRpc });
   if (runtimeStates.installed.status !== "not_installed" && !runtimeStates.installed.complete) {
     issues.push(
       `Installed runtime closure incomplete or mismatched (status=${runtimeStates.installed.status}, missing=${runtimeStates.installed.missingFiles.join(",") || "none"}, mismatched=${runtimeStates.installed.mismatchedFiles.join(",") || "none"})`
@@ -13045,7 +13457,7 @@ export async function diagnoseLocalBridgeState(cfg, { fix = false } = {}) {
     githubUser: cfg.githubUser || null,
     identity: {
       algorithm: "ed25519",
-      fingerprint: idKey.fingerprint,
+      fingerprint: idKey?.fingerprint || liveSpecs?.keyFingerprint || null,
       publicKeyRegistered: Boolean(liveSpecs?.publicKey),
     },
     os: {
@@ -13059,11 +13471,8 @@ export async function diagnoseLocalBridgeState(cfg, { fix = false } = {}) {
     offlineReplay,
     healthy: issues.length === 0,
     issues,
-    repairedActions: fix ? repairedActions : undefined,
-    daemon: {
-      pid: daemonState.pid || process.pid,
-      running: true,
-    },
+    repairedActions: effectiveFix ? repairedActions : undefined,
+    daemon: daemonReport,
     runtime: {
       type: wsInfo ? "copilot-desktop" : "copilot-cli",
       copilotDesktopRunning: Boolean(wsInfo),
@@ -13081,17 +13490,86 @@ export async function diagnoseLocalBridgeState(cfg, { fix = false } = {}) {
 
 export async function diagnoseFleetMachines(
   cfg,
-  { machines = "*", scope = null, fix = false } = {}
+  { machines = "*", scope = null, fix = false, passive = !fix } = {}
 ) {
-  const [pingReplies, bootstrapMembers] = await Promise.all([
-    invokeRemoteRpc(cfg, {
-      toMachine: "*",
-      action: "ping",
-      collectAll: true,
-      timeoutMs: 2500,
-    }),
-    fetchBootstrapMembers(),
-  ]);
+  const effectiveFix = passive ? false : Boolean(fix);
+  const effectivePassive = Boolean(passive) || !effectiveFix;
+  let daemonStatus = null;
+
+  if (effectivePassive) {
+    daemonStatus = inspectLocalDaemonPassive(cfg);
+    const hasTransport =
+      cfg?.protocol === "broker-free-v34" || Boolean(cfg?.connectionString);
+    if (!daemonStatus.running || !hasTransport) {
+      const effectiveDaemon = !daemonStatus.running
+        ? daemonStatus
+        : {
+            ...daemonStatus,
+            status: "unavailable",
+            running: false,
+            reason: "missing_transport_config",
+          };
+      return {
+        ok: false,
+        status: "unavailable",
+        healthy: false,
+        passive: true,
+        fix: false,
+        reason:
+          effectiveDaemon.reason ||
+          (!daemonStatus.running
+            ? `Fleet diagnostics require a running local daemon (current status: ${effectiveDaemon.status}); passive mode did not start it`
+            : "Missing SignalR transport configuration"),
+        daemon: effectiveDaemon,
+        checkedAt: new Date().toISOString(),
+        expectedVersion: BRIDGE_VERSION,
+        totalChecked: 0,
+        onlineCount: 0,
+        offlineCount: 0,
+        healthyCount: 0,
+        unhealthyCount: 0,
+        members: [],
+      };
+    }
+  }
+
+  let pingReplies;
+  let bootstrapMembers;
+  try {
+    [pingReplies, bootstrapMembers] = await Promise.all([
+      invokeRemoteRpc(cfg, {
+        toMachine: "*",
+        action: "ping",
+        params: effectivePassive ? { passive: true } : {},
+        collectAll: true,
+        timeoutMs: 2500,
+        passive: effectivePassive,
+      }),
+      fetchBootstrapMembers({ bootstrapUrl: cfg?.bootstrapUrl || DEFAULT_BOOTSTRAP_URL }),
+    ]);
+  } catch (err) {
+    if (effectivePassive) {
+      const reason = formatErrorDetail(err);
+      return {
+        ok: false,
+        status: "unavailable",
+        healthy: false,
+        passive: true,
+        fix: false,
+        reason,
+        daemon: { ...(daemonStatus || inspectLocalDaemonPassive(cfg)), status: "unavailable", transportError: reason },
+        checkedAt: new Date().toISOString(),
+        expectedVersion: BRIDGE_VERSION,
+        totalChecked: 0,
+        onlineCount: 0,
+        offlineCount: 0,
+        healthyCount: 0,
+        unhealthyCount: 0,
+        members: [],
+      };
+    }
+    throw err;
+  }
 
   const pingsByMachine = new Map();
   for (const r of pingReplies) {
@@ -13134,11 +13612,13 @@ export async function diagnoseFleetMachines(
     target: t,
     toMachine: t.machineId,
     action: "diagnose",
-    params: { fix: Boolean(fix) },
+    params: { fix: Boolean(effectiveFix), passive: Boolean(effectivePassive) },
   }));
 
   const batchOutcomes =
-    batchItems.length > 0 ? await invokeRemoteRpcBatch(cfg, batchItems, 15000) : [];
+    batchItems.length > 0
+      ? await invokeRemoteRpcBatch(cfg, batchItems, 15000, { passive: effectivePassive })
+      : [];
   const diagByMachine = new Map();
   for (const o of batchOutcomes) {
     const key = String(o.item.target.machineId).toLowerCase();
@@ -13238,7 +13718,40 @@ export async function diagnoseFleetMachines(
     };
   });
 
+  if (effectivePassive && pingsByMachine.size === 0 && bootstrapMembers.length === 0) {
+    return {
+      ok: false,
+      status: "unavailable",
+      healthy: false,
+      passive: true,
+      fix: false,
+      reason: "No SignalR ping responses received from local or remote daemon",
+      daemon: {
+        ...(daemonStatus || inspectLocalDaemonPassive(cfg)),
+        status: "unavailable",
+        reason: "no_signalr_ping_response",
+      },
+      checkedAt: new Date().toISOString(),
+      expectedVersion: BRIDGE_VERSION,
+      totalChecked: 0,
+      onlineCount: 0,
+      offlineCount: 0,
+      healthyCount: 0,
+      unhealthyCount: 0,
+      members: [],
+    };
+  }
+
   return {
+    ...(effectivePassive
+      ? {
+          ok: true,
+          status: "ok",
+          passive: true,
+          fix: false,
+          daemon: daemonStatus || inspectLocalDaemonPassive(cfg),
+        }
+      : {}),
     checkedAt: new Date().toISOString(),
     expectedVersion: BRIDGE_VERSION,
     totalChecked: memberReports.length,
@@ -15341,6 +15854,15 @@ Each PC runs two distinct coordinator threads with strict separation of concerns
 // 10. CLI Argument Parser & Entrypoint
 // ---------------------------------------------------------------------------
 
+function parseBooleanOption(val, defaultVal = false) {
+  if (val === undefined || val === null) return defaultVal;
+  if (typeof val === "boolean") return val;
+  const s = String(val).trim().toLowerCase();
+  if (s === "true" || s === "1" || s === "yes") return true;
+  if (s === "false" || s === "0" || s === "no") return false;
+  return Boolean(val);
+}
+
 function parseCliArgs(argv) {
   const positional = [];
   const flags = {};
@@ -15429,11 +15951,12 @@ Usage:
   node bridge.mjs install [--machine-id <name>] [--scope work|private] [--github-user <handle>] [--connection-string <str>]
   node bridge.mjs vote-release --branch <candidate-branch> [--machines <m1,m2,*>]
   node bridge.mjs update [--all] [--machines <m1,m2,DESKTOP-*>] [--scope work|private]
-  node bridge.mjs diagnose [--fix] [--machines <m1,m2,DESKTOP-*>] [--scope work|private]
+  node bridge.mjs diagnose [--fix] [--passive] [--machines <m1,m2,DESKTOP-*>] [--scope work|private]
   node bridge.mjs reprovision --machines <m1,m2>
   node bridge.mjs set-scope <work|private>
   node bridge.mjs version
-  node bridge.mjs status
+  node bridge.mjs self-info
+  node bridge.mjs status [--passive]
   node bridge.mjs flock [--scope work|private] [--github-user <handle>]
   node bridge.mjs members [--scope work|private] [--github-user <handle>]
   node bridge.mjs specs [--refresh]
@@ -15462,6 +15985,12 @@ Usage:
 
   if (flags.version || flags.v) {
     console.log(BRIDGE_VERSION);
+    return;
+  }
+
+  if (command === "self-info" || command === "mcp-self-info") {
+    const cfg = loadConfig({ autoFetchAz: false, refreshSpecs: false, passive: true });
+    console.log(JSON.stringify(getMcpSelfInfo(cfg), null, 2));
     return;
   }
 
@@ -15553,7 +16082,24 @@ Usage:
     return;
   }
 
-  const cfg = loadConfig({ autoFetchAz: true, refreshSpecs: Boolean(flags.refresh) });
+  const passiveCli =
+    (command === "status" && parseBooleanOption(flags.passive, false)) ||
+    (command === "mcp" &&
+      (parseBooleanOption(flags.passive, false) ||
+        parseBooleanOption(process.env.COPILOT_FLOCK_PASSIVE, false))) ||
+    ((command === "diagnose" || command === "doctor" || command === "health") &&
+      (flags["no-passive"]
+        ? false
+        : parseBooleanOption(
+            flags.passive,
+            !(parseBooleanOption(flags.fix, false) || parseBooleanOption(flags.repair, false))
+          )));
+
+  const cfg = loadConfig({
+    autoFetchAz: !passiveCli,
+    refreshSpecs: !passiveCli && Boolean(flags.refresh),
+    passive: passiveCli,
+  });
   if (flags.flock !== undefined) {
     cfg.flockId = flags.flock;
     cfg.explicitFlock = true;
@@ -15571,7 +16117,7 @@ Usage:
       return;
     }
     const supported = new Set(["daemon", "mcp", "machines", "sessions", "send", "transcript", "broadcast",
-      "status", "flocks", "my-flocks", "version", "versions", "specs", "share-thread", "unshare-thread", "shared-threads", "kick"]);
+      "status", "self-info", "mcp-self-info", "flocks", "my-flocks", "version", "versions", "specs", "share-thread", "unshare-thread", "shared-threads", "kick"]);
     if (!supported.has(command)) throw new Error(`Command ${command} is not available in broker-free mode; legacy fallback is forbidden`);
   }
 
@@ -15581,7 +16127,7 @@ Usage:
   }
 
   if (command === "mcp") {
-    await runMcpServer(cfg);
+    await runMcpServer(cfg, { passive: passiveCli });
     return;
   }
 
@@ -15761,6 +16307,7 @@ Usage:
 
   if (command === "status") {
     const out = await executeMcpTool(cfg, "bridge_status", {
+      ...(passiveCli ? { passive: true } : {}),
       ...(flags.flock || positional[0] ? { flock: flags.flock || positional[0] } : {}),
     });
     console.log(JSON.stringify(out, null, 2));
@@ -16020,12 +16567,19 @@ Usage:
   }
 
   if (command === "diagnose" || command === "doctor" || command === "health") {
-    await ensureDaemonStarted(cfg);
+    const requestedFix =
+      parseBooleanOption(flags.fix, false) || parseBooleanOption(flags.repair, false);
+    const passive = passiveCli;
+    const fix = passive ? false : requestedFix;
+    if (!passive) {
+      await ensureDaemonStarted(cfg);
+    }
     const machinesArg = flags.machines || flags.machine || flags["to-machine"] || positional[0] || "*";
     const res = await diagnoseFleetMachines(cfg, {
       machines: machinesArg,
       scope: flags.scope || flags.profile || null,
-      fix: Boolean(flags.fix || flags.repair),
+      fix,
+      passive,
     });
     console.log(JSON.stringify(res, null, 2));
     return;
