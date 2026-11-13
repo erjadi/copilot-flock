@@ -345,15 +345,21 @@ export async function drainOfflineStoreItems({
 
 export async function ackOfflineStoreItems({
   requestIds = [],
+  onlyForMachine = null,
   queuePath = OFFLINE_QUEUE_PATH,
 }) {
   const ackSet = new Set(
     (Array.isArray(requestIds) ? requestIds : []).map((id) => String(id || "").trim()).filter(Boolean)
   );
+  const scopedMachine = onlyForMachine ? String(onlyForMachine).trim().toLowerCase() : null;
   return await withQueueStoreLock(async () => {
     const store = loadOfflineQueueStore(queuePath);
     const before = store.items.length;
-    const remaining = store.items.filter((item) => !ackSet.has(item.requestId));
+    const remaining = store.items.filter(
+      (item) =>
+        !ackSet.has(item.requestId) ||
+        (scopedMachine !== null && String(item.toMachine || "").toLowerCase() !== scopedMachine)
+    );
     if (remaining.length !== before) {
       saveOfflineQueueStore({ items: remaining }, queuePath);
     }
@@ -1921,22 +1927,132 @@ export async function listV3UserFlocks(
   };
 }
 
-function readRequestBody(req) {
+function readRequestBodyWithRaw(req) {
   return new Promise((resolve) => {
     let body = "";
     req.on("data", (chunk) => {
       if (body.length < 65536) body += chunk;
     });
     req.on("end", () => {
-      if (!body) return resolve({});
+      if (!body) return resolve({ raw: "", parsed: {} });
       try {
-        resolve(JSON.parse(body));
+        resolve({ raw: body, parsed: JSON.parse(body) });
       } catch {
-        resolve({});
+        resolve({ raw: body, parsed: {} });
       }
     });
-    req.on("error", () => resolve({}));
+    req.on("error", () => resolve({ raw: "", parsed: {} }));
   });
+}
+
+export function verifyTokenLocalDeviceHttpAuth(
+  req,
+  url,
+  rawBody = "",
+  { storePath = V3_FLOCKS_PATH } = {}
+) {
+  const cleanDevice = String(req.headers["x-flock-device-id"] || "").trim().toLowerCase();
+  const timestamp = String(req.headers["x-flock-timestamp"] || "").trim();
+  const signature = String(req.headers["x-flock-signature"] || "").trim();
+  if (!cleanDevice && !timestamp && !signature) return null;
+  if (!cleanDevice || !timestamp || !signature) {
+    return {
+      ok: false,
+      statusCode: 401,
+      error: "Incomplete token-local device authentication headers",
+    };
+  }
+  const now = Date.now();
+  const tsMs = Date.parse(timestamp);
+  if (!Number.isFinite(tsMs) || Math.abs(now - tsMs) > 300000) {
+    return {
+      ok: false,
+      statusCode: 401,
+      error: "Token-local device signature timestamp out of bounds",
+    };
+  }
+
+  const store = loadV3FlockStore(storePath);
+  const pinnedKeys = new Set();
+  const allowedPeerMachines = new Set();
+  let githubUser = null;
+  let githubUserId = null;
+  let machineId = null;
+  let hasCollaboratorOrOwner = false;
+
+  for (const f of Object.values(store.flocks || {})) {
+    if (f.expiresAtMs && Number(f.expiresAtMs) <= now) continue;
+    const activeMembers = Object.values(f.members || {}).filter(
+      (m) =>
+        m &&
+        (!m.membershipExpiresAtMs || Number(m.membershipExpiresAtMs) > now) &&
+        !isPrincipalRevokedInFlock(f, {
+          githubUser: m.githubUser,
+          githubUserId: m.githubUserId,
+          peerId: m.peerId,
+          deviceId: m.deviceId,
+        })
+    );
+    const matching = activeMembers.find((m) => m.deviceId === cleanDevice && m.publicKey);
+    if (!matching) continue;
+
+    const mUser = String(matching.githubUser || "").trim().toLowerCase();
+    const mUserId = Number(matching.githubUserId) || null;
+    if (!mUser || !mUserId) continue;
+    if (githubUser && githubUser !== mUser) {
+      return {
+        ok: false,
+        statusCode: 403,
+        error: "Conflicting principals for device fingerprint",
+      };
+    }
+    githubUser = mUser;
+    githubUserId = mUserId;
+    if (matching.machineId) machineId = matching.machineId;
+    pinnedKeys.add(matching.publicKey);
+    if (matching.trustTier === "owner" || matching.trustTier === "collaborator") {
+      hasCollaboratorOrOwner = true;
+    }
+    for (const peer of activeMembers) {
+      if (peer.machineId) allowedPeerMachines.add(String(peer.machineId).toLowerCase());
+    }
+  }
+
+  if (pinnedKeys.size === 0 || !githubUser || !githubUserId) {
+    return {
+      ok: false,
+      statusCode: 403,
+      error: `Device "${cleanDevice}" has no active enrolled flock membership`,
+    };
+  }
+
+  const bodyDigest = crypto
+    .createHash("sha256")
+    .update(String(rawBody || ""), "utf8")
+    .digest("hex");
+  const canonical = `http|v3|${String(req.method || "GET").toUpperCase()}|${url.pathname}${url.search}|${bodyDigest}|${cleanDevice}|${timestamp}`;
+  const sigBuf = Buffer.from(signature, "base64");
+  for (const pubKey of pinnedKeys) {
+    const valid = crypto.verify(null, Buffer.from(canonical, "utf8"), pubKey, sigBuf);
+    if (!valid) {
+      return {
+        ok: false,
+        statusCode: 401,
+        error: "Invalid Ed25519 token-local device HTTP signature",
+      };
+    }
+  }
+
+  return {
+    ok: true,
+    tokenLocalDevice: true,
+    deviceId: cleanDevice,
+    machineId,
+    githubUser,
+    githubUserId,
+    hasCollaboratorOrOwner,
+    allowedPeerMachines,
+  };
 }
 
 export function createBootstrapServer({
@@ -1975,7 +2091,8 @@ export function createBootstrapServer({
       url.searchParams.get("sandbox") === "v3";
     const subPath = url.pathname.replace(/^\/api\/v3(?:\/preview)?/, "");
     const storePath = isPreview ? v3PreviewStorePath : v3StorePath;
-    const bodyData = req.method === "POST" ? await readRequestBody(req) : {};
+    const { raw: rawBody, parsed: bodyData } =
+      req.method === "POST" ? await readRequestBodyWithRaw(req) : { raw: "", parsed: {} };
 
     // Token refresh does not require a GitHub token (uses challenge-bound Ed25519 signature)
     if (subPath === "/token/refresh" && req.method === "POST") {
@@ -2157,24 +2274,46 @@ export function createBootstrapServer({
       }
     }
 
+    let privilegedVerification;
+    let verification;
     if (!githubToken) {
-      sendJson(res, 401, {
-        ok: false,
-        error: `Missing GitHub token for ${url.pathname}`,
-      });
-      return;
-    }
-
-    const privilegedVerification = await verifyGitHubRepoAccess(githubToken, apiGet);
-    const verification = !privilegedVerification.ok && (isEnrollment || isMyFlocks || isFlocksSync)
-      ? verifiedGitHubIdentity(await apiGet("/user", githubToken))
-      : privilegedVerification;
-    if (!verification.ok) {
-      sendJson(res, 403, {
-        ok: false,
-        error: `Access denied: deployment maintainer, repository collaborator/write access or explicit allowlisting required for ${ALLOWED_REPO} (${verification.reason}).`,
-      });
-      return;
+      const deviceAuth = verifyTokenLocalDeviceHttpAuth(req, url, rawBody, { storePath });
+      if (!deviceAuth) {
+        sendJson(res, 401, {
+          ok: false,
+          error: `Missing GitHub token for ${url.pathname}`,
+        });
+        return;
+      }
+      if (!deviceAuth.ok) {
+        sendJson(res, deviceAuth.statusCode || 401, {
+          ok: false,
+          error: deviceAuth.error,
+        });
+        return;
+      }
+      if (subPath === "/maintainer/overview") {
+        sendJson(res, 403, { ok: false, error: "Maintainer overview requires GitHub token authentication" });
+        return;
+      }
+      privilegedVerification = { ok: false, reason: "Token-local device auth" };
+      verification = {
+        ok: true,
+        githubUser: deviceAuth.githubUser,
+        githubUserId: deviceAuth.githubUserId,
+      };
+    } else {
+      privilegedVerification = await verifyGitHubRepoAccess(githubToken, apiGet);
+      verification = !privilegedVerification.ok && (isEnrollment || isMyFlocks || isFlocksSync)
+        ? verifiedGitHubIdentity(await apiGet("/user", githubToken))
+        : privilegedVerification;
+      if (!verification.ok) {
+        sendJson(res, 403, {
+          ok: false,
+          error: `Access denied: deployment maintainer, repository collaborator/write access or explicit allowlisting required for ${ALLOWED_REPO} (${verification.reason}).`,
+        });
+        return;
+      }
     }
 
     const callerGitHubUser = verification.githubUser.toLowerCase();
@@ -2343,29 +2482,56 @@ export function createBootstrapServer({
     const authHeader = String(req.headers.authorization || "");
     const bearerMatch = authHeader.match(/^(?:Bearer|token)\s+(.+)$/i);
     const githubToken = (bearerMatch ? bearerMatch[1] : String(req.headers["x-github-token"] || "")).trim();
+    const { raw: rawBody, parsed: bodyData } =
+      req.method === "POST" ? await readRequestBodyWithRaw(req) : { raw: "", parsed: {} };
 
+    let verification = null;
+    let deviceAuth = null;
     if (!githubToken) {
-      sendJson(res, 401, {
-        ok: false,
-        error: `Missing GitHub token. Pass 'Authorization: Bearer <github_token>' from a user with access to ${ALLOWED_REPO}.`,
-      });
-      return;
+      deviceAuth = verifyTokenLocalDeviceHttpAuth(req, url, rawBody, { storePath: v3StorePath });
+      if (!deviceAuth) {
+        sendJson(res, 401, {
+          ok: false,
+          error: `Missing GitHub token. Pass 'Authorization: Bearer <github_token>' from a user with access to ${ALLOWED_REPO}.`,
+        });
+        return;
+      }
+      if (!deviceAuth.ok) {
+        sendJson(res, deviceAuth.statusCode || 401, {
+          ok: false,
+          error: deviceAuth.error,
+        });
+        return;
+      }
+      if (url.pathname === "/api/bootstrap") {
+        sendJson(res, 403, {
+          ok: false,
+          error: "Token-local devices cannot access /api/bootstrap; use /api/v3/enroll.",
+        });
+        return;
+      }
+      verification = {
+        ok: true,
+        repo: ALLOWED_REPO,
+        githubUser: deviceAuth.githubUser,
+        githubName: null,
+      };
+    } else {
+      verification = await verifyGitHubRepoAccess(githubToken, apiGet);
+      if (!verification.ok) {
+        sendJson(res, 403, {
+          ok: false,
+          error: `Access denied: deployment maintainer, repository collaborator/write access or explicit allowlisting required for ${ALLOWED_REPO} (${verification.reason}).`,
+        });
+        return;
+      }
     }
 
-    const verification = await verifyGitHubRepoAccess(githubToken, apiGet);
-    if (!verification.ok) {
-      sendJson(res, 403, {
-        ok: false,
-        error: `Access denied: deployment maintainer, repository collaborator/write access or explicit allowlisting required for ${ALLOWED_REPO} (${verification.reason}).`,
-      });
-      return;
-    }
-
-    const bodyData = req.method === "POST" ? await readRequestBody(req) : {};
     const machineId =
       bodyData.machineId ||
       url.searchParams.get("machineId") ||
       req.headers["x-machine-id"] ||
+      deviceAuth?.machineId ||
       null;
     const scope =
       bodyData.scope ||
@@ -2385,11 +2551,25 @@ export function createBootstrapServer({
       bodyData.platform ||
       url.searchParams.get("platform") ||
       null;
-    const githubUser =
-      verification.githubUser ||
-      bodyData.githubUser ||
-      url.searchParams.get("githubUser") ||
-      null;
+    const githubUser = deviceAuth
+      ? deviceAuth.githubUser
+      : verification.githubUser ||
+        bodyData.githubUser ||
+        url.searchParams.get("githubUser") ||
+        null;
+
+    if (deviceAuth && url.pathname === "/api/register") {
+      if (
+        !deviceAuth.machineId ||
+        String(machineId || "").trim().toLowerCase() !== String(deviceAuth.machineId).trim().toLowerCase()
+      ) {
+        sendJson(res, 403, {
+          ok: false,
+          error: "Token-local device can only register its own enrolled machineId.",
+        });
+        return;
+      }
+    }
 
     let registry = loadMembersRegistry(membersPath);
     if (machineId && (url.pathname === "/api/bootstrap" || url.pathname === "/api/register")) {
@@ -2406,18 +2586,36 @@ export function createBootstrapServer({
     }
 
     if (url.pathname === "/api/members") {
+      const visibleMembers = deviceAuth
+        ? Object.values(registry).filter(
+            (m) => m?.machineId && deviceAuth.allowedPeerMachines.has(String(m.machineId).toLowerCase())
+          )
+        : Object.values(registry);
       sendJson(res, 200, {
         ok: true,
         repo: verification.repo,
         callerGitHubUser: githubUser,
-        members: Object.values(registry),
+        members: visibleMembers,
       });
       return;
     }
 
     if (url.pathname === "/api/queue/status") {
       const store = loadOfflineQueueStore();
-      const targetFilter = (url.searchParams.get("machineId") || "").trim().toLowerCase();
+      const rawFilter = (url.searchParams.get("machineId") || "").trim().toLowerCase();
+      if (deviceAuth) {
+        const ownMachineLower = String(deviceAuth.machineId || "").trim().toLowerCase();
+        if (!ownMachineLower || (rawFilter && rawFilter !== ownMachineLower)) {
+          sendJson(res, 403, {
+            ok: false,
+            error: "Token-local device can only inspect offline queue status for its own machineId.",
+          });
+          return;
+        }
+      }
+      const targetFilter = deviceAuth
+        ? String(deviceAuth.machineId || "").trim().toLowerCase()
+        : rawFilter;
       const items = targetFilter
         ? store.items.filter((x) => String(x.toMachine || "").toLowerCase() === targetFilter)
         : store.items;
@@ -2441,12 +2639,22 @@ export function createBootstrapServer({
     }
 
     if (url.pathname === "/api/queue/enqueue") {
+      if (deviceAuth) {
+        const targetLower = String(bodyData.toMachine || "").trim().toLowerCase();
+        if (!deviceAuth.hasCollaboratorOrOwner || !targetLower || !deviceAuth.allowedPeerMachines.has(targetLower)) {
+          sendJson(res, 403, {
+            ok: false,
+            error: "Token-local device can only enqueue offline messages to peers in an active shared flock.",
+          });
+          return;
+        }
+      }
       try {
         const result = await enqueueOfflineStoreItem({
           toMachine: bodyData.toMachine,
           rpcPayload: bodyData.rpcPayload,
           githubUser,
-          machineId,
+          machineId: deviceAuth ? deviceAuth.machineId : machineId,
           ttlSeconds: bodyData.ttlSeconds,
         });
         sendJson(res, 200, result);
@@ -2461,9 +2669,20 @@ export function createBootstrapServer({
     }
 
     if (url.pathname === "/api/queue/drain") {
+      const requestedDrainTarget = bodyData.machineId || machineId;
+      if (deviceAuth) {
+        const ownMachineLower = String(deviceAuth.machineId || "").trim().toLowerCase();
+        if (!ownMachineLower || String(requestedDrainTarget || "").trim().toLowerCase() !== ownMachineLower) {
+          sendJson(res, 403, {
+            ok: false,
+            error: "Token-local device can only drain offline queue items addressed to its own machineId.",
+          });
+          return;
+        }
+      }
       try {
         const result = await drainOfflineStoreItems({
-          targetMachine: bodyData.machineId || machineId,
+          targetMachine: requestedDrainTarget,
           peekOnly: Boolean(bodyData.peekOnly),
         });
         sendJson(res, 200, result);
@@ -2478,9 +2697,17 @@ export function createBootstrapServer({
     }
 
     if (url.pathname === "/api/queue/ack") {
+      if (deviceAuth && !deviceAuth.machineId) {
+        sendJson(res, 403, {
+          ok: false,
+          error: "Token-local device must have an enrolled machineId to acknowledge offline queue items.",
+        });
+        return;
+      }
       try {
         const result = await ackOfflineStoreItems({
           requestIds: bodyData.requestIds,
+          onlyForMachine: deviceAuth ? deviceAuth.machineId : null,
         });
         sendJson(res, 200, result);
       } catch (err) {

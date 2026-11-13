@@ -1446,7 +1446,7 @@ export function resolveLocalGitHubUser({ allowCli = false } = {}) {
     } catch {}
   }
 
-  if (!allowCli) return null;
+  if (!allowCli || isTokenLocalAuthEnabled()) return null;
 
   // 2. Fallback to GitHub CLI (`gh api user --jq .login`) only during config initialization
   try {
@@ -5015,7 +5015,46 @@ function parseConnectionString(connStr) {
   return { endpoint, host: url.host, accessKey };
 }
 
-export function resolveLocalGitHubToken() {
+export function isTokenLocalAuthEnabled(cfg = null) {
+  if (cfg && typeof cfg === "object" && Object.prototype.hasOwnProperty.call(cfg, "tokenLocalAuth")) {
+    return Boolean(cfg.tokenLocalAuth);
+  }
+  if (process.env.COPILOT_FLOCK_TOKEN_LOCAL === "1") return true;
+  try {
+    const p = cfg?.configPath || getConfigPath();
+    if (p && fs.existsSync(p)) {
+      const parsed = JSON.parse(fs.readFileSync(p, "utf8"));
+      if (parsed?.tokenLocalAuth === true) return true;
+    }
+  } catch {}
+  return false;
+}
+
+export function buildTokenLocalDeviceAuthHeaders(
+  { method = "GET", pathnameWithSearch = "/", body = "" } = {},
+  identity = ensureMachineIdentityKeypair(),
+  now = Date.now()
+) {
+  const cleanDevice = String(identity?.fingerprint || "").trim().toLowerCase();
+  if (!cleanDevice || !identity?.privateKey) return null;
+  const timestamp = new Date(now).toISOString();
+  const bodyDigest = crypto
+    .createHash("sha256")
+    .update(String(body || ""), "utf8")
+    .digest("hex");
+  const canonical = `http|v3|${String(method || "GET").toUpperCase()}|${pathnameWithSearch}|${bodyDigest}|${cleanDevice}|${timestamp}`;
+  const signature = crypto
+    .sign(null, Buffer.from(canonical, "utf8"), identity.privateKey)
+    .toString("base64");
+  return {
+    deviceId: cleanDevice,
+    timestamp,
+    signature,
+  };
+}
+
+export function resolveLocalGitHubToken(cfg = null) {
+  if (isTokenLocalAuthEnabled(cfg)) return null;
   const envTok = (process.env.GITHUB_TOKEN || process.env.GH_TOKEN || "").trim();
   if (envTok) return envTok;
 
@@ -5061,8 +5100,10 @@ export function fetchConnectionStringViaGitHubBootstrap({
   machineId = os.hostname(),
   scope = "work",
   githubUser = null,
+  cfg = null,
 } = {}) {
-  const ghToken = resolveLocalGitHubToken();
+  if (isTokenLocalAuthEnabled(cfg)) return null;
+  const ghToken = resolveLocalGitHubToken(cfg);
   if (!ghToken || !bootstrapUrl) return null;
 
   try {
@@ -5141,7 +5182,7 @@ export function registerWithBootstrapServer({
   specs = null,
   tokenLocalAuth = false,
 } = {}) {
-  if (tokenLocalAuth) return { ok: true, tokenLocal: true };
+  if (tokenLocalAuth || isTokenLocalAuthEnabled()) return { ok: true, tokenLocal: true };
   const ghToken = resolveLocalGitHubToken();
   if (!ghToken || !bootstrapUrl) return null;
 
@@ -5202,7 +5243,7 @@ export function registerWithBootstrapServer({
   return null;
 }
 
-export function fetchBootstrapMembersStatus({ bootstrapUrl = DEFAULT_BOOTSTRAP_URL } = {}) {
+export function fetchBootstrapMembersStatus({ bootstrapUrl = DEFAULT_BOOTSTRAP_URL, cfg = null } = {}) {
   if (!bootstrapUrl) {
     return {
       attempted: false,
@@ -5228,8 +5269,9 @@ export function fetchBootstrapMembersStatus({ bootstrapUrl = DEFAULT_BOOTSTRAP_U
       members: [],
     };
   }
-  const ghToken = resolveLocalGitHubToken();
-  if (!ghToken) {
+  const useTokenLocal = isTokenLocalAuthEnabled(cfg);
+  const ghToken = useTokenLocal ? null : resolveLocalGitHubToken(cfg);
+  if (!useTokenLocal && !ghToken) {
     return {
       attempted: false,
       ok: false,
@@ -5244,6 +5286,24 @@ export function fetchBootstrapMembersStatus({ bootstrapUrl = DEFAULT_BOOTSTRAP_U
   try {
     const membersUrl = validateBootstrapControlPlaneUrl(bootstrapUrl);
     membersUrl.pathname = membersUrl.pathname.replace(/\/api\/bootstrap\/?$/, "/api/members");
+    const devAuth = useTokenLocal
+      ? buildTokenLocalDeviceAuthHeaders({
+          method: "GET",
+          pathnameWithSearch: membersUrl.pathname + membersUrl.search,
+          body: "",
+        })
+      : null;
+    if (useTokenLocal && !devAuth) {
+      return {
+        attempted: false,
+        ok: false,
+        status: "skipped",
+        statusCode: null,
+        fetchedAt: null,
+        error: "Missing local device identity for token-local auth",
+        members: [],
+      };
+    }
     const inlineScript = `
       const https = require("node:https");
       const url = new URL(process.env.MEMBERS_URL);
@@ -5253,13 +5313,20 @@ export function fetchBootstrapMembersStatus({ bootstrapUrl = DEFAULT_BOOTSTRAP_U
         completed = true;
         process.stdout.write(JSON.stringify(payload));
       }
+      const headers = {
+        "Accept": "application/json",
+        "User-Agent": "copilot-signalr-bridge/1.7"
+      };
+      if (process.env.GH_BOOT_TOKEN) {
+        headers["Authorization"] = "Bearer " + process.env.GH_BOOT_TOKEN;
+      } else if (process.env.FLOCK_DEV_ID && process.env.FLOCK_DEV_TS && process.env.FLOCK_DEV_SIG) {
+        headers["X-Flock-Device-Id"] = process.env.FLOCK_DEV_ID;
+        headers["X-Flock-Timestamp"] = process.env.FLOCK_DEV_TS;
+        headers["X-Flock-Signature"] = process.env.FLOCK_DEV_SIG;
+      }
       const req = https.request(url, {
         method: "GET",
-        headers: {
-          "Authorization": "Bearer " + process.env.GH_BOOT_TOKEN,
-          "Accept": "application/json",
-          "User-Agent": "copilot-signalr-bridge/1.7"
-        },
+        headers,
         timeout: 8000
       }, (res) => {
         let data = "";
@@ -5295,7 +5362,10 @@ export function fetchBootstrapMembersStatus({ bootstrapUrl = DEFAULT_BOOTSTRAP_U
       env: {
         ...process.env,
         MEMBERS_URL: membersUrl.toString(),
-        GH_BOOT_TOKEN: ghToken,
+        GH_BOOT_TOKEN: ghToken || "",
+        FLOCK_DEV_ID: devAuth?.deviceId || "",
+        FLOCK_DEV_TS: devAuth?.timestamp || "",
+        FLOCK_DEV_SIG: devAuth?.signature || "",
       },
     }).trim();
     if (out) {
@@ -5344,8 +5414,8 @@ export function fetchBootstrapMembersStatus({ bootstrapUrl = DEFAULT_BOOTSTRAP_U
   }
 }
 
-export function fetchBootstrapMembers({ bootstrapUrl = DEFAULT_BOOTSTRAP_URL } = {}) {
-  return fetchBootstrapMembersStatus({ bootstrapUrl }).members;
+export function fetchBootstrapMembers({ bootstrapUrl = DEFAULT_BOOTSTRAP_URL, cfg = null } = {}) {
+  return fetchBootstrapMembersStatus({ bootstrapUrl, cfg }).members;
 }
 
 export function callBootstrapQueueApi({
@@ -5353,24 +5423,41 @@ export function callBootstrapQueueApi({
   endpointPath = "/api/queue/status",
   method = "GET",
   bodyObj = null,
+  cfg = null,
 } = {}) {
-  const ghToken = resolveLocalGitHubToken();
-  if (!ghToken || !bootstrapUrl) return null;
+  if (!bootstrapUrl) return null;
+  const useTokenLocal = isTokenLocalAuthEnabled(cfg);
+  const ghToken = useTokenLocal ? null : resolveLocalGitHubToken(cfg);
+  if (!useTokenLocal && !ghToken) return null;
 
   try {
     const apiUrl = validateBootstrapControlPlaneUrl(bootstrapUrl);
     apiUrl.pathname = apiUrl.pathname.replace(/\/api\/bootstrap\/?$/, endpointPath);
     const payload = bodyObj ? JSON.stringify(bodyObj) : "";
+    const devAuth = useTokenLocal
+      ? buildTokenLocalDeviceAuthHeaders({
+          method,
+          pathnameWithSearch: apiUrl.pathname + apiUrl.search,
+          body: payload,
+        })
+      : null;
+    if (useTokenLocal && !devAuth) return null;
     const inlineScript = `
       const https = require("node:https");
       const url = new URL(process.env.QUEUE_API_URL);
       const method = process.env.QUEUE_API_METHOD || "GET";
       const body = process.env.QUEUE_API_BODY || "";
       const headers = {
-        "Authorization": "Bearer " + process.env.GH_BOOT_TOKEN,
         "Accept": "application/json",
         "User-Agent": "copilot-signalr-bridge/2.1"
       };
+      if (process.env.GH_BOOT_TOKEN) {
+        headers["Authorization"] = "Bearer " + process.env.GH_BOOT_TOKEN;
+      } else if (process.env.FLOCK_DEV_ID && process.env.FLOCK_DEV_TS && process.env.FLOCK_DEV_SIG) {
+        headers["X-Flock-Device-Id"] = process.env.FLOCK_DEV_ID;
+        headers["X-Flock-Timestamp"] = process.env.FLOCK_DEV_TS;
+        headers["X-Flock-Signature"] = process.env.FLOCK_DEV_SIG;
+      }
       if (method === "POST") {
         headers["Content-Type"] = "application/json";
         headers["Content-Length"] = Buffer.byteLength(body);
@@ -5397,7 +5484,10 @@ export function callBootstrapQueueApi({
         QUEUE_API_URL: apiUrl.toString(),
         QUEUE_API_METHOD: method,
         QUEUE_API_BODY: payload,
-        GH_BOOT_TOKEN: ghToken,
+        GH_BOOT_TOKEN: ghToken || "",
+        FLOCK_DEV_ID: devAuth?.deviceId || "",
+        FLOCK_DEV_TS: devAuth?.timestamp || "",
+        FLOCK_DEV_SIG: devAuth?.signature || "",
       },
     }).trim();
     if (out) return JSON.parse(out);
@@ -5410,12 +5500,14 @@ export function enqueueOfflineMessage({
   toMachine,
   rpcPayload,
   ttlSeconds = 86400,
+  cfg = null,
 } = {}) {
   return callBootstrapQueueApi({
     bootstrapUrl,
     endpointPath: "/api/queue/enqueue",
     method: "POST",
     bodyObj: { toMachine, rpcPayload, ttlSeconds },
+    cfg,
   });
 }
 
@@ -5423,24 +5515,28 @@ export function drainOfflineQueue({
   bootstrapUrl = DEFAULT_BOOTSTRAP_URL,
   machineId = os.hostname(),
   peekOnly = true,
+  cfg = null,
 } = {}) {
   return callBootstrapQueueApi({
     bootstrapUrl,
     endpointPath: "/api/queue/drain",
     method: "POST",
     bodyObj: { machineId, peekOnly },
+    cfg,
   });
 }
 
 export function ackOfflineQueueMessages({
   bootstrapUrl = DEFAULT_BOOTSTRAP_URL,
   requestIds = [],
+  cfg = null,
 } = {}) {
   return callBootstrapQueueApi({
     bootstrapUrl,
     endpointPath: "/api/queue/ack",
     method: "POST",
     bodyObj: { requestIds },
+    cfg,
   });
 }
 
@@ -5448,6 +5544,7 @@ export function getOfflineQueueStatus({
   bootstrapUrl = DEFAULT_BOOTSTRAP_URL,
   machineId = null,
   configPath = null,
+  cfg = null,
 } = {}) {
   const u = validateBootstrapControlPlaneUrl(bootstrapUrl, {
     configPath,
@@ -5459,6 +5556,7 @@ export function getOfflineQueueStatus({
     bootstrapUrl: u.toString(),
     endpointPath: u.pathname + u.search,
     method: "GET",
+    cfg: cfg || (configPath ? { configPath } : null),
   });
 }
 
@@ -10204,6 +10302,7 @@ export async function drainAndProcessOfflineQueue(
           ackFn({
             bootstrapUrl: cfg.bootstrapUrl || DEFAULT_BOOTSTRAP_URL,
             requestIds: retryIds,
+            cfg,
           })
         );
         if (retryRes?.ok) {
@@ -10217,6 +10316,7 @@ export async function drainAndProcessOfflineQueue(
           bootstrapUrl: cfg.bootstrapUrl || DEFAULT_BOOTSTRAP_URL,
           machineId: cfg.machineId,
           peekOnly: true,
+          cfg,
         })
       );
       if (!drained || !Array.isArray(drained.messages) || drained.messages.length === 0) {
@@ -10304,6 +10404,7 @@ export async function drainAndProcessOfflineQueue(
           ackFn({
             bootstrapUrl: cfg.bootstrapUrl || DEFAULT_BOOTSTRAP_URL,
             requestIds: toAckIds,
+            cfg,
           })
         );
         if (ackRes?.ok) {
@@ -16998,6 +17099,10 @@ export function callBootstrapV3Endpoint(
   subPath,
   { method = "POST", body = null, sandbox = isSandboxV3Mode() } = {}
 ) {
+  const isTokenLocalConfig = Boolean(
+    cfg?.tokenLocalAuth === true ||
+      (typeof isTokenLocalAuthEnabled === "function" && isTokenLocalAuthEnabled(cfg))
+  );
   const isTokenLocalVoucherEnroll = Boolean(
     subPath === "/enroll" &&
       method === "POST" &&
@@ -17009,12 +17114,13 @@ export function callBootstrapV3Endpoint(
   const isTokenLocalSync = Boolean(
     subPath === "/flocks/sync" &&
       method === "POST" &&
-      cfg?.tokenLocalAuth === true &&
+      isTokenLocalConfig &&
       body?.deviceId &&
       body?.signature &&
       body?.timestamp
   );
-  const ghToken = isTokenLocalVoucherEnroll || isTokenLocalSync ? null : resolveLocalGitHubToken();
+  const useTokenLocal = isTokenLocalConfig || isTokenLocalVoucherEnroll || isTokenLocalSync;
+  const ghToken = useTokenLocal ? null : resolveLocalGitHubToken();
   const hasCfgBootstrap = Boolean(
     cfg && Object.prototype.hasOwnProperty.call(cfg, "bootstrapUrl")
   );
@@ -17041,6 +17147,10 @@ export function callBootstrapV3Endpoint(
     };
     if (process.env.GH_BOOT_TOKEN) {
       headers["Authorization"] = "Bearer " + process.env.GH_BOOT_TOKEN;
+    } else if (process.env.FLOCK_DEV_ID && process.env.FLOCK_DEV_TS && process.env.FLOCK_DEV_SIG) {
+      headers["X-Flock-Device-Id"] = process.env.FLOCK_DEV_ID;
+      headers["X-Flock-Timestamp"] = process.env.FLOCK_DEV_TS;
+      headers["X-Flock-Signature"] = process.env.FLOCK_DEV_SIG;
     }
     if (method === "POST") {
       headers["Content-Type"] = "application/json; charset=utf-8";
@@ -17107,6 +17217,9 @@ export function callBootstrapV3Endpoint(
     let requestBody = body;
     if (subPath === "/enroll" && method === "POST" && body?.enrollmentJson) {
       const preboundId = Number(body.enrollmentJson?.invitedGitHubUserId);
+      if (useTokenLocal && !(Number.isSafeInteger(preboundId) && preboundId > 0)) {
+        throw new Error("Token-local invited enrollment requires invitedGitHubUserId in enrollmentJson");
+      }
       const githubUserId =
         Number.isSafeInteger(preboundId) && preboundId > 0
           ? preboundId
@@ -17121,6 +17234,25 @@ export function callBootstrapV3Endpoint(
             );
       requestBody = signV3EnrollmentRequest(body, githubUserId, ensureMachineIdentityKeypair());
     }
+    const serializedBody = requestBody ? JSON.stringify(requestBody) : "";
+    const devAuth =
+      useTokenLocal &&
+      !isTokenLocalVoucherEnroll &&
+      !isTokenLocalSync &&
+      typeof buildTokenLocalDeviceAuthHeaders === "function"
+        ? buildTokenLocalDeviceAuthHeaders({
+            method,
+            pathnameWithSearch: u.pathname + u.search,
+            body: serializedBody,
+          })
+        : null;
+    const extraEnv = devAuth
+      ? {
+          FLOCK_DEV_ID: devAuth.deviceId,
+          FLOCK_DEV_TS: devAuth.timestamp,
+          FLOCK_DEV_SIG: devAuth.signature,
+        }
+      : {};
     const out = execFileSync(process.execPath, ["-e", inlineScript], {
       encoding: "utf8",
       stdio: ["ignore", "pipe", "ignore"],
@@ -17130,8 +17262,9 @@ export function callBootstrapV3Endpoint(
         ...process.env,
         V3_URL: u.toString(),
         V3_METHOD: method,
-        V3_BODY: requestBody ? JSON.stringify(requestBody) : "",
+        V3_BODY: serializedBody,
         GH_BOOT_TOKEN: ghToken || "",
+        ...extraEnv,
       },
     }).trim();
     return out ? JSON.parse(out) : null;
@@ -17681,7 +17814,9 @@ export async function resolveLegacyFlockRoster(cfg, options = {}) {
     (async () => {
       if (options.fetchV3MyFlocks) return await options.fetchV3MyFlocks(cfg);
       if (!hasBootstrap) return { __skipped: true, error: "Bootstrap URL not configured" };
-      if (!resolveLocalGitHubToken()) return { __skipped: true, error: "Missing local GitHub token" };
+      if (!isTokenLocalAuthEnabled(cfg) && !resolveLocalGitHubToken(cfg)) {
+        return { __skipped: true, error: "Missing local GitHub token" };
+      }
       return callBootstrapV3Endpoint(cfg, "/my-flocks", { method: "GET" });
     })(),
     (async () => {
@@ -17697,7 +17832,7 @@ export async function resolveLegacyFlockRoster(cfg, options = {}) {
           members: [],
         };
       }
-      return fetchBootstrapMembersStatus({ bootstrapUrl: cfg?.bootstrapUrl || DEFAULT_BOOTSTRAP_URL });
+      return fetchBootstrapMembersStatus({ bootstrapUrl: cfg?.bootstrapUrl || DEFAULT_BOOTSTRAP_URL, cfg });
     })(),
   ]);
 

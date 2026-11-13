@@ -53,7 +53,7 @@ flowchart LR
   - This machine already has `~/.copilot/flock/config.json` with a configured `bootstrapUrl` / `connectionString`.
 - **Why zero Azure setup and zero GitHub token forwarding are needed**:
   - The Enrollment JSON already contains `"bootstrapUrl"` and an owner-minted `"voucherSecret"` + `"invitedGitHubUserId"`.
-  - When `"tokenLocalVoucherAuth": true` (or `"voucherSecret"`) is present in the Enrollment JSON, `node flock.mjs install --invite-file` is **100% token-local**: it **never calls `resolveLocalGitHubToken()` or `gh auth token`**, and **never sends any GitHub token in `Authorization: Bearer`** to the bootstrap server. Instead, it generates a local Ed25519 keypair and signs the enrollment request locally using only the device's Ed25519 private key and the pre-bound `invitedGitHubUserId`.
+  - When `"tokenLocalVoucherAuth": true` (or `"voucherSecret"`) is present in the Enrollment JSON, **every runtime path** — `node flock.mjs install --invite-file`, the background daemon (`drainAndProcessOfflineQueue` → `callBootstrapQueueApi`), `/api/members` (`fetchBootstrapMembersStatus`), and `/api/v3/*` (`callBootstrapV3Endpoint`) — is **100% token-local**: `resolveLocalGitHubToken()` is hard-gated to return `null` immediately whenever `tokenLocalAuth: true` is persisted in `config.json` (never touching `GITHUB_TOKEN`, `gh auth token`, or `git credential fill`), and all subsequent broker/queue HTTP calls sign requests locally with the device's Ed25519 keypair (`X-Flock-Device-Id`, `X-Flock-Timestamp`, `X-Flock-Signature`) with zero GitHub token ever transmitted.
 - **Exact single command you (Copilot) should run**:
   ```powershell
   # Save the pasted copilot-flock-invite-v3 JSON to a temporary file and run install --invite-file:

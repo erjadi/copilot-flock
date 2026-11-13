@@ -121,6 +121,8 @@ import {
   redactBootstrapUrlForDiagnostic,
   callBootstrapV3Endpoint,
   getOfflineQueueStatus,
+  buildTokenLocalDeviceAuthHeaders,
+  resolveLocalGitHubToken,
   captureCallerMcpSnapshot,
   inspectLocalRuntimeHealth,
   reapOrphanedMcpProcesses,
@@ -313,13 +315,13 @@ test("broker HTTP routes admit signed invited devices without repo write access 
       server.once("error", reject);
       server.listen(0, "127.0.0.1", resolve);
     });
-    async function request(endpoint, token = "guest", body = null) {
+    async function request(endpoint, token = "guest", body = null, extraHeaders = {}) {
       return await new Promise((resolve, reject) => {
         const payload = body === null ? null : JSON.stringify(body);
         const req = http.request({
           hostname: "127.0.0.1", port: server.address().port, path: endpoint,
           method: payload === null ? "GET" : "POST",
-          headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}), ...(payload === null ? {} : { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(payload) }) },
+          headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}), ...extraHeaders, ...(payload === null ? {} : { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(payload) }) },
         }, (res) => {
           let text = "";
           res.setEncoding("utf8");
@@ -377,6 +379,47 @@ test("broker HTTP routes admit signed invited devices without repo write access 
     };
     const badSecretSigned = signV3EnrollmentRequest({ ...tokenLocalBody, enrollmentJson: badSecretInvite }, 2002, keys);
     assert.equal((await request("/api/v3/enroll", "", badSecretSigned)).status, 403);
+
+    // Hard gate: resolveLocalGitHubToken never reads env/CLI when tokenLocalAuth is enabled
+    const prevGhTok = process.env.GH_TOKEN;
+    process.env.GH_TOKEN = "ghp_synthetic_never_forward";
+    try {
+      assert.equal(resolveLocalGitHubToken({ tokenLocalAuth: true }), null);
+    } finally {
+      if (prevGhTok === undefined) delete process.env.GH_TOKEN;
+      else process.env.GH_TOKEN = prevGhTok;
+    }
+
+    // Token-local Ed25519 device HTTP auth for queue drain/ack/status, members, and /api/v3/my-flocks (zero GitHub token)
+    const devIdentity = { fingerprint: "token-local-device", privateKey: keys.privateKey, publicKey: keys.publicKey };
+    const signDevReq = (method, endpoint, bodyObj = null) => {
+      const raw = bodyObj === null ? "" : JSON.stringify(bodyObj);
+      const h = buildTokenLocalDeviceAuthHeaders({ method, pathnameWithSearch: endpoint, body: raw }, devIdentity);
+      return {
+        "X-Flock-Device-Id": h.deviceId,
+        "X-Flock-Timestamp": h.timestamp,
+        "X-Flock-Signature": h.signature,
+      };
+    };
+    const drainOwnBody = { machineId: "TOKEN-LOCAL-PC", peekOnly: true };
+    const drainOwnRes = await request("/api/queue/drain", "", drainOwnBody, signDevReq("POST", "/api/queue/drain", drainOwnBody));
+    assert.equal(drainOwnRes.status, 200, drainOwnRes.body.error);
+    assert.equal(drainOwnRes.body.machineId, "TOKEN-LOCAL-PC");
+
+    const drainOtherBody = { machineId: "ARM64-LAPTOP", peekOnly: true };
+    assert.equal((await request("/api/queue/drain", "", drainOtherBody, signDevReq("POST", "/api/queue/drain", drainOtherBody))).status, 403);
+    assert.equal((await request("/api/queue/drain", "", { machineId: "TOKEN-LOCAL-PC", peekOnly: false }, signDevReq("POST", "/api/queue/drain", drainOwnBody))).status, 401);
+
+    const ackBody = { requestIds: ["req-none"] };
+    assert.equal((await request("/api/queue/ack", "", ackBody, signDevReq("POST", "/api/queue/ack", ackBody))).status, 200);
+    assert.equal((await request("/api/queue/status", "", null, signDevReq("GET", "/api/queue/status"))).status, 200);
+    assert.equal((await request("/api/queue/status?machineId=OTHER-PC", "", null, signDevReq("GET", "/api/queue/status?machineId=OTHER-PC"))).status, 403);
+    assert.equal((await request("/api/bootstrap", "", null, signDevReq("GET", "/api/bootstrap"))).status, 403);
+    assert.equal((await request("/api/members", "", null, signDevReq("GET", "/api/members"))).status, 200);
+    const devMyFlocks = await request("/api/v3/my-flocks", "", null, signDevReq("GET", "/api/v3/my-flocks"));
+    assert.equal(devMyFlocks.status, 200, devMyFlocks.body.error);
+    assert.equal(devMyFlocks.body.githubUser, "invited-user");
+    assert.equal((await request("/api/v3/my-flocks?githubUser=deployment-maintainer", "", null, signDevReq("GET", "/api/v3/my-flocks?githubUser=deployment-maintainer"))).status, 403);
     const myFlocks = await request("/api/v3/my-flocks");
     assert.equal(myFlocks.status, 200);
     assert.equal(myFlocks.body.githubUser, "invited-user");
