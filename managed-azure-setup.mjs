@@ -66,7 +66,7 @@ export function createBrokerZip(destination) {
   const local = [];
   const central = [];
   let offset = 0;
-  const files = ["bootstrap-server.mjs", "flock-membership.mjs", "package.json"];
+  const files = ["bootstrap-server.mjs", "flock-membership.mjs", "flock-lifecycle.mjs", "flock-protocol.mjs", "runtime-manifest.json", "package.json"];
   for (const name of files) {
     const data = fs.readFileSync(path.join(root, name));
     const filename = Buffer.from(name);

@@ -293,7 +293,7 @@ test("ZIP contains exactly the current broker sources and opens without Windows 
       names.push(name);
       offset += 30 + nameLength + length;
     }
-    assert.deepEqual(names, ["bootstrap-server.mjs", "flock-membership.mjs", "package.json"]);
+    assert.deepEqual(names, ["bootstrap-server.mjs", "flock-membership.mjs", "flock-lifecycle.mjs", "flock-protocol.mjs", "runtime-manifest.json", "package.json"]);
     if (process.platform === "win32") {
       const result = spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command",
         "Add-Type -AssemblyName System.IO.Compression.FileSystem; [System.IO.Compression.ZipFile]::ExtractToDirectory($env:TEST_ZIP, $env:TEST_DEST)"],
