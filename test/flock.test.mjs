@@ -319,7 +319,7 @@ test("broker HTTP routes admit signed invited devices without repo write access 
         const req = http.request({
           hostname: "127.0.0.1", port: server.address().port, path: endpoint,
           method: payload === null ? "GET" : "POST",
-          headers: { Authorization: `Bearer ${token}`, ...(payload === null ? {} : { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(payload) }) },
+          headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}), ...(payload === null ? {} : { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(payload) }) },
         }, (res) => {
           let text = "";
           res.setEncoding("utf8");
@@ -363,6 +363,20 @@ test("broker HTTP routes admit signed invited devices without repo write access 
     const joined = enrollment.body.enrolledFlocks.find((flock) => flock.flockId === invite.flockId);
     assert.equal(joined.trustTier, "guest");
     assert.ok(Date.parse(joined.membershipExpiresAt) > Date.now());
+
+    // Token-local voucher enrollment (zero Authorization header / zero GitHub token transmitted)
+    const tokenLocalBody = { ...body, deviceId: "token-local-device", machineId: "TOKEN-LOCAL-PC", keyFingerprint: "token-local-device" };
+    const tokenLocalSigned = signV3EnrollmentRequest(tokenLocalBody, 2002, keys);
+    const tokenLocalEnroll = await request("/api/v3/enroll", "", tokenLocalSigned);
+    assert.equal(tokenLocalEnroll.status, 200, tokenLocalEnroll.body.error);
+    assert.equal(tokenLocalEnroll.body.githubUser, "invited-user");
+    assert.equal(tokenLocalEnroll.body.githubUserId, 2002);
+    const badSecretInvite = {
+      ...invite.enrollmentJson,
+      flocks: invite.enrollmentJson.flocks.map((f) => ({ ...f, voucherSecret: "wrong-secret" })),
+    };
+    const badSecretSigned = signV3EnrollmentRequest({ ...tokenLocalBody, enrollmentJson: badSecretInvite }, 2002, keys);
+    assert.equal((await request("/api/v3/enroll", "", badSecretSigned)).status, 403);
     const myFlocks = await request("/api/v3/my-flocks");
     assert.equal(myFlocks.status, 200);
     assert.equal(myFlocks.body.githubUser, "invited-user");

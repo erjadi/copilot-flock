@@ -47,12 +47,13 @@ flowchart LR
   - **Windows 11**: Avoid `winget` MSI installers that trigger blocking UAC prompts. Download the official portable `node-v22.x-win-x64.zip` (or `win-arm64.zip`) into `%LOCALAPPDATA%\Programs\nodejs` and add it to the user `PATH` (`node >= 22.5` includes built-in `node:sqlite`). Note that GitHub Copilot Desktop already bundles `git.exe` (`%LOCALAPPDATA%\github-copilot-git-*\cmd`) and `gh.exe` (`%LOCALAPPDATA%\copilot-desktop-gh-*`).
   - **Headless Linux (`Ubuntu` / `Debian` / `ARM64`)**: Install Node.js `>= 22.5` into user space (e.g. `~/.local/bin` or `fnm`/`nvm`) and run `sudo loginctl enable-linger "$USER"` so `systemd --user` keeps `copilot-flock.service` running across SSH logouts and unattended reboots.
 
-### Case 1 — The User Has an Invite to an Existing Flock (`copilot-flock-invite-v3`)
+### Case 1 — The User Has an Invite to an Existing Flock (`copilot-flock-invite-v3` / `tokenLocalVoucherAuth: true`)
 - **When this applies**:
-  - The user pasted a message containing a `"type": "copilot-flock-invite-v3"` JSON block (either from their own other PC, a teammate's shared flock like `<owner>/<team>`, or a time-bound guest pass like `<owner>/<flock>/<machineId>`), **OR**
+  - The user pasted a message containing a `"v": 3` Enrollment JSON block (with `"tokenLocalVoucherAuth": true` or `"voucherSecret"`, either from their own other PC, a teammate's shared flock like `<owner>/<team>`, or a time-bound guest pass like `<owner>/<flock>/<machineId>`), **OR**
   - This machine already has `~/.copilot/flock/config.json` with a configured `bootstrapUrl` / `connectionString`.
-- **Why zero Azure setup is needed**:
-  - The signed Enrollment JSON already contains `"bootstrapUrl": "https://.../api/bootstrap"`.
+- **Why zero Azure setup and zero GitHub token forwarding are needed**:
+  - The Enrollment JSON already contains `"bootstrapUrl"` and an owner-minted `"voucherSecret"` + `"invitedGitHubUserId"`.
+  - When `"tokenLocalVoucherAuth": true` (or `"voucherSecret"`) is present in the Enrollment JSON, `node flock.mjs install --invite-file` is **100% token-local**: it **never calls `resolveLocalGitHubToken()` or `gh auth token`**, and **never sends any GitHub token in `Authorization: Bearer`** to the bootstrap server. Instead, it generates a local Ed25519 keypair and signs the enrollment request locally using only the device's Ed25519 private key and the pre-bound `invitedGitHubUserId`.
 - **Exact single command you (Copilot) should run**:
   ```powershell
   # Save the pasted copilot-flock-invite-v3 JSON to a temporary file and run install --invite-file:

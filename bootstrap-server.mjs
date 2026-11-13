@@ -415,7 +415,7 @@ function githubApiGet(apiPath, githubToken, redirectsLeft = 3) {
         path: u ? `${u.pathname}${u.search}` : apiPath,
         method: "GET",
         headers: {
-          Authorization: `Bearer ${githubToken}`,
+          ...(githubToken ? { Authorization: `Bearer ${githubToken}` } : {}),
           Accept: "application/vnd.github+json",
           "User-Agent": "copilot-signalr-bridge-bootstrap/3.0",
           "X-GitHub-Api-Version": "2022-11-28",
@@ -1350,16 +1350,19 @@ export async function createV3FlockInvite(
     }
 
     const voucherId = crypto.randomUUID();
+    const voucherSecret = crypto.randomBytes(24).toString("base64url");
     const effectiveTrust =
       trustTier || (parsed.machineId || durMins ? "guest" : "collaborator");
+    const resolvedInvitedId = invitedGitHubUserId ? Number(invitedGitHubUserId) : null;
     f.vouchers[voucherId] = {
       voucherId,
+      voucherSecret,
       flockId: f.flockId,
       flockUuid: f.flockUuid,
       targetAddress: parsed.canonicalPath,
       targetMachineId: parsed.machineId || null,
       invitedUser: cleanInvited,
-      invitedGitHubUserId: invitedGitHubUserId ? Number(invitedGitHubUserId) : null,
+      invitedGitHubUserId: resolvedInvitedId,
       invitedBy: cleanCaller,
       trustTier: effectiveTrust,
       durationMinutes: durMins,
@@ -1375,8 +1378,9 @@ export async function createV3FlockInvite(
 
     const enrollmentJson = {
       v: 3,
+      tokenLocalVoucherAuth: true,
       invitedUser: cleanInvited,
-      invitedGitHubUserId: invitedGitHubUserId ? Number(invitedGitHubUserId) : null,
+      invitedGitHubUserId: resolvedInvitedId,
       invitedBy: cleanCaller,
       bootstrapUrl,
       voucherExpiresAt: new Date(voucherExpiresAtMs).toISOString(),
@@ -1384,6 +1388,7 @@ export async function createV3FlockInvite(
       flocks: [
         {
           voucherId,
+          voucherSecret,
           flockId: f.flockId,
           flockUuid: f.flockUuid,
           targetAddress: parsed.canonicalPath,
@@ -1397,7 +1402,7 @@ export async function createV3FlockInvite(
     };
 
     const pasteablePrompt =
-      `Accept my pending GitHub repo invite to \`erjadi/copilot-flock\` (if any), clone \`https://github.com/erjadi/copilot-flock\`, install and set up Copilot Flock on this machine, and enroll me using this enrollment JSON:\n` +
+      `Accept my pending GitHub repo invite to \`erjadi/copilot-flock\` (if any), clone \`https://github.com/erjadi/copilot-flock\`, install and set up Copilot Flock on this machine, and enroll me using this token-local enrollment JSON (no GitHub token is sent to the bootstrap server):\n` +
       `\`\`\`json\n${JSON.stringify(enrollmentJson, null, 2)}\n\`\`\``;
 
     return {
@@ -2012,6 +2017,145 @@ export function createBootstrapServer({
     const authHeader = String(req.headers.authorization || "");
     const bearerMatch = authHeader.match(/^(?:Bearer|token)\s+(.+)$/i);
     const githubToken = (bearerMatch ? bearerMatch[1] : String(req.headers["x-github-token"] || "")).trim();
+    const isEnrollment = subPath === "/enroll" && req.method === "POST";
+    const isMyFlocks = subPath === "/my-flocks" && req.method === "GET";
+    const isFlocksSync = subPath === "/flocks/sync" && req.method === "POST";
+
+    if (!githubToken && isEnrollment && Array.isArray(bodyData.enrollmentJson?.flocks) && bodyData.enrollmentJson.flocks.length > 0) {
+      try {
+        if (typeof bodyData.signature !== "string" || !bodyData.signature || typeof bodyData.timestamp !== "string" || !bodyData.timestamp) {
+          sendJson(res, 401, { ok: false, error: "Token-local invited enrollment requires a signed device enrollment" });
+          return;
+        }
+        if (bodyData.sandboxPrincipalOverride) {
+          sendJson(res, 403, { ok: false, error: "Token-local invited enrollment cannot override the invited GitHub identity" });
+          return;
+        }
+        const store = loadV3FlockStore(storePath);
+        let matchedUser = null;
+        let matchedUserId = null;
+        for (const fInvite of bodyData.enrollmentJson.flocks) {
+          const parsedAddr = parseFlockAddress(fInvite?.flockId);
+          const targetFlock = store.flocks[parsedAddr.flockId];
+          const voucher = targetFlock?.vouchers?.[fInvite?.voucherId];
+          if (!voucher) {
+            sendJson(res, 403, { ok: false, error: `Invalid or unknown voucherId for flock "${parsedAddr.flockId}"` });
+            return;
+          }
+          if (voucher.voucherSecret) {
+            const suppliedSecret = String(fInvite.voucherSecret || "");
+            const expectedBuf = Buffer.from(String(voucher.voucherSecret), "utf8");
+            const suppliedBuf = Buffer.from(suppliedSecret, "utf8");
+            if (expectedBuf.length !== suppliedBuf.length || !crypto.timingSafeEqual(expectedBuf, suppliedBuf)) {
+              sendJson(res, 403, { ok: false, error: "Invalid or missing voucherSecret for token-local enrollment" });
+              return;
+            }
+          }
+          const vUser = String(voucher.invitedUser || "").trim().toLowerCase();
+          if (!vUser) {
+            sendJson(res, 403, { ok: false, error: "Voucher is missing invitedUser binding" });
+            return;
+          }
+          if (matchedUser && matchedUser !== vUser) {
+            sendJson(res, 403, { ok: false, error: "All vouchers in a single enrollment must bind to the same invitedUser" });
+            return;
+          }
+          matchedUser = vUser;
+          if (voucher.invitedGitHubUserId && Number.isSafeInteger(Number(voucher.invitedGitHubUserId)) && Number(voucher.invitedGitHubUserId) > 0) {
+            matchedUserId = Number(voucher.invitedGitHubUserId);
+          }
+        }
+        if (!matchedUserId && matchedUser) {
+          const publicUserRes = await apiGet(`/users/${encodeURIComponent(matchedUser)}`, "");
+          if (publicUserRes.statusCode === 200 && Number.isSafeInteger(Number(publicUserRes.body?.id)) && Number(publicUserRes.body.id) > 0) {
+            matchedUserId = Number(publicUserRes.body.id);
+          }
+        }
+        if (!matchedUser || !matchedUserId) {
+          sendJson(res, 403, { ok: false, error: "Could not resolve numeric GitHub principal ID for token-local voucher" });
+          return;
+        }
+        const out = await enrollV3Device(
+          {
+            ...bodyData,
+            githubUser: matchedUser,
+            githubUserId: matchedUserId,
+          },
+          { storePath, sandbox: isPreview }
+        );
+        if (bodyData.machineId) {
+          saveMemberRegistration({
+            machineId: bodyData.machineId,
+            githubUser: matchedUser,
+            githubName: null,
+            scope: bodyData.scope || "work",
+            version: bodyData.version || "3.5.0",
+            hostname: bodyData.hostname || bodyData.machineId,
+            platform: bodyData.platform || null,
+            specs: bodyData.specs || null,
+          }, membersPath);
+        }
+        const connStr = process.env.SIGNALR_CONNECTION_STRING || "";
+        sendJson(res, 200, {
+          ...out,
+          hub: DEFAULT_HUB,
+          ...(connStr ? { connectionString: connStr } : {}),
+        });
+        return;
+      } catch (err) {
+        sendJson(res, err.statusCode || 500, {
+          ok: false,
+          code: err.code || "V3_ERROR",
+          error: err.message,
+        });
+        return;
+      }
+    }
+
+    if (!githubToken && isFlocksSync && bodyData.deviceId && bodyData.signature && bodyData.timestamp) {
+      try {
+        if (bodyData.sandboxPrincipalOverride) {
+          sendJson(res, 403, { ok: false, error: "Membership sync cannot override the authenticated GitHub identity" });
+          return;
+        }
+        const cleanDev = String(bodyData.deviceId).trim().toLowerCase();
+        const store = loadV3FlockStore(storePath);
+        let pinnedUser = null;
+        let pinnedUserId = null;
+        for (const f of Object.values(store.flocks || {})) {
+          for (const m of Object.values(f.members || {})) {
+            if (m && m.deviceId === cleanDev && m.githubUser && Number(m.githubUserId) > 0 && m.publicKey) {
+              pinnedUser = String(m.githubUser).toLowerCase();
+              pinnedUserId = Number(m.githubUserId);
+              break;
+            }
+          }
+          if (pinnedUser && pinnedUserId) break;
+        }
+        if (!pinnedUser || !pinnedUserId) {
+          sendJson(res, 403, { ok: false, error: `No enrolled device key pinned for device "${cleanDev}"` });
+          return;
+        }
+        const out = await syncV3DeviceMemberships(
+          {
+            ...bodyData,
+            githubUser: pinnedUser,
+            githubUserId: pinnedUserId,
+            requireSignature: true,
+          },
+          { storePath }
+        );
+        sendJson(res, 200, out);
+        return;
+      } catch (err) {
+        sendJson(res, err.statusCode || 500, {
+          ok: false,
+          code: err.code || "V3_ERROR",
+          error: err.message,
+        });
+        return;
+      }
+    }
 
     if (!githubToken) {
       sendJson(res, 401, {
@@ -2022,9 +2166,6 @@ export function createBootstrapServer({
     }
 
     const privilegedVerification = await verifyGitHubRepoAccess(githubToken, apiGet);
-    const isEnrollment = subPath === "/enroll" && req.method === "POST";
-    const isMyFlocks = subPath === "/my-flocks" && req.method === "GET";
-    const isFlocksSync = subPath === "/flocks/sync" && req.method === "POST";
     const verification = !privilegedVerification.ok && (isEnrollment || isMyFlocks || isFlocksSync)
       ? verifiedGitHubIdentity(await apiGet("/user", githubToken))
       : privilegedVerification;
@@ -2122,12 +2263,27 @@ export function createBootstrapServer({
       }
 
       if ((subPath === "/flocks/create" || subPath === "/flocks/invite") && req.method === "POST") {
+        let resolvedInvitedUserId = bodyData.invitedGitHubUserId || null;
+        const rawInvitedUser = String(bodyData.invitedUser || callerGitHubUser).replace(/^@/, "").trim().toLowerCase();
+        if (!resolvedInvitedUserId && rawInvitedUser) {
+          if (rawInvitedUser === callerGitHubUser && callerGitHubUserId) {
+            resolvedInvitedUserId = callerGitHubUserId;
+          } else {
+            try {
+              const invitedRes = await apiGet(`/users/${encodeURIComponent(rawInvitedUser)}`, githubToken);
+              if (invitedRes.statusCode === 200 && Number.isSafeInteger(Number(invitedRes.body?.id)) && Number(invitedRes.body.id) > 0) {
+                resolvedInvitedUserId = Number(invitedRes.body.id);
+              }
+            } catch {}
+          }
+        }
         const out = await createV3FlockInvite(
           {
             ...bodyData,
             callerGitHubUser,
             callerGitHubUserId,
             invitedUser: bodyData.invitedUser || callerGitHubUser,
+            invitedGitHubUserId: resolvedInvitedUserId,
           },
           { storePath, sandbox: isPreview }
         );

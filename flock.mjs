@@ -3293,6 +3293,8 @@ export function loadConfig({ autoFetchAz = true, refreshSpecs = false, passive =
         githubUser,
         specs,
         bootstrapUrl,
+        configPath: activeConfigPath,
+        tokenLocalAuth: Boolean(cfg.tokenLocalAuth),
         hub,
         connectionString: null,
         endpoint: null,
@@ -3321,6 +3323,7 @@ export function loadConfig({ autoFetchAz = true, refreshSpecs = false, passive =
     specs,
     bootstrapUrl,
     configPath: activeConfigPath,
+    tokenLocalAuth: Boolean(cfg.tokenLocalAuth),
     hub,
     connectionString,
     endpoint: parsed.endpoint,
@@ -3770,6 +3773,26 @@ export function reconcileAuthoritativeFlockMemberships(
 }
 
 export function applyV3EnrollmentResult(cfg, result, customPath = getFlocksConfigPath()) {
+  if (result?.connectionString && cfg && !cfg.connectionString) {
+    try {
+      const activeConfigPath = cfg.configPath || getConfigPath();
+      if (activeConfigPath && fs.existsSync(activeConfigPath)) {
+        const updatedCfg = JSON.parse(fs.readFileSync(activeConfigPath, "utf8"));
+        updatedCfg.connectionString = result.connectionString;
+        if (result.hub && !updatedCfg.hub) updatedCfg.hub = result.hub;
+        if (result.githubUser) updatedCfg.githubUser = normalizeGitHubUser(result.githubUser);
+        updatedCfg.updatedAt = new Date().toISOString();
+        writeConfigFileSecure(updatedCfg, activeConfigPath);
+      }
+      const parsed = parseConnectionString(result.connectionString);
+      cfg.connectionString = result.connectionString;
+      cfg.endpoint = parsed.endpoint;
+      cfg.host = parsed.host;
+      cfg.accessKey = parsed.accessKey;
+      if (result.hub && !cfg.hub) cfg.hub = result.hub;
+      if (result.githubUser && !cfg.githubUser) cfg.githubUser = normalizeGitHubUser(result.githubUser);
+    } catch {}
+  }
   const reconciled = reconcileAuthoritativeFlockMemberships(cfg, result, customPath, {
     requireMemberProof: false,
   });
@@ -5116,7 +5139,9 @@ export function registerWithBootstrapServer({
   scope = "work",
   githubUser = null,
   specs = null,
+  tokenLocalAuth = false,
 } = {}) {
+  if (tokenLocalAuth) return { ok: true, tokenLocal: true };
   const ghToken = resolveLocalGitHubToken();
   if (!ghToken || !bootstrapUrl) return null;
 
@@ -16973,7 +16998,23 @@ export function callBootstrapV3Endpoint(
   subPath,
   { method = "POST", body = null, sandbox = isSandboxV3Mode() } = {}
 ) {
-  const ghToken = resolveLocalGitHubToken();
+  const isTokenLocalVoucherEnroll = Boolean(
+    subPath === "/enroll" &&
+      method === "POST" &&
+      body?.enrollmentJson &&
+      (body.enrollmentJson.tokenLocalVoucherAuth === true ||
+        (Array.isArray(body.enrollmentJson.flocks) &&
+          body.enrollmentJson.flocks.some((f) => Boolean(f?.voucherSecret))))
+  );
+  const isTokenLocalSync = Boolean(
+    subPath === "/flocks/sync" &&
+      method === "POST" &&
+      cfg?.tokenLocalAuth === true &&
+      body?.deviceId &&
+      body?.signature &&
+      body?.timestamp
+  );
+  const ghToken = isTokenLocalVoucherEnroll || isTokenLocalSync ? null : resolveLocalGitHubToken();
   const hasCfgBootstrap = Boolean(
     cfg && Object.prototype.hasOwnProperty.call(cfg, "bootstrapUrl")
   );
@@ -17065,13 +17106,19 @@ export function callBootstrapV3Endpoint(
   try {
     let requestBody = body;
     if (subPath === "/enroll" && method === "POST" && body?.enrollmentJson) {
-      const githubUserId = Number(execFileSync("gh", ["api", "user", "--jq", ".id"], {
-        encoding: "utf8",
-        stdio: ["ignore", "pipe", "pipe"],
-        timeout: 10000,
-        windowsHide: true,
-        env: { ...process.env, GH_TOKEN: ghToken },
-      }).trim());
+      const preboundId = Number(body.enrollmentJson?.invitedGitHubUserId);
+      const githubUserId =
+        Number.isSafeInteger(preboundId) && preboundId > 0
+          ? preboundId
+          : Number(
+              execFileSync("gh", ["api", "user", "--jq", ".id"], {
+                encoding: "utf8",
+                stdio: ["ignore", "pipe", "pipe"],
+                timeout: 10000,
+                windowsHide: true,
+                env: ghToken ? { ...process.env, GH_TOKEN: ghToken } : process.env,
+              }).trim()
+            );
       requestBody = signV3EnrollmentRequest(body, githubUserId, ensureMachineIdentityKeypair());
     }
     const out = execFileSync(process.execPath, ["-e", inlineScript], {
@@ -17183,6 +17230,17 @@ export async function installBridge({
         );
         existing.bootstrapUrl = `${origin}/api/bootstrap`;
       }
+      if (
+        parsedEnrollmentJson &&
+        (parsedEnrollmentJson.tokenLocalVoucherAuth === true ||
+          (Array.isArray(parsedEnrollmentJson.flocks) &&
+            parsedEnrollmentJson.flocks.some((f) => Boolean(f?.voucherSecret))))
+      ) {
+        existing.tokenLocalAuth = true;
+        if (!existing.githubUser && parsedEnrollmentJson.invitedUser) {
+          existing.githubUser = normalizeGitHubUser(parsedEnrollmentJson.invitedUser);
+        }
+      }
     }
     if (bootstrapUrlArg !== undefined) {
       const origin = validatePinnedBootstrapOrigin(bootstrapUrlArg, null, {
@@ -17217,7 +17275,17 @@ export async function installBridge({
       writeConfigFileSecure(existing, activeConfigPath);
     }
 
-    cfg = loadConfig({ autoFetchAz: true, refreshSpecs: true });
+    const isTokenLocalVoucher = Boolean(
+      parsedEnrollmentJson &&
+        (parsedEnrollmentJson.tokenLocalVoucherAuth === true ||
+          (Array.isArray(parsedEnrollmentJson.flocks) &&
+            parsedEnrollmentJson.flocks.some((f) => Boolean(f?.voucherSecret))))
+    );
+    cfg = loadConfig({
+      autoFetchAz: !isTokenLocalVoucher,
+      refreshSpecs: true,
+      passive: isTokenLocalVoucher && !existing.connectionString && !process.env.SIGNALR_CONNECTION_STRING,
+    });
     loadLocalFlocksConfig(cfg);
   } catch (err) {
     stagedRelease.cleanup();
