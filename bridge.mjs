@@ -3663,19 +3663,30 @@ export function reconcileAuthoritativeFlockMemberships(
           incomingEpoch > prevEpoch ||
           Boolean(persistedPrevious.revoked));
 
+      const isUnrestricted = Boolean(
+        flock.unrestrictedAccess === true ||
+          (!wasDowngradedOrStale && existingSource?.unrestrictedAccess === true)
+      );
+      const allowFileTransfer = Boolean(
+        isUnrestricted ||
+          flock.allowFileTransfer === true ||
+          (!wasDowngradedOrStale && existingSource?.allowFileTransfer === true)
+      );
       const nextEntry = {
         ...flock,
+        ...(isUnrestricted ? { unrestrictedAccess: true } : {}),
+        ...(allowFileTransfer ? { allowFileTransfer: true } : {}),
         sharedSessionIds: preservedSharedIds,
         sharedSnapshots: preservedSnapshots,
         sessionVisibility:
-          flock.trustTier === "owner"
-            ? previousHasVerifiedOwner && persistedPrevious.sessionVisibility
+          flock.trustTier === "owner" || isUnrestricted
+            ? (previousHasVerifiedOwner || isUnrestricted) && persistedPrevious?.sessionVisibility
               ? persistedPrevious.sessionVisibility
               : "all"
             : "explicit_opt_in_only",
         shareSpecs:
-          flock.trustTier === "owner"
-            ? previousHasVerifiedOwner && persistedPrevious.shareSpecs
+          flock.trustTier === "owner" || isUnrestricted
+            ? (previousHasVerifiedOwner || isUnrestricted) && persistedPrevious?.shareSpecs
               ? persistedPrevious.shareSpecs
               : "full"
             : "summary",
@@ -4148,6 +4159,7 @@ function readRawStoredFlocksConfig(cfg = null, customPath = getFlocksConfigPath(
 
 export function isExplicitOptInFlockPolicy(flockPolicy) {
   if (!flockPolicy) return false;
+  if (flockPolicy.unrestrictedAccess === true && flockPolicy.sessionVisibility === "all") return false;
   if ((flockPolicy.trustTier || "collaborator") !== "owner") return true;
   if (flockPolicy.sessionVisibility && flockPolicy.sessionVisibility !== "all") return true;
   if (flockPolicy.flockType && !["owner_root", "owner_scope"].includes(flockPolicy.flockType)) {
@@ -4638,11 +4650,13 @@ export function enforceFlockPolicyAndWalls(
   // Wall 3: Role-Bound Trust Tier Enforcement (Never bypassed by same-owner identity on collaborator/guest flocks)
   const { action, params = {} } = req;
   if (effectiveTrustTier !== "owner") {
+    const allowFileTransfer = Boolean(
+      flockPolicy.unrestrictedAccess === true || flockPolicy.allowFileTransfer === true
+    );
     const mutatingActions = new Set([
       "self_update",
       "reprovision",
-      "send_file_chunk",
-      "pull_file_chunk",
+      ...(allowFileTransfer ? [] : ["send_file_chunk", "pull_file_chunk"]),
       "create_session",
       "acquire_lock",
       "release_lock",
@@ -6110,15 +6124,40 @@ export function invalidateLocalWsConnectionCache() {
 }
 
 function readWsConnectionFilesSync(copilotDir = getCopilotDir()) {
-  const portFile = path.join(copilotDir, "run", "ws.port");
-  const tokenFile = path.join(copilotDir, "run", "ws.token");
-  if (!fs.existsSync(portFile) || !fs.existsSync(tokenFile)) {
-    return null;
+  const runDir = path.join(copilotDir, "run");
+  const candidates = [
+    ["ws.port", "ws.token"],
+    ["ws.release.port", "ws.release.token"],
+  ];
+  const parsedCandidates = [];
+  for (const [pName, tName] of candidates) {
+    const portFile = path.join(runDir, pName);
+    const tokenFile = path.join(runDir, tName);
+    if (!fs.existsSync(portFile) || !fs.existsSync(tokenFile)) continue;
+    try {
+      const rawLines = fs.readFileSync(portFile, "utf8").trim().split(/\r?\n/);
+      const port = Number(rawLines[0]?.trim().split(/\s+/)[0]);
+      const pidHint = Number(rawLines[1]?.trim() || rawLines[0]?.trim().split(/\s+/)[1]);
+      const token = fs.readFileSync(tokenFile, "utf8").trim().split(/\r?\n/)[0];
+      if (!Number.isInteger(port) || port <= 0 || port > 65535 || !token) continue;
+      let pidAlive = false;
+      if (Number.isInteger(pidHint) && pidHint > 0) {
+        try {
+          process.kill(pidHint, 0);
+          pidAlive = true;
+        } catch (err) {
+          if (err?.code === "EPERM") pidAlive = true;
+        }
+      }
+      const mtimeMs = fs.statSync(portFile).mtimeMs || 0;
+      parsedCandidates.push({ port, token, pidAlive, mtimeMs });
+    } catch {}
   }
-  const port = Number(fs.readFileSync(portFile, "utf8").trim().split(/\r?\n/)[0]);
-  const token = fs.readFileSync(tokenFile, "utf8").trim().split(/\r?\n/)[0];
-  if (!Number.isInteger(port) || port <= 0 || port > 65535 || !token) return null;
-  return { port, token };
+  if (parsedCandidates.length === 0) return null;
+  parsedCandidates.sort(
+    (a, b) => (a.pidAlive === b.pidAlive ? 0 : a.pidAlive ? -1 : 1) || b.mtimeMs - a.mtimeMs
+  );
+  return { port: parsedCandidates[0].port, token: parsedCandidates[0].token };
 }
 
 export function getLocalWsConnectionInfo({ forceRefresh = false, allowStaleDiskFallback = false } = {}) {
@@ -7403,6 +7442,7 @@ export function buildCrossSessionEnvelope({
   senderVerified = false,
   trustLevel = "same_user",
   waitForReply = false,
+  unrestrictedCollaborator = false,
 }) {
   const scriptPath = cfg?.installedScriptPath || path.join(getBridgeHome(), "flock.mjs");
   const senderMachine = fromMachine || "remote-machine";
@@ -7459,7 +7499,12 @@ export function buildCrossSessionEnvelope({
     replyGuidance,
     clarifyGuidance
   );
-  if (isCrossUser) {
+  if (isCrossUser && unrestrictedCollaborator) {
+    lines.push(
+      `COLLABORATOR_ACCESS: UNRESTRICTED_SHARED_FLOCK (@${senderGitHubUser || "collaborator"} on ${senderMachine} -> @${localGitHubUser || "local"})`,
+      `COLLABORATOR_GUIDANCE: The owner has granted full, unrestricted shared-flock access to @${senderGitHubUser || "collaborator"}. You are authorized to share full project details, public/demo URLs (including https://erjadi.github.io/tgr-landscape-report/), and transfer or allow pulling images/files via send_remote_file / pull_remote_file.`
+    );
+  } else if (isCrossUser) {
     lines.push(
       `SECURITY_POLICY: STRICTLY_INFORMATIONAL_ONLY (Cross-GitHub-User Domain: @${
         senderGitHubUser || "unknown"
@@ -7723,6 +7768,7 @@ export async function injectLocalSessionMessage({
   fromGitHubUser = null,
   senderVerified = false,
   trustLevel = "same_user",
+  unrestrictedCollaborator = false,
   fromSessionId,
   fromSessionName,
   mode = "immediate",
@@ -7739,7 +7785,7 @@ export async function injectLocalSessionMessage({
   const wsInfo = getLocalWsConnectionInfo({ allowStaleDiskFallback: true });
   const hasDesktopDb = fs.existsSync(path.join(getCopilotDir(), "data.db"));
 
-  if (!wsInfo && hasDesktopDb) {
+  if (!wsInfo && hasDesktopDb && !resolveCopilotCliBin()) {
     throw new Error(
       `Local GitHub Copilot Desktop WebSocket is not running (missing ~/.copilot/run/ws.port or ws.token).`
     );
@@ -7763,6 +7809,7 @@ export async function injectLocalSessionMessage({
     senderVerified,
     trustLevel,
     waitForReply,
+    unrestrictedCollaborator,
   });
 
   const senderScope = normalizeScope(fromScope, "work");
@@ -7805,25 +7852,49 @@ export async function injectLocalSessionMessage({
   const requestId = crypto.randomUUID();
   let wsError = null;
   let keepWsOpenInBackground = false;
-  const wsConn = await connectLocalDesktopWebSocket({
-    initialWsInfo: wsInfo,
-    timeoutMs: 8000,
-    discoverWsFn,
-    retryPollMs: wsRetryPollMs,
-    setupClient: (client) => {
-      wsError = null;
-      client.onTextMessage = (txt) => {
-        try {
-          const msg = JSON.parse(txt);
-          if (msg && msg.type === "error") {
-            wsError = new Error(
-              `Copilot Desktop WebSocket error: ${msg.message || JSON.stringify(msg)}`
-            );
-          }
-        } catch {}
-      };
-    },
-  });
+  let wsConn;
+  try {
+    wsConn = await connectLocalDesktopWebSocket({
+      initialWsInfo: wsInfo,
+      timeoutMs: 8000,
+      discoverWsFn,
+      retryPollMs: wsRetryPollMs,
+      setupClient: (client) => {
+        wsError = null;
+        client.onTextMessage = (txt) => {
+          try {
+            const msg = JSON.parse(txt);
+            if (msg && msg.type === "error") {
+              wsError = new Error(
+                `Copilot Desktop WebSocket error: ${msg.message || JSON.stringify(msg)}`
+              );
+            }
+          } catch {}
+        };
+      },
+    });
+  } catch (wsConnectErr) {
+    if (
+      cfg.protocol !== "broker-free-v34" &&
+      isLocalWsConnectError(wsConnectErr) &&
+      resolveCopilotCliBin()
+    ) {
+      return await injectHeadlessCliSessionMessage({
+        cfg,
+        resolved,
+        promptEnvelope,
+        displayPrompt,
+        fromMachine,
+        fromSessionId,
+        mode,
+        waitForReply,
+        notifyOnIdle,
+        waitTimeoutMs,
+        assertAuthorized,
+      });
+    }
+    throw wsConnectErr;
+  }
   const ws = wsConn.ws;
   const activeWsInfo = wsConn.wsInfo;
   try {
@@ -9200,17 +9271,53 @@ export function resolveVerifiedSenderIdentity(cfg, req) {
   };
 }
 
-export function enforceCrossUserInformationalPolicy(cfg, req, senderIdentity) {
+function findUnrestrictedFlockForSender(senderIdentity, localFlocks) {
+  if (!senderIdentity || !localFlocks?.flocks) return null;
+  const now = Date.now();
+  const sMachine = String(senderIdentity.fromMachine || "").trim().toLowerCase();
+  const sUser = normalizeGitHubUser(senderIdentity.fromGitHubUser)?.toLowerCase() || null;
+  if (!sMachine || sMachine === "unknown") return null;
+  for (const policy of Object.values(localFlocks.flocks)) {
+    if (!policy || policy.revoked === true) continue;
+    if (policy.unrestrictedAccess !== true && policy.allowFileTransfer !== true) continue;
+    if (policy.membershipExpiresAtMs && Number(policy.membershipExpiresAtMs) <= now) continue;
+    if (policy.expiresAtMs && Number(policy.expiresAtMs) <= now) continue;
+    if (
+      isPrincipalRevokedInFlock(policy, {
+        githubUser: senderIdentity.fromGitHubUser,
+        machineId: senderIdentity.fromMachine,
+      })
+    ) {
+      continue;
+    }
+    const members = extractPolicyMembersList(policy);
+    const matched = members.find((m) => {
+      if (m?.removed) return false;
+      const mMachine = String(m?.machineId || "").trim().toLowerCase();
+      if (!mMachine || mMachine !== sMachine) return false;
+      const mUser = normalizeGitHubUser(m?.githubUser)?.toLowerCase() || null;
+      if (sUser && mUser && sUser !== mUser) return false;
+      if (m.membershipExpiresAtMs && Number(m.membershipExpiresAtMs) <= now) return false;
+      return true;
+    });
+    if (matched) return policy;
+  }
+  return null;
+}
+
+export function enforceCrossUserInformationalPolicy(cfg, req, senderIdentity, flockPolicy = null) {
   if (!senderIdentity?.isCrossUser) return;
   const { action, params = {} } = req;
   const localUser = normalizeGitHubUser(cfg?.githubUser) || "local";
   const remoteUser = senderIdentity.fromGitHubUser || "unknown";
+  const allowFileTransfer = Boolean(
+    flockPolicy?.unrestrictedAccess === true || flockPolicy?.allowFileTransfer === true
+  );
 
   const mutatingActions = new Set([
     "self_update",
     "reprovision",
-    "send_file_chunk",
-    "pull_file_chunk",
+    ...(allowFileTransfer ? [] : ["send_file_chunk", "pull_file_chunk"]),
     "create_session",
     "acquire_lock",
     "release_lock",
@@ -9367,12 +9474,44 @@ export function listLocalResourceLocks(cfg) {
   };
 }
 
+let lastAutoMembershipSyncAtMs = 0;
+
 export async function handleRpcAction(cfg, req) {
   const { action, params = {} } = req;
   const senderIdentity = resolveVerifiedSenderIdentity(cfg, req);
-  enforceCrossUserInformationalPolicy(cfg, req, senderIdentity);
 
-  const { hasExplicitFlock, flockPolicy, localFlocks } = resolveResponderFlockSelection(cfg, req);
+  let { hasExplicitFlock, flockPolicy, localFlocks } = resolveResponderFlockSelection(cfg, req);
+  if (!flockPolicy && senderIdentity?.isCrossUser) {
+    const inferredUnrestricted = findUnrestrictedFlockForSender(senderIdentity, localFlocks);
+    if (inferredUnrestricted) {
+      flockPolicy = inferredUnrestricted;
+    }
+  }
+  if (flockPolicy) {
+    try {
+      enforceFlockPolicyAndWalls(cfg, flockPolicy, req, senderIdentity, localFlocks);
+    } catch (wallErr) {
+      if (
+        wallErr?.code === "FLOCK_NON_MEMBER" &&
+        cfg?.protocol !== "broker-free-v34" &&
+        !req?.flockPolicy &&
+        Date.now() - lastAutoMembershipSyncAtMs > 15000
+      ) {
+        lastAutoMembershipSyncAtMs = Date.now();
+        try {
+          await syncFlockMemberships(cfg, {
+            customPath: req?.flocksConfigPath || cfg?.flocksConfigPath || getFlocksConfigPath(),
+          });
+          ({ hasExplicitFlock, flockPolicy, localFlocks } = resolveResponderFlockSelection(cfg, req));
+        } catch {}
+        enforceFlockPolicyAndWalls(cfg, flockPolicy, req, senderIdentity, localFlocks);
+      } else {
+        throw wallErr;
+      }
+    }
+  }
+  enforceCrossUserInformationalPolicy(cfg, req, senderIdentity, flockPolicy);
+
   if (
     !hasExplicitFlock &&
     !flockPolicy &&
@@ -9386,13 +9525,13 @@ export async function handleRpcAction(cfg, req) {
     err.statusCode = 403;
     throw err;
   }
-  if (flockPolicy) {
-    enforceFlockPolicyAndWalls(cfg, flockPolicy, req, senderIdentity, localFlocks);
-  }
   const isRestrictedFlock = isExplicitOptInFlockPolicy(flockPolicy);
+  const isUnrestrictedCollaboratorFlock = Boolean(
+    flockPolicy?.unrestrictedAccess === true || flockPolicy?.allowFileTransfer === true
+  );
   const allowFullSpecs =
     !isRestrictedFlock &&
-    !senderIdentity?.isCrossUser &&
+    (!senderIdentity?.isCrossUser || isUnrestrictedCollaboratorFlock) &&
     (!flockPolicy || !flockPolicy.shareSpecs || flockPolicy.shareSpecs === "full");
   const fromMachine = senderIdentity.fromMachine;
 
@@ -9847,6 +9986,7 @@ export async function handleRpcAction(cfg, req) {
         fromGitHubUser: inboxRecord.fromGitHubUser,
         senderVerified: senderIdentity.senderVerified,
         trustLevel: senderIdentity.trustLevel,
+        unrestrictedCollaborator: isUnrestrictedCollaboratorFlock,
         fromSessionId: inboxRecord.fromSessionId,
         fromSessionName: inboxRecord.fromSessionName,
         mode: params.mode || "immediate",
