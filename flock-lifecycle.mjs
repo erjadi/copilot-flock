@@ -15,6 +15,7 @@ export const RUNTIME_CUTOVER_JOURNAL_FILENAME = ".runtime-cutover-journal.json";
 export const REQUIRED_RUNTIME_ENTRYPOINTS = Object.freeze(["flock.mjs", "bridge.mjs"]);
 export const REQUIRED_COMPANION_MODULES = Object.freeze([
   "flock-lifecycle.mjs",
+  "flock-operations.mjs",
   "flock-membership.mjs",
   "flock-protocol.mjs",
   "flock-azure.mjs",
@@ -25,10 +26,11 @@ export const REQUIRED_RUNTIME_MODULES = Object.freeze([
   ...REQUIRED_COMPANION_MODULES,
 ]);
 const runtimeFiles = [
-  "flock.mjs", "bridge.mjs", "flock-lifecycle.mjs", "flock-membership.mjs", "flock-registry.mjs",
+  "flock.mjs", "bridge.mjs", "flock-lifecycle.mjs", "flock-operations.mjs", "flock-membership.mjs", "flock-registry.mjs",
   "config.json", "identity.json", "flocks.json", "flock-registry.json", "state.json", "daemon.pid",
   "daemon-identity.json", "daemon.log", "inbox.jsonl", "outbox.jsonl", "locks.json",
-  "cli-sessions.json", "processed-offline-ids.json", "last-vote-report.json",
+  "cli-sessions.json", "operations.json", "cli-leases.json", "flock-credentials.json",
+  "processed-offline-ids.json", "last-vote-report.json",
   "installation.json", "uninstall-progress.json",
   "flock-protocol.mjs", "flock-azure.mjs", "flock-broker-free.mjs", "broker-free.json",
   RUNTIME_MANIFEST_FILENAME, RUNTIME_STATE_FILENAME,
@@ -125,7 +127,10 @@ export function atomicJson(filename, value, expected) {
 export function recordInstalledArtifact(root, filename, paths = lifecyclePaths()) {
   if (!paths.roots.includes(root) ||
       ![...paths.skills, ...paths.persistence,
-        ...runtimeFiles.filter((name) => name.endsWith(".mjs")).map((name) => path.join(root, name))].includes(filename)) {
+        ...runtimeFiles.filter((name) =>
+          name.endsWith(".mjs") ||
+          ["flock-credentials.json", "operations.json", "cli-leases.json"].includes(name)
+        ).map((name) => path.join(root, name))].includes(filename)) {
     throw new Error("Artifact is outside the installation allowlist");
   }
   assertNoLinks(root);
@@ -1745,10 +1750,12 @@ export function loadRuntimeManifest(dir, options = {}) {
 
 const EMBEDDED_RUNTIME_MANIFEST_FALLBACK = (() => {
   let selfSha = "0".repeat(64);
+  let operationsSha = "0".repeat(64);
   try {
     selfSha = hashRuntimeModule(fs.readFileSync(fileURLToPath(import.meta.url)));
+    operationsSha = hashRuntimeModule(fs.readFileSync(path.join(__lifecycleDir, "flock-operations.mjs")));
   } catch {}
-  const entrypointSha = "64e870baf32ae483c816045df7b6c27e601eff7597df287b324533028440b871";
+  const entrypointSha = "284f8ab538097a2b283d7b8a3bcd01d65800af2762abb340bd242b09c469e68c";
   const fallback = {
     type: "copilot-flock-runtime-manifest-v1",
     schema: 1,
@@ -1762,6 +1769,7 @@ const EMBEDDED_RUNTIME_MANIFEST_FALLBACK = (() => {
           "./flock-broker-free.mjs",
           "./flock-lifecycle.mjs",
           "./flock-membership.mjs",
+          "./flock-operations.mjs",
           "./flock-protocol.mjs",
         ],
       },
@@ -1785,6 +1793,11 @@ const EMBEDDED_RUNTIME_MANIFEST_FALLBACK = (() => {
         sha256: selfSha,
         imports: ["./flock-membership.mjs"],
       },
+      "flock-operations.mjs": {
+        role: "companion",
+        sha256: operationsSha,
+        imports: ["./flock-lifecycle.mjs"],
+      },
       "flock-membership.mjs": {
         role: "companion",
         sha256: "01b78c41f52193332aa44af190cea838a5d92b12f089989432c59e230dabbb37",
@@ -1795,7 +1808,7 @@ const EMBEDDED_RUNTIME_MANIFEST_FALLBACK = (() => {
       },
       "flock-protocol.mjs": {
         role: "companion",
-        sha256: "4292997940c5b36d6873a00b9ad6aa248ae58e897df98cffd937aeb34a44c8f3",
+        sha256: "75f2ddd34f0c67bb2f5aa9974ac88fc5e81531da6e6a46b50308fe94c2c89f87",
         imports: ["./flock-lifecycle.mjs"],
       },
       "flock.mjs": {
@@ -1805,6 +1818,7 @@ const EMBEDDED_RUNTIME_MANIFEST_FALLBACK = (() => {
           "./flock-broker-free.mjs",
           "./flock-lifecycle.mjs",
           "./flock-membership.mjs",
+          "./flock-operations.mjs",
           "./flock-protocol.mjs",
         ],
       },
@@ -2211,8 +2225,10 @@ export function recoverInterruptedRuntimeCutover(targetDir, { force = false } = 
     "runtime-manifest.json",
     "flock-registry.mjs",
     "flock-broker-free.mjs",
+    "flock-operations.mjs",
     "flock-protocol.mjs",
     "flock-lifecycle.mjs",
+    "flock-operations.mjs",
     "flock-membership.mjs",
     "flock-azure.mjs",
   ];

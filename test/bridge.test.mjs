@@ -3173,6 +3173,7 @@ test("mcp_self_info tool and self-info CLI report in-memory loadTimeDigest and d
       entryFilename,
       "flock-lifecycle.mjs",
       "flock-membership.mjs",
+      "flock-operations.mjs",
       "flock-protocol.mjs",
       "flock-azure.mjs",
       "flock-broker-free.mjs",

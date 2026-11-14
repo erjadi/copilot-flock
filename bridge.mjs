@@ -69,6 +69,12 @@ import {
 } from "./flock-membership.mjs";
 import { BrokerFreeRuntime } from "./flock-broker-free.mjs";
 import { authorizeAction, ownerFingerprint } from "./flock-protocol.mjs";
+import {
+  HeadlessSessionSupervisor,
+  PersistentOperationStore,
+  PresenceStateTracker,
+  compactOperation,
+} from "./flock-operations.mjs";
 
 export {
   FlockMembershipRegistry,
@@ -164,6 +170,7 @@ const PROCESS_STARTED_AT = new Date().toISOString();
 
 const RUNTIME_SIBLING_MODULES = [
   "flock-lifecycle.mjs",
+  "flock-operations.mjs",
   "flock-membership.mjs",
   "flock-protocol.mjs",
   "flock-azure.mjs",
@@ -613,6 +620,7 @@ const RUNTIME_COMPANION_MODULES = [
   "flock-azure.mjs",
   "flock-broker-free.mjs",
   "flock-lifecycle.mjs",
+  "flock-operations.mjs",
   "flock-membership.mjs",
   "flock-protocol.mjs",
 ];
@@ -3664,8 +3672,41 @@ export function loadFlockCredentialVault(customFlocksPath = getFlocksConfigPath(
   return { ...parsed, vaultPath };
 }
 
-function applyCredentialVaultToConfig(cfg, customFlocksPath = getFlocksConfigPath()) {
+export function cleanupFlockCredentialVault(
+  customFlocksPath = getFlocksConfigPath(),
+  { now = Date.now(), removeFlockIds = [] } = {}
+) {
   const vault = loadFlockCredentialVault(customFlocksPath);
+  const removed = new Set(removeFlockIds.map((value) => String(value).toLowerCase()));
+  let changed = false;
+  for (const [flockId, entry] of Object.entries(vault.credentials || {})) {
+    if (removed.has(String(flockId).toLowerCase())) {
+      delete vault.credentials[flockId];
+      changed = true;
+      continue;
+    }
+    const expiresAt = Number(entry?.credentialExpiresAtMs) || Date.parse(entry?.tokenExpiresAt || "");
+    if (Number.isFinite(expiresAt) && expiresAt <= now) {
+      for (const field of ["clientToken", "bearerToken", "restTokens", "clientAudience"]) {
+        if (entry[field] != null) {
+          entry[field] = field === "restTokens" ? { broadcast: null, users: {} } : null;
+          changed = true;
+        }
+      }
+      entry.expiredAt = new Date(expiresAt).toISOString();
+    }
+  }
+  if (changed) {
+    vault.updatedAt = new Date(now).toISOString();
+    const persisted = { ...vault };
+    delete persisted.vaultPath;
+    atomicJson(vault.vaultPath, persisted);
+  }
+  return { changed, vault };
+}
+
+function applyCredentialVaultToConfig(cfg, customFlocksPath = getFlocksConfigPath()) {
+  const { vault } = cleanupFlockCredentialVault(customFlocksPath);
   const entries = Object.values(vault.credentials || {}).filter(
     (entry) => entry && entry.endpoint && (entry.clientToken || entry.bearerToken)
   );
@@ -4359,16 +4400,30 @@ export async function refreshTokenLocalTransportCredentials(
   return cfg;
 }
 
-async function ensureTokenLocalTransportCredentials(
+export async function ensureTokenLocalTransportCredentials(
   cfg,
-  { targetUserId = null, requireBroadcast = false } = {}
+  {
+    targetUserId = null,
+    requireBroadcast = false,
+    flockId = null,
+    refreshFn = refreshTokenLocalTransportCredentials,
+    syncFn = syncFlockMemberships,
+  } = {}
 ) {
   if (!isTokenLocalAuthEnabled(cfg)) return cfg;
   const targetToken = targetUserId ? resolveSignalRRestUserToken(cfg, targetUserId) : null;
   const broadcastToken = requireBroadcast ? cfg?.restTokens?.broadcast?.token : null;
   const expiresSoon = !cfg?.credentialExpiresAt || cfg.credentialExpiresAt <= Date.now() + 30000;
   if (!cfg?.clientToken || expiresSoon || (targetUserId && !targetToken) || (requireBroadcast && !broadcastToken)) {
-    await refreshTokenLocalTransportCredentials(cfg);
+    const actualFlockId = flockId || cfg?.credentialFlockId || cfg?.flockId || null;
+    await refreshFn(cfg, { flockId: actualFlockId });
+    if (targetUserId && !resolveSignalRRestUserToken(cfg, targetUserId) && actualFlockId) {
+      await syncFn(cfg, {
+        flockId: actualFlockId,
+        correlationId: crypto.randomUUID(),
+      });
+      await refreshFn(cfg, { flockId: actualFlockId });
+    }
   }
   return cfg;
 }
@@ -4527,7 +4582,15 @@ export async function verifyEnrollmentReadiness(
       error.code = "READINESS_ACK_MISMATCH";
       throw error;
     }
-    const policyAssertions = evaluateEnrollmentPolicyAssertions(cfg, flock, member);
+    const explicitOptInPolicy = isExplicitOptInFlockPolicy(flock);
+    const policyAssertions = explicitOptInPolicy
+      ? evaluateEnrollmentPolicyAssertions(cfg, flock, member)
+      : {
+          ok: true,
+          mode: "owner_positive_assertions",
+          ownerMachineReachable: true,
+          exactFlockAcknowledged: true,
+        };
     if (!policyAssertions.ok) {
       const error = new Error(
         "Enrollment readiness policy-wall assertions did not deny all forbidden operations"
@@ -5014,7 +5077,7 @@ function projectPublicOnlineMachine(machine) {
     "machineId", "canonicalAddress", "version", "manifestDigest", "scope", "githubUser",
     "hostname", "platform", "copilotDesktopRunning", "copilotDesktopReachable",
     "headlessCliAvailable", "activeSessionCount", "pid", "timestamp", "respondedAt",
-    "overallState", "presenceLayers",
+    "overallState", "presence", "lastSeenAt", "presenceLayers",
   ]) {
     if (machine[key] !== undefined) out[key] = machine[key];
   }
@@ -6914,7 +6977,10 @@ export function signalrRestPost({
 }
 
 export async function sendSignalRToUser(cfg, userId, target, payload) {
-  await ensureTokenLocalTransportCredentials(cfg, { targetUserId: userId });
+  await ensureTokenLocalTransportCredentials(cfg, {
+    targetUserId: userId,
+    flockId: payload?.flockId || payload?.flock || payload?.params?.flock || null,
+  });
   const encodedUser = encodeURIComponent(userId);
   return signalrRestPost({
     endpoint: cfg.endpoint,
@@ -6927,7 +6993,10 @@ export async function sendSignalRToUser(cfg, userId, target, payload) {
 }
 
 export async function sendSignalRBroadcast(cfg, target, payload) {
-  await ensureTokenLocalTransportCredentials(cfg, { requireBroadcast: true });
+  await ensureTokenLocalTransportCredentials(cfg, {
+    requireBroadcast: true,
+    flockId: payload?.flockId || payload?.flock || payload?.params?.flock || null,
+  });
   return signalrRestPost({
     endpoint: cfg.endpoint,
     accessKey: cfg.accessKey,
@@ -7965,6 +8034,11 @@ export function queryLocalSessionsFromDb({ query = "", limit = 30, runningOnly =
   if (rows.length === 0) {
     rows = queryHeadlessCliSessionsFallback();
   }
+  const activeHeadlessSessions = getHeadlessSessionSupervisor().activeSessionIds();
+  rows = rows.map((row) => ({
+    ...row,
+    is_running: Boolean(row.is_running) || activeHeadlessSessions.has(String(row.session_id)),
+  }));
 
   const q = (query || "").trim().toLowerCase();
   const filtered = rows.filter((r) => {
@@ -8815,6 +8889,33 @@ function resolveCopilotCliBin() {
   return remember(null);
 }
 
+let remoteOperationStore;
+let headlessSessionSupervisor;
+
+function getRemoteOperationStore() {
+  const root = path.resolve(getBridgeHome());
+  if (!remoteOperationStore || remoteOperationStore.root !== root) {
+    remoteOperationStore = new PersistentOperationStore(root);
+  }
+  return remoteOperationStore;
+}
+
+function getHeadlessSessionSupervisor() {
+  const root = path.resolve(getBridgeHome());
+  if (!headlessSessionSupervisor || headlessSessionSupervisor.root !== root) {
+    headlessSessionSupervisor = new HeadlessSessionSupervisor(root);
+  }
+  return headlessSessionSupervisor;
+}
+
+function operationRequesterFromParams(params = {}, fallbackFlockId = null) {
+  return {
+    flockId: params.flock || fallbackFlockId || null,
+    requesterMachine: params.fromMachine,
+    requesterSession: params.fromSessionId || null,
+  };
+}
+
 async function injectHeadlessCliSessionMessage({
   cfg,
   resolved,
@@ -8829,6 +8930,9 @@ async function injectHeadlessCliSessionMessage({
   waitTimeoutMs = 90000,
   assertAuthorized = () => {},
   allowAll = false,
+  operationId = crypto.randomUUID(),
+  correlationId = operationId,
+  cancelOnTimeout = false,
 }) {
   assertAuthorized();
   const copilotBin = resolveCopilotCliBin();
@@ -8841,8 +8945,22 @@ async function injectHeadlessCliSessionMessage({
   const sessionDir = path.join(getCopilotDir(), "session-state", resolved.session_id);
   fs.mkdirSync(sessionDir, { recursive: true });
   const eventsPath = path.join(sessionDir, "events.jsonl");
-  const requestId = crypto.randomUUID();
+  const requestId = operationId;
   const nowIso = new Date().toISOString();
+  const operationStore = getRemoteOperationStore();
+  const supervisor = getHeadlessSessionSupervisor();
+  if (!operationStore.get(operationId)) {
+    operationStore.admit({
+      operationId,
+      correlationId,
+      action: "send_message",
+      flockId: replyFlockId || cfg.flockId || null,
+      requesterMachine: fromMachine || "local",
+      requesterSession: fromSessionId || null,
+      targetMachine: cfg.machineId,
+      targetSession: resolved.session_id,
+    });
+  }
 
   saveHeadlessCliSession({
     ...resolved,
@@ -8863,7 +8981,8 @@ async function injectHeadlessCliSessionMessage({
   ];
   const sessionCwd = resolved.path && fs.existsSync(resolved.path) ? resolved.path : HOME_DIR;
 
-  if (waitForReply) {
+  const executeTurn = supervisor.enqueue(resolved.session_id, operationId, async ({ bindProcess }) => {
+    operationStore.transition(operationId, "delivered", { deliveryStage: "headless_fifo_admitted" });
     const replyText = await new Promise((resolve, reject) => {
       assertAuthorized();
       const child = spawnSessionSafeProcess(copilotBin, cliArgs, {
@@ -8871,27 +8990,34 @@ async function injectHeadlessCliSessionMessage({
         stdio: ["ignore", "pipe", "pipe"],
         windowsHide: true,
       }, { unitPrefix: "copilot-flock-session", unitId: requestId });
+      let processIdentity = inspectProcess(child.pid);
+      for (let attempt = 0; !processIdentity?.start && attempt < 10; attempt++) {
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+        processIdentity = inspectProcess(child.pid);
+      }
+      if (!processIdentity?.start) {
+        reject(new Error("Cannot prove headless Copilot CLI process creation identity"));
+        return;
+      }
+      bindProcess(processIdentity, child);
+      operationStore.transition(operationId, "running", {
+        deliveryStage: "runtime_dispatched",
+        processIdentity,
+        runtime: { eventsPath, startByteOffset: fs.existsSync(eventsPath) ? fs.statSync(eventsPath).size : 0 },
+      });
       let stdout = "";
       let stderr = "";
-      const timer = setTimeout(() => {
-        try {
-          child.kill();
-        } catch {}
-        reject(new Error(`Headless copilot CLI timed out after ${waitTimeoutMs}ms`));
-      }, waitTimeoutMs);
 
       child.stdout.on("data", (d) => {
-        stdout += d.toString("utf8");
+        if (stdout.length < 256 * 1024) stdout += d.toString("utf8");
       });
       child.stderr.on("data", (d) => {
-        stderr += d.toString("utf8");
+        if (stderr.length < 64 * 1024) stderr += d.toString("utf8");
       });
       child.on("error", (err) => {
-        clearTimeout(timer);
         reject(err);
       });
       child.on("close", (code) => {
-        clearTimeout(timer);
         try { assertAuthorized(); } catch (error) { reject(error); return; }
         const text = stdout.trim();
         if (text) {
@@ -8935,41 +9061,12 @@ async function injectHeadlessCliSessionMessage({
         }
       });
     });
-
-    return {
-      status: "delivered",
-      dispatchedToRuntime: true,
-      transport: "copilot-cli",
-      requestId,
-      targetMachine: cfg.machineId,
-      targetSessionId: resolved.session_id,
-      targetSessionTitle: resolved.title,
-      mode: mode === "enqueue" ? "enqueue" : "immediate",
-      deliveredAt: new Date().toISOString(),
-      reply: {
-        completed: true,
-        content: replyText,
-      },
+    const result = {
+      completed: true,
+      content: replyText,
     };
-  }
-
-  // Non-blocking background execution via headless copilot CLI
-  if (notifyOnIdle && fromMachine) {
-    assertAuthorized();
-    assertAuthorized();
-    const bgChild = spawnSessionSafeProcess(copilotBin, cliArgs, {
-      cwd: sessionCwd,
-      detached: true,
-      stdio: ["ignore", "pipe", "pipe"],
-      windowsHide: true,
-    }, { unitPrefix: "copilot-flock-session", unitId: requestId });
-    let bgStdout = "";
-    bgChild.stdout?.on("data", (d) => {
-      if (bgStdout.length < 256 * 1024) bgStdout += d.toString("utf8");
-    });
-    bgChild.on("close", async () => {
-      const text = bgStdout.trim();
-      if (!text) return;
+    operationStore.transition(operationId, "completed", { result });
+    if (notifyOnIdle && fromMachine && replyText.trim()) {
       try {
         await invokeRemoteRpc(cfg, {
           toMachine: fromMachine,
@@ -8978,8 +9075,10 @@ async function injectHeadlessCliSessionMessage({
           params: {
             ...(replyFlockId ? { flock: replyFlockId } : {}),
             targetSession: fromSessionId || "latest",
-            message: `[Async Idle Notification from @${cfg.machineId} / "${resolved.title}" (${resolved.session_id})]:\n${text}`,
+            message: `[Async Idle Notification from @${cfg.machineId} / "${resolved.title}" (${resolved.session_id}) / operation ${operationId}]:\n${replyText}`,
             messageType: "async_idle_reply",
+            operationId,
+            correlationId,
             fromMachine: cfg.machineId,
             fromScope: cfg.scope,
             fromGitHubUser: cfg.githubUser || null,
@@ -8991,47 +9090,87 @@ async function injectHeadlessCliSessionMessage({
           timeoutMs: 15000,
         });
       } catch {}
-    });
-    if (cfg.protocol === "broker-free-v34") {
-      await new Promise((resolve, reject) => { bgChild.once("spawn", resolve); bgChild.once("error", reject); });
-      assertAuthorized();
     }
-    bgChild.unref();
-
     return {
-      status: "delivered",
+      ...result,
+      operation: compactOperation(operationStore.get(operationId)),
+    };
+  }).catch((error) => {
+    const current = operationStore.get(operationId);
+    if (current && !["completed", "failed", "cancelled"].includes(current.state)) {
+      operationStore.transition(operationId, current.cancellationRequested ? "cancelled" : "failed", {
+        error: formatErrorDetail(error),
+      });
+    }
+    throw error;
+  });
+
+  if (waitForReply) {
+    const timedOut = Symbol("timed-out");
+    const outcome = await Promise.race([
+      executeTurn,
+      new Promise((resolve) => setTimeout(() => resolve(timedOut), waitTimeoutMs)),
+    ]);
+    if (outcome === timedOut) {
+      if (cancelOnTimeout) {
+        operationStore.requestCancellation(operationId, {
+          flockId: replyFlockId || cfg.flockId || null,
+          requesterMachine: fromMachine || "local",
+          requesterSession: fromSessionId || null,
+        });
+        supervisor.cancel(operationId);
+      }
+      const operation = operationStore.markWaitTimedOut(operationId);
+      return {
+        status: "timed_out_waiting",
+        deliveryStage: operation.deliveryStage || "runtime_dispatched",
+        dispatchedToRuntime: ["running", "completed"].includes(operation.state),
+        transport: "copilot-cli",
+        operationId,
+        correlationId,
+        requestId,
+        targetMachine: cfg.machineId,
+        targetSessionId: resolved.session_id,
+        targetSessionTitle: resolved.title,
+        mode: mode === "enqueue" ? "enqueue" : "immediate",
+        operation: compactOperation(operation),
+      };
+    }
+    return {
+      status: "completed",
+      deliveryStage: "assistant_completed",
       dispatchedToRuntime: true,
-      notifyOnIdleScheduled: true,
       transport: "copilot-cli",
-      pid: bgChild.pid,
+      operationId,
+      correlationId,
       requestId,
       targetMachine: cfg.machineId,
       targetSessionId: resolved.session_id,
       targetSessionTitle: resolved.title,
       mode: mode === "enqueue" ? "enqueue" : "immediate",
       deliveredAt: new Date().toISOString(),
+      reply: outcome,
+      operation: compactOperation(operationStore.get(operationId)),
     };
   }
 
-  const bgChild = spawnSessionSafeProcess(copilotBin, cliArgs, {
-    cwd: sessionCwd,
-    detached: true,
-    stdio: "ignore",
-    windowsHide: true,
-  }, { unitPrefix: "copilot-flock-session", unitId: requestId });
-  bgChild.unref();
+  executeTurn.catch(() => {});
 
   return {
-    status: "delivered",
-    dispatchedToRuntime: true,
+    status: "accepted",
+    deliveryStage: "headless_fifo_queued",
+    dispatchedToRuntime: false,
+    notifyOnIdleScheduled: Boolean(notifyOnIdle && fromMachine),
     transport: "copilot-cli",
-    pid: bgChild.pid,
+    operationId,
+    correlationId,
     requestId,
     targetMachine: cfg.machineId,
     targetSessionId: resolved.session_id,
     targetSessionTitle: resolved.title,
     mode: mode === "enqueue" ? "enqueue" : "immediate",
-    deliveredAt: new Date().toISOString(),
+    acceptedAt: new Date().toISOString(),
+    operation: compactOperation(operationStore.get(operationId)),
   };
 }
 
@@ -9059,6 +9198,9 @@ export async function injectLocalSessionMessage({
   wsRetryPollMs = 120,
   assertAuthorized = () => {},
   allowAll = false,
+  operationId = null,
+  correlationId = null,
+  cancelOnTimeout = false,
 }) {
   assertAuthorized();
   const wsInfo = getLocalWsConnectionInfo({ allowStaleDiskFallback: true });
@@ -9112,6 +9254,9 @@ export async function injectLocalSessionMessage({
       waitTimeoutMs,
       assertAuthorized,
       allowAll,
+      operationId: operationId || undefined,
+      correlationId: correlationId || operationId || undefined,
+      cancelOnTimeout,
     });
     assertAuthorized();
     if (cfg.protocol === "broker-free-v34") {
@@ -9130,7 +9275,7 @@ export async function injectLocalSessionMessage({
     return result;
   }
 
-  const requestId = crypto.randomUUID();
+  const requestId = operationId || crypto.randomUUID();
   let wsError = null;
   let keepWsOpenInBackground = false;
   let wsConn;
@@ -9174,6 +9319,9 @@ export async function injectLocalSessionMessage({
         waitTimeoutMs,
         assertAuthorized,
         allowAll,
+        operationId: operationId || undefined,
+        correlationId: correlationId || operationId || undefined,
+        cancelOnTimeout,
       });
     }
     throw wsConnectErr;
@@ -9289,6 +9437,12 @@ export async function injectLocalSessionMessage({
                 bgMatchedTurnId
               );
               if (reply?.completed && reply.content) {
+                if (operationId && getRemoteOperationStore().get(operationId)?.state === "running") {
+                  getRemoteOperationStore().transition(operationId, "completed", {
+                    deliveryStage: "assistant_completed",
+                    result: reply,
+                  });
+                }
                 await invokeRemoteRpc(cfg, {
                   toMachine: fromMachine,
                   action: "send_message",
@@ -9320,6 +9474,8 @@ export async function injectLocalSessionMessage({
           queuedBehindActiveTurn: true,
           notifyOnIdleScheduled: Boolean(notifyOnIdle && fromMachine),
           requestId,
+          operationId: operationId || requestId,
+          correlationId: correlationId || operationId || requestId,
           targetMachine: cfg.machineId,
           targetSessionId: resolved.session_id,
           targetSessionTitle: resolved.title,
@@ -9343,6 +9499,8 @@ export async function injectLocalSessionMessage({
       dispatchedToRuntime: true,
       queuedBehindActiveTurn: false,
       requestId,
+      operationId: operationId || requestId,
+      correlationId: correlationId || operationId || requestId,
       targetMachine: cfg.machineId,
       targetSessionId: resolved.session_id,
       targetSessionTitle: resolved.title,
@@ -9374,7 +9532,31 @@ export async function injectLocalSessionMessage({
         Math.max(50, Math.min(500, pollInterval * 2)),
         matchedTurnId
       );
-      result.reply = reply;
+      if (reply?.timedOut && operationId) {
+        result.status = "timed_out_waiting";
+        result.waitState = "timed_out_waiting";
+        result.operation = compactOperation(getRemoteOperationStore().markWaitTimedOut(operationId));
+        (async () => {
+          const completed = await waitForSessionReply(
+            eventReader,
+            [],
+            6 * 60 * 60 * 1000,
+            500,
+            matchedTurnId
+          );
+          if (completed?.completed) {
+            const current = getRemoteOperationStore().get(operationId);
+            if (current?.state === "running") {
+              getRemoteOperationStore().transition(operationId, "completed", {
+                deliveryStage: "assistant_completed_after_wait_timeout",
+                result: completed,
+              });
+            }
+          }
+        })().catch(() => {});
+      } else {
+        result.reply = reply;
+      }
     } else if (notifyOnIdle && fromMachine) {
       result.notifyOnIdleScheduled = true;
       (async () => {
@@ -9387,6 +9569,12 @@ export async function injectLocalSessionMessage({
             matchedTurnId
           );
           if (reply?.completed && reply.content) {
+            if (operationId && getRemoteOperationStore().get(operationId)?.state === "running") {
+              getRemoteOperationStore().transition(operationId, "completed", {
+                deliveryStage: "assistant_completed",
+                result: reply,
+              });
+            }
             await invokeRemoteRpc(cfg, {
               toMachine: fromMachine,
               action: "send_message",
@@ -11046,6 +11234,41 @@ export async function handleRpcAction(cfg, req) {
     (!senderIdentity?.isCrossUser || isUnrestrictedCollaboratorFlock) &&
     (!flockPolicy || !flockPolicy.shareSpecs || flockPolicy.shareSpecs === "full");
   const fromMachine = senderIdentity.fromMachine;
+  const operationStore = getRemoteOperationStore();
+
+  if (action === "get_operation") {
+    const operation = operationStore.reconcile(params.operationId);
+    if (!operation) {
+      const error = new Error(`Unknown operation "${params.operationId}"`);
+      error.code = "OPERATION_NOT_FOUND";
+      error.statusCode = 404;
+      throw error;
+    }
+    operationStore.assertRequester(
+      operation,
+      operationRequesterFromParams(params, flockPolicy?.flockId || requestedFlockId)
+    );
+    return { operation: compactOperation(operation) };
+  }
+
+  if (action === "cancel_operation") {
+    const requester = operationRequesterFromParams(params, flockPolicy?.flockId || requestedFlockId);
+    const reconciled = operationStore.reconcile(params.operationId);
+    operationStore.assertRequester(reconciled, requester);
+    const requested = operationStore.requestCancellation(params.operationId, requester);
+    if (!requested.alreadyTerminal) {
+      const cancelledProcess = getHeadlessSessionSupervisor().cancel(params.operationId);
+      if (!cancelledProcess && ["accepted", "delivered"].includes(requested.operation.state)) {
+        operationStore.transition(params.operationId, "cancelled", {
+          error: "Cancelled by the authorized originating requester before runtime completion",
+        });
+      }
+    }
+    return {
+      cancellationAccepted: !requested.alreadyTerminal,
+      operation: compactOperation(operationStore.get(params.operationId)),
+    };
+  }
 
   if (action === "ping") {
     const wsInfo = await verifyLocalWsConnectionInfo({ forceRefresh: false, retryPollMs: 0 });
@@ -11398,6 +11621,31 @@ export async function handleRpcAction(cfg, req) {
       };
     }
 
+    const operationId = String(params.operationId || req.operationId || req.requestId || crypto.randomUUID());
+    const correlationId = String(params.correlationId || req.correlationId || operationId);
+    const admitted = operationStore.admit({
+      operationId,
+      correlationId,
+      cancelOnTimeout: Boolean(params.cancelOnTimeout),
+      action: "send_message",
+      flockId: flockPolicy?.flockId || requestedFlockId || null,
+      requesterMachine: inboxRecord.fromMachine,
+      requesterSession: inboxRecord.fromSessionId,
+      targetMachine: cfg.machineId,
+      targetSession: params.targetSession || "latest",
+    });
+    if (admitted.replayed) {
+      return {
+        status: admitted.operation.state,
+        deliveryStage: admitted.operation.deliveryStage || null,
+        deduplicated: true,
+        operationId,
+        correlationId,
+        cancelOnTimeout: Boolean(params.cancelOnTimeout),
+        operation: compactOperation(admitted.operation),
+      };
+    }
+
     // Idempotency / Deduplication check (skip only when waitForReply is requested and prior had no reply)
     const nowMs = Date.now();
     pruneRecentDeliveryCache(nowMs);
@@ -11412,13 +11660,38 @@ export async function handleRpcAction(cfg, req) {
     const existingByHash = !params.waitForReply ? recentDeliveryCache.get(dedupKey) : null;
     const cachedHit = existingByReq || existingByHash;
     if (cachedHit && cachedHit.result) {
+      operationStore.transition(operationId, "delivered", {
+        deliveryStage: "deduplicated_existing_delivery",
+      });
       return {
         ...cachedHit.result,
         deduplicated: true,
+        operationId,
+        correlationId,
+        operation: compactOperation(operationStore.get(operationId)),
       };
     }
 
     const recordDeliveredInboxEntry = (res) => {
+      const current = operationStore.get(operationId);
+      if (current && current.state === "accepted" && res?.status !== "accepted") {
+        operationStore.transition(operationId, "delivered", {
+          deliveryStage: res?.deliveryStage || "transport_delivered",
+        });
+      }
+      const delivered = operationStore.get(operationId);
+      if (delivered && delivered.state === "delivered" && res?.dispatchedToRuntime) {
+        operationStore.transition(operationId, "running", {
+          deliveryStage: res?.deliveryStage || "runtime_dispatched",
+        });
+      }
+      const running = operationStore.get(operationId);
+      if (running && running.state === "running" && res?.reply?.completed) {
+        operationStore.transition(operationId, "completed", {
+          deliveryStage: "assistant_completed",
+          result: res.reply,
+        });
+      }
       fs.appendFileSync(
         getInboxPath(),
         JSON.stringify({
@@ -11480,6 +11753,8 @@ export async function handleRpcAction(cfg, req) {
             waitForReply: Boolean(params.waitForReply),
             waitTimeoutMs: Number(params.waitTimeoutMs) || 90000,
             dispatchTimeoutMs: Number(params.dispatchTimeoutMs) || 8000,
+            operationId,
+            correlationId,
             allowAll: shouldGrantRemoteAllowAll({
               senderIdentity,
               flockPolicy,
@@ -11538,6 +11813,8 @@ export async function handleRpcAction(cfg, req) {
         notifyOnIdle: Boolean(params.notifyOnIdle),
         waitTimeoutMs: Number(params.waitTimeoutMs) || 90000,
         dispatchTimeoutMs: Number(params.dispatchTimeoutMs) || 8000,
+        operationId,
+        correlationId,
         allowAll: shouldGrantRemoteAllowAll({
           senderIdentity,
           flockPolicy,
@@ -11551,6 +11828,10 @@ export async function handleRpcAction(cfg, req) {
       }
       return deliveryRes;
     } catch (err) {
+      const current = operationStore.get(operationId);
+      if (current && !["completed", "failed", "cancelled"].includes(current.state)) {
+        operationStore.transition(operationId, "failed", { error: formatErrorDetail(err) });
+      }
       fs.appendFileSync(
         getInboxPath(),
         JSON.stringify({
@@ -13020,6 +13301,16 @@ const MCP_TOOLS = [
           description:
             "If true (and wait_for_reply is false), the target daemon watches events.jsonl and pushes the completed turn reply back to from_session automatically when the session finishes.",
         },
+        operation_id: {
+          type: "string",
+          description:
+            "Optional stable client operation ID. Reusing the same ID with identical origin/flock/target parameters is idempotent; conflicting replay is rejected.",
+        },
+        cancel_on_timeout: {
+          type: "boolean",
+          description:
+            "If true, explicitly request cancellation when wait_for_reply expires. Default false keeps the remote operation running.",
+        },
         offline_queue: {
           type: "boolean",
           description:
@@ -13044,6 +13335,34 @@ const MCP_TOOLS = [
         },
       },
       required: ["to_session", "message"],
+    },
+  },
+  {
+    name: "get_remote_operation",
+    description:
+      "Query a durable remote operation by operation ID. The exact originating flock, machine, and sender session must match.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        to_machine: { type: "string", description: "Machine executing the operation." },
+        operation_id: { type: "string", description: "Operation ID returned by send_remote_session_message." },
+        from_session: { type: "string", description: "Exact originating sender session used for the operation." },
+      },
+      required: ["to_machine", "operation_id", "from_session"],
+    },
+  },
+  {
+    name: "cancel_remote_operation",
+    description:
+      "Explicitly cancel a durable remote operation when supported. Cancellation is restricted to the exact originating flock, machine, and sender session and verifies the tracked process creation identity.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        to_machine: { type: "string", description: "Machine executing the operation." },
+        operation_id: { type: "string", description: "Operation ID returned by send_remote_session_message." },
+        from_session: { type: "string", description: "Exact originating sender session used for the operation." },
+      },
+      required: ["to_machine", "operation_id", "from_session"],
     },
   },
   {
@@ -14420,6 +14739,33 @@ export async function executeMcpTool(cfg, name, args = {}, options = {}) {
     return res.result;
   }
 
+  if (name === "get_remote_operation" || name === "cancel_remote_operation") {
+    await ensureDaemon(cfg);
+    const flockSel = authorizeCallerFlockSelection(cfg, args.flock);
+    const targetMachine = await resolveTargetMachine(cfg, args.to_machine, {
+      allowLoopback: Boolean(args.allow_loopback),
+      flockId: flockSel.canonicalPath,
+    });
+    let senderSessionId = args.from_session;
+    try {
+      senderSessionId = resolveLocalSession(senderSessionId).session_id;
+    } catch {}
+    const res = await invokeRemoteRpc(cfg, {
+      toMachine: targetMachine,
+      action: name === "get_remote_operation" ? "get_operation" : "cancel_operation",
+      flockId: flockSel.canonicalPath,
+      params: {
+        flock: flockSel.canonicalPath,
+        operationId: args.operation_id,
+        fromMachine: cfg.machineId,
+        fromSessionId: senderSessionId,
+      },
+      timeoutMs: 10000,
+      allowLoopback: Boolean(args.allow_loopback),
+    });
+    return res.result;
+  }
+
   if (name === "send_remote_session_message") {
     await ensureDaemon(cfg);
     const targetMachine = await resolveTargetMachine(cfg, args.to_machine, {
@@ -14441,6 +14787,7 @@ export async function executeMcpTool(cfg, name, args = {}, options = {}) {
       ? Math.max(8000, Math.min(30000, waitTimeoutMs))
       : 8000;
     const rpcTimeoutMs = waitForReply ? waitTimeoutMs + 12000 : dispatchTimeoutMs + 7000;
+    const operationId = String(args.operation_id || crypto.randomUUID());
 
     const baseSendParams = {
       ...(args.flock !== undefined && args.flock !== null ? { flock: args.flock } : {}),
@@ -14454,6 +14801,9 @@ export async function executeMcpTool(cfg, name, args = {}, options = {}) {
       mode: args.mode || "immediate",
       waitForReply,
       notifyOnIdle,
+      operationId,
+      correlationId: operationId,
+      cancelOnTimeout: Boolean(args.cancel_on_timeout),
       waitTimeoutMs,
       dispatchTimeoutMs,
       delegate: Boolean(args.delegate),
@@ -14522,6 +14872,8 @@ export async function executeMcpTool(cfg, name, args = {}, options = {}) {
             status: "queued_offline",
             deliveryStage: "queued_in_servicebus",
             dispatchedToRuntime: false,
+            operationId,
+            correlationId: operationId,
             requestId: reqId,
             targetMachine,
             targetSession: args.to_session,
@@ -18531,20 +18883,41 @@ export async function diagnoseLocalBridgeState(
   };
 }
 
-export function classifyLayeredPresence({ online, member = {}, ping = {}, diagnostic = null, issues = [] }) {
+export function classifyLayeredPresence({
+  online,
+  member = {},
+  ping = {},
+  diagnostic = null,
+  issues = [],
+  nowMs = Date.now(),
+  reconnectGraceMs = 20000,
+  presenceExpiryMs = 90000,
+}) {
+  const lastSeenAt =
+    ping.respondedAt || ping.timestamp || diagnostic?.checkedAt || member.lastSeenAt || member.updatedAt || null;
+  const stateTracker = new PresenceStateTracker({
+    clock: () => nowMs,
+    reconnectGraceMs,
+    expiryMs: presenceExpiryMs,
+  });
   if (!online) {
+    const presence = stateTracker.classify({
+      transportOnline: false,
+      lastSeenAt,
+      reason: "no_signalr_ping_response",
+    });
     return {
-      overallState: "offline",
+      overallState: presence.state,
       presenceLayers: {
         transport: {
-          state: "offline",
-          lastSeenAt: member.lastSeenAt || member.updatedAt || null,
-          reason: "no_signalr_ping_response",
+          state: presence.state,
+          lastSeenAt: presence.lastSeenAt,
+          reason: presence.reason,
         },
-        authorization: { state: "unknown", reason: "transport_offline" },
-        executionSurface: { state: "unknown", reason: "transport_offline" },
-        coordinator: { state: "unknown", reason: "transport_offline" },
-        tracker: { state: "unknown", reason: "transport_offline" },
+        authorization: { state: "unknown", reason: `transport_${presence.state}` },
+        executionSurface: { state: "unknown", reason: `transport_${presence.state}` },
+        coordinator: { state: "unknown", reason: `transport_${presence.state}` },
+        tracker: { state: "unknown", reason: `transport_${presence.state}` },
       },
     };
   }
@@ -18575,18 +18948,21 @@ export function classifyLayeredPresence({ online, member = {}, ping = {}, diagno
   const coordinator = threadState(diagnostic?.threads?.coordinator || null);
   const tracker = threadState(diagnostic?.threads?.threadTracker || null);
   const hasThreadDiagnostics = Boolean(diagnostic?.threads);
+  const summarized = stateTracker.classify({
+    transportOnline: true,
+    lastSeenAt,
+    desktopReachable: runtime || hasPingExecutionProbe ? desktopReady : null,
+    headlessCliAvailable: runtime || hasPingExecutionProbe ? cliReady : null,
+    coordinatorHealthy: hasThreadDiagnostics ? coordinator.state === "ready" : null,
+    trackerHealthy: hasThreadDiagnostics ? tracker.state === "ready" : null,
+    reason: issues.length > 0 ? "diagnostic_issues" : null,
+  });
   return {
-    overallState:
-      executionState === "unavailable" ||
-      (hasThreadDiagnostics && coordinator.state === "degraded") ||
-      (hasThreadDiagnostics && tracker.state !== "ready") ||
-      issues.length > 0
-        ? "degraded"
-        : "online",
+    overallState: summarized.state,
     presenceLayers: {
       transport: {
         state: "online",
-        lastSeenAt: ping.respondedAt || ping.timestamp || diagnostic?.checkedAt || null,
+        lastSeenAt: summarized.lastSeenAt,
         reason: null,
       },
       authorization: { state: "authorized", reason: null },
@@ -20445,8 +20821,12 @@ function applyLivePresenceToLegacyRoster(baseState, onlineMachines, liveSignalRS
         membershipAuthenticated: true,
         membershipStatus: "active",
         membershipExpiresAt: m.membershipExpiresAt ?? prev?.membershipExpiresAt ?? null,
-        online: livePresenceProbed ? Boolean(live) : null,
-        presence: livePresenceProbed ? (live ? "online" : "offline") : "unprobed",
+        online: livePresenceProbed
+          ? Boolean(live) || layeredPresence?.overallState === "reconnecting"
+          : null,
+        presence: livePresenceProbed
+          ? layeredPresence?.overallState || (live ? "online" : "offline")
+          : "unprobed",
         ...(layeredPresence
           ? {
               overallState: layeredPresence.overallState,
@@ -20472,8 +20852,12 @@ function applyLivePresenceToLegacyRoster(baseState, onlineMachines, liveSignalRS
         membershipAuthenticated: true,
         membershipStatus: "active",
         membershipExpiresAt: m.membershipExpiresAt || null,
-        online: livePresenceProbed ? Boolean(live) : null,
-        presence: livePresenceProbed ? (live ? "online" : "offline") : "unprobed",
+        online: livePresenceProbed
+          ? Boolean(live) || layeredPresence?.overallState === "reconnecting"
+          : null,
+        presence: livePresenceProbed
+          ? layeredPresence?.overallState || (live ? "online" : "offline")
+          : "unprobed",
         ...(layeredPresence
           ? {
               overallState: layeredPresence.overallState,
@@ -20508,7 +20892,9 @@ function applyLivePresenceToLegacyRoster(baseState, onlineMachines, liveSignalRS
   });
 
   const knownMembers = [...knownMap.values()].map(({ __ownerSpecs, ...rest }) => rest);
-  const offlineMembers = livePresenceProbed ? knownMembers.filter((m) => m.online === false) : [];
+  const offlineMembers = livePresenceProbed
+    ? knownMembers.filter((m) => m.overallState === "offline")
+    : [];
 
   let filteredOnlineMachines = onlineMachines;
   if (livePresenceProbed) {

@@ -749,6 +749,7 @@ export async function evictSignalRHubUserImmediate({
   if (!endpoint || !accessKey || !hub || !userId) {
     return { evicted: false, reason: "missing_signalr_config" };
   }
+
   try {
     const u = new URL(
       `${endpoint}/api/v1/hubs/${encodeURIComponent(hub)}/users/${encodeURIComponent(userId)}`
@@ -792,6 +793,10 @@ export async function evictSignalRHubUserImmediate({
   } catch (err) {
     return { evicted: false, error: err.message };
   }
+}
+
+export function leaveV3EvictionTarget(member) {
+  return { hub: DEFAULT_HUB, userId: member.machineId };
 }
 
 let flockStoreMutex = Promise.resolve();
@@ -994,6 +999,24 @@ export async function enrollV3Device(
       [rootFlock.flockId, { flock: rootFlock, trustTier: "owner", membershipExpiresAtMs: null }],
       [scopeFlock.flockId, { flock: scopeFlock, trustTier: "owner", membershipExpiresAtMs: null }],
     ]);
+    for (const ownedFlock of Object.values(store.flocks || {})) {
+      if (
+        ownedFlock &&
+        !["owner_root", "owner_scope"].includes(ownedFlock.flockType) &&
+        !ownedFlock.targetMachineId &&
+        String(ownedFlock.ownerGitHubUser || "").toLowerCase() === cleanUser &&
+        (!ownedFlock.ownerGitHubUserId || Number(ownedFlock.ownerGitHubUserId) === numUserId) &&
+        (!Array.isArray(ownedFlock.allowedScopes) ||
+          ownedFlock.allowedScopes.length === 0 ||
+          ownedFlock.allowedScopes.includes(normScope))
+      ) {
+        targetFlocksToJoin.set(ownedFlock.flockId, {
+          flock: ownedFlock,
+          trustTier: "owner",
+          membershipExpiresAtMs: null,
+        });
+      }
+    }
 
     // 2. Redeem any Enrollment JSON vouchers atomically
     if (enrollmentJson && Array.isArray(enrollmentJson.flocks)) {
@@ -1848,9 +1871,9 @@ export async function leaveV3Device(request, {
   storePath = V3_FLOCKS_PATH,
   membersPath = null,
   deleteSubscription = deleteLegacyPeerSubscription,
-  evict = (member, flock) => evictSignalRHubUserImmediate({
+  evict = (member) => evictSignalRHubUserImmediate({
     connectionString: process.env.SIGNALR_CONNECTION_STRING || "",
-    hub: flock.hubName, userId: member.peerId,
+    ...leaveV3EvictionTarget(member),
   }),
 } = {}) {
   return withFlockStoreLock(async () => {

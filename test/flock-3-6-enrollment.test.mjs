@@ -13,6 +13,8 @@ import {
 } from "../bootstrap-server.mjs";
 import {
   applyV3EnrollmentResult,
+  cleanupFlockCredentialVault,
+  ensureTokenLocalTransportCredentials,
   handleRpcAction,
   loadFlockCredentialVault,
   openFlockMembershipRegistry,
@@ -214,6 +216,119 @@ test("3.6 membership sync capability preflight is bounded and single-flight", as
   assert.equal(syncCalls, 1);
   assert.ok(attempts.every((attempt) => attempt.status === "rejected"));
   assert.ok(attempts.every((attempt) => attempt.reason.code === "SYNTHETIC_SYNC_FAILURE"));
+});
+
+test("3.6 token-local REST refresh and sync stay bound to the actual shared flock", async () => {
+  const calls = [];
+  const cfg = {
+    tokenLocalAuth: true,
+    credentialFlockId: "owner/root",
+    flockId: "owner/root",
+    clientToken: "client",
+    credentialExpiresAt: Date.now() + 60000,
+    restTokens: { broadcast: null, users: {} },
+  };
+  await ensureTokenLocalTransportCredentials(cfg, {
+    targetUserId: "REMOTE-PC",
+    flockId: "owner/shared-team",
+    refreshFn: async (_cfg, options) => {
+      calls.push(["refresh", options.flockId]);
+    },
+    syncFn: async (_cfg, options) => {
+      calls.push(["sync", options.flockId]);
+      cfg.restTokens.users["REMOTE-PC"] = { token: "scoped" };
+    },
+  });
+
+  assert.deepEqual(calls, [
+    ["refresh", "owner/shared-team"],
+    ["sync", "owner/shared-team"],
+    ["refresh", "owner/shared-team"],
+  ]);
+});
+
+test("3.6 credential vault rotation clears expired scoped tokens but retains refresh identity", (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "flock-36-vault-cleanup-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const flocksPath = path.join(root, "flocks.json");
+  fs.writeFileSync(path.join(root, "flock-credentials.json"), JSON.stringify({
+    type: "copilot-flock-token-local-credentials-v1",
+    credentials: {
+      "owner/team": {
+        flockId: "owner/team",
+        clientToken: "expired-client",
+        bearerToken: "expired-bearer",
+        restTokens: { broadcast: { token: "expired-broadcast" }, users: { PC: { token: "expired-user" } } },
+        credentialExpiresAtMs: 1000,
+        serverNonce: "retain-for-refresh",
+      },
+    },
+  }));
+  const cleaned = cleanupFlockCredentialVault(flocksPath, { now: 2000 });
+  assert.equal(cleaned.changed, true);
+  const entry = cleaned.vault.credentials["owner/team"];
+  assert.equal(entry.clientToken, null);
+  assert.deepEqual(entry.restTokens, { broadcast: null, users: {} });
+  assert.equal(entry.serverNonce, "retain-for-refresh");
+});
+
+test("3.6 owner second workstation readiness uses positive assertions and shared-flock backfill", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "flock-36-owner-backfill-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const storePath = path.join(root, "broker.json");
+  const first = identity();
+  const second = identity();
+  await enrollV3Device({
+    githubUser: "owner",
+    githubUserId: 1001,
+    deviceId: first.fingerprint,
+    machineId: "OWNER-PC-1",
+    scope: "work",
+    publicKey: first.publicKey,
+    keyFingerprint: first.fingerprint,
+  }, { storePath, connectionString: "" });
+  await createV3FlockInvite({
+    callerGitHubUser: "owner",
+    callerGitHubUserId: 1001,
+    targetAddress: "owner/shared-team",
+    invitedUser: "alice",
+    invitedGitHubUserId: 2002,
+    allowedScopes: ["work"],
+  }, { storePath });
+  const enrolled = await enrollV3Device({
+    githubUser: "owner",
+    githubUserId: 1001,
+    deviceId: second.fingerprint,
+    machineId: "OWNER-PC-2",
+    scope: "work",
+    publicKey: second.publicKey,
+    keyFingerprint: second.fingerprint,
+  }, { storePath, connectionString: "" });
+  assert.ok(enrolled.enrolledFlocks.some((flock) => flock.flockId === "owner/shared-team"));
+  const stored = JSON.parse(fs.readFileSync(storePath, "utf8"));
+  const shared = stored.flocks["owner/shared-team"];
+  assert.equal(Object.values(shared.members).some((member) => member.machineId === "OWNER-PC-2"), true);
+  assert.equal(shared.sessionVisibility, undefined);
+
+  const ownerScope = enrolled.enrolledFlocks.find((flock) => flock.flockId === "owner/work");
+  const readiness = await verifyEnrollmentReadiness(
+    { machineId: "OWNER-PC-2", githubUser: "owner", scope: "work" },
+    [ownerScope],
+    {
+      correlationId: "owner-second-pc",
+      invokeRpc: async () => ({
+        result: {
+          enrollmentReadinessAck: {
+            correlationId: "owner-second-pc",
+            flockId: ownerScope.flockId,
+            rosterEpoch: ownerScope.rosterEpoch,
+          },
+        },
+      }),
+    }
+  );
+  assert.equal(readiness.ready, true);
+  assert.equal(readiness.policyAssertions.mode, "owner_positive_assertions");
 });
 
 test("3.6 first contact auto-syncs once on an unpinned explicit-flock peer and retries", async () => {

@@ -462,8 +462,8 @@ test("broker HTTP routes admit signed invited devices without repo write access 
       assert.equal(selfEnrollment.status, 200, selfEnrollment.body.error);
       assert.equal(selfEnrollment.body.githubUser, "deployment-maintainer");
       assert.equal(selfEnrollment.body.githubUserId, 1001);
-      assert.equal(selfEnrollment.body.enrolledFlocks.length, 2);
-      assert.deepEqual(selfEnrollment.body.enrolledFlocks.map((flock) => flock.trustTier), ["owner", "owner"]);
+      assert.equal(selfEnrollment.body.enrolledFlocks.length, 3);
+      assert.deepEqual(selfEnrollment.body.enrolledFlocks.map((flock) => flock.trustTier), ["owner", "owner", "owner"]);
     }
     for (const [trustTier, durationMinutes] of [["collaborator", null], ["guest", 10]]) {
       const scopedInvite = await request("/api/v3/flocks/invite", "maintainer", {
@@ -3743,10 +3743,11 @@ test("legacy flock_status and list_flocks surface offline shared-flock collabora
   assert.equal(byMachine.get("DESKTOP-2R3PAUG")?.heartbeatObserved, true);
 
   const rene = byMachine.get("DESKTOP-PSCVM1T");
-  assert.ok(rene, "Offline collaborator DESKTOP-PSCVM1T must be surfaced in knownMembers");
+  assert.ok(rene, "Recently enrolled collaborator DESKTOP-PSCVM1T must be surfaced during reconnect grace");
   assert.equal(rene.githubUser, "renepajta");
-  assert.equal(rene.online, false);
-  assert.equal(rene.presence, "offline");
+  assert.equal(rene.online, true);
+  assert.equal(rene.presence, "reconnecting");
+  assert.equal(rene.overallState, "reconnecting");
   assert.equal(rene.heartbeatObserved, false);
   assert.equal(rene.membershipAuthenticated, true);
   assert.equal(rene.membershipStatus, "active");
@@ -3755,14 +3756,15 @@ test("legacy flock_status and list_flocks surface offline shared-flock collabora
   assert.equal(rene.rosterEpoch, 5);
 
   const ue3 = byMachine.get("DESKTOP-UE3B1TD");
-  assert.ok(ue3, "Offline owner-root member DESKTOP-UE3B1TD from /api/members must be surfaced");
-  assert.equal(ue3.online, false);
+  assert.ok(ue3, "Owner-root member DESKTOP-UE3B1TD from /api/members must be surfaced during reconnect grace");
+  assert.equal(ue3.online, true);
+  assert.equal(ue3.presence, "reconnecting");
   assert.equal(ue3.removed, false);
   assert.ok(ue3.flocks.includes("erjadi"));
   assert.ok(ue3.flocks.includes("erjadi/personal"));
 
   const offlineIds = statusOut.offlineMembers.map((m) => m.machineId).sort();
-  assert.deepEqual(offlineIds, ["CLOUD-DEV-VM", "DESKTOP-PSCVM1T", "DESKTOP-UE3B1TD"]);
+  assert.deepEqual(offlineIds, []);
 
   // Roster metadata explicitly reports source, freshness, and complete refresh
   assert.equal(statusOut.roster.source, "broker_live");
@@ -4126,12 +4128,16 @@ test("legacy flock_status and list_flocks prevent cross-flock metadata disclosur
   assert.equal(failedOut.roster.refresh.failed, true);
   assert.equal(failedOut.roster.refresh.incomplete, true);
   assert.ok(failedOut.roster.refresh.errors.length >= 1);
-  // Offline cached members remain active (missing heartbeats != removal), while expired guest stays excluded
+  // Recently seen cached members remain in reconnect grace (missing heartbeats != immediate offline),
+  // while the expired guest stays excluded.
+  assert.deepEqual(failedOut.offlineMembers, []);
   assert.deepEqual(
-    failedOut.offlineMembers.map((m) => m.machineId).sort(),
+    failedOut.knownMembers
+      .filter((m) => m.overallState === "reconnecting")
+      .map((m) => m.machineId)
+      .sort(),
     ["CLOUD-DEV-VM", "DESKTOP-PSCVM1T"]
   );
-  assert.ok(failedOut.offlineMembers.every((m) => m.removed === false && m.presence === "offline"));
 });
 
 test("broker-free flock_status and list_flocks surface offline collaborators across post-join enrollments without cross-flock disclosure, resurrection, or legacy fallback", async (t) => {
@@ -5647,7 +5653,7 @@ test("reconcileAuthoritativeFlockMemberships heals downgraded owner roles, enfor
         afterLower.flocks["erjadi/personal"].sharedSnapshots["sess-keep-1"].summarySnapshot,
         "Approved snapshot 1"
       );
-      assert.equal(afterLower.flocks["erjadi/studio-team"].trustTier, "collaborator");
+      assert.equal(afterLower.flocks["erjadi/studio-team"].trustTier, "owner");
       assert.equal(
         appliedLower.enrolledFlocks.find((f) => f.flockId === "erjadi/personal").trustTier,
         "owner"
@@ -6402,6 +6408,7 @@ test("fleet runtime staging rejects omitted modules, partial copies, interrupted
         "./flock-broker-free.mjs",
         "./flock-lifecycle.mjs",
         "./flock-membership.mjs",
+        "./flock-operations.mjs",
         "./flock-protocol.mjs",
       ],
     };
@@ -7758,6 +7765,7 @@ test("mcp_self_info tool and self-info CLI report in-memory loadTimeDigest and d
       entryFilename,
       "flock-lifecycle.mjs",
       "flock-membership.mjs",
+      "flock-operations.mjs",
       "flock-protocol.mjs",
       "flock-azure.mjs",
       "flock-broker-free.mjs",
@@ -8346,6 +8354,7 @@ test("flock_status exposes independent installedOnDisk, residentDaemon, and call
       "flock-broker-free.mjs",
       "flock-lifecycle.mjs",
       "flock-membership.mjs",
+      "flock-operations.mjs",
       "flock-protocol.mjs",
     ]) {
       fs.copyFileSync(path.join(repoRoot, modName), path.join(flockDir, modName));

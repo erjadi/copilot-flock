@@ -218,6 +218,27 @@ fail-closed replay quarantine:
   longer exists are safely recovered after power restoration without stealing
   live locks.
 
+## Resumable remote operations and presence
+
+Long-running remote turns use durable operation IDs with separate admission,
+transport-delivery, runtime-dispatch, and assistant-completion states. A caller
+wait expiring returns `timed_out_waiting`; it does not terminate the remote
+turn. The originating flock, machine, and session can query or explicitly
+cancel the operation. Replaying the same operation ID is idempotent only when
+those authorization and target fields still match.
+
+Headless CLI turns share one bounded FIFO per target session. Durable leases
+record both PID and process creation identity, so restart recovery never treats
+a reused PID as the original process. Session discovery merges these leases
+with Desktop state, including `running_only` queries and worker selection.
+
+Presence is layered and reports `online`, `reconnecting`, `degraded`, or
+`offline`. Brief SignalR interruptions remain `reconnecting` during a bounded
+grace period. A refused Desktop WebSocket with a viable headless CLI, or an
+unhealthy coordinator/tracker with live transport, is `degraded`, not
+`offline`. Expired, removed, and tombstoned memberships never receive reconnect
+grace, and stale presence expires deterministically.
+
 ## Renewal, removal and availability
 
 Renewal is owner-mediated and preserves device keys, role, allowed sessions

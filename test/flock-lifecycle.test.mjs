@@ -12,7 +12,7 @@ import { lifecyclePaths, atomicJson, recordInstalledArtifact, uninstallFlock as 
   configureLinuxSystemdPersistence, activateLinuxSystemdDaemon, readLinuxCgroupPids,
   prepareOutsideLinuxServiceCgroupSpawn, spawnSessionSafeProcess } from "../flock-lifecycle.mjs";
 import { matchesMember, signLeave, verifyLeave } from "../flock-membership.mjs";
-import { leaveV3Device, kickV3FlockMember, planV3DeviceLeave } from "../bootstrap-server.mjs";
+import { leaveV3Device, leaveV3EvictionTarget, kickV3FlockMember, planV3DeviceLeave } from "../bootstrap-server.mjs";
 
 const uninstallFlock = (options) => runUninstall({ findProcesses: async () => [], ...options });
 
@@ -277,6 +277,13 @@ test("device leave is signed, bound to every selector, fresh and unforgeable", (
   assert.throws(() => verifyLeave(request, key.publicKey, Date.now() + 400000), /expired/);
 });
 
+test("v3 leave eviction targets the default hub user by machine identity", () => {
+  assert.deepEqual(
+    leaveV3EvictionTarget({ peerId: "peer-a", machineId: "PC-A" }),
+    { hub: "copilotbridge", userId: "PC-A" }
+  );
+});
+
 test("legacy kick with user AND device leaves the owner's other machines and vouchers intact", async () => {
   const f = fixture();
   try {
@@ -335,6 +342,11 @@ for (const platform of ["win32", "linux", "darwin"]) {
       for (const artifact of [...f.paths.skills.slice(0, 2), f.paths.persistence[0]]) {
         fs.mkdirSync(path.dirname(artifact), { recursive: true });
         fs.writeFileSync(artifact, "test-owned-content");
+        recordInstalledArtifact(f.root, artifact, f.paths);
+      }
+      for (const name of ["flock-credentials.json", "operations.json", "cli-leases.json"]) {
+        const artifact = path.join(f.root, name);
+        fs.writeFileSync(artifact, JSON.stringify({ owned: true }));
         recordInstalledArtifact(f.root, artifact, f.paths);
       }
       const disabled = [];
