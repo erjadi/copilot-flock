@@ -77,6 +77,37 @@ performing cloud mutation, remote-machine update, deployment, or a release vote.
   order. Authoritative registry tombstones also suppress collaborator presence
   before broker refresh.
 
+### Resident updates and pre-enrollment MCP
+
+Resident `self_update` now returns an `activating` acknowledgment containing
+the update/correlation ID, previous PID, and target manifest digest before
+launching its activator. The detached, session-safe activator is launched only
+after the SignalR response POST completes; it must not block the response while
+stopping that response's own daemon. An unflushed response or failed launch is
+persisted explicitly, and existing activation intent blocks conflicting updates.
+Fleet polling requires the exact requested update ID, terminal verified phase,
+replacement PID, target digest and verified imports/closure before success.
+Failed or rolled-back activation is not a successful fleet update. Local fleet
+updates use the same noninteractive update implementation, not a second Git path.
+
+MCP stdio starts passively without GitHub/Azure CLI discovery, SignalR keys,
+or a token-local credential vault. Unconfigured sessions can initialize, list
+tools, inspect self-info, create a support-only key, submit a support report,
+attempt explicit enrollment/removal or safe Join Code generation, and request
+explicitly passive status/diagnostics. Other tools return
+`UNCONFIGURED_TRANSPORT` or `TOKEN_LOCAL_CREDENTIALS_UNAVAILABLE` from the tool
+call rather than terminating stdio startup. Successful enrollment reloads the
+same MCP process's runtime configuration; caller code/module digest snapshots
+still describe the actually loaded generation.
+
+Qualification includes actual subprocess tests: empty-home and missing-vault
+stdio clients submit support to a local TLS bootstrap service, reject ordinary
+remote tools, and continue after real enrollment without restarting stdio.
+A child resident daemon uses real WebSocket/HTTPS RPC, a disposable Git origin,
+and the real activator to check reply ordering, PID replacement, and terminal
+verification/failure. Test TLS certificates use `openssl` (available with Git
+on the Windows qualification host); no live Azure service or fleet is used.
+
 ## Qualification still required
 
 1. Run the complete repository suite on the exact candidate commit.

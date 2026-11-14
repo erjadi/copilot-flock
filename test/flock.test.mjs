@@ -6714,17 +6714,21 @@ test("fleet runtime staging rejects omitted modules, partial copies, interrupted
 
     // Verify updateFleetMachines (`update_remote_machines`) exposes staged/installed/resident/verified for remote peers too
     let discoverCall = 0;
+    const updateIds = new Map();
     const fleetRes = await updateFleetMachines(testCfg, {
       machines: "*",
       includeSelf: true,
       sourceDir: validV2Dir,
       gitSync: false,
       postUpdateWaitMs: 0,
-      localInstallFn: async () => ({
-        version: "3.5.0-rc1",
-        daemonPid: process.pid,
-        runtimeStates: getLocalRuntimeStates({ targetDir }),
-      }),
+      localUpdateFn: async (_cfg, options) => {
+        assert.equal(options.sourceDir, validV2Dir);
+        assert.equal(options.gitSync, false);
+        return {
+          status: "verified", version: "3.5.0-rc1", daemonPid: process.pid,
+          runtimeStates: getLocalRuntimeStates({ targetDir }),
+        };
+      },
       discoverFn: async () => {
         discoverCall++;
         if (discoverCall === 1) {
@@ -6737,6 +6741,7 @@ test("fleet runtime staging rejects omitted modules, partial copies, interrupted
         return [
           {
             machineId: "REMOTE-OK",
+            update: { updateId: updateIds.get("REMOTE-OK"), phase: "verified" },
             scope: "personal",
             pid: 4100,
             version: "3.5.0-rc1",
@@ -6758,13 +6763,15 @@ test("fleet runtime staging rejects omitted modules, partial copies, interrupted
           },
         ];
       },
-      invokeBatchFn: async (_cfg, items) =>
-        items.map((item) => ({
+      invokeBatchFn: async (_cfg, items) => {
+        for (const item of items) updateIds.set(item.toMachine, item.params.operationId);
+        return items.map((item) => ({
           item,
           ok: true,
           response: {
             result: {
-              status: "updating",
+              status: "verified",
+              updateId: item.params.operationId,
               machineId: item.toMachine,
               staged: { status: "promoted", version: "3.5.0-rc1", digest: v2Manifest.manifestDigest, manifestDigest: v2Manifest.manifestDigest, closureVerified: true, importVerified: true },
               installed: { status: "installed", complete: true, version: "3.5.0-rc1", digest: v2Manifest.manifestDigest, manifestDigest: v2Manifest.manifestDigest },
@@ -6772,10 +6779,11 @@ test("fleet runtime staging rejects omitted modules, partial copies, interrupted
               verified: { status: "pending_daemon_restart", closureVerified: true, importVerified: true, residentMatchesInstalled: false, version: "3.5.0-rc1", digest: v2Manifest.manifestDigest, manifestDigest: v2Manifest.manifestDigest },
             },
           },
-        })),
+        }));
+      },
     });
 
-    assert.equal(fleetRes.ok, true);
+    assert.equal(fleetRes.ok, false, "A lagging daemon is not a successful fleet update");
     assert.equal(fleetRes.localUpdate.ok, true);
     assert.equal(fleetRes.installed.version, "3.5.0-rc1");
     assert.equal(fleetRes.resident.version, "3.5.0-rc1");
@@ -9944,7 +9952,7 @@ test("3.6 conformance blockers: signed outbound protected RPCs, unsigned read re
       postUpdateWaitMs: 0,
       discoverFn: async () => [{ machineId: "PEER-WORK-PC", scope: "work", githubUser: "erjadi", version: BRIDGE_VERSION }],
     });
-    assert.equal(updRes.remoteUpdates[0].ok, true);
+    assert.equal(updRes.remoteUpdates[0].ok, false, "An admitted update without exact activation evidence is not verified");
 
     const fixDiagRes = await diagnoseFleetMachines(callerCfg, {
       machines: "PEER-WORK-PC",

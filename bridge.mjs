@@ -3369,6 +3369,7 @@ export function loadConfig({ autoFetchAz = true, refreshSpecs = false, passive =
       credentialFlocksPath
     );
     if (vaultConfig.endpoint && vaultConfig.clientToken) {
+      delete vaultConfig.unconfigured;
       const finalConfigSnap = computeConfigFileSnapshot(activeConfigPath);
       Object.defineProperty(vaultConfig, "_callerSnapshot", {
         value: {
@@ -10833,7 +10834,7 @@ function pruneRecentDeliveryCache(nowMs = Date.now()) {
   }
 }
 
-export function resolveOrFindBridgeGitRepo() {
+export function resolveOrFindBridgeGitRepo({ noninteractive = false } = {}) {
   const candidates = [
     __dirname,
     path.join(HOME_DIR, "copilot-flock"),
@@ -10852,6 +10853,7 @@ export function resolveOrFindBridgeGitRepo() {
         fs.existsSync(path.join(dir, ".git")) &&
         (fs.existsSync(path.join(dir, "flock.mjs")) || fs.existsSync(path.join(dir, "bridge.mjs")))
       ) {
+        if (noninteractive) return dir;
         try {
           execFileSync(
             "git",
@@ -10863,6 +10865,7 @@ export function resolveOrFindBridgeGitRepo() {
       }
     } catch {}
   }
+  if (noninteractive) return null;
   const cloneTarget = path.join(getBridgeHome(), "repo");
   try {
     fs.mkdirSync(path.dirname(cloneTarget), { recursive: true });
@@ -11552,6 +11555,7 @@ export async function handleRpcAction(cfg, req) {
       installed: runtimeStates.installed,
       resident: runtimeStates.resident,
       verified: runtimeStates.verified,
+      update: runtimeStates.update,
       scope: normalizeScope(cfg.scope, "work"),
       githubUser,
       specs,
@@ -12176,7 +12180,11 @@ export async function handleRpcAction(cfg, req) {
   }
 
   if (action === "self_update") {
-    return await performLocalSelfUpdate(cfg);
+    return await performLocalSelfUpdate(cfg, {
+      deferActivation: req.deferUpdateActivation === true,
+      updateId: params.operationId || req.requestId || crypto.randomUUID(),
+      correlationId: params.correlationId || req.correlationId || req.requestId || crypto.randomUUID(),
+    });
   }
 
   if (action === "diagnose") {
@@ -12809,6 +12817,25 @@ export function createDaemonHeartbeatMonitor({
   };
 }
 
+const AFTER_RPC_RESPONSE = Symbol("afterRpcResponse");
+
+export async function dispatchDaemonRpcRequest(cfg, request, sendResponse) {
+  const result = await handleRpcAction(cfg, {
+    ...request, deferUpdateActivation: true, inProcessSelfPing: false,
+    flockPolicy: undefined, registryMembers: undefined,
+    enforceSignature: true, requireVerifiedAuth: true,
+  });
+  try { await sendResponse(result); }
+  catch (error) {
+    if (result?.status === "activating") recordRuntimeUpdatePhase(getBridgeHome(), {
+      updateId: result.updateId, correlationId: result.correlationId, phase: "failed",
+      error, code: "UPDATE_REPLY_FLUSH_FAILED", reason: "activation_not_launched",
+    });
+    throw error;
+  }
+  if (result?.[AFTER_RPC_RESPONSE]) await result[AFTER_RPC_RESPONSE]();
+}
+
 export async function runDaemon(cfg) {
   ensureBridgeDir();
   pinDaemonIdentity(getBridgeHome(), __filename);
@@ -12845,36 +12872,29 @@ export async function runDaemon(cfg) {
   const knownPeers = new Map();
   const updateStateFile = (status, extra = {}) => {
     try {
-      fs.writeFileSync(
-        statePath,
-        JSON.stringify(
-          {
-            status,
-            version: BRIDGE_VERSION,
-            startedAt: daemonSnapshot.loadedAt,
-            scriptPath: daemonSnapshot.scriptPath,
-            scriptSha256: daemonSnapshot.scriptSha256,
-            codeDigest: daemonSnapshot.codeDigest,
-            configSha256: daemonSnapshot.configSha256,
-            configGeneration: daemonSnapshot.configGeneration,
-            machineId: cfg.machineId,
-            scope: cfg.scope,
-            version: BRIDGE_VERSION,
-            manifestDigest: RUNTIME_MODULE_MANIFEST?.manifestDigest || null,
-            residentRuntime: buildInProcessResidentRuntime(),
-            endpoint: cfg.endpoint,
-            hub: cfg.hub,
-            pid: process.pid,
-            updatedAt: new Date().toISOString(),
-            knownPeers: Array.from(knownPeers.values()),
-            ...extra,
-          },
-          null,
-          2
-        ),
-        "utf8"
-      );
-    } catch {}
+      atomicJson(statePath, {
+        status,
+        version: BRIDGE_VERSION,
+        startedAt: daemonSnapshot.loadedAt,
+        scriptPath: daemonSnapshot.scriptPath,
+        scriptSha256: daemonSnapshot.scriptSha256,
+        codeDigest: daemonSnapshot.codeDigest,
+        configSha256: daemonSnapshot.configSha256,
+        configGeneration: daemonSnapshot.configGeneration,
+        machineId: cfg.machineId,
+        scope: cfg.scope,
+        manifestDigest: RUNTIME_MODULE_MANIFEST?.manifestDigest || null,
+        residentRuntime: buildInProcessResidentRuntime(),
+        endpoint: cfg.endpoint,
+        hub: cfg.hub,
+        pid: process.pid,
+        updatedAt: new Date().toISOString(),
+        knownPeers: Array.from(knownPeers.values()),
+        ...extra,
+      });
+    } catch (error) {
+      logDaemon("Daemon state persistence failed", { error: redactFlockSnapshot(error.message) });
+    }
   };
 
   logDaemon(`Starting Copilot Flock daemon`, {
@@ -12930,20 +12950,10 @@ export async function runDaemon(cfg) {
               });
             }
             try {
-              const result = await handleRpcAction(cfg, {
-                ...payload,
-                inProcessSelfPing: false,
-                flockPolicy: undefined,
-                registryMembers: undefined,
-                enforceSignature: true,
-                requireVerifiedAuth: true,
-              });
-              await sendSignalRToUser(cfg, replyUserId, "bridgeRpcResponse", {
-                requestId,
-                fromMachine: cfg.machineId,
-                result,
-                respondedAt: new Date().toISOString(),
-              });
+              await dispatchDaemonRpcRequest(cfg, payload, (result) =>
+                sendSignalRToUser(cfg, replyUserId, "bridgeRpcResponse", {
+                  requestId, fromMachine: cfg.machineId, result, respondedAt: new Date().toISOString(),
+                }));
             } catch (err) {
               const errDetail = formatErrorDetail(err);
               logDaemon(`RPC error on action ${action}: ${errDetail}`);
@@ -14385,6 +14395,17 @@ export async function executeMcpTool(cfg, name, args = {}, options = {}) {
   const projectStatus = (result) => projectPublicStatusResponse(result, args);
   const projectFlocks = (result) => projectPublicFlocksResponse(result, args);
   const deps = options;
+  const zeroTransport = new Set([
+    "mcp_self_info", "create_support_device_key", "submit_support_report",
+    "enroll_from_invite_json", "unenroll_flock", "join_request",
+  ]);
+  const passiveHealth = ["flock_status", "bridge_status", "diagnose_flock_fleet", "diagnose_bridge_fleet"].includes(name) &&
+    args.passive === true && !args.fix;
+  if (cfg?.unconfigured && !zeroTransport.has(name) && !passiveHealth) {
+    throw Object.assign(new Error("Transport is unavailable. Use support diagnostics or complete verified enrollment before remote operations."), {
+      code: cfg.tokenLocalAuth ? "TOKEN_LOCAL_CREDENTIALS_UNAVAILABLE" : "UNCONFIGURED_TRANSPORT",
+    });
+  }
   if (name === "mcp_self_info") {
     return getMcpSelfInfo(cfg);
   }
@@ -16655,7 +16676,7 @@ export async function generateFlockTopologyDiagram(
 export async function runMcpServer(cfg, { passive = false } = {}) {
   activeCallerMcpSnapshot = captureCallerMcpSnapshot(cfg, { surface: "mcp-stdio" });
   // Start local daemon in background if not already running (unless passive)
-  if (!passive) {
+  if (!passive && !cfg.unconfigured) {
     ensureDaemonStarted(cfg).catch(() => {});
   }
 
@@ -16720,6 +16741,12 @@ export async function runMcpServer(cfg, { passive = false } = {}) {
         const toolName = params?.name;
         const toolArgs = params?.arguments || {};
         const output = await executeMcpTool(cfg, toolName, toolArgs);
+        if (["enroll_from_invite_json", "accept_welcome"].includes(toolName)) {
+          const refreshed = loadConfig({ autoFetchAz: false, refreshSpecs: false, passive: true });
+          for (const key of Object.keys(cfg)) delete cfg[key];
+          Object.assign(cfg, refreshed);
+          activeCallerMcpSnapshot = captureCallerMcpSnapshot(cfg, { surface: "mcp-stdio" });
+        }
         sendRpcMessage({
           jsonrpc: "2.0",
           id,
@@ -16742,7 +16769,7 @@ export async function runMcpServer(cfg, { passive = false } = {}) {
             content: [
               {
                 type: "text",
-                text: `Error: ${err.message}`,
+                text: `Error${err.code ? ` [${err.code}]` : ""}: ${err.message}`,
               },
             ],
           },
@@ -17433,7 +17460,7 @@ export async function reviewReleaseCandidate(cfg, params = {}, internalOptions =
   const checkTimeoutMs =
     Number(internalOptions.checkTimeoutMs) > 0 ? Number(internalOptions.checkTimeoutMs) : 15000;
   const testTimeoutMs =
-    Number(internalOptions.testTimeoutMs) > 0 ? Number(internalOptions.testTimeoutMs) : 300000;
+    Number(internalOptions.testTimeoutMs) > 0 ? Number(internalOptions.testTimeoutMs) : 900000;
   const fetchTimeoutMs =
     Number(internalOptions.fetchTimeoutMs) > 0 ? Number(internalOptions.fetchTimeoutMs) : 20000;
 
@@ -18129,26 +18156,37 @@ export async function activateRuntimeUpdate(cfg, {
       await stopPinnedDaemon(root, paths);
       await ensureDaemonStarted(cfg);
     }
-    const deadline = Date.now() + 20000;
+    const deadline = Date.now() + 45000;
+    let lastReadinessError = null;
     while (Date.now() < deadline) {
       const status = inspectLocalDaemonPassive(cfg);
       if (status.running) {
-        const reply = await invokeRemoteRpc(cfg, {
-          toMachine: cfg.machineId, action: "ping", params: { passive: true },
-          timeoutMs: 2000, allowLoopback: true, passive: true,
-        });
-        const resident = reply?.result?.resident;
-        if (resident?.running && resident.pid === status.pid) return resident;
+        try {
+          const reply = await invokeRemoteRpc(cfg, {
+            toMachine: cfg.machineId, action: "ping", params: { passive: true },
+            timeoutMs: Math.min(8000, Math.max(1000, deadline - Date.now())), allowLoopback: true, passive: true,
+          });
+          const resident = reply?.result?.resident;
+          if (resident?.running && resident.pid === status.pid) return resident;
+          lastReadinessError = new Error("Readiness ping did not prove the expected daemon PID");
+        } catch (error) {
+          if (!/Timed out|ECONNRESET|ECONNREFUSED|ETIMEDOUT/.test(error.message)) throw error;
+          lastReadinessError = error;
+        }
       }
       await new Promise((resolve) => setTimeout(resolve, 200));
     }
-    throw new Error("Updated daemon readiness and runtime digest could not be verified");
+    throw new Error(`Updated daemon readiness and runtime digest could not be verified: ${
+      redactFlockSnapshot(lastReadinessError?.message || "daemon did not become available")
+    }`);
   },
   selfTest = async () => {
-    const result = await runBoundedSubprocess(process.execPath, [path.join(root, "flock.mjs"), "self-test"], {
+    const result = await runBoundedSubprocess(process.execPath, [path.join(root, "flock.mjs"), "self-test", "--summary"], {
       timeoutMs: 30000, maxOutputBytes: 8192,
     });
-    if (!result.ok) throw new Error("Updated runtime self-test failed; inspect daemon health and retry activation");
+    if (!result.ok) throw new Error(`Updated runtime self-test failed (${result.timedOut ? "timeout" : `exit ${result.exitCode}`}): ${
+      redactFlockSnapshot(result.stderr || result.spawnError?.message || "inspect daemon health and retry activation").slice(0, 1024)
+    }`);
     const body = JSON.parse(result.stdout);
     if (body.ok !== true || body.machineId !== cfg.machineId) throw new Error("Updated runtime self-test returned an invalid identity");
   },
@@ -18239,6 +18277,7 @@ export async function performLocalSelfUpdate(
     gitExecFileSync = execFileSync,
     spawnProcess = spawnSessionSafeProcess,
     activationTimeoutMs = 120000,
+    deferActivation = false,
   } = {}
 ) {
   if (!/^[A-Za-z0-9-]{1,128}$/.test(updateId)) throw new Error("Invalid runtime update ID");
@@ -18248,6 +18287,25 @@ export async function performLocalSelfUpdate(
     throw err;
   }
   const resolvedTargetDir = targetDir ? path.resolve(targetDir) : getBridgeHome();
+  const activationPath = assertNoLinks(path.join(resolvedTargetDir, "update-activation.json"));
+  if (fs.existsSync(activationPath)) {
+    const pending = JSON.parse(fs.readFileSync(activationPath, "utf8"));
+    const current = readRuntimeState(resolvedTargetDir).update;
+    if (pending.updateId !== updateId) {
+      throw Object.assign(new Error("An existing runtime activation requires completion or explicit recovery before another update"), {
+        code: "UPDATE_IN_PROGRESS",
+      });
+    }
+    if (["failed", "rolled_back"].includes(current?.phase)) {
+      throw Object.assign(new Error(`Runtime update ${current.phase}; inspect the persisted recovery journal`), {
+        code: current.code || "RUNTIME_ACTIVATION_FAILED",
+      });
+    }
+    return {
+      status: "activating", updateId, correlationId: pending.correlationId,
+      targetDigest: pending.manifestDigest, previousPid: pending.previousPid || null, deduplicated: true,
+    };
+  }
   const resolvedLegacyDir = legacyDir !== undefined
     ? (legacyDir ? path.resolve(legacyDir) : null)
     : getLegacyBridgeHome();
@@ -18256,7 +18314,7 @@ export async function performLocalSelfUpdate(
     ? path.resolve(sourceDir)
     : repoDirOverride
     ? path.resolve(repoDirOverride)
-    : resolveOrFindBridgeGitRepo();
+    : resolveOrFindBridgeGitRepo({ noninteractive: true });
   if (!repoDir) {
     throw new Error(`Could not locate or clone copilot-signalr-bridge git repo on ${cfg.machineId}`);
   }
@@ -18376,7 +18434,37 @@ export async function performLocalSelfUpdate(
       type: "copilot-flock-update-activation-v1", updateId, correlationId,
       manifestDigest: activated.installed.digest, rollbackSource,
       previousManifestDigest: previousStates.installed?.digest || null,
+      previousPid: residentNow.pid,
     });
+    if (deferActivation) {
+      const result = {
+        status: "activating", updateId, correlationId, machineId: cfg.machineId,
+        targetDigest: activated.installed.digest, previousPid: process.pid,
+        staged: activated.staged, installed: activated.installed,
+        resident: activated.resident, verified: { ...activated.verified, fullyActive: false, status: "pending_activation" },
+      };
+      Object.defineProperty(result, AFTER_RPC_RESPONSE, {
+        value: async () => {
+          try {
+            const child = spawnProcess(process.execPath, [targetScript, "activate-update", "--update-id", updateId], {
+              detached: true, stdio: "ignore", windowsHide: true,
+            }, { unitPrefix: "copilot-flock-activate", unitId: updateId, requireOutsideCgroup: true });
+            await new Promise((resolve, reject) => {
+              child.once("spawn", resolve);
+              child.once("error", reject);
+            });
+            child.unref();
+          } catch (error) {
+            recordRuntimeUpdatePhase(resolvedTargetDir, {
+              updateId, correlationId, phase: "failed", error, code: "RUNTIME_ACTIVATION_SPAWN_FAILED",
+              reason: "post_reply_launcher_failed",
+            });
+            logDaemon("Update activator launch failed after RPC response", { updateId, error: redactFlockSnapshot(error.message) });
+          }
+        },
+      });
+      return result;
+    }
     try {
       const child = spawnProcess(
         process.execPath,
@@ -18518,8 +18606,9 @@ export async function updateFleetMachines(
     runImportCheck = null,
     discoverFn = discoverMachines,
     invokeBatchFn = invokeRemoteRpcBatch,
-    localInstallFn = installBridge,
+    localUpdateFn = performLocalSelfUpdate,
     postUpdateWaitMs = 4500,
+    verificationTimeoutMs = 90000,
   } = {}
 ) {
   const discovered = await discoverFn(cfg, { includeSelf: true, timeoutMs: 2500 });
@@ -18534,48 +18623,24 @@ export async function updateFleetMachines(
     target: t,
     toMachine: t.machineId,
     action: "self_update",
-    params: {},
+    params: { operationId: crypto.randomUUID(), correlationId: crypto.randomUUID() },
   }));
   const batchOutcomes =
-    batchItems.length > 0 ? await invokeBatchFn(cfg, batchItems, 25000) : [];
+    batchItems.length > 0 ? await invokeBatchFn(cfg, batchItems, 90000) : [];
 
   let localUpdate = null;
   if (includeSelf && matchesSelectorList(cfg.machineId, machines)) {
-    const repoDir = sourceDir ? path.resolve(sourceDir) : resolveOrFindBridgeGitRepo();
     try {
-      if (repoDir && !sourceDir && gitSync) {
-        execFileSync("git", ["-C", repoDir, "fetch", "origin", "main"], {
-          stdio: ["ignore", "pipe", "pipe"],
-          timeout: 20000,
-          windowsHide: true,
-        });
-        execFileSync("git", ["-C", repoDir, "reset", "--hard", "origin/main"], {
-          stdio: ["ignore", "pipe", "pipe"],
-          timeout: 10000,
-          windowsHide: true,
-        });
-      }
-      const candidateSource = repoDir || __dirname;
-      ensureBridgeDir();
-      stageAndActivateRuntime({
-        sourceDir: candidateSource,
-        targetDir: getBridgeHome(),
-        verifyImports,
-        ...(runImportCheck ? { runImportCheck } : {}),
-      });
-      const installRes = await localInstallFn({
-        scopeArg: cfg.scope,
-        githubUserArg: cfg.githubUser,
-        sourceDirArg: getBridgeHome(),
-        verifyImportsArg: false,
-      });
-      const states = installRes?.runtimeStates || getLocalRuntimeStates();
+      const update = await localUpdateFn(cfg, { sourceDir, gitSync, verifyImports, runImportCheck });
+      const states = update.runtimeStates || getLocalRuntimeStates();
+      const verified = update.status === "verified" && states.verified?.fullyActive === true;
       localUpdate = {
         machineId: cfg.machineId,
-        ok: true,
-        error: null,
-        version: states.installed?.version || installRes?.version || BRIDGE_VERSION,
-        daemonPid: installRes?.daemonPid ?? states.resident?.pid ?? null,
+        ok: verified,
+        error: verified ? null : `Local update remains ${update.status || "unverified"}; inspect its persisted update ID`,
+        updateId: update.updateId, correlationId: update.correlationId,
+        version: states.installed?.version || null,
+        daemonPid: states.resident?.pid ?? null,
         runtimeStates: states,
         staged: states.staged,
         installed: states.installed,
@@ -18603,7 +18668,19 @@ export async function updateFleetMachines(
   if (batchItems.length > 0 && postUpdateWaitMs > 0) {
     await new Promise((r) => setTimeout(r, postUpdateWaitMs));
   }
-  const verifiedOnline = await discoverFn(cfg, { includeSelf: true, timeoutMs: 3000 });
+  let verifiedOnline = await discoverFn(cfg, { includeSelf: true, timeoutMs: 3000 });
+  const pending = batchOutcomes.filter((outcome) => outcome.ok && outcome.response?.result?.status === "activating");
+  const activationFinished = (outcome) => {
+    const result = outcome.response.result;
+    const after = verifiedOnline.find((machine) => machine.machineId === outcome.item.target.machineId);
+    const update = after?.update || after?.runtimeStates?.update;
+    return update?.updateId === result.updateId && ["verified", "rolled_back", "failed"].includes(update.phase);
+  };
+  const deadline = Date.now() + verificationTimeoutMs;
+  while (pending.some((outcome) => !activationFinished(outcome)) && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, Math.min(1000, Math.max(1, deadline - Date.now()))));
+    verifiedOnline = await discoverFn(cfg, { includeSelf: true, timeoutMs: 3000 });
+  }
   const verifiedMap = new Map(verifiedOnline.map((m) => [m.machineId, m]));
 
   const remoteUpdates = batchOutcomes.map((o) => {
@@ -18680,8 +18757,17 @@ export async function updateFleetMachines(
       verifiedAt: rpcRes?.verified?.verifiedAt || null,
     };
 
+    const update = after?.update || after?.runtimeStates?.update;
+    const expectedDigest = rpcRes?.targetDigest || rpcRes?.installed?.manifestDigest || rpcRes?.installed?.digest;
+    const phaseVerified = Boolean(
+      rpcRes?.updateId && rpcRes.updateId === o.item.params?.operationId &&
+      update?.updateId === rpcRes.updateId && update.phase === "verified" &&
+      residentState.manifestDigest === expectedDigest &&
+      (rpcRes.status !== "activating" || residentState.pid !== rpcRes.previousPid)
+    );
     const activationVerified = Boolean(
       o.ok &&
+      phaseVerified &&
       installedState.complete !== false &&
       closureOk &&
       importOk &&
@@ -18690,10 +18776,14 @@ export async function updateFleetMachines(
 
     return {
       machineId: mId,
-      ok: Boolean(o.ok),
+      ok: activationVerified,
       activationVerified,
       updateResult: rpcRes,
-      error: o.ok ? null : o.error,
+      updateId: rpcRes?.updateId || null,
+      correlationId: rpcRes?.correlationId || null,
+      updatePhase: update?.phase || rpcRes?.status || "failed",
+      error: activationVerified ? null : o.error || update?.error ||
+        (["failed", "rolled_back"].includes(update?.phase) ? `Update ${update.phase}` : "Update activation verification remains incomplete"),
       verifiedOnlineVersion: after?.version || null,
       verifiedDaemonPid: after?.pid || null,
       runtimeStates: {
@@ -22921,9 +23011,7 @@ Usage:
 
   const passiveCli =
     (command === "status" && parseBooleanOption(flags.passive, false)) ||
-    (command === "mcp" &&
-      (parseBooleanOption(flags.passive, false) ||
-        parseBooleanOption(process.env.COPILOT_FLOCK_PASSIVE, false))) ||
+    command === "mcp" ||
     ((command === "diagnose" || command === "doctor" || command === "health") &&
       (flags["no-passive"]
         ? false
@@ -23711,9 +23799,11 @@ Usage:
           scope: cfg.scope,
           endpoint: cfg.endpoint,
           hub: cfg.hub,
-          onlineMachines: machines,
-          sampleSessions: sessionsResp.result,
-          dryRunInjection: drySendResp.result,
+          ...(flags.summary ? {} : {
+            onlineMachines: machines,
+            sampleSessions: sessionsResp.result,
+            dryRunInjection: drySendResp.result,
+          }),
         },
         null,
         2

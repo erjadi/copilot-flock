@@ -30,6 +30,7 @@ import {
   ensureMachineIdentityKeypair,
   openFlockMembershipRegistry,
   resolveLegacyFlockRoster,
+  updateFleetMachines,
 } from "../flock.mjs";
 import { createBootstrapServer, enrollV3Device } from "../bootstrap-server.mjs";
 
@@ -696,6 +697,7 @@ test("spawnInstall activation waits for resident digest and self-test verificati
                 if (fails && selfTests === 1) throw new Error("self-test denied");
               },
             });
+
             child.emit("exit", 0);
           } catch { child.emit("exit", 1); }
         });
@@ -716,5 +718,44 @@ test("spawnInstall activation waits for resident digest and self-test verificati
       assert.equal(selfTests, 1);
     }
   }
+});
+
+test("fleet updates poll exact update identity and replacement PID instead of accepting an activating acknowledgement", async () => {
+  const digest = "d".repeat(64);
+  let probes = 0;
+  let updateId;
+  const result = await updateFleetMachines({ machineId: "LOCAL" }, {
+    includeSelf: false, postUpdateWaitMs: 0, verificationTimeoutMs: 3000,
+    discoverFn: async () => {
+      probes++;
+      if (probes === 1) return [{ machineId: "REMOTE", pid: 10 }];
+      return [{
+        machineId: "REMOTE", pid: probes === 2 ? 10 : 11,
+        update: { updateId, phase: probes === 2 ? "activated" : "verified" },
+        installed: { complete: true, version: "3.6.0", manifestDigest: digest },
+        resident: { running: true, pid: probes === 2 ? 10 : 11, version: "3.6.0", manifestDigest: digest },
+        verified: { fullyActive: true, closureVerified: true, importVerified: true },
+      }];
+    },
+    invokeBatchFn: async (_cfg, items) => items.map((item) => {
+      updateId = item.params.operationId;
+      return { item, ok: true, response: { result: {
+        status: "activating", updateId, correlationId: "poll-correlation", previousPid: 10, targetDigest: digest,
+      } } };
+    }),
+  });
+  assert.equal(probes, 3);
+  assert.equal(result.ok, true);
+  assert.equal(result.remoteUpdates[0].activationVerified, true);
+  const failed = await updateFleetMachines({ machineId: "LOCAL" }, {
+    includeSelf: false, postUpdateWaitMs: 0, verificationTimeoutMs: 0,
+    discoverFn: async () => [{ machineId: "REMOTE", update: { updateId: "update-poll", phase: "rolled_back", error: "self-test failed" } }],
+    invokeBatchFn: async (_cfg, items) => items.map((item) => ({
+      item, ok: true, response: { result: { status: "activating", updateId: "update-poll" } },
+    })),
+  });
+  assert.equal(failed.ok, false);
+  assert.equal(failed.remoteUpdates[0].updatePhase, "rolled_back");
+  assert.equal(failed.remoteUpdates[0].error, "self-test failed");
 });
 
