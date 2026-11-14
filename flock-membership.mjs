@@ -237,7 +237,10 @@ export function parseCanonicalFlockAddress(targetStr, defaultOwner = null) {
     };
   }
   const owner = (parts[0] || defaultOwner || "").toLowerCase();
-  const flockName = parts[1].toLowerCase() === "private" ? "personal" : parts[1].toLowerCase();
+  const flockName = parts[1].toLowerCase();
+  if (flockName === "private") {
+    throw registryError("OBSOLETE_SCOPE", `Obsolete flock scope "private" is not supported; use "${owner}/personal" explicitly`);
+  }
   const machineId = parts.length === 3 ? parts[2] : null;
   const flockId = `${owner}/${flockName}`;
   const isBuiltInScope = flockName === "personal" || flockName === "work";
@@ -589,8 +592,11 @@ export function resolveMemberIdentityKey(member, { protocol = "v3-broker" } = {}
 
 function normalizeScopeValue(scope) {
   const s = String(scope || "").trim().toLowerCase();
-  if (s === "personal" || s === "private") return "personal";
-  return "work";
+  if (s === "personal" || s === "work") return s;
+  if (s === "private") {
+    throw registryError("OBSOLETE_SCOPE", `Obsolete machine scope "private" is not supported; use "personal" explicitly`);
+  }
+  throw registryError("INVALID_SCOPE", `Invalid machine scope "${scope}"; expected "personal" or "work"`);
 }
 
 function normalizeRoleValue(role) {
@@ -1695,6 +1701,7 @@ export class FlockMembershipRegistry {
     }
 
     const incomingMembersMap = {};
+    const quarantinedMembers = [];
     for (const rawMember of Array.isArray(flockSummary.members) ? flockSummary.members : []) {
       const ids = resolveMemberIdentityKey(rawMember, { protocol: "v3-broker" });
       const existingTomb = nextTombstones[ids.identityKey];
@@ -1722,12 +1729,23 @@ export class FlockMembershipRegistry {
         githubName: rawMember.githubName ?? matchedBm?.githubName ?? previous?.githubName ?? null,
         joinedAt: rawMember.joinedAt ?? matchedBm?.registeredAt ?? previous?.joinedAtMs ?? null,
       };
-      const normalized = normalizeMemberRecord(mergedRaw, {
-        protocol: "v3-broker",
-        epoch: incomingEpoch,
-        revision: previous ? previous.updatedAtRevision : provisionalRevision,
-        previous,
-      });
+      let normalized;
+      try {
+        normalized = normalizeMemberRecord(mergedRaw, {
+          protocol: "v3-broker",
+          epoch: incomingEpoch,
+          revision: previous ? previous.updatedAtRevision : provisionalRevision,
+          previous,
+        });
+      } catch (error) {
+        if (error?.code !== "OBSOLETE_SCOPE") throw error;
+        quarantinedMembers.push({
+          machineId: rawMember.machineId || null,
+          peerId: ids.peerId,
+          reason: "obsolete_private_scope",
+        });
+        continue;
+      }
       if (previous && canonical(canonicalizeMemberForHash({ ...normalized, updatedAtRevision: previous.updatedAtRevision })) !==
           canonical(canonicalizeMemberForHash(previous))) {
         normalized.updatedAtRevision = provisionalRevision;
@@ -1823,6 +1841,7 @@ export class FlockMembershipRegistry {
       members: incomingMembersMap,
       tombstones: nextTombstones,
       presence: nextPresence,
+      quarantinedMembers,
     };
     this.save(data);
     return {
@@ -1832,6 +1851,7 @@ export class FlockMembershipRegistry {
       rosterEpoch: incomingEpoch,
       rosterRevision: finalRevision,
       rosterHash: finalHash,
+      quarantinedMembers,
     };
   }
 

@@ -105,6 +105,7 @@ async function applyThroughClient(filename, api, surface, result, storePath, cli
   const run = new AsyncFunction("cfg", "args", "fs", "validatePinnedBootstrapOrigin", "getConfigPath",
     "writeConfigFileSecure", "ensureMachineIdentityKeypair", "callBootstrapV3Endpoint",
     "applyV3EnrollmentResult", "registerWithBootstrapServer", "normalizeScope", "formatErrorDetail",
+    "projectPublicEnrollmentResult",
     `const name="enroll_from_invite_json"; const sandboxMode=false; const parsedEnrollmentJson=null;
      const activeConfigPath=getConfigPath();
      ${source.slice(start, end)}
@@ -114,7 +115,8 @@ async function applyThroughClient(filename, api, surface, result, storePath, cli
     api.writeConfigFileSecure, () => ({ fingerprint: owner.deviceId, publicKey: keys.publicKey }),
     (_cfg, subPath) => { assert.equal(subPath, "/enroll"); return result; },
     (currentCfg, response) => api.applyV3EnrollmentResult(currentCfg, response, storePath),
-    async () => ({ ok: true }), api.normalizeScope, api.formatErrorDetail);
+    async () => ({ ok: true }), api.normalizeScope, api.formatErrorDetail,
+    api.projectPublicEnrollmentResult);
 }
 
 test("v3 hotfix both clients apply duplicate owner records in either order without retaining stale privileges", async () => {

@@ -10,6 +10,9 @@ evidence; preparing or reviewing source does not authorize deployment.
 
 Tell Copilot: **"Set up a new broker-free Flock. Confirm my subscription,
 region, resource group, personal/work scope and costs before provisioning."**
+Machine scope is strictly `personal` or `work`. Obsolete `private`
+configuration and input are rejected explicitly and must be updated to
+`personal`; no silent compatibility alias is retained.
 The [managed setup guide](./BOOTSTRAP_NEW_FLOCK_BYO_AZURE.md) describes the
 two-service default. Each flock has one designated local rotation owner.
 The owner's GitHub label is informational, not cryptographic authority.

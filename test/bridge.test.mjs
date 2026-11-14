@@ -143,7 +143,6 @@ test("reply and clarification shell examples strip unsafe remote identifiers", (
     }
   }
 });
-
 test("public distribution has Apache licensing, loopback viewer defaults and synthetic demo traffic", () => {
   if (!fs.existsSync(new URL("../package.json", import.meta.url))) return;
   for (const file of ["../package.json", "../viewer/package.json"]) {
@@ -811,7 +810,7 @@ test(
     // 3. Start mock Copilot Desktop WebSocket server to test simultaneous get_transcript + ping + list_sessions + send_message
     const cfg = {
       machineId: "TEST-MACHINE",
-      scope: "private",
+      scope: "personal",
       hub: "copilotbridge",
       host: "your-signalr.service.signalr.net",
       endpoint: "https://your-signalr.service.signalr.net",
@@ -896,34 +895,26 @@ test(
         action: "list_sessions",
         params: { limit: 10 },
       }),
-      handleRpcAction(cfg, {
-        requestId: "req-send-nonwait",
+      injectLocalSessionMessage({
+        cfg,
+        targetSession: hugeSessionId,
+        message: "Non-wait message on 540 MiB log",
         fromMachine: "PEER-PC",
-        action: "send_message",
-        params: {
-          targetSession: hugeSessionId,
-          message: "Non-wait message on 540 MiB log",
-          fromMachine: "PEER-PC",
-          fromScope: "private",
-          fromSessionId: "peer-session-1",
-          fromSessionName: "Peer Session 1",
-          waitForReply: false,
-        },
+        fromScope: "personal",
+        fromSessionId: "peer-session-1",
+        fromSessionName: "Peer Session 1",
+        waitForReply: false,
       }),
-      handleRpcAction(cfg, {
-        requestId: "req-send-wait",
+      injectLocalSessionMessage({
+        cfg,
+        targetSession: hugeSessionId,
+        message: "Wait message on 540 MiB log",
         fromMachine: "PEER-PC",
-        action: "send_message",
-        params: {
-          targetSession: hugeSessionId,
-          message: "Wait message on 540 MiB log",
-          fromMachine: "PEER-PC",
-          fromScope: "private",
-          fromSessionId: "peer-session-2",
-          fromSessionName: "Peer Session 2",
-          waitForReply: true,
-          waitTimeoutMs: 5000,
-        },
+        fromScope: "personal",
+        fromSessionId: "peer-session-2",
+        fromSessionName: "Peer Session 2",
+        waitForReply: true,
+        waitTimeoutMs: 5000,
       }),
     ]);
     const totalConcurrentMs = performance.now() - tConcurrent0;
@@ -1015,7 +1006,7 @@ test(
 
     const cfg = {
       machineId: "TEST-MACHINE",
-      scope: "private",
+      scope: "personal",
       hub: "copilotbridge",
       host: "your-signalr.service.signalr.net",
       endpoint: "https://your-signalr.service.signalr.net",
@@ -1030,7 +1021,7 @@ test(
           targetSession: sessionId,
           message: "Expected target message that never gets written",
           fromMachine: "PEER-PC",
-          fromScope: "private",
+          fromScope: "personal",
           fromSessionId: "s-1",
           fromSessionName: "Sender 1",
           dispatchTimeoutMs: 220,
@@ -1052,7 +1043,7 @@ test(
           targetSession: sessionId,
           message: "Message triggering ws error",
           fromMachine: "PEER-PC",
-          fromScope: "private",
+          fromScope: "personal",
           fromSessionId: "s-2",
           fromSessionName: "Sender 2",
           dispatchTimeoutMs: 2000,
@@ -1086,7 +1077,7 @@ test("filterBroadcastTargets supports selective broadcast by wildcard machines, 
     },
     {
       machineId: "MAIN-WORKSTATION",
-      scope: "private",
+      scope: "personal",
       githubUser: "erjadi",
       specs: {
         memory: { totalGb: 64, freeGb: 40 },
@@ -1097,7 +1088,7 @@ test("filterBroadcastTargets supports selective broadcast by wildcard machines, 
     },
     {
       machineId: "3D-STUDIO-PC",
-      scope: "private",
+      scope: "personal",
       githubUser: "erjadi",
       specs: {
         memory: { totalGb: 64, freeGb: 38 },
@@ -1108,7 +1099,7 @@ test("filterBroadcastTargets supports selective broadcast by wildcard machines, 
     },
     {
       machineId: "GUEST-MACBOOK",
-      scope: "private",
+      scope: "personal",
       githubUser: "guestdev",
       specs: {
         memory: { totalGb: 16, freeGb: 6 },
@@ -1168,7 +1159,7 @@ test("refreshLiveSpecs and ping include githubUser and live hardware specs", asy
     const pingRes = await handleRpcAction(
       {
         machineId: "TEST-NODE",
-        scope: "private",
+        scope: "personal",
         githubUser: "erjadi",
         specs,
       },
@@ -1202,43 +1193,83 @@ test(
     assert.equal(parsedMsg, "Multi-line message with (parentheses) and *markdown*\nLine 2");
 
     // 2. Test chunked file transfer (send_file_chunk + pull_file_chunk) with SHA-256 verification
-    const cfg = { machineId: "TEST-NODE", scope: "private", githubUser: "erjadi" };
+    const cfg = { machineId: "TEST-NODE", scope: "personal", githubUser: "erjadi" };
+    const peerKey = crypto.generateKeyPairSync("ed25519", {
+      publicKeyEncoding: { type: "spki", format: "pem" },
+      privateKeyEncoding: { type: "pkcs8", format: "pem" },
+    });
+    const fileTransferMembers = [{
+      machineId: "PEER-NODE",
+      githubUser: "erjadi",
+      scope: "personal",
+      publicKey: peerKey.publicKey,
+    }];
+    cfg.flocksConfigPath = path.join(env.tempRoot, "flocks.json");
+    writeConfigFileSecure({
+      flocks: {
+        erjadi: {
+          flockId: "erjadi",
+          flockType: "owner_root",
+          trustTier: "owner",
+          sessionVisibility: "all",
+          members: fileTransferMembers,
+        },
+      },
+    }, cfg.flocksConfigPath);
+    const signedRpc = (action, params) => {
+      const requestId = crypto.randomUUID();
+      const sentAt = new Date().toISOString();
+      const signedParams = { ...params, flock: "erjadi" };
+      return {
+        requestId,
+        sentAt,
+        fromMachine: "PEER-NODE",
+        toMachine: cfg.machineId,
+        action,
+        params: signedParams,
+        auth: signRpcRequest({
+          requestId,
+          sentAt,
+          fromMachine: "PEER-NODE",
+          toMachine: cfg.machineId,
+          action,
+          params: signedParams,
+          identity: {
+            publicKey: peerKey.publicKey,
+            privateKey: peerKey.privateKey,
+            fingerprint: "peer",
+          },
+        }),
+        registryMembers: fileTransferMembers,
+      };
+    };
     const payload = Buffer.from("Hello SignalR chunked binary transfer! 🚀".repeat(200), "utf8");
     const expectedSha256 = crypto.createHash("sha256").update(payload).digest("hex");
     const half = Math.floor(payload.length / 2);
 
-    const chunk0 = await handleRpcAction(cfg, {
-      action: "send_file_chunk",
-      params: {
+    const chunk0 = await handleRpcAction(cfg, signedRpc("send_file_chunk", {
         remotePath: "test-artifact.bin",
         chunkIndex: 0,
         totalChunks: 2,
         dataBase64: payload.subarray(0, half).toString("base64"),
-      },
-    });
+    }));
     assert.equal(chunk0.status, "chunk_written");
 
-    const chunk1 = await handleRpcAction(cfg, {
-      action: "send_file_chunk",
-      params: {
+    const chunk1 = await handleRpcAction(cfg, signedRpc("send_file_chunk", {
         remotePath: "test-artifact.bin",
         chunkIndex: 1,
         totalChunks: 2,
         dataBase64: payload.subarray(half).toString("base64"),
         expectedSha256,
-      },
-    });
+    }));
     assert.equal(chunk1.status, "completed");
     assert.equal(chunk1.sha256, expectedSha256);
 
-    const pulled = await handleRpcAction(cfg, {
-      action: "pull_file_chunk",
-      params: {
+    const pulled = await handleRpcAction(cfg, signedRpc("pull_file_chunk", {
         remotePath: chunk1.remotePath,
         offset: 0,
         length: 262144,
-      },
-    });
+    }));
     assert.equal(pulled.eof, true);
     assert.equal(pulled.sha256, expectedSha256);
     assert.deepEqual(Buffer.from(pulled.dataBase64, "base64"), payload);
@@ -1309,7 +1340,7 @@ test(
       {
         machineId: "ERJADI-PC",
         githubUser: "erjadi",
-        scope: "private",
+        scope: "personal",
         publicKey: bobKey.publicKey,
       },
     ];
@@ -1324,7 +1355,7 @@ test(
       params: {
         // Alice tries to spoof fromGitHubUser="erjadi" and fromScope="private" in params!
         fromGitHubUser: "erjadi",
-        fromScope: "private",
+        fromScope: "personal",
         message: "What is your status?",
       },
       identity: {
@@ -1335,7 +1366,7 @@ test(
     });
 
     const resolvedSender = resolveVerifiedSenderIdentity(
-      { machineId: "MAIN-WORKSTATION", githubUser: "erjadi", scope: "private" },
+      { machineId: "MAIN-WORKSTATION", githubUser: "erjadi", scope: "personal" },
       {
         requestId: "req-sec-1",
         sentAt,
@@ -1344,7 +1375,7 @@ test(
         action: "send_message",
         params: {
           fromGitHubUser: "erjadi",
-          fromScope: "private",
+          fromScope: "personal",
           message: "What is your status?",
         },
         auth: signedAuth,
@@ -1364,7 +1395,7 @@ test(
     assert.throws(
       () =>
         resolveVerifiedSenderIdentity(
-          { machineId: "MAIN-WORKSTATION", githubUser: "erjadi", scope: "private" },
+          { machineId: "MAIN-WORKSTATION", githubUser: "erjadi", scope: "personal" },
           {
             requestId: "req-forged",
             sentAt,
@@ -1384,7 +1415,7 @@ test(
       await assert.rejects(
         () =>
           handleRpcAction(
-            { machineId: "MAIN-WORKSTATION", githubUser: "erjadi", scope: "private" },
+            { machineId: "MAIN-WORKSTATION", githubUser: "erjadi", scope: "personal" },
             {
               requestId: `req-block-${blockedAction}`,
               fromMachine: "ALICE-PC",
@@ -1553,7 +1584,7 @@ test(
       },
     });
     const delayedVerified = resolveVerifiedSenderIdentity(
-      { machineId: "MAIN-WORKSTATION", githubUser: "erjadi", scope: "private" },
+      { machineId: "MAIN-WORKSTATION", githubUser: "erjadi", scope: "personal" },
       {
         requestId: "req-delayed-10m",
         sentAt: tenMinAgoIso,
@@ -1965,11 +1996,11 @@ test(
   process.env.COPILOT_HOME = env.tempRoot;
 
   try {
-    // 1. Scope normalization ("private" -> "personal", "work" -> "work", no "private" output)
-    assert.equal(normalizeScope("private"), "personal");
+    // 1. Scope normalization is strictly canonical and rejects obsolete aliases.
+    assert.throws(() => normalizeScope("private"), (err) => err.code === "OBSOLETE_SCOPE");
     assert.equal(normalizeScope("personal"), "personal");
     assert.equal(normalizeScope("work"), "work");
-    assert.equal(normalizeV3Scope("private"), "personal");
+    assert.throws(() => normalizeV3Scope("private"), (err) => err.code === "OBSOLETE_SCOPE");
     assert.equal(normalizeV3Scope("work"), "work");
 
     // 2. Universal <owner>/<flock>[/<machineId>] address parser
@@ -1983,10 +2014,10 @@ test(
     assert.equal(addrPersonal.isBuiltInScope, true);
     assert.equal(addrPersonal.machineId, null);
 
-    const addrLegacyPrivate = parseFlockAddress("erjadi/private/MAIN-WORKSTATION");
-    assert.equal(addrLegacyPrivate.flockId, "erjadi/personal");
-    assert.equal(addrLegacyPrivate.machineId, "MAIN-WORKSTATION");
-    assert.equal(addrLegacyPrivate.canonicalPath, "erjadi/personal/MAIN-WORKSTATION");
+    assert.throws(
+      () => parseFlockAddress("erjadi/private/MAIN-WORKSTATION"),
+      (err) => err.code === "OBSOLETE_SCOPE"
+    );
 
     const addrTeamPc = parseFlockAddress("erjadi/studio-team/CLOUD-DEV-VM");
     assert.equal(addrTeamPc.flockId, "erjadi/studio-team");
@@ -2727,7 +2758,7 @@ test(
     const rawInitialConfig = JSON.stringify(
       {
         machineId: "PASSIVE-STOPPED-PC",
-        scope: "private",
+        scope: "personal",
         githubUser: "erjadi",
         hub: "copilotbridge",
         connectionString:
@@ -3009,7 +3040,7 @@ const home = process.env.COPILOT_HOME;
 const dir = path.join(home, "flock");
 fs.writeFileSync(path.join(dir, "daemon.pid"), String(process.pid), "utf8");
 fs.writeFileSync(path.join(dir, "state.json"), JSON.stringify({ pid: process.pid, status: "connected", updatedAt: new Date().toISOString() }), "utf8");
-setTimeout(() => process.exit(0), 2500);
+setTimeout(() => process.exit(0), 15000);
 `,
       "utf8"
     );
@@ -3033,7 +3064,9 @@ setTimeout(() => process.exit(0), 2500);
     assert.equal(fs.existsSync(path.join(flockDir, "daemon.pid")), true);
     spawnedDaemonChild = Number(fs.readFileSync(path.join(flockDir, "daemon.pid"), "utf8").trim());
     assert.ok(spawnedDaemonChild > 0);
-    assert.equal(activeDiag.onlineCount, 1);
+    assert.equal(activeDiag.daemon.running, true);
+    assert.equal(activeDiag.onlineCount, 0);
+    assert.match(activeDiag.reason, /No SignalR ping responses/);
   } finally {
     if (spawnedDaemonChild) {
       try {

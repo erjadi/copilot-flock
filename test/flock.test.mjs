@@ -65,7 +65,13 @@ import {
   shareThreadWithFlock,
   unshareThreadFromFlock,
   listSharedThreadsForMachine,
+  projectPublicFlocksResponse,
+  projectPublicEnrollmentResult,
+  projectPublicStatusResponse,
   enforceFlockPolicyAndWalls,
+  assertVerifiedExecutionAuthorization,
+  shouldGrantRemoteAllowAll,
+  classifyLayeredPresence,
   validatePinnedBootstrapOrigin,
   recordSandboxManifestResource,
   teardownLocalSandbox,
@@ -179,7 +185,6 @@ test("reply and clarification shell examples strip unsafe remote identifiers", (
     }
   }
 });
-
 test("public distribution has Apache licensing, loopback viewer defaults and synthetic demo traffic", () => {
   if (!fs.existsSync(new URL("../package.json", import.meta.url))) return;
   for (const file of ["../package.json", "../viewer/package.json"]) {
@@ -932,7 +937,7 @@ test(
     // 3. Start mock Copilot Desktop WebSocket server to test simultaneous get_transcript + ping + list_sessions + send_message
     const cfg = {
       machineId: "TEST-MACHINE",
-      scope: "private",
+      scope: "personal",
       hub: "copilotbridge",
       host: "your-signalr.service.signalr.net",
       endpoint: "https://your-signalr.service.signalr.net",
@@ -1017,34 +1022,26 @@ test(
         action: "list_sessions",
         params: { limit: 10 },
       }),
-      handleRpcAction(cfg, {
-        requestId: "req-send-nonwait",
+      injectLocalSessionMessage({
+        cfg,
+        targetSession: hugeSessionId,
+        message: "Non-wait message on 540 MiB log",
         fromMachine: "PEER-PC",
-        action: "send_message",
-        params: {
-          targetSession: hugeSessionId,
-          message: "Non-wait message on 540 MiB log",
-          fromMachine: "PEER-PC",
-          fromScope: "private",
-          fromSessionId: "peer-session-1",
-          fromSessionName: "Peer Session 1",
-          waitForReply: false,
-        },
+        fromScope: "personal",
+        fromSessionId: "peer-session-1",
+        fromSessionName: "Peer Session 1",
+        waitForReply: false,
       }),
-      handleRpcAction(cfg, {
-        requestId: "req-send-wait",
+      injectLocalSessionMessage({
+        cfg,
+        targetSession: hugeSessionId,
+        message: "Wait message on 540 MiB log",
         fromMachine: "PEER-PC",
-        action: "send_message",
-        params: {
-          targetSession: hugeSessionId,
-          message: "Wait message on 540 MiB log",
-          fromMachine: "PEER-PC",
-          fromScope: "private",
-          fromSessionId: "peer-session-2",
-          fromSessionName: "Peer Session 2",
-          waitForReply: true,
-          waitTimeoutMs: 5000,
-        },
+        fromScope: "personal",
+        fromSessionId: "peer-session-2",
+        fromSessionName: "Peer Session 2",
+        waitForReply: true,
+        waitTimeoutMs: 5000,
       }),
     ]);
     const totalConcurrentMs = performance.now() - tConcurrent0;
@@ -1133,7 +1130,7 @@ test("injectLocalSessionMessage rejects unrelated user.message events, never rep
 
     const cfg = {
       machineId: "TEST-MACHINE",
-      scope: "private",
+      scope: "personal",
       hub: "copilotbridge",
       host: "your-signalr.service.signalr.net",
       endpoint: "https://your-signalr.service.signalr.net",
@@ -1148,7 +1145,7 @@ test("injectLocalSessionMessage rejects unrelated user.message events, never rep
           targetSession: sessionId,
           message: "Expected target message that never gets written",
           fromMachine: "PEER-PC",
-          fromScope: "private",
+          fromScope: "personal",
           fromSessionId: "s-1",
           fromSessionName: "Sender 1",
           dispatchTimeoutMs: 220,
@@ -1170,7 +1167,7 @@ test("injectLocalSessionMessage rejects unrelated user.message events, never rep
           targetSession: sessionId,
           message: "Message triggering ws error",
           fromMachine: "PEER-PC",
-          fromScope: "private",
+          fromScope: "personal",
           fromSessionId: "s-2",
           fromSessionName: "Sender 2",
           dispatchTimeoutMs: 2000,
@@ -1204,7 +1201,7 @@ test("filterBroadcastTargets supports selective broadcast by wildcard machines, 
     },
     {
       machineId: "MAIN-WORKSTATION",
-      scope: "private",
+      scope: "personal",
       githubUser: "erjadi",
       specs: {
         memory: { totalGb: 64, freeGb: 40 },
@@ -1215,7 +1212,7 @@ test("filterBroadcastTargets supports selective broadcast by wildcard machines, 
     },
     {
       machineId: "3D-STUDIO-PC",
-      scope: "private",
+      scope: "personal",
       githubUser: "erjadi",
       specs: {
         memory: { totalGb: 64, freeGb: 38 },
@@ -1226,7 +1223,7 @@ test("filterBroadcastTargets supports selective broadcast by wildcard machines, 
     },
     {
       machineId: "GUEST-MACBOOK",
-      scope: "private",
+      scope: "personal",
       githubUser: "guestdev",
       specs: {
         memory: { totalGb: 16, freeGb: 6 },
@@ -1281,7 +1278,7 @@ test("refreshLiveSpecs and ping include githubUser and live hardware specs", asy
   const pingRes = await handleRpcAction(
     {
       machineId: "TEST-NODE",
-      scope: "private",
+      scope: "personal",
       githubUser: "erjadi",
       specs,
     },
@@ -1305,43 +1302,83 @@ test("v1.8.0: daemon deduplication, chunked SHA-256 file transfer, and --message
     assert.equal(parsedMsg, "Multi-line message with (parentheses) and *markdown*\nLine 2");
 
     // 2. Test chunked file transfer (send_file_chunk + pull_file_chunk) with SHA-256 verification
-    const cfg = { machineId: "TEST-NODE", scope: "private", githubUser: "erjadi" };
+    const cfg = { machineId: "TEST-NODE", scope: "personal", githubUser: "erjadi" };
+    const peerKey = crypto.generateKeyPairSync("ed25519", {
+      publicKeyEncoding: { type: "spki", format: "pem" },
+      privateKeyEncoding: { type: "pkcs8", format: "pem" },
+    });
+    const fileTransferMembers = [{
+      machineId: "PEER-NODE",
+      githubUser: "erjadi",
+      scope: "personal",
+      publicKey: peerKey.publicKey,
+    }];
+    cfg.flocksConfigPath = path.join(env.tempRoot, "flocks.json");
+    writeConfigFileSecure({
+      flocks: {
+        erjadi: {
+          flockId: "erjadi",
+          flockType: "owner_root",
+          trustTier: "owner",
+          sessionVisibility: "all",
+          members: fileTransferMembers,
+        },
+      },
+    }, cfg.flocksConfigPath);
+    const signedRpc = (action, params) => {
+      const requestId = crypto.randomUUID();
+      const sentAt = new Date().toISOString();
+      const signedParams = { ...params, flock: "erjadi" };
+      return {
+        requestId,
+        sentAt,
+        fromMachine: "PEER-NODE",
+        toMachine: cfg.machineId,
+        action,
+        params: signedParams,
+        auth: signRpcRequest({
+          requestId,
+          sentAt,
+          fromMachine: "PEER-NODE",
+          toMachine: cfg.machineId,
+          action,
+          params: signedParams,
+          identity: {
+            publicKey: peerKey.publicKey,
+            privateKey: peerKey.privateKey,
+            fingerprint: "peer",
+          },
+        }),
+        registryMembers: fileTransferMembers,
+      };
+    };
     const payload = Buffer.from("Hello SignalR chunked binary transfer! 🚀".repeat(200), "utf8");
     const expectedSha256 = crypto.createHash("sha256").update(payload).digest("hex");
     const half = Math.floor(payload.length / 2);
 
-    const chunk0 = await handleRpcAction(cfg, {
-      action: "send_file_chunk",
-      params: {
+    const chunk0 = await handleRpcAction(cfg, signedRpc("send_file_chunk", {
         remotePath: "test-artifact.bin",
         chunkIndex: 0,
         totalChunks: 2,
         dataBase64: payload.subarray(0, half).toString("base64"),
-      },
-    });
+    }));
     assert.equal(chunk0.status, "chunk_written");
 
-    const chunk1 = await handleRpcAction(cfg, {
-      action: "send_file_chunk",
-      params: {
+    const chunk1 = await handleRpcAction(cfg, signedRpc("send_file_chunk", {
         remotePath: "test-artifact.bin",
         chunkIndex: 1,
         totalChunks: 2,
         dataBase64: payload.subarray(half).toString("base64"),
         expectedSha256,
-      },
-    });
+    }));
     assert.equal(chunk1.status, "completed");
     assert.equal(chunk1.sha256, expectedSha256);
 
-    const pulled = await handleRpcAction(cfg, {
-      action: "pull_file_chunk",
-      params: {
+    const pulled = await handleRpcAction(cfg, signedRpc("pull_file_chunk", {
         remotePath: chunk1.remotePath,
         offset: 0,
         length: 262144,
-      },
-    });
+    }));
     assert.equal(pulled.eof, true);
     assert.equal(pulled.sha256, expectedSha256);
     assert.deepEqual(Buffer.from(pulled.dataBase64, "base64"), payload);
@@ -1412,7 +1449,7 @@ test("v1.8.0: daemon deduplication, chunked SHA-256 file transfer, and --message
       {
         machineId: "ERJADI-PC",
         githubUser: "erjadi",
-        scope: "private",
+        scope: "personal",
         publicKey: bobKey.publicKey,
       },
     ];
@@ -1427,7 +1464,7 @@ test("v1.8.0: daemon deduplication, chunked SHA-256 file transfer, and --message
       params: {
         // Alice tries to spoof fromGitHubUser="erjadi" and fromScope="private" in params!
         fromGitHubUser: "erjadi",
-        fromScope: "private",
+        fromScope: "personal",
         message: "What is your status?",
       },
       identity: {
@@ -1438,7 +1475,7 @@ test("v1.8.0: daemon deduplication, chunked SHA-256 file transfer, and --message
     });
 
     const resolvedSender = resolveVerifiedSenderIdentity(
-      { machineId: "MAIN-WORKSTATION", githubUser: "erjadi", scope: "private" },
+      { machineId: "MAIN-WORKSTATION", githubUser: "erjadi", scope: "personal" },
       {
         requestId: "req-sec-1",
         sentAt,
@@ -1447,7 +1484,7 @@ test("v1.8.0: daemon deduplication, chunked SHA-256 file transfer, and --message
         action: "send_message",
         params: {
           fromGitHubUser: "erjadi",
-          fromScope: "private",
+          fromScope: "personal",
           message: "What is your status?",
         },
         auth: signedAuth,
@@ -1467,7 +1504,7 @@ test("v1.8.0: daemon deduplication, chunked SHA-256 file transfer, and --message
     assert.throws(
       () =>
         resolveVerifiedSenderIdentity(
-          { machineId: "MAIN-WORKSTATION", githubUser: "erjadi", scope: "private" },
+          { machineId: "MAIN-WORKSTATION", githubUser: "erjadi", scope: "personal" },
           {
             requestId: "req-forged",
             sentAt,
@@ -1487,7 +1524,7 @@ test("v1.8.0: daemon deduplication, chunked SHA-256 file transfer, and --message
       await assert.rejects(
         () =>
           handleRpcAction(
-            { machineId: "MAIN-WORKSTATION", githubUser: "erjadi", scope: "private" },
+            { machineId: "MAIN-WORKSTATION", githubUser: "erjadi", scope: "personal" },
             {
               requestId: `req-block-${blockedAction}`,
               fromMachine: "ALICE-PC",
@@ -1656,7 +1693,7 @@ test("v1.8.0: daemon deduplication, chunked SHA-256 file transfer, and --message
       },
     });
     const delayedVerified = resolveVerifiedSenderIdentity(
-      { machineId: "MAIN-WORKSTATION", githubUser: "erjadi", scope: "private" },
+      { machineId: "MAIN-WORKSTATION", githubUser: "erjadi", scope: "personal" },
       {
         requestId: "req-delayed-10m",
         sentAt: tenMinAgoIso,
@@ -2065,11 +2102,10 @@ test("v3.0.0 multi-flock platform: universal <owner>/<flock>[/<machineId>] addre
   process.env.COPILOT_HOME = env.tempRoot;
 
   try {
-    // 1. Scope normalization ("private" -> "personal", "work" -> "work", no "private" output)
-    assert.equal(normalizeScope("private"), "personal");
+    // 1. Scope normalization is strictly canonical and rejects obsolete aliases.
+    assert.throws(() => normalizeScope("private"), (err) => err.code === "OBSOLETE_SCOPE");
     assert.equal(normalizeScope("personal"), "personal");
     assert.equal(normalizeScope("work"), "work");
-    assert.equal(normalizeV3Scope("private"), "personal");
     assert.equal(normalizeV3Scope("work"), "work");
 
     // 2. Universal <owner>/<flock>[/<machineId>] address parser
@@ -2083,10 +2119,10 @@ test("v3.0.0 multi-flock platform: universal <owner>/<flock>[/<machineId>] addre
     assert.equal(addrPersonal.isBuiltInScope, true);
     assert.equal(addrPersonal.machineId, null);
 
-    const addrLegacyPrivate = parseFlockAddress("erjadi/private/MAIN-WORKSTATION");
-    assert.equal(addrLegacyPrivate.flockId, "erjadi/personal");
-    assert.equal(addrLegacyPrivate.machineId, "MAIN-WORKSTATION");
-    assert.equal(addrLegacyPrivate.canonicalPath, "erjadi/personal/MAIN-WORKSTATION");
+    assert.throws(
+      () => parseFlockAddress("erjadi/private/MAIN-WORKSTATION"),
+      (err) => err.code === "OBSOLETE_SCOPE"
+    );
 
     const addrTeamPc = parseFlockAddress("erjadi/studio-team/CLOUD-DEV-VM");
     assert.equal(addrTeamPc.flockId, "erjadi/studio-team");
@@ -7199,7 +7235,7 @@ test("passive diagnostics keep stopped and unavailable daemons non-mutating with
     const rawInitialConfig = JSON.stringify(
       {
         machineId: "PASSIVE-STOPPED-PC",
-        scope: "private",
+        scope: "personal",
         githubUser: "erjadi",
         hub: "copilotbridge",
         connectionString:
@@ -7474,7 +7510,7 @@ const home = process.env.COPILOT_HOME;
 const dir = path.join(home, "flock");
 fs.writeFileSync(path.join(dir, "daemon.pid"), String(process.pid), "utf8");
 fs.writeFileSync(path.join(dir, "state.json"), JSON.stringify({ pid: process.pid, status: "connected", updatedAt: new Date().toISOString() }), "utf8");
-setTimeout(() => process.exit(0), 2500);
+setTimeout(() => process.exit(0), 15000);
 `,
       "utf8"
     );
@@ -7498,7 +7534,9 @@ setTimeout(() => process.exit(0), 2500);
     assert.equal(fs.existsSync(path.join(flockDir, "daemon.pid")), true);
     spawnedDaemonChild = Number(fs.readFileSync(path.join(flockDir, "daemon.pid"), "utf8").trim());
     assert.ok(spawnedDaemonChild > 0);
-    assert.equal(activeDiag.onlineCount, 1);
+    assert.equal(activeDiag.daemon.running, true);
+    assert.equal(activeDiag.onlineCount, 0);
+    assert.match(activeDiag.reason, /No SignalR ping responses/);
   } finally {
     if (spawnedDaemonChild) {
       try {
@@ -7903,21 +7941,68 @@ test("TODO #14: ECONNREFUSED on stale ws.port (portA) invalidates cache, re-read
       endpoint: "https://your-signalr.service.signalr.net",
       installedScriptPath: path.join(env.tempRoot, "flock", "flock.mjs"),
     };
-
-    const healRes = await handleRpcAction(cfg, {
-      requestId: "req-wake-heal-1",
-      fromMachine: "DESKTOP-2R3PAUG",
-      action: "send_message",
-      params: {
-        targetSession: sessionId,
-        message: "Immediate post-wake message after port rebind",
+    const peerKey = crypto.generateKeyPairSync("ed25519", {
+      publicKeyEncoding: { type: "spki", format: "pem" },
+      privateKeyEncoding: { type: "pkcs8", format: "pem" },
+    });
+    const registryMembers = [{
+      machineId: "DESKTOP-2R3PAUG",
+      githubUser: "erjadi",
+      scope: "personal",
+      publicKey: peerKey.publicKey,
+    }];
+    cfg.flocksConfigPath = path.join(env.tempRoot, "flocks.json");
+    writeConfigFileSecure({
+      flocks: {
+        erjadi: {
+          flockId: "erjadi",
+          flockType: "owner_root",
+          trustTier: "owner",
+          sessionVisibility: "all",
+          members: registryMembers,
+        },
+      },
+    }, cfg.flocksConfigPath);
+    const signedSendRequest = (requestId, params) => {
+      const signedParams = {
+        ...params,
+        flock: "erjadi",
+        fromMachine: "DESKTOP-2R3PAUG",
         fromScope: "personal",
         fromGitHubUser: "erjadi",
-        fromSessionId: "coord-1",
-        fromSessionName: "Coordinator",
-        dispatchTimeoutMs: 1500,
-      },
-    });
+      };
+      const sentAt = new Date().toISOString();
+      return {
+        requestId,
+        sentAt,
+        fromMachine: "DESKTOP-2R3PAUG",
+        toMachine: cfg.machineId,
+        action: "send_message",
+        params: signedParams,
+        auth: signRpcRequest({
+          requestId,
+          sentAt,
+          fromMachine: "DESKTOP-2R3PAUG",
+          toMachine: cfg.machineId,
+          action: "send_message",
+          params: signedParams,
+          identity: {
+            publicKey: peerKey.publicKey,
+            privateKey: peerKey.privateKey,
+            fingerprint: "peer",
+          },
+        }),
+        registryMembers,
+      };
+    };
+
+    const healRes = await handleRpcAction(cfg, signedSendRequest("req-wake-heal-1", {
+      targetSession: sessionId,
+      message: "Immediate post-wake message after port rebind",
+      fromSessionId: "coord-1",
+      fromSessionName: "Coordinator",
+      dispatchTimeoutMs: 1500,
+    }));
 
     assert.equal(healRes.status, "delivered");
     assert.equal(healRes.dispatchedToRuntime, true);
@@ -8010,21 +8095,20 @@ test("TODO #14: ECONNREFUSED on stale ws.port (portA) invalidates cache, re-read
     env.writeWsConfig(portC);
     invalidateLocalWsConnectionCache();
 
-    await assert.rejects(
-      () =>
-        handleRpcAction(cfg, {
-          requestId: "req-dead-ws-1",
-          fromMachine: "DESKTOP-2R3PAUG",
-          action: "send_message",
-          params: {
+    const previousPath = process.env.PATH;
+    process.env.PATH = env.tempRoot;
+    try {
+      await assert.rejects(
+        () =>
+          handleRpcAction(cfg, signedSendRequest("req-dead-ws-1", {
             targetSession: sessionId,
             message: "Message while Desktop is genuinely offline",
-            fromScope: "personal",
-            fromGitHubUser: "erjadi",
-          },
-        }),
-      /ECONNREFUSED|closed before upgrade|connect/i
-    );
+          })),
+        /WebSocket is not running|headless 'copilot' CLI binary was not found|ECONNREFUSED|connect/i
+      );
+    } finally {
+      process.env.PATH = previousPath;
+    }
 
     const inboxEntriesAfterDead = fs
       .readFileSync(inboxPath, "utf8")
@@ -8904,6 +8988,251 @@ assert.equal(windowsStore.entry, replacement, "Old WMI completion must not publi
   assert.equal("thermal" in noneSanitized, false);
   assert.equal("gpus" in noneSanitized, false);
   assert.equal("disks" in noneSanitized, false);
+});
+
+test("3.6 foundation: public DTOs, exact flock execution, shared-thread isolation, and layered presence fail closed", () => {
+  const secretValue = "SECRET-HUB-JWT-DO-NOT-RETURN";
+  const projected = projectPublicFlocksResponse({
+    machineId: "OWNER-PC",
+    protocol: "legacy-v3",
+    scope: "personal",
+    localFlocks: {
+      ownerGitHubUser: "demo",
+      scope: "personal",
+      flocks: {
+        "demo/team": {
+          flockId: "demo/team",
+          trustTier: "collaborator",
+          hubToken: secretValue,
+          serverNonce: "SECRET-NONCE",
+          connectionString: "Endpoint=https://example.invalid;AccessKey=SECRET",
+          members: [{ machineId: "PEER", scope: "work", privateKey: "SECRET-PRIVATE-KEY" }],
+        },
+      },
+    },
+    remoteOwnedFlocks: [{ flockId: "demo/team", hubToken: secretValue }],
+    remoteJoinedFlocks: [{ flockId: "demo/other", voucherSecret: "SECRET-VOUCHER" }],
+    cachedFlocks: [{ flockId: "demo/team", transport: { serviceBusListenSas: "SECRET-SAS" } }],
+    flocks: [{ flockId: "demo/team", hubToken: secretValue }],
+    knownMembers: [{ machineId: "PEER", scope: "work", privateKey: "SECRET-PRIVATE-KEY" }],
+    roster: { protocol: "legacy-v3", hubToken: secretValue, flocks: [{ flockId: "demo/team", hubToken: secretValue }] },
+  });
+  const serialized = JSON.stringify(projected);
+  for (const forbidden of [
+    secretValue,
+    "SECRET-NONCE",
+    "SECRET-VOUCHER",
+    "SECRET-SAS",
+    "SECRET-PRIVATE-KEY",
+    "AccessKey=SECRET",
+  ]) {
+    assert.equal(serialized.includes(forbidden), false, `Public list_flocks DTO leaked ${forbidden}`);
+  }
+  const publicStatus = JSON.stringify(
+    projectPublicStatusResponse({
+      status: "ok",
+      hubToken: secretValue,
+      onlineMachines: [{ machineId: "PEER", scope: "work", hubToken: secretValue }],
+      flocks: [{ flockId: "demo/team", hubToken: secretValue }],
+      roster: { protocol: "legacy-v3", hubToken: secretValue },
+    })
+  );
+  const publicEnrollment = JSON.stringify(
+    projectPublicEnrollmentResult({
+      ok: true,
+      enrolledFlocks: [{ flockId: "demo/team", hubToken: secretValue, serverNonce: "SECRET-NONCE" }],
+    })
+  );
+  assert.equal(publicStatus.includes(secretValue), false);
+  assert.equal(publicEnrollment.includes(secretValue), false);
+  assert.equal(publicEnrollment.includes("SECRET-NONCE"), false);
+  assert.equal(JSON.parse(publicEnrollment).enrolledFlocks[0].tokenPresent, true);
+
+  assert.throws(
+    () =>
+      assertVerifiedExecutionAuthorization({
+        action: "send_message",
+        senderIdentity: { senderVerified: false },
+        hasExplicitFlock: true,
+        flockPolicy: { flockId: "demo/team" },
+      }),
+    (err) => err.code === "SENDER_NOT_VERIFIED"
+  );
+  assert.throws(
+    () =>
+      assertVerifiedExecutionAuthorization({
+        action: "create_session",
+        senderIdentity: { senderVerified: true },
+        hasExplicitFlock: false,
+        flockPolicy: null,
+      }),
+    (err) => err.code === "EXACT_FLOCK_REQUIRED"
+  );
+  assert.doesNotThrow(() =>
+    assertVerifiedExecutionAuthorization({
+      action: "send_message",
+      senderIdentity: { senderVerified: true },
+      hasExplicitFlock: true,
+      flockPolicy: { flockId: "demo/team" },
+    })
+  );
+  assert.equal(
+    shouldGrantRemoteAllowAll({
+      senderIdentity: {
+        senderVerified: true,
+        isCrossUser: false,
+        fromGitHubUser: "demo",
+      },
+      flockPolicy: { flockId: "demo/team", trustTier: "collaborator" },
+      localGitHubUser: "demo",
+    }),
+    false
+  );
+  assert.equal(
+    shouldGrantRemoteAllowAll({
+      senderIdentity: {
+        senderVerified: true,
+        isCrossUser: false,
+        fromGitHubUser: "demo",
+      },
+      flockPolicy: { flockId: "demo", trustTier: "owner" },
+      localGitHubUser: "demo",
+    }),
+    true
+  );
+  const unpinnedKey = crypto.generateKeyPairSync("ed25519", {
+    publicKeyEncoding: { type: "spki", format: "pem" },
+    privateKeyEncoding: { type: "pkcs8", format: "pem" },
+  });
+  const unpinnedParams = {
+    flock: "demo/team",
+    targetSession: "shared",
+    message: "must not execute",
+    fromMachine: "UNPINNED-PC",
+    fromScope: "personal",
+    fromGitHubUser: "demo",
+  };
+  const unpinnedSentAt = new Date().toISOString();
+  const unpinnedAuth = signRpcRequest({
+    requestId: "req-unpinned",
+    sentAt: unpinnedSentAt,
+    fromMachine: "UNPINNED-PC",
+    toMachine: "OWNER-PC",
+    action: "send_message",
+    params: unpinnedParams,
+    identity: {
+      publicKey: unpinnedKey.publicKey,
+      privateKey: unpinnedKey.privateKey,
+      fingerprint: "unpinned",
+    },
+  });
+  assert.throws(
+    () =>
+      resolveVerifiedSenderIdentity(
+        { machineId: "OWNER-PC", githubUser: "demo", scope: "personal" },
+        {
+          requestId: "req-unpinned",
+          sentAt: unpinnedSentAt,
+          fromMachine: "UNPINNED-PC",
+          toMachine: "OWNER-PC",
+          action: "send_message",
+          params: unpinnedParams,
+          auth: unpinnedAuth,
+          registryMembers: [],
+        }
+      ),
+    (err) => err.code === "UNPINNED_PEER_KEY"
+  );
+  assert.throws(
+    () =>
+      enforceFlockPolicyAndWalls(
+        { machineId: "OWNER-PC", githubUser: "demo", scope: "personal" },
+        {
+          flockId: "demo/team",
+          trustTier: "collaborator",
+          members: [{ machineId: "AUTHORIZED-PC", githubUser: "demo", scope: "personal" }],
+        },
+        { action: "send_message", params: {} },
+        {
+          fromMachine: "OTHER-PC",
+          fromGitHubUser: "demo",
+          fromScope: "personal",
+          senderVerified: true,
+          isCrossUser: false,
+        }
+      ),
+    (err) => err.code === "FLOCK_NON_MEMBER"
+  );
+
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "flock-shared-isolation-"));
+  try {
+    const configPath = path.join(tempRoot, "flocks.json");
+    writeConfigFileSecure(
+      {
+        flocks: {
+          "demo/team-a": {
+            flockId: "demo/team-a",
+            trustTier: "collaborator",
+            sharedSessionIds: ["session-a"],
+            sharedSnapshots: {
+              "session-a": { title: "Team A", summarySnapshot: "A", sharedAt: "2026-11-14T00:00:00Z" },
+            },
+          },
+          "demo/team-b": {
+            flockId: "demo/team-b",
+            trustTier: "collaborator",
+            sharedSessionIds: ["session-b"],
+            sharedSnapshots: {
+              "session-b": { title: "Team B", summarySnapshot: "B", sharedAt: "2026-11-14T00:00:00Z" },
+            },
+          },
+          "demo/owner-team": {
+            flockId: "demo/owner-team",
+            trustTier: "owner",
+            sharedSessionIds: ["session-owner"],
+            sharedSnapshots: {
+              "session-owner": { title: "Owner Team", summarySnapshot: "Owner", sharedAt: "2026-11-14T00:00:00Z" },
+            },
+          },
+        },
+      },
+      configPath
+    );
+    const scoped = listSharedThreadsForMachine(
+      { machineId: "OWNER-PC", githubUser: "demo", scope: "personal" },
+      configPath,
+      "demo/team-a"
+    );
+    assert.equal(scoped.flockId, "demo/team-a");
+    assert.deepEqual(scoped.sharedThreads.map((thread) => thread.sessionId), ["session-a"]);
+    assert.equal(JSON.stringify(scoped).includes("team-b"), false);
+    assert.equal(JSON.stringify(scoped).includes("session-b"), false);
+    const ownerScoped = listSharedThreadsForMachine(
+      { machineId: "OWNER-PC", githubUser: "demo", scope: "personal" },
+      configPath,
+      "demo/owner-team"
+    );
+    assert.deepEqual(ownerScoped.sharedThreads.map((thread) => thread.sessionId), ["session-owner"]);
+  } finally {
+    fs.rmSync(tempRoot, { recursive: true, force: true });
+  }
+
+  const ue3Presence = classifyLayeredPresence({
+    online: true,
+    ping: { machineId: "DESKTOP-UE3B1TD", respondedAt: "2026-11-14T14:00:00Z" },
+    diagnostic: {
+      runtime: { copilotDesktopRunning: true, wsPort: 12345, copilotCliBin: null },
+      threads: {
+        coordinator: { exists: true, healthy: true, permissionMode: "allow-all" },
+        threadTracker: { exists: true, healthy: false, permissionMode: "unknown" },
+      },
+    },
+  });
+  assert.equal(ue3Presence.overallState, "degraded");
+  assert.equal(ue3Presence.presenceLayers.transport.state, "online");
+  assert.equal(ue3Presence.presenceLayers.executionSurface.state, "ready");
+  assert.equal(ue3Presence.presenceLayers.coordinator.state, "ready");
+  assert.equal(ue3Presence.presenceLayers.tracker.state, "unknown");
 });
 
 test("TODO #14: wall-clock time-skip detector triggers immediate ws.port re-discovery and presence refresh, and bridge.mjs stays byte-identical to flock.mjs", async () => {

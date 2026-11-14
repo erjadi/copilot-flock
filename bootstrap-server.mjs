@@ -535,10 +535,22 @@ function sendJson(res, statusCode, body) {
 
 export function normalizeV3Scope(rawScope, fallback = "work") {
   const s = String(rawScope || "").trim().toLowerCase();
-  if (s === "personal" || s === "private") return "personal";
-  if (s === "work") return "work";
+  if (s === "personal" || s === "work") return s;
+  if (s === "private") {
+    const err = new Error(`Obsolete machine scope "private" is not supported; use "personal" explicitly`);
+    err.code = "OBSOLETE_SCOPE";
+    err.statusCode = 400;
+    throw err;
+  }
+  if (s) {
+    const err = new Error(`Invalid machine scope "${rawScope}"; expected "personal" or "work"`);
+    err.code = "INVALID_SCOPE";
+    err.statusCode = 400;
+    throw err;
+  }
   const fb = String(fallback || "work").trim().toLowerCase();
-  return fb === "personal" || fb === "private" ? "personal" : "work";
+  if (fb === "personal" || fb === "work") return fb;
+  throw new Error(`Invalid fallback machine scope "${fallback}"`);
 }
 
 export function parseFlockAddress(targetStr, defaultOwner = null) {
@@ -570,7 +582,13 @@ export function parseFlockAddress(targetStr, defaultOwner = null) {
     };
   }
   const owner = (parts[0] || defaultOwner || "").toLowerCase();
-  const flockName = parts[1].toLowerCase() === "private" ? "personal" : parts[1].toLowerCase();
+  const flockName = parts[1].toLowerCase();
+  if (flockName === "private") {
+    const err = new Error(`Obsolete flock scope "private" is not supported; use "${owner}/personal" explicitly`);
+    err.code = "OBSOLETE_SCOPE";
+    err.statusCode = 400;
+    throw err;
+  }
   const machineId = parts.length === 3 ? parts[2] : null;
   const flockId = `${owner}/${flockName}`;
   const isBuiltInScope = flockName === "personal" || flockName === "work";
