@@ -9,13 +9,14 @@
   "files": {
     "bridge.mjs": {
       "role": "entrypoint",
-      "sha256": "9e5693a053f992cc551f0afa5151b3f78c2a99264f75913225e88d82f9357776",
+      "sha256": "a399902119c80c86744ed16567cb30cc52ee0aab83eaa388f2d49f9b87b703e9",
       "imports": [
         "./flock-broker-free.mjs",
         "./flock-lifecycle.mjs",
         "./flock-membership.mjs",
         "./flock-operations.mjs",
-        "./flock-protocol.mjs"
+        "./flock-protocol.mjs",
+        "./flock-support.mjs"
       ]
     },
     "flock-azure.mjs": {
@@ -37,7 +38,7 @@
     },
     "flock-lifecycle.mjs": {
       "role": "companion",
-      "sha256": "d31215a0ef49c0f418e1d184138754d396ff0192ad3edf852307ce6d6a984b79",
+      "sha256": "e89a433f266967625ab409ac0bfee5357466340b1fd81c8b03f01bcc5ba7b446",
       "imports": [
         "./flock-membership.mjs"
       ]
@@ -52,7 +53,7 @@
     },
     "flock-operations.mjs": {
       "role": "companion",
-      "sha256": "a43c77db954ff7143a0381b72d8c82a5826f75a26c45b2b8285604180143754c",
+      "sha256": "8c8649a54371066ae556410a744b98fbe123f0782f3864eccda5198a548a6b23",
       "imports": [
         "./flock-lifecycle.mjs"
       ]
@@ -64,17 +65,25 @@
         "./flock-lifecycle.mjs"
       ]
     },
+    "flock-support.mjs": {
+      "role": "companion",
+      "sha256": "962022c53e34f71d8d93df8f36bd71beab1df503b581f5627127673466f56266",
+      "imports": [
+        "./flock-lifecycle.mjs"
+      ]
+    },
     "flock.mjs": {
       "role": "entrypoint",
-      "sha256": "9e5693a053f992cc551f0afa5151b3f78c2a99264f75913225e88d82f9357776",
+      "sha256": "a399902119c80c86744ed16567cb30cc52ee0aab83eaa388f2d49f9b87b703e9",
       "imports": [
         "./flock-broker-free.mjs",
         "./flock-lifecycle.mjs",
         "./flock-membership.mjs",
         "./flock-operations.mjs",
-        "./flock-protocol.mjs"
+        "./flock-protocol.mjs",
+        "./flock-support.mjs"
       ]
     }
   },
-  "manifestDigest": "26ad366ee051b6dbba67e3488b5ba9f93c29bcd2fe54540de794de0fc72552ff"
+  "manifestDigest": "1f18f4f456bd4b75b46f64ddc1410d251a2efe99d1227c4dd288395f7df83a19"
 }

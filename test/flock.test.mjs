@@ -6410,6 +6410,7 @@ test("fleet runtime staging rejects omitted modules, partial copies, interrupted
         "./flock-membership.mjs",
         "./flock-operations.mjs",
         "./flock-protocol.mjs",
+        "./flock-support.mjs",
       ],
     };
     const sortedEntries = Object.keys(unpinnedManifest.files).sort().map((n) => [
@@ -6641,7 +6642,7 @@ test("fleet runtime staging rejects omitted modules, partial copies, interrupted
       gitSync: false,
       spawnInstall: false,
     });
-    assert.equal(selfUpdateRes.status, "updating");
+    assert.equal(selfUpdateRes.status, "activated");
     assert.equal(selfUpdateRes.staged.status, "promoted");
     assert.equal(selfUpdateRes.staged.version, "3.5.0-rc1");
     assert.equal(selfUpdateRes.staged.digest, v2Manifest.manifestDigest);
@@ -6905,6 +6906,13 @@ test("release voter extracts complete modular dependency closure into isolated f
       fs.mkdirSync(path.dirname(dest), { recursive: true });
       fs.writeFileSync(dest, content, "utf8");
     }
+    const packageVersion = JSON.parse(filesMap["package.json"]).version;
+    const manifest = computeRuntimeManifest(rootDir, { version: packageVersion });
+    fs.writeFileSync(
+      path.join(rootDir, RUNTIME_MANIFEST_FILENAME),
+      JSON.stringify(manifest, null, 2) + "\n",
+      "utf8"
+    );
   };
 
   try {
@@ -6950,20 +6958,26 @@ test("release voter extracts complete modular dependency closure into isolated f
     gitRun(originWorkDir, ["config", "user.email", "voter-test@example.invalid"]);
     gitRun(originWorkDir, ["config", "user.name", "Voter Test"]);
 
+    const candidateEntrypoint = [
+      'import { LIFECYCLE_STATE } from "./flock-lifecycle.mjs";',
+      'export function summarizeCandidate() { return LIFECYCLE_STATE; }',
+    ].join("\n");
     const baseModularCandidate = {
       "package.json": JSON.stringify({ name: "copilot-flock", version: "3.5.0-test", type: "module" }, null, 2),
       "flock-lifecycle.mjs": 'export const LIFECYCLE_STATE = "fresh-candidate-lifecycle";\n',
+      "flock-azure.mjs": "export const AZURE_READY = true;\n",
+      "flock-broker-free.mjs": "export const BROKER_FREE_READY = true;\n",
+      "flock-membership.mjs": "export const MEMBERSHIP_READY = true;\n",
+      "flock-operations.mjs": "export const OPERATIONS_READY = true;\n",
+      "flock-protocol.mjs": "export const PROTOCOL_READY = true;\n",
+      "flock-support.mjs": "export const SUPPORT_READY = true;\n",
       "modules/deep-helper.mjs": 'export function computeDeepTag(x) { return `deep:${x}`; }\n',
       "custom-modular-feature.mjs": [
         'import { computeDeepTag } from "./modules/deep-helper.mjs";',
         'export const FEATURE_TAG = computeDeepTag("modular-v35");',
       ].join("\n"),
-      "flock.mjs": [
-        'import { LIFECYCLE_STATE } from "./flock-lifecycle.mjs";',
-        'import { FEATURE_TAG } from "./custom-modular-feature.mjs";',
-        'export function summarizeCandidate() { return `${LIFECYCLE_STATE}|${FEATURE_TAG}`; }',
-      ].join("\n"),
-      "bridge.mjs": 'export { summarizeCandidate } from "./flock.mjs";\n',
+      "flock.mjs": candidateEntrypoint,
+      "bridge.mjs": candidateEntrypoint,
       "bootstrap-server.mjs": [
         'import { FEATURE_TAG } from "./custom-modular-feature.mjs";',
         'export const BOOTSTRAP_READY = FEATURE_TAG;',
@@ -6978,7 +6992,7 @@ test("release voter extracts complete modular dependency closure into isolated f
         'import { BOOTSTRAP_READY } from "../bootstrap-server.mjs";',
         `const hostTempRoot = ${JSON.stringify(env.tempRoot)};`,
         'test("modular candidate runs in isolated fixture without reading ~/.copilot/flock", () => {',
-        '  assert.equal(summarizeCandidate(), "fresh-candidate-lifecycle|deep:modular-v35");',
+        '  assert.equal(summarizeCandidate(), "fresh-candidate-lifecycle");',
         '  assert.equal(BOOTSTRAP_READY, "deep:modular-v35");',
         '  assert.notEqual(path.resolve(process.env.COPILOT_HOME || ""), path.resolve(hostTempRoot));',
         '  assert.equal(fs.existsSync(path.join(os.homedir(), ".copilot", "flock", "config.json")), false);',
@@ -7069,9 +7083,9 @@ test("release voter extracts complete modular dependency closure into isolated f
     gitRun(originWorkDir, ["checkout", "-b", "rc-missing-module", "main"]);
     writeTreeFiles(originWorkDir, {
       ...baseModularCandidate,
-      "flock.mjs": [
+      "bootstrap-server.mjs": [
         'import { MISSING_SYM } from "./uncommitted-missing-module.mjs";',
-        'export function summarizeCandidate() { return MISSING_SYM; }',
+        'export const BOOTSTRAP_READY = MISSING_SYM;',
       ].join("\n"),
     });
     gitRun(originWorkDir, ["add", "-A"]);
@@ -7096,8 +7110,8 @@ test("release voter extracts complete modular dependency closure into isolated f
     gitRun(originWorkDir, ["checkout", "-b", "rc-failing-preflight", "main"]);
     writeTreeFiles(originWorkDir, {
       ...baseModularCandidate,
-      "flock.mjs": [
-        baseModularCandidate["flock.mjs"],
+      "bootstrap-server.mjs": [
+        baseModularCandidate["bootstrap-server.mjs"],
         'import fs from "node:fs";',
         'fs.writeSync(1, "HEAD-STDOUT-αβγ🚀-" + "ω".repeat(900) + "-TAIL-STDOUT-END\\n");',
         'fs.writeSync(2, "HEAD-STDERR-δεζ❌-" + "λ".repeat(900) + "-TAIL-STDERR-END\\n");',
@@ -7767,6 +7781,7 @@ test("mcp_self_info tool and self-info CLI report in-memory loadTimeDigest and d
       "flock-membership.mjs",
       "flock-operations.mjs",
       "flock-protocol.mjs",
+      "flock-support.mjs",
       "flock-azure.mjs",
       "flock-broker-free.mjs",
     ];
@@ -8356,6 +8371,7 @@ test("flock_status exposes independent installedOnDisk, residentDaemon, and call
       "flock-membership.mjs",
       "flock-operations.mjs",
       "flock-protocol.mjs",
+      "flock-support.mjs",
     ]) {
       fs.copyFileSync(path.join(repoRoot, modName), path.join(flockDir, modName));
     }
@@ -10957,7 +10973,7 @@ test("NEXUS-V2 regressions: live cutover inspection safety, fs.renameSync post-C
       assert.equal(actualSha, fEntry.sha256, `Restored ${fName} must match old generation SHA-256`);
     }
 
-    // 4d. Restore failure retry matrix at callback 8 (after flock.mjs is promoted):
+    // 4d. Restore failure retry matrix after flock.mjs is promoted:
     // Injecting EACCES on restoring flock.mjs (or flock-membership.mjs) during boot #1 must NOT leave
     // new flock.mjs paired with old flock-membership.mjs, so boot #2 links ESM imports and recovers 100%!
     for (const lockedFile of ["flock.mjs", "flock-membership.mjs"]) {
@@ -10973,12 +10989,12 @@ test("NEXUS-V2 regressions: live cutover inspection safety, fs.renameSync post-C
             sourceDir: ${JSON.stringify(v2Source)},
             targetDir: ${JSON.stringify(crossTarget)},
             verifyImports: false,
-            onDuringCutover: ({ index }) => { if (index === 8) process.exit(77); },
+            onDuringCutover: ({ filename }) => { if (filename === "flock.mjs") process.exit(77); },
           });`,
         ],
         { encoding: "utf8", timeout: 15000 }
       );
-      assert.equal(crashAt8.status, 77, `Expected exit 77 at callback 8 for ${lockedFile}`);
+      assert.equal(crashAt8.status, 77, `Expected exit 77 after flock.mjs promotion for ${lockedFile}`);
 
       const preloadPath = path.join(scratchRoot, `inject-eacces-${lockedFile}.mjs`);
       fs.writeFileSync(

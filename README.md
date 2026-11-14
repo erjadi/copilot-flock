@@ -4,6 +4,16 @@ Licensed under [Apache-2.0](./LICENSE). Copyright 2026 Eric Jadi.
 Viewer preview data, hostnames, network addresses and governance examples are
 synthetic, not captured conversations or real signed release evidence.
 
+**3.6 candidate, not yet released or deployed:** Milestones 1-4 add guarded
+enrollment and operations, schema-36 capability negotiation, phased runtime
+updates with rollback/error journals, compact diagnostics, and a separate
+text-only newcomer support quarantine. The support capability grants no flock,
+SignalR, Service Bus, roster, presence, session, repository, file, config,
+command, queue, enrollment, key-rotation, or autopilot authority. Exact-candidate
+tests, live Azure isolation, fleet canary qualification, and the required
+all-online release vote remain outstanding. See
+[3.6 candidate release notes](./docs/RELEASE_NOTES_3_6_CANDIDATE.md).
+
 **3.4.1 candidate, not yet released:** Linux `systemd --user` activation generates
 `KillMode=process` units, supervises daemon-spawned children in outside-cgroup
 transient scopes when available, signals only the creation-pinned daemon PID

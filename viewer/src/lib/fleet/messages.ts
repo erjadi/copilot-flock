@@ -11,8 +11,8 @@ export function parseMessage(raw: string): ParsedMessage {
   if (remote) {
     origin.machine = remote[1];
     origin.user = remote[2].match(/\(@([^)]*)\)/)?.[1];
-    const scope = remote[2].match(/\((personal|private|work)\)/i)?.[1]?.toLowerCase();
-    origin.scope = scope === "private" ? "personal" : scope;
+    const scope = remote[2].match(/\((personal|work)\)/i)?.[1]?.toLowerCase();
+    origin.scope = scope;
     origin.thread = remote[2].match(/\/\s*(.+)$/)?.[1]?.trim();
     metadata.push(remote[0].trim());
     body = body.slice(remote[0].length);
@@ -51,7 +51,12 @@ function setOrigin(origin: RemoteOrigin, key: string, value: string) {
   if (k === "trust_level") { origin.trustLevel = value; return; }
   const fields: Record<string, "machine" | "scope" | "user" | "thread"> = { from_machine: "machine", from_scope: "scope", from_github_user: "user", from_display_name: "thread", from_session_id: "thread", from_session: "thread" };
   const field = fields[k];
-  if (field && (!origin[field] || k === "from_display_name")) origin[field] = field === "scope" && value.toLowerCase() === "private" ? "personal" : value;
+  if (field && (!origin[field] || k === "from_display_name")) {
+    if (field === "scope" && value.toLowerCase() === "private") {
+      throw new Error("Obsolete scope 'private'; migrate the sender to 'personal'");
+    }
+    origin[field] = value;
+  }
 }
 
 /** Ignore heading-like text inside code fences; only reports with multiple numbered sections fold. */

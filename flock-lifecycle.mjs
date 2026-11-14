@@ -20,6 +20,7 @@ export const REQUIRED_COMPANION_MODULES = Object.freeze([
   "flock-protocol.mjs",
   "flock-azure.mjs",
   "flock-broker-free.mjs",
+  "flock-support.mjs",
 ]);
 export const REQUIRED_RUNTIME_MODULES = Object.freeze([
   ...REQUIRED_RUNTIME_ENTRYPOINTS,
@@ -27,6 +28,7 @@ export const REQUIRED_RUNTIME_MODULES = Object.freeze([
 ]);
 const runtimeFiles = [
   "flock.mjs", "bridge.mjs", "flock-lifecycle.mjs", "flock-operations.mjs", "flock-membership.mjs", "flock-registry.mjs",
+  "flock-support.mjs",
   "config.json", "identity.json", "flocks.json", "flock-registry.json", "state.json", "daemon.pid",
   "daemon-identity.json", "daemon.log", "inbox.jsonl", "outbox.jsonl", "locks.json",
   "cli-sessions.json", "operations.json", "cli-leases.json", "flock-credentials.json",
@@ -168,21 +170,63 @@ export function inspectProcess(pid, platform = process.platform) {
   }
 }
 
+export function parseWindowsCommandLine(commandLine) {
+  const input = String(commandLine || "");
+  const argv = [];
+  let arg = "";
+  let quoted = false;
+  let backslashes = 0;
+  let started = false;
+  for (let i = 0; i <= input.length; i++) {
+    const ch = i < input.length ? input[i] : " ";
+    if (ch === "\\") {
+      backslashes++;
+      started = true;
+      continue;
+    }
+    if (ch === '"') {
+      arg += "\\".repeat(Math.floor(backslashes / 2));
+      if (backslashes % 2 === 0) quoted = !quoted;
+      else arg += '"';
+      backslashes = 0;
+      started = true;
+      continue;
+    }
+    if (backslashes) {
+      arg += "\\".repeat(backslashes);
+      backslashes = 0;
+    }
+    if (!quoted && /\s/.test(ch)) {
+      if (started) {
+        argv.push(arg);
+        arg = "";
+        started = false;
+      }
+      continue;
+    }
+    arg += ch;
+    started = true;
+  }
+  return argv;
+}
+
 export function pinDaemonIdentity(root, script, inspect = inspectProcess) {
   const identity = inspect(process.pid);
   if (!identity?.start) throw new Error("Cannot pin daemon process creation identity");
   atomicJson(path.join(root, "daemon-identity.json"), { ...identity, script: path.resolve(script) });
 }
 
-function commandIsDaemon(identity, scripts) {
-  if (identity.argv) return identity.argv.length === 3 &&
-    scripts.includes(path.resolve(identity.argv[1])) && identity.argv[2] === "daemon";
-  return scripts.some((script) => [
-    `"${identity.executable}" "${script}" daemon`,
-    `"${identity.executable}" ${script} daemon`,
-    `${identity.executable} "${script}" daemon`,
-    `${identity.executable} ${script} daemon`,
-  ].includes(identity.command));
+export function commandIsDaemon(identity, scripts) {
+  const argv = identity?.argv || parseWindowsCommandLine(identity?.command);
+  if (!Array.isArray(argv) || argv.length !== 3 || argv[2] !== "daemon") return false;
+  const executable = path.resolve(argv[0]);
+  const expectedExecutable = path.resolve(identity?.executable || argv[0]);
+  if (process.platform === "win32") {
+    if (executable.toLowerCase() !== expectedExecutable.toLowerCase()) return false;
+    return scripts.some((script) => path.resolve(argv[1]).toLowerCase() === path.resolve(script).toLowerCase());
+  }
+  if (executable !== expectedExecutable) return false;
+  return scripts.includes(path.resolve(argv[1]));
 }
 
 export function inspectLinuxUnifiedCgroup(pid, {
@@ -1751,11 +1795,13 @@ export function loadRuntimeManifest(dir, options = {}) {
 const EMBEDDED_RUNTIME_MANIFEST_FALLBACK = (() => {
   let selfSha = "0".repeat(64);
   let operationsSha = "0".repeat(64);
+  let supportSha = "0".repeat(64);
   try {
     selfSha = hashRuntimeModule(fs.readFileSync(fileURLToPath(import.meta.url)));
     operationsSha = hashRuntimeModule(fs.readFileSync(path.join(__lifecycleDir, "flock-operations.mjs")));
+    supportSha = hashRuntimeModule(fs.readFileSync(path.join(__lifecycleDir, "flock-support.mjs")));
   } catch {}
-  const entrypointSha = "9e5693a053f992cc551f0afa5151b3f78c2a99264f75913225e88d82f9357776";
+  const entrypointSha = "a399902119c80c86744ed16567cb30cc52ee0aab83eaa388f2d49f9b87b703e9";
   const fallback = {
     type: "copilot-flock-runtime-manifest-v1",
     schema: 1,
@@ -1771,6 +1817,7 @@ const EMBEDDED_RUNTIME_MANIFEST_FALLBACK = (() => {
           "./flock-membership.mjs",
           "./flock-operations.mjs",
           "./flock-protocol.mjs",
+          "./flock-support.mjs",
         ],
       },
       "flock-azure.mjs": {
@@ -1811,6 +1858,11 @@ const EMBEDDED_RUNTIME_MANIFEST_FALLBACK = (() => {
         sha256: "75f2ddd34f0c67bb2f5aa9974ac88fc5e81531da6e6a46b50308fe94c2c89f87",
         imports: ["./flock-lifecycle.mjs"],
       },
+      "flock-support.mjs": {
+        role: "companion",
+        sha256: supportSha,
+        imports: ["./flock-lifecycle.mjs"],
+      },
       "flock.mjs": {
         role: "entrypoint",
         sha256: entrypointSha,
@@ -1820,6 +1872,7 @@ const EMBEDDED_RUNTIME_MANIFEST_FALLBACK = (() => {
           "./flock-membership.mjs",
           "./flock-operations.mjs",
           "./flock-protocol.mjs",
+          "./flock-support.mjs",
         ],
       },
     },
@@ -2126,13 +2179,13 @@ export function readRuntimeState(targetDir) {
   const statePath = path.join(resolvedTarget, RUNTIME_STATE_FILENAME);
   assertNoLinks(statePath);
   if (!fs.existsSync(statePath)) {
-    return { type: "copilot-flock-runtime-state-v1", staged: null, installed: null, verified: null };
+    return { type: "copilot-flock-runtime-state-v1", update: null, staged: null, installed: null, verified: null };
   }
   try {
     const parsed = JSON.parse(fs.readFileSync(statePath, "utf8"));
     if (parsed && parsed.type === "copilot-flock-runtime-state-v1") return parsed;
   } catch {}
-  return { type: "copilot-flock-runtime-state-v1", staged: null, installed: null, verified: null };
+  return { type: "copilot-flock-runtime-state-v1", update: null, staged: null, installed: null, verified: null };
 }
 
 function updateRuntimeState(targetDir, patch) {
@@ -2141,6 +2194,7 @@ function updateRuntimeState(targetDir, patch) {
   const current = readRuntimeState(resolvedTarget);
   const next = {
     type: "copilot-flock-runtime-state-v1",
+    update: patch.update !== undefined ? patch.update : current.update || null,
     staged: patch.staged !== undefined ? patch.staged : current.staged,
     installed: patch.installed !== undefined ? patch.installed : current.installed,
     verified: patch.verified !== undefined ? patch.verified : current.verified,
@@ -2148,6 +2202,53 @@ function updateRuntimeState(targetDir, patch) {
   };
   atomicJson(path.join(resolvedTarget, RUNTIME_STATE_FILENAME), next);
   return next;
+}
+
+function redactRuntimeError(error) {
+  return String(error?.message || error || "")
+    .replace(/-----BEGIN [^-]+ PRIVATE KEY-----[\s\S]*?-----END [^-]+ PRIVATE KEY-----/gi, "[REDACTED PRIVATE KEY]")
+    .replace(/\b(?:gh[opsu]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,})\b/g, "[REDACTED TOKEN]")
+    .replace(/\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/g, "[REDACTED JWT]")
+    .replace(/\b(AccessKey|SharedAccessKey|SharedAccessSignature|sig)=([^;\s&]+)/gi, "$1=[REDACTED]")
+    .slice(0, 4096);
+}
+
+export function recordRuntimeUpdatePhase(targetDir, {
+  updateId,
+  correlationId = updateId,
+  phase,
+  error = null,
+  code = null,
+  manifestDigest = null,
+  version = null,
+  reason = null,
+} = {}) {
+  if (!updateId || !phase) throw new Error("Runtime update phase requires updateId and phase");
+  const current = readRuntimeState(targetDir);
+  const now = new Date().toISOString();
+  const previous = current.update?.updateId === updateId ? current.update : null;
+  const entry = {
+    updateId,
+    correlationId: correlationId || updateId,
+    phase,
+    version: version ?? previous?.version ?? null,
+    manifestDigest: manifestDigest ?? previous?.manifestDigest ?? null,
+    reason: reason ?? previous?.reason ?? null,
+    error: error ? redactRuntimeError(error) : null,
+    code: code || null,
+    updatedAt: now,
+    history: [
+      ...(previous?.history || []),
+      {
+        phase,
+        at: now,
+        ...(code ? { code } : {}),
+        ...(error ? { error: redactRuntimeError(error) } : {}),
+      },
+    ].slice(-24),
+  };
+  updateRuntimeState(targetDir, { update: entry });
+  return entry;
 }
 
 const activeCutoverTargets = new Set();
@@ -2225,6 +2326,7 @@ export function recoverInterruptedRuntimeCutover(targetDir, { force = false } = 
     "runtime-manifest.json",
     "flock-registry.mjs",
     "flock-broker-free.mjs",
+    "flock-support.mjs",
     "flock-operations.mjs",
     "flock-protocol.mjs",
     "flock-lifecycle.mjs",
@@ -2586,7 +2688,7 @@ export function inspectRuntimeGenerations(targetDir, { resident = null } = {}) {
     verifiedAt: closureVerified && importVerified ? (persistedVerified?.verifiedAt || null) : null,
   };
 
-  return { staged, installed, resident: normalizedResident, verified };
+  return { update: persisted.update || null, staged, installed, resident: normalizedResident, verified };
 }
 
 export async function inspectRuntimeGenerationsAsync(targetDir, { resident = null } = {}) {
@@ -2857,7 +2959,7 @@ export async function inspectRuntimeGenerationsAsync(targetDir, { resident = nul
     verifiedAt: closureVerified && importVerified ? (persistedVerified?.verifiedAt || null) : null,
   };
 
-  return { staged, installed, resident: normalizedResident, verified };
+  return { update: persisted.update || null, staged, installed, resident: normalizedResident, verified };
 }
 
 export function stageRuntimeRelease({
@@ -2870,6 +2972,8 @@ export function stageRuntimeRelease({
   onBeforeStageFile = null,
   onAfterStageFile = null,
   keepStageOnFailure = false,
+  updateId = crypto.randomUUID(),
+  correlationId = updateId,
 } = {}) {
   const resolvedSource = assertNoLinks(sourceDir);
   const resolvedTarget = assertNoLinks(targetDir);
@@ -2888,6 +2992,15 @@ export function stageRuntimeRelease({
   const recordStageFailure = (err, candidateManifest) => {
     if (!targetExistedBefore && fs.readdirSync(resolvedTarget).length === 0) return;
     try {
+      recordRuntimeUpdatePhase(resolvedTarget, {
+        updateId,
+        correlationId,
+        phase: "failed",
+        error: err,
+        code: err.code || "RUNTIME_STAGE_FAILED",
+        version: candidateManifest?.version || null,
+        manifestDigest: candidateManifest?.manifestDigest || null,
+      });
       updateRuntimeState(resolvedTarget, {
         staged: {
           status: "failed",
@@ -2974,12 +3087,21 @@ export function stageRuntimeRelease({
       updatedAt: new Date().toISOString(),
     };
     updateRuntimeState(resolvedTarget, { staged: stagedState });
+    recordRuntimeUpdatePhase(resolvedTarget, {
+      updateId,
+      correlationId,
+      phase: "staged",
+      version: resolvedManifest.version,
+      manifestDigest: resolvedManifest.manifestDigest,
+    });
 
     return {
       ok: true,
       stageDir,
       manifest: resolvedManifest,
       verification,
+      updateId,
+      correlationId,
       staged: stagedState,
       cleanup: () => cleanupDirectorySafe(stageDir),
     };
@@ -3000,6 +3122,8 @@ export function activateStagedRuntime({
   onDuringBackup = null,
   onDuringCutover = null,
   resident = null,
+  updateId = null,
+  correlationId = null,
 } = {}) {
   const resolvedStage = assertNoLinks(stageDir);
   const resolvedTarget = assertNoLinks(targetDir);
@@ -3014,6 +3138,8 @@ export function activateStagedRuntime({
   }
 
   const resolvedManifest = manifest ? validateRuntimeManifest(manifest) : loadRuntimeManifest(resolvedStage);
+  const effectiveUpdateId = updateId || readRuntimeState(resolvedTarget).update?.updateId || crypto.randomUUID();
+  const effectiveCorrelationId = correlationId || readRuntimeState(resolvedTarget).update?.correlationId || effectiveUpdateId;
 
   if (verifyBeforeCutover) {
     // Re-verify exact SHA-256 digests and manifest integrity in stageDir immediately before cutover
@@ -3185,13 +3311,27 @@ export function activateStagedRuntime({
         activatedAt: nowIso,
       },
       verified: {
-        status: "verified",
+        status: "activated",
         version: resolvedManifest.version,
         manifestDigest: resolvedManifest.manifestDigest,
         closureVerified: true,
         importVerified: importWasVerified,
         verifiedAt: nowIso,
       },
+    });
+    recordRuntimeUpdatePhase(resolvedTarget, {
+      updateId: effectiveUpdateId,
+      correlationId: effectiveCorrelationId,
+      phase: "installed",
+      version: resolvedManifest.version,
+      manifestDigest: resolvedManifest.manifestDigest,
+    });
+    recordRuntimeUpdatePhase(resolvedTarget, {
+      updateId: effectiveUpdateId,
+      correlationId: effectiveCorrelationId,
+      phase: "activated",
+      version: resolvedManifest.version,
+      manifestDigest: resolvedManifest.manifestDigest,
     });
     if (fs.existsSync(journalPath)) {
       fs.unlinkSync(assertNoLinks(journalPath));
@@ -3242,6 +3382,15 @@ export function activateStagedRuntime({
       } catch {}
     }
     try {
+      recordRuntimeUpdatePhase(resolvedTarget, {
+        updateId: effectiveUpdateId,
+        correlationId: effectiveCorrelationId,
+        phase: rollbackIncomplete ? "failed" : "rolled_back",
+        error: err,
+        code: rollbackIncomplete ? "RUNTIME_CUTOVER_RECOVERY_FAILED" : err.code || "RUNTIME_CUTOVER_FAILED",
+        version: resolvedManifest.version,
+        manifestDigest: resolvedManifest.manifestDigest,
+      });
       updateRuntimeState(resolvedTarget, {
         staged: {
           status: "failed",
@@ -3295,6 +3444,8 @@ export function stageAndActivateRuntime({
   onDuringBackup = null,
   onDuringCutover = null,
   resident = null,
+  updateId = crypto.randomUUID(),
+  correlationId = updateId,
 } = {}) {
   const stagedResult = stageRuntimeRelease({
     sourceDir,
@@ -3305,6 +3456,8 @@ export function stageAndActivateRuntime({
     runImportCheck,
     onBeforeStageFile,
     onAfterStageFile,
+    updateId,
+    correlationId,
   });
 
   if (!activate) {
@@ -3327,6 +3480,8 @@ export function stageAndActivateRuntime({
     onDuringBackup,
     onDuringCutover,
     resident,
+    updateId,
+    correlationId,
   });
 }
 

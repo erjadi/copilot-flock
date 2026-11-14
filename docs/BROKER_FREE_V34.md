@@ -1,5 +1,11 @@
 # Broker-free 3.4.0
 
+> **3.6 candidate note:** Current source adds schema-36 capability negotiation,
+> phased update journals, compact diagnostics, and an isolated
+> `SupportCapabilityV1` newcomer mailbox. These additions are not release
+> evidence and do not widen membership or transport authority. See
+> [the 3.6 candidate notes](./RELEASE_NOTES_3_6_CANDIDATE.md).
+
 This source does not by itself establish a released or production-validated
 deployment. Existing installations are not migrated. Exact-commit live Azure
 isolation tests, immutable implementation review and the all-online-member

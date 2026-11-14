@@ -52,6 +52,9 @@ import {
   stageRuntimeRelease,
   activateStagedRuntime,
   stageAndActivateRuntime,
+  recordRuntimeUpdatePhase,
+  parseWindowsCommandLine,
+  commandIsDaemon,
 } from "./flock-lifecycle.mjs";
 import {
   isSyntheticBuiltInFlock,
@@ -75,6 +78,7 @@ import {
   PresenceStateTracker,
   compactOperation,
 } from "./flock-operations.mjs";
+import { SupportMailbox, ensureSupportDeviceKey } from "./flock-support.mjs";
 
 export {
   FlockMembershipRegistry,
@@ -110,6 +114,9 @@ export {
   stageRuntimeRelease,
   activateStagedRuntime,
   stageAndActivateRuntime,
+  recordRuntimeUpdatePhase,
+  parseWindowsCommandLine,
+  commandIsDaemon,
 };
 
 if (typeof dns.setDefaultResultOrder === "function") {
@@ -190,6 +197,15 @@ function copyRuntimeModules(sourceDirectory, destinationDirectory, installedEntr
 }
 
 export const BRIDGE_VERSION = "3.6.0";
+export const FLOCK_PROTOCOL_VERSION = 36;
+export const FLOCK_CAPABILITIES = Object.freeze({
+  brokerFreeOperations: true,
+  operationQueryCancel: true,
+  phasedRuntimeUpdate: true,
+  quarantinedSupportMailbox: true,
+  compactDiagnostics: true,
+  canonicalScopes: ["personal", "work"],
+});
 
 function buildInProcessResidentRuntime() {
   const digest = RUNTIME_MODULE_MANIFEST?.manifestDigest || null;
@@ -198,6 +214,8 @@ function buildInProcessResidentRuntime() {
     running: true,
     pid: process.pid,
     version: BRIDGE_VERSION,
+    protocolVersion: FLOCK_PROTOCOL_VERSION,
+    capabilities: FLOCK_CAPABILITIES,
     digest,
     manifestDigest: digest,
     startedAt: PROCESS_STARTED_AT,
@@ -4997,7 +5015,24 @@ function projectPublicDaemonStatus(daemon) {
   return out;
 }
 
-export function projectPublicStatusResponse(result) {
+function boundedPage(items, { cursor = 0, limit = 20, full = false } = {}) {
+  const all = Array.isArray(items) ? items : [];
+  if (full) return { items: all, page: { cursor: 0, nextCursor: null, total: all.length, full: true } };
+  const offset = Math.max(0, Number(cursor) || 0);
+  const size = Math.min(100, Math.max(1, Number(limit) || 20));
+  const pageItems = all.slice(offset, offset + size);
+  return {
+    items: pageItems,
+    page: {
+      cursor: offset,
+      nextCursor: offset + pageItems.length < all.length ? offset + pageItems.length : null,
+      total: all.length,
+      full: false,
+    },
+  };
+}
+
+export function projectPublicStatusResponse(result, options = {}) {
   const out = {};
   for (const key of [
     "status", "passive", "localMachineId", "machineId", "protocol", "flockId",
@@ -5019,16 +5054,36 @@ export function projectPublicStatusResponse(result) {
   if (result?.daemon !== undefined) out.daemon = projectPublicDaemonStatus(result.daemon);
   if (result?.specs) out.specs = projectPublicSpecs(result.specs);
   if (Array.isArray(result?.onlineMachines)) {
-    out.onlineMachines = result.onlineMachines.map(projectPublicOnlineMachine).filter(Boolean);
+    const page = boundedPage(result.onlineMachines, {
+      cursor: options.cursor,
+      limit: options.limit,
+      full: options.full === true || options.detail === "full",
+    });
+    out.onlineMachines = page.items.map(projectPublicOnlineMachine).filter(Boolean);
+    out.onlineMachinesPage = page.page;
   }
   if (Array.isArray(result?.knownMembers)) {
-    out.knownMembers = result.knownMembers.map(projectPublicMember).filter(Boolean);
+    const page = boundedPage(result.knownMembers, {
+      cursor: options.cursor,
+      limit: options.limit,
+      full: options.full === true || options.detail === "full",
+    });
+    out.knownMembers = page.items.map(projectPublicMember).filter(Boolean);
+    out.knownMembersPage = page.page;
   }
   if (Array.isArray(result?.offlineMembers)) {
-    out.offlineMembers = result.offlineMembers.map(projectPublicMember).filter(Boolean);
+    out.offlineMembers = boundedPage(result.offlineMembers, {
+      cursor: options.cursor,
+      limit: options.limit,
+      full: options.full === true || options.detail === "full",
+    }).items.map(projectPublicMember).filter(Boolean);
   }
   if (Array.isArray(result?.flocks)) {
-    out.flocks = result.flocks.map(projectPublicFlockRecord).filter(Boolean);
+    out.flocks = boundedPage(result.flocks, {
+      cursor: options.cursor,
+      limit: options.limit,
+      full: options.full === true || options.detail === "full",
+    }).items.map(projectPublicFlockRecord).filter(Boolean);
   }
   if (result?.roster) out.roster = projectPublicRoster(result.roster);
   return out;
@@ -5161,15 +5216,20 @@ function projectPublicRoster(roster) {
   return out;
 }
 
-export function projectPublicFlocksResponse(result) {
+export function projectPublicFlocksResponse(result, options = {}) {
+  const full = options.full === true || options.detail === "full";
+  const flockPage = boundedPage(result.flocks || [], { cursor: options.cursor, limit: options.limit, full });
+  const memberPage = boundedPage(result.knownMembers || [], { cursor: options.cursor, limit: options.limit, full });
   const projected = {
     machineId: result.machineId,
     protocol: result.protocol,
     canonicalAddress: result.canonicalAddress,
     scope: result.scope,
     effectiveOwner: result.effectiveOwner,
-    flocks: (result.flocks || []).map(projectPublicFlockRecord).filter(Boolean),
-    knownMembers: (result.knownMembers || []).map(projectPublicMember).filter(Boolean),
+    flocks: flockPage.items.map(projectPublicFlockRecord).filter(Boolean),
+    flocksPage: flockPage.page,
+    knownMembers: memberPage.items.map(projectPublicMember).filter(Boolean),
+    knownMembersPage: memberPage.page,
     roster: projectPublicRoster(result.roster),
   };
   if (Array.isArray(result.localFlocks)) {
@@ -11425,6 +11485,8 @@ export async function handleRpcAction(cfg, req) {
       machineId: cfg.machineId,
       canonicalAddress: `${(githubUser || "unknown").toLowerCase()}/${normalizeScope(cfg.scope, "work")}/${cfg.machineId}`,
       version: BRIDGE_VERSION,
+      protocolVersion: FLOCK_PROTOCOL_VERSION,
+      capabilities: FLOCK_CAPABILITIES,
       manifestDigest: RUNTIME_MODULE_MANIFEST?.manifestDigest || null,
       runtimeStates,
       staged: runtimeStates.staged,
@@ -13242,6 +13304,46 @@ export async function ensureDaemonStarted(cfg) {
 const MCP_TOOLS = [
   { name: "join_request", description: "Generate a device-bound Join Code locally; no bearer invitation or enrollment occurs.",
     inputSchema: { type: "object", properties: {} } },
+  { name: "create_support_device_key", description: "Create or read the isolated support-only device key used before normal enrollment.",
+    inputSchema: { type: "object", properties: {} } },
+  { name: "issue_support_ticket", description: "Issue a signed, short-lived, single-use support-only ticket bound to a supplied support device public key.",
+    inputSchema: { type: "object", properties: {
+      flock: { type: "string" }, support_public_key: { type: "string" },
+      ttl_seconds: { type: "number" },
+    }, required: ["flock", "support_public_key"] } },
+  { name: "revoke_support_ticket", description: "Revoke an unredeemed support ticket issued by this maintainer device.",
+    inputSchema: { type: "object", properties: { ticket_id: { type: "string" } }, required: ["ticket_id"] } },
+  { name: "submit_support_report", description: "Redeem one support ticket and submit bounded text plus schema-validated inert diagnostics. This grants no membership or execution rights.",
+    inputSchema: { type: "object", properties: {
+      ticket: { type: "object" }, text: { type: "string", maxLength: 4096 },
+      diagnostics: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          artifact: { type: "string", maxLength: 1024 },
+          protocol: { type: "string", maxLength: 1024 },
+          platform: { type: "string", maxLength: 1024 },
+          stage: { type: "string", maxLength: 1024 },
+          error: { type: "string", maxLength: 1024 },
+          correlation: { type: "string", maxLength: 1024 },
+          clock: { type: "string", maxLength: 1024 },
+          fingerprint: { type: "string", maxLength: 1024 },
+          rosterEpoch: { type: "integer", minimum: 0 },
+        },
+      },
+    }, required: ["ticket", "text"] } },
+  { name: "list_support_attempts", description: "List quarantined support attempts issued by this maintainer device with cursor pagination.",
+    inputSchema: { type: "object", properties: {
+      cursor: { type: "number" }, limit: { type: "number" }, include_closed: { type: "boolean" },
+    } } },
+  { name: "read_support_attempt", description: "Read inert support report data for an attempt issued by this maintainer device.",
+    inputSchema: { type: "object", properties: { attempt_id: { type: "string" } }, required: ["attempt_id"] } },
+  { name: "reply_support_attempt", description: "Append a bounded maintainer text reply to a quarantined support attempt.",
+    inputSchema: { type: "object", properties: {
+      attempt_id: { type: "string" }, text: { type: "string" },
+    }, required: ["attempt_id", "text"] } },
+  { name: "close_support_attempt", description: "Close a quarantined support attempt without enrolling or promoting the ticket holder.",
+    inputSchema: { type: "object", properties: { attempt_id: { type: "string" } }, required: ["attempt_id"] } },
   { name: "approve_join", description: "Designated owner approves independently verified device keys and seals a scoped Welcome Ticket.",
     inputSchema: { type: "object", properties: { flock: { type: "string" }, join_code: { type: "object" },
       device_fingerprint: { type: "string" }, role: { type: "string", enum: ["collaborator", "guest"] },
@@ -13624,7 +13726,7 @@ const MCP_TOOLS = [
   {
     name: "diagnose_bridge_fleet",
     description:
-      "Diagnose (and optionally auto-repair with fix=true) the bridge state of one or all enrolled machines: checks bridge version, single daemon instance, boot persistence, and verifies that both required coordinator threads ('Copilot SignalR Bridge Coordinator' and 'Copilot SignalR Thread Tracker') exist and have mode='autopilot' and permission_mode='allow-all'.",
+      "Diagnose the Copilot Flock runtime, protocol/capability compatibility, daemon lifecycle, boot persistence, and required Copilot Flock Coordinator and Thread Tracker surfaces. Optional repair never downgrades security.",
     inputSchema: {
       type: "object",
       properties: {
@@ -14189,6 +14291,31 @@ for (const tool of MCP_TOOLS) {
       "Explicit <owner>/<flock> membership selector (validated first when supplied). Required for multi-flock broker-free calls unless an explicit to_machine has a single active, non-expired authorized route.",
   };
 }
+for (const name of ["flock_status", "bridge_status", "list_flocks", "list_flock_members", "diagnose_bridge_fleet"]) {
+  const tool = MCP_TOOLS.find((entry) => entry.name === name);
+  if (!tool) continue;
+  tool.inputSchema.properties.detail ||= {
+    type: "string",
+    enum: ["summary", "full"],
+    description: "Response detail level. Defaults to bounded summary.",
+  };
+  tool.inputSchema.properties.cursor ||= {
+    type: "number",
+    description: "Zero-based cursor for bounded list data.",
+  };
+  tool.inputSchema.properties.limit ||= {
+    type: "number",
+    description: "Page size, capped at 100.",
+  };
+}
+for (const name of [
+  "create_support_device_key", "issue_support_ticket", "revoke_support_ticket",
+  "submit_support_report", "list_support_attempts", "read_support_attempt",
+  "reply_support_attempt", "close_support_attempt",
+]) {
+  const tool = MCP_TOOLS.find((entry) => entry.name === name);
+  if (tool) tool.inputSchema.additionalProperties = false;
+}
 Object.assign(MCP_TOOLS.find((tool) => tool.name === "kick_flock_member").inputSchema.properties, {
   peer_id: { type: "string", description: "Exact signed device fingerprint; conjunctive with machine_id when both are supplied." },
   operation_id: { type: "string", description: "Stable operation ID for retrying an interrupted owner rotation." },
@@ -14216,6 +14343,110 @@ export async function executeMcpTool(cfg, name, args = {}, options = {}) {
     if (cfg.protocol !== "broker-free-v34") throw new Error("Legacy enrollment is unchanged; generate broker-free Join Codes in a separately configured installation");
     return (options.brokerFreeRuntimeFactory || brokerFreeRuntime)(cfg, options.runtimeOptions || {})
       .joinRequest({ machineId: cfg.machineId, scope: cfg.scope, flockId: args.flock });
+  }
+  if (name.startsWith("support_") || [
+    "create_support_device_key", "issue_support_ticket", "revoke_support_ticket",
+    "submit_support_report", "list_support_attempts", "read_support_attempt",
+    "reply_support_attempt", "close_support_attempt",
+  ].includes(name)) {
+    const supportRoot = path.resolve(
+      options.supportRoot || path.join(getBridgeHome(), ".data", "support-quarantine")
+    );
+    const mailbox = new SupportMailbox(path.join(supportRoot, "mailbox"), options.supportOptions || {});
+    const maintainerKey = () => {
+      const identity = readMachineIdentityKeypairPassive() || ensureMachineIdentityKeypair();
+      return {
+        ...identity,
+        deviceId: cfg?.identity?.deviceId || cfg?.deviceId || cfg?.machineId || identity.fingerprint,
+      };
+    };
+    const assertMaintainer = (flockSelector = null) => {
+      if (options.supportMaintainerAuthorized === true) return;
+      if (cfg?.protocol === "broker-free-v34") {
+        const runtime = (options.brokerFreeRuntimeFactory || brokerFreeRuntime)(cfg, options.runtimeOptions || {});
+        runtime.assertOwner(runtime.select(flockSelector || cfg?.flockId));
+        return;
+      }
+      const selected = authorizeCallerFlockSelection(cfg, flockSelector || cfg?.flockId);
+      const policy = loadLocalFlocksConfig(cfg).flocks?.[selected.canonicalPath];
+      const caller = normalizeGitHubUser(cfg?.githubUser)?.toLowerCase();
+      if (!caller || normalizeGitHubUser(policy?.ownerGitHubUser)?.toLowerCase() !== caller) {
+        const error = new Error("Support mailbox maintainer access requires verified flock owner authority");
+        error.code = "SUPPORT_MAINTAINER_REQUIRED";
+        error.statusCode = 403;
+        throw error;
+      }
+    };
+    if (name === "create_support_device_key") {
+      const key = ensureSupportDeviceKey(path.join(supportRoot, "device"));
+      return {
+        identity: "ticket_holder",
+        deviceId: key.deviceId,
+        fingerprint: key.fingerprint,
+        publicKey: key.publicKey,
+        authority: "support_only",
+      };
+    }
+    if (name === "issue_support_ticket") {
+      assertMaintainer(args.flock);
+      return mailbox.issue({
+        maintainerIdentity: maintainerKey(),
+        flockId: args.flock,
+        supportPublicKey: args.support_public_key,
+        ttlSeconds: args.ttl_seconds,
+      });
+    }
+    if (name === "revoke_support_ticket") {
+      assertMaintainer(args.flock);
+      return mailbox.revoke({
+        ticketId: args.ticket_id,
+        maintainerDeviceId: maintainerKey().deviceId,
+      });
+    }
+    if (name === "submit_support_report") {
+      const key = ensureSupportDeviceKey(path.join(supportRoot, "device"));
+      const report = {
+        text: args.text,
+        diagnostics: args.diagnostics || {},
+        submittedAt: new Date().toISOString(),
+      };
+      const signature = crypto.sign(null, Buffer.from(JSON.stringify({
+        ticketId: args.ticket?.body?.ticketId,
+        nonce: args.ticket?.body?.nonce,
+        report,
+      })), key.privateKey).toString("base64");
+      return mailbox.submit({
+        ticket: args.ticket,
+        supportPublicKey: key.publicKey,
+        report,
+        signature,
+      });
+    }
+    if (name === "list_support_attempts") {
+      assertMaintainer(args.flock);
+      return mailbox.list({
+        maintainerDeviceId: maintainerKey().deviceId,
+        cursor: args.cursor,
+        limit: args.limit,
+        includeClosed: Boolean(args.include_closed),
+      });
+    }
+    if (name === "read_support_attempt") {
+      assertMaintainer(args.flock);
+      return mailbox.get({ attemptId: args.attempt_id, maintainerDeviceId: maintainerKey().deviceId });
+    }
+    if (name === "reply_support_attempt") {
+      assertMaintainer(args.flock);
+      return mailbox.reply({
+        attemptId: args.attempt_id,
+        maintainerDeviceId: maintainerKey().deviceId,
+        text: args.text,
+      });
+    }
+    if (name === "close_support_attempt") {
+      assertMaintainer(args.flock);
+      return mailbox.close({ attemptId: args.attempt_id, maintainerDeviceId: maintainerKey().deviceId });
+    }
   }
   if (cfg.protocol === "broker-free-v34") {
     const hasExplicitFlock = Object.prototype.hasOwnProperty.call(args, "flock") && args.flock !== undefined && args.flock !== null;
@@ -14316,6 +14547,7 @@ export async function executeMcpTool(cfg, name, args = {}, options = {}) {
     }
     const supported = new Set(["flock_status", "bridge_status", "list_remote_machines", "list_remote_sessions",
       "get_remote_session_transcript", "send_remote_session_message", "broadcast_remote_session_message",
+      "get_remote_operation", "cancel_remote_operation",
       "share_thread", "unshare_thread", "list_shared_threads"]);
     if (!supported.has(name)) throw new Error(`Tool ${name} is not a broker-free operation; legacy broker fallback is forbidden`);
 
@@ -14480,6 +14712,16 @@ export async function executeMcpTool(cfg, name, args = {}, options = {}) {
         toMachine: targetMachineFromFlock || args.to_machine,
         action: "send_message",
         params: { targetSession: args.to_session, delegate: Boolean(args.delegate) },
+      },
+      get_remote_operation: {
+        toMachine: targetMachineFromFlock || args.to_machine,
+        action: "get_operation",
+        params: { operationId: args.operation_id, fromSessionId: args.from_session },
+      },
+      cancel_remote_operation: {
+        toMachine: targetMachineFromFlock || args.to_machine,
+        action: "cancel_operation",
+        params: { operationId: args.operation_id, fromSessionId: args.from_session },
       },
     }[name];
     if (rpcRouteSpec) {
@@ -17110,6 +17352,9 @@ export async function reviewReleaseCandidate(cfg, params = {}, internalOptions =
     bridgeSyntaxOk: false,
     bootstrapSyntaxOk: false,
     unitTestsOk: false,
+    entrypointByteParityOk: false,
+    runtimeManifestOk: false,
+    fullQualificationSuiteOk: false,
     extractedFileCount: 0,
     verifiedEntrypoints: [],
   };
@@ -17240,11 +17485,22 @@ export async function reviewReleaseCandidate(cfg, params = {}, internalOptions =
     const hasFlockMjs = fs.existsSync(path.join(fixtureDir, "flock.mjs"));
     const hasBridgeMjs = fs.existsSync(path.join(fixtureDir, "bridge.mjs"));
     const hasBootstrapMjs = fs.existsSync(path.join(fixtureDir, "bootstrap-server.mjs"));
-    const candidateTestRel = fs.existsSync(path.join(fixtureDir, "test", "flock.test.mjs"))
-      ? "test/flock.test.mjs"
-      : fs.existsSync(path.join(fixtureDir, "test", "bridge.test.mjs"))
-        ? "test/bridge.test.mjs"
-        : null;
+    const candidateTestRels = [
+      ...(
+        fs.existsSync(path.join(fixtureDir, "test"))
+          ? fs.readdirSync(path.join(fixtureDir, "test"))
+              .filter((name) => name.endsWith(".test.mjs"))
+              .map((name) => `test/${name}`)
+          : []
+      ),
+      ...(
+        fs.existsSync(path.join(fixtureDir, "viewer", "test"))
+          ? fs.readdirSync(path.join(fixtureDir, "viewer", "test"))
+              .filter((name) => name.endsWith(".test.mjs"))
+              .map((name) => `viewer/test/${name}`)
+          : []
+      ),
+    ].sort();
 
     if (!hasFlockMjs && !hasBridgeMjs) {
       throw Object.assign(
@@ -17258,11 +17514,29 @@ export async function reviewReleaseCandidate(cfg, params = {}, internalOptions =
         { isFixtureInfraError: true }
       );
     }
-    if (!candidateTestRel) {
+    if (candidateTestRels.length === 0) {
       throw Object.assign(
-        new Error("Candidate fixture is missing required unit test suite (test/flock.test.mjs or test/bridge.test.mjs)"),
+        new Error("Candidate fixture is missing the repository qualification test suite"),
         { isFixtureInfraError: true }
       );
+    }
+    if (hasFlockMjs && hasBridgeMjs) {
+      checks.entrypointByteParityOk = fs
+        .readFileSync(path.join(fixtureDir, "flock.mjs"))
+        .equals(fs.readFileSync(path.join(fixtureDir, "bridge.mjs")));
+      if (!checks.entrypointByteParityOk) {
+        throw Object.assign(new Error("flock.mjs and bridge.mjs byte parity failed"), {
+          isFixtureInfraError: true,
+        });
+      }
+    }
+    const candidateManifest = loadRuntimeManifest(fixtureDir);
+    const recomputedManifest = computeRuntimeManifest(fixtureDir, { version: candidateManifest.version });
+    checks.runtimeManifestOk = candidateManifest.manifestDigest === recomputedManifest.manifestDigest;
+    if (!checks.runtimeManifestOk) {
+      throw Object.assign(new Error("Runtime manifest/fallback verification failed"), {
+        isFixtureInfraError: true,
+      });
     }
 
     checks.fixtureExtractedOk = true;
@@ -17419,7 +17693,7 @@ export async function reviewReleaseCandidate(cfg, params = {}, internalOptions =
       } else if (process.allowedNodeEnvironmentFlags?.has?.("--experimental-test-isolation")) {
         testArgs.push("--experimental-test-isolation=none");
       }
-      testArgs.push(path.join(fixtureDir, ...candidateTestRel.split("/")));
+      testArgs.push(...candidateTestRels.map((rel) => path.join(fixtureDir, ...rel.split("/"))));
 
       const testRes = await runBoundedSubprocess(preflightExecutable, testArgs, {
         cwd: fixtureDir,
@@ -17446,6 +17720,7 @@ export async function reviewReleaseCandidate(cfg, params = {}, internalOptions =
         }
       } else {
         checks.unitTestsOk = true;
+        checks.fullQualificationSuiteOk = true;
         failureCategory = "passed";
       }
     }
@@ -17475,7 +17750,10 @@ export async function reviewReleaseCandidate(cfg, params = {}, internalOptions =
     issues.length > 0 ||
     !checks.fixtureExtractedOk ||
     !checks.dependencyClosureOk ||
-    !checks.unitTestsOk
+    !checks.unitTestsOk ||
+    !checks.entrypointByteParityOk ||
+    !checks.runtimeManifestOk ||
+    !checks.fullQualificationSuiteOk
   ) {
     if (failureCategory === "passed") {
       failureCategory = !checks.fixtureExtractedOk
@@ -17754,6 +18032,11 @@ export async function performLocalSelfUpdate(
     onBeforeStageFile = null,
     onAfterStageFile = null,
     onDuringCutover = null,
+    updateId = crypto.randomUUID(),
+    correlationId = updateId,
+    repoDirOverride = null,
+    gitExecFileSync = execFileSync,
+    spawnProcess = spawnSessionSafeProcess,
   } = {}
 ) {
   if (cfg?.protocol === "broker-free-v34") {
@@ -17766,29 +18049,97 @@ export async function performLocalSelfUpdate(
     ? (legacyDir ? path.resolve(legacyDir) : null)
     : getLegacyBridgeHome();
 
-  const repoDir = sourceDir ? path.resolve(sourceDir) : resolveOrFindBridgeGitRepo();
+  const repoDir = sourceDir
+    ? path.resolve(sourceDir)
+    : repoDirOverride
+    ? path.resolve(repoDirOverride)
+    : resolveOrFindBridgeGitRepo();
   if (!repoDir) {
     throw new Error(`Could not locate or clone copilot-signalr-bridge git repo on ${cfg.machineId}`);
   }
+  fs.mkdirSync(resolvedTargetDir, { recursive: true });
 
   let newCommit = null;
   if (!sourceDir && gitSync) {
-    execFileSync("git", ["-C", repoDir, "fetch", "origin", "main"], {
-      stdio: ["ignore", "pipe", "pipe"],
-      timeout: 20000,
-      windowsHide: true,
-    });
-    execFileSync("git", ["-C", repoDir, "reset", "--hard", "origin/main"], {
-      stdio: ["ignore", "pipe", "pipe"],
-      timeout: 10000,
-      windowsHide: true,
-    });
-    newCommit = execFileSync("git", ["-C", repoDir, "rev-parse", "--short", "HEAD"], {
+    const noninteractiveEnv = {
+      ...process.env,
+      GIT_TERMINAL_PROMPT: "0",
+      GCM_INTERACTIVE: "Never",
+      GIT_ASKPASS: "",
+      SSH_ASKPASS: "",
+    };
+    for (const key of [
+      "VSCODE_GIT_ASKPASS_NODE",
+      "VSCODE_GIT_ASKPASS_EXTRA_ARGS",
+      "VSCODE_GIT_ASKPASS_MAIN",
+      "VSCODE_GIT_IPC_HANDLE",
+      "ELECTRON_RUN_AS_NODE",
+    ]) {
+      delete noninteractiveEnv[key];
+    }
+    try {
+      const gitArgs = [
+        "-c", "credential.interactive=never",
+        "-c", "core.askPass=",
+        "-C", repoDir,
+      ];
+      gitExecFileSync("git", [...gitArgs, "ls-remote", "--exit-code", "origin", "refs/heads/main"], {
+        stdio: ["ignore", "pipe", "pipe"],
+        timeout: 15000,
+        windowsHide: true,
+        env: noninteractiveEnv,
+      });
+      gitExecFileSync("git", [...gitArgs, "fetch", "--no-tags", "origin", "main"], {
+        stdio: ["ignore", "pipe", "pipe"],
+        timeout: 20000,
+        windowsHide: true,
+        env: noninteractiveEnv,
+      });
+      gitExecFileSync("git", [...gitArgs, "reset", "--hard", "origin/main"], {
+        stdio: ["ignore", "pipe", "pipe"],
+        timeout: 10000,
+        windowsHide: true,
+        env: noninteractiveEnv,
+      });
+    } catch (error) {
+      error.code = "UPDATE_NONINTERACTIVE_AUTH_FAILED";
+      error.message =
+        "Noninteractive update preflight failed. Use an already authorized signed release/bundle source; interactive Git credential prompts are disabled.";
+      recordRuntimeUpdatePhase(resolvedTargetDir, {
+        updateId,
+        correlationId,
+        phase: "failed",
+        error,
+        code: error.code,
+        reason: "noninteractive_auth_preflight",
+      });
+      throw error;
+    }
+    newCommit = gitExecFileSync("git", ["-C", repoDir, "rev-parse", "--short", "HEAD"], {
       encoding: "utf8",
       stdio: ["ignore", "pipe", "ignore"],
       timeout: 5000,
       windowsHide: true,
     }).trim();
+  }
+
+  let rollbackSource = null;
+  const previousStates = inspectRuntimeGenerations(resolvedTargetDir, {
+    resident: buildInProcessResidentRuntime(),
+  });
+  if (previousStates.installed?.complete) {
+    rollbackSource = fs.mkdtempSync(path.join(os.tmpdir(), `flock-update-rollback-${updateId}-`));
+    const previousManifest = loadRuntimeManifest(resolvedTargetDir);
+    for (const filename of Object.keys(previousManifest.files)) {
+      fs.copyFileSync(
+        assertNoLinks(path.join(resolvedTargetDir, filename)),
+        assertNoLinks(path.join(rollbackSource, filename))
+      );
+    }
+    fs.copyFileSync(
+      assertNoLinks(path.join(resolvedTargetDir, RUNTIME_MANIFEST_FILENAME)),
+      assertNoLinks(path.join(rollbackSource, RUNTIME_MANIFEST_FILENAME))
+    );
   }
 
   if (!targetDir) ensureBridgeDir();
@@ -17802,6 +18153,8 @@ export async function performLocalSelfUpdate(
     onAfterStageFile,
     onDuringCutover,
     resident: residentNow,
+    updateId,
+    correlationId,
   });
 
   if (resolvedLegacyDir && fs.existsSync(resolvedLegacyDir) && path.resolve(resolvedLegacyDir) !== path.resolve(resolvedTargetDir)) {
@@ -17816,32 +18169,93 @@ export async function performLocalSelfUpdate(
 
   const targetScript = path.join(resolvedTargetDir, "flock.mjs");
   if (spawnInstall) {
-    // Spawn `node flock.mjs install` detached after 300ms so the RPC reply returns first
-    setTimeout(() => {
-      try {
-        const child = spawnSessionSafeProcess(
-          process.execPath,
-          [
-            targetScript,
-            "install",
-            "--scope",
-            cfg.scope || "work",
-            ...(cfg.githubUser ? ["--github-user", cfg.githubUser] : []),
-          ],
-          {
-            detached: true,
-            stdio: "ignore",
-            windowsHide: true,
-          },
-          { unitPrefix: "copilot-flock-install", unitId: crypto.randomUUID() }
-        );
-        child.unref();
-      } catch {}
-    }, 300);
+    try {
+      const child = spawnProcess(
+        process.execPath,
+        [
+          targetScript,
+          "install",
+          "--scope",
+          cfg.scope || "work",
+          ...(cfg.githubUser ? ["--github-user", cfg.githubUser] : []),
+        ],
+        {
+          detached: true,
+          stdio: "ignore",
+          windowsHide: true,
+        },
+        { unitPrefix: "copilot-flock-install", unitId: updateId }
+      );
+      await new Promise((resolve, reject) => {
+        const timer = setTimeout(resolve, 250);
+        timer.unref?.();
+        child.once("spawn", () => {
+          clearTimeout(timer);
+          resolve();
+        });
+        child.once("error", (error) => {
+          clearTimeout(timer);
+          reject(error);
+        });
+      });
+      child.unref();
+    } catch (error) {
+      let rolledBack = false;
+      let rollbackError = null;
+      if (rollbackSource) {
+        try {
+          stageAndActivateRuntime({
+            sourceDir: rollbackSource,
+            targetDir: resolvedTargetDir,
+            verifyImports: true,
+            updateId,
+            correlationId,
+            resident: residentNow,
+          });
+          rolledBack = true;
+        } catch (rollbackFailure) {
+          rollbackError = rollbackFailure;
+        }
+      }
+      recordRuntimeUpdatePhase(resolvedTargetDir, {
+        updateId,
+        correlationId,
+        phase: rolledBack ? "rolled_back" : "failed",
+        error: rollbackError || error,
+        code: rollbackError
+          ? "RUNTIME_ROLLBACK_FAILED"
+          : rolledBack
+          ? "RUNTIME_ACTIVATION_SPAWN_ROLLED_BACK"
+          : "RUNTIME_ACTIVATION_SPAWN_FAILED",
+        manifestDigest: activated.installed?.manifestDigest,
+        version: activated.installed?.version,
+        reason: "launcher_spawn_failed",
+      });
+      if (rollbackSource && fs.existsSync(rollbackSource)) {
+        fs.rmSync(rollbackSource, { recursive: true, force: true });
+      }
+      throw Object.assign(new Error(`Runtime activation launcher failed: ${error.message}`), {
+        code: rolledBack ? "RUNTIME_ACTIVATION_SPAWN_ROLLED_BACK" : "RUNTIME_ACTIVATION_SPAWN_FAILED",
+        cause: error,
+      });
+    }
+  } else if (activated.verified?.fullyActive) {
+    recordRuntimeUpdatePhase(resolvedTargetDir, {
+      updateId,
+      correlationId,
+      phase: "verified",
+      manifestDigest: activated.installed?.manifestDigest,
+      version: activated.installed?.version,
+    });
+  }
+  if (rollbackSource && fs.existsSync(rollbackSource)) {
+    fs.rmSync(rollbackSource, { recursive: true, force: true });
   }
 
   return {
-    status: "updating",
+    status: activated.verified?.fullyActive ? "verified" : "activated",
+    updateId,
+    correlationId,
     machineId: cfg.machineId,
     previousVersion: BRIDGE_VERSION,
     previousDigest: RUNTIME_MODULE_MANIFEST?.manifestDigest || null,
@@ -19375,12 +19789,26 @@ export async function diagnoseFleetMachines(
     const diag = diagOutcome?.ok ? diagOutcome.response.result : null;
     const runningVersion = diag?.version || livePings[0].version || "unknown";
     const versionMatch = runningVersion === BRIDGE_VERSION;
+    const protocolVersion = Number(diag?.protocolVersion || livePings[0].protocolVersion) || null;
+    const capabilities = diag?.capabilities || livePings[0].capabilities || {};
+    const requiredCapabilities = [
+      "brokerFreeOperations",
+      "operationQueryCancel",
+      "phasedRuntimeUpdate",
+      "compactDiagnostics",
+    ];
+    const missingCapabilities = requiredCapabilities.filter((capability) => capabilities?.[capability] !== true);
     const issues = diag?.issues ? [...diag.issues] : [];
     if (!diagOutcome?.ok) {
       issues.push(`Diagnose RPC failed: ${diagOutcome?.error || "unknown error"}`);
     }
     if (!versionMatch) {
       issues.push(`Version mismatch: running ${runningVersion}, expected ${BRIDGE_VERSION}`);
+    }
+    if (protocolVersion !== FLOCK_PROTOCOL_VERSION || missingCapabilities.length > 0) {
+      issues.push(
+        `Incompatible peer capabilities: protocol ${protocolVersion || "unknown"}, missing ${missingCapabilities.join(", ") || "none"}`
+      );
     }
     if (daemonInstanceCount > 1) {
       issues.push(
@@ -19426,6 +19854,23 @@ export async function diagnoseFleetMachines(
       version: runningVersion,
       expectedVersion: BRIDGE_VERSION,
       versionMatch,
+      compatibility: {
+        compatible: protocolVersion === FLOCK_PROTOCOL_VERSION && missingCapabilities.length === 0,
+        protocolVersion,
+        expectedProtocolVersion: FLOCK_PROTOCOL_VERSION,
+        capabilities,
+        missingCapabilities,
+        remediation:
+          protocolVersion === FLOCK_PROTOCOL_VERSION && missingCapabilities.length === 0
+            ? null
+            : {
+                code: "PEER_UPGRADE_REQUIRED",
+                action: "Update the peer through the verified phased update path, restart its resident daemon, and reconnect its MCP caller. Security downgrade is forbidden.",
+                prompt:
+                  `On ${livePings[0].machineId || bm.machineId}, inspect Copilot Flock update state and schema-36 capabilities. ` +
+                  "Use only the verified phased update path, preserve the current protocol and credentials, restart the resident daemon safely, reconnect the MCP caller, and repair the canonical Copilot Flock Coordinator and Copilot Flock Thread Tracker if missing. Do not downgrade security or re-enroll.",
+              },
+      },
       runtimeStates: diag?.runtimeStates || livePings[0].runtimeStates || null,
       staged: diag?.staged || livePings[0].staged || null,
       installed: diag?.installed || livePings[0].installed || null,
@@ -20896,6 +21341,7 @@ export async function resolveLegacyFlockRoster(cfg, options = {}) {
     remoteOwnedFlocks: remoteOwnedView,
     remoteJoinedFlocks: remoteJoinedView,
     quarantinedMembers,
+    revokedOwnerMachines,
     v3Source,
     membersSource,
     localCacheSource: {
@@ -20956,12 +21402,16 @@ function applyLivePresenceToLegacyRoster(baseState, onlineMachines, liveSignalRS
   const allowedLiveKeys = new Set();
   const allowedLiveMachines = new Set();
   const quarantinedMembers = [...(baseState.quarantinedMembers || [])];
+  const revokedOwnerMachines = baseState.revokedOwnerMachines || new Set();
 
   const flocksOut = baseState.scopedFlocks.map((f) => {
     const callerHasOwnerSpecs = f.trustTier === "owner" && f.shareSpecs === "full";
     const flockEpoch = Number(f.rosterEpoch) || 1;
     const flockMembers = (f.members || []).flatMap((m) => {
       const mUser = normalizeGitHubUser(m.githubUser || f.ownerGitHubUser)?.toLowerCase() || "unknown";
+      if (revokedOwnerMachines.has(`${mUser}:${String(m.machineId || "").toLowerCase()}`)) {
+        return [];
+      }
       const live = findLiveMatch(mUser, m.machineId);
       let resolvedScope;
       try {
@@ -21098,6 +21548,7 @@ function applyLivePresenceToLegacyRoster(baseState, onlineMachines, liveSignalRS
         }
         const mLower = String(lm.machineId).toLowerCase();
         const uLower = normalizeGitHubUser(lm.githubUser)?.toLowerCase() || null;
+        if (uLower && revokedOwnerMachines.has(`${uLower}:${mLower}`)) return false;
         if (baseState.scopedTargetFlockId) {
           if (uLower) return allowedLiveKeys.has(`${uLower}:${mLower}`);
           return allowedLiveMachines.has(mLower);
@@ -21571,12 +22022,48 @@ export async function dispatchBrokerFreeRpc(cfg, { member, payload, action, asse
     if (bindings[id] && bindings[id] !== flockId) throw new Error("Thread is bound to another flock");
     return { id, ...entry[1] };
   };
+  if (action === "get_operation" || action === "cancel_operation") {
+    assertAuthorized();
+    authorizeAction(member, action, payload);
+    const store = getRemoteOperationStore();
+    const requester = {
+      flockId,
+      requesterMachine: member.machineId,
+      requesterSession: params.fromSessionId || null,
+      requesterGitHubUser: null,
+      requesterPeerId: member.peerId || null,
+    };
+    const operation = store.reconcile(params.operationId);
+    if (!operation) {
+      const error = new Error(`Unknown operation "${params.operationId}"`);
+      error.code = "OPERATION_NOT_FOUND";
+      error.statusCode = 404;
+      throw error;
+    }
+    store.assertRequester(operation, requester);
+    if (action === "get_operation") return { operation: compactOperation(operation) };
+    const requested = store.requestCancellation(params.operationId, requester);
+    if (!requested.alreadyTerminal) {
+      const cancelledProcess = getHeadlessSessionSupervisor().cancel(params.operationId);
+      if (!cancelledProcess && ["accepted", "delivered"].includes(requested.operation.state)) {
+        store.transition(params.operationId, "cancelled", {
+          error: "Cancelled by the authorized originating requester before runtime completion",
+        });
+      }
+    }
+    return {
+      cancellationAccepted: !requested.alreadyTerminal,
+      operation: compactOperation(store.get(params.operationId)),
+    };
+  }
   if (action === "ping") {
     const runtimeStates = await getLocalRuntimeStatesAsync({ inDaemonProcess: true });
     return {
       machineId: cfg.machineId,
       scope: cfg.scope,
       version: BRIDGE_VERSION,
+      protocolVersion: FLOCK_PROTOCOL_VERSION,
+      capabilities: FLOCK_CAPABILITIES,
       manifestDigest: RUNTIME_MODULE_MANIFEST?.manifestDigest || null,
       runtimeStates,
       staged: runtimeStates.staged,

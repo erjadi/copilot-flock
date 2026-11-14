@@ -104,6 +104,13 @@ export function envelope(fromSession: string, toMachine: string, toSession: stri
 /** Normalize only scope fields; raw technical payloads and unrelated prose remain intact. */
 export function normalizeLegacyScopes<T>(value: T): T {
   if (Array.isArray(value)) return value.map(normalizeLegacyScopes) as T;
-  if (value && typeof value === "object") return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, /^(scope|from_scope|to_scope)$/i.test(key) && item === "private" ? "personal" : normalizeLegacyScopes(item)])) as T;
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.entries(value).map(([key, item]) => {
+      if (/^(scope|from_scope|to_scope)$/i.test(key) && item === "private") {
+        throw new Error("Obsolete scope 'private'; migrate the source to 'personal'");
+      }
+      return [key, normalizeLegacyScopes(item)];
+    })) as T;
+  }
   return value;
 }

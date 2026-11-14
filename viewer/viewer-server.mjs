@@ -892,7 +892,7 @@ const server = http.createServer(async (req, res) => {
         summary: `list_projects ok · ${lat}ms (${rpcRes.result?.count ?? 0} repos)`,
         payload: { requestId: reqId, ok: true, latencyMs: lat },
       });
-      sendJson(res, 200, rpcRes.result || { machineId: machine, scope: "private", count: 0, projects: [] });
+      sendJson(res, 200, rpcRes.result || { machineId: machine, scope: "personal", count: 0, projects: [] });
     } catch (err) {
       sendJson(res, 502, { error: err.message });
     }
