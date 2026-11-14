@@ -348,7 +348,7 @@ test(
     const voucher = store.flocks[invite.flockId].vouchers[invite.enrollmentJson.flocks[0].voucherId];
     voucher.membershipExpiresAtMs = Date.now() - 1;
     fs.writeFileSync(storePath, JSON.stringify(store));
-    assert.equal((await request("/api/v3/enroll", "guest", signed)).status, 403);
+    assert.equal((await request("/api/v3/enroll", "guest", signed)).status, 200);
     voucher.membershipExpiresAtMs = null;
     voucher.voucherExpiresAtMs = Date.now() - 1;
     fs.writeFileSync(storePath, JSON.stringify(store));
@@ -714,7 +714,7 @@ test(
 
   let wsServer = null;
   try {
-    assert.equal(BRIDGE_VERSION, "3.5.0");
+    assert.equal(BRIDGE_VERSION, "3.6.0");
 
     const hugeSessionId = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
     const eventsPath = env.insertSession({

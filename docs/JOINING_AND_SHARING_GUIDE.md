@@ -119,3 +119,18 @@ Enrolling `CLOUD-DEV-VM` or `LINUX-GPU-HOST` into `erjadi/studio-team` never exp
   > *"Unshare this thread from `erjadi/studio-team`."* (Calls MCP tool `unshare_thread`, revoking external visibility immediately.)
 - **Kick a member or revoke a guest pass early**:
   > *"Remove `@bob` from `erjadi/personal/LINUX-GPU-HOST`."* (Calls MCP tool `kick_flock_member`, increments `rosterEpoch`, and drops active WebSocket connections immediately.)
+## 6. 3.6 Enrollment Readiness and Voucher Lifecycle
+
+Token-local enrollment never sends a GitHub token or returns/stores a master
+SignalR `AccessKey` connection string. Voucher redemption requires the
+recipient-bound secret and a signed device request. Collaborator vouchers
+default to a 72-hour redemption window; guest vouchers default to 24 hours.
+Post-redemption membership duration starts when each device redeems and is
+tracked independently from voucher expiry.
+
+Reissuing an invitation with replacement semantics atomically supersedes prior
+matching vouchers. Superseded, replayed, expired, and secret-less vouchers fail
+with distinct errors. Enrollment reports `verified_bidirectional` only after a
+correlated peer acknowledgement proves matching flock identity and roster
+epoch. When no peer is online it remains enrolled but reports
+`enrolled_awaiting_peer_online`, not ready.

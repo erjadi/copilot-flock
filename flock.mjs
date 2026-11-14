@@ -182,7 +182,7 @@ function copyRuntimeModules(sourceDirectory, destinationDirectory, installedEntr
   }
 }
 
-export const BRIDGE_VERSION = "3.5.0";
+export const BRIDGE_VERSION = "3.6.0";
 
 function buildInProcessResidentRuntime() {
   const digest = RUNTIME_MODULE_MANIFEST?.manifestDigest || null;
@@ -3512,6 +3512,67 @@ export function saveLocalFlocksConfig(flocksConfig, customPath = getFlocksConfig
   return atomicWriteFlocksConfig(customPath, flocksConfig);
 }
 
+export function persistTokenLocalCredentialVault(
+  result,
+  customFlocksPath = getFlocksConfigPath()
+) {
+  const credentials = {};
+  for (const flock of result?.enrolledFlocks || []) {
+    if (!flock?.flockId) continue;
+    if (!flock.hubToken && !flock.clientToken && !flock.serverNonce) continue;
+    credentials[flock.flockId] = {
+      flockId: flock.flockId,
+      flockUuid: flock.flockUuid || null,
+      endpoint: flock.endpoint || null,
+      hubName: flock.hubName || null,
+      bearerToken: flock.hubToken || flock.clientToken || null,
+      tokenExpiresAt: flock.tokenExpiresAt || flock.credentialExpiresAt || null,
+      serverNonce: flock.serverNonce || null,
+      rosterEpoch: Number(flock.rosterEpoch) || null,
+      updatedAt: new Date().toISOString(),
+    };
+  }
+  if (Object.keys(credentials).length === 0) return null;
+  const vaultPath = path.join(path.dirname(customFlocksPath), "flock-credentials.json");
+  let vault = { type: "copilot-flock-token-local-credentials-v1", credentials: {} };
+  if (fs.existsSync(vaultPath)) {
+    const parsed = JSON.parse(fs.readFileSync(assertNoLinks(vaultPath), "utf8"));
+    if (parsed?.type !== vault.type || !parsed.credentials || typeof parsed.credentials !== "object") {
+      const error = new Error(`Invalid token-local credential vault: ${vaultPath}`);
+      error.code = "CREDENTIAL_VAULT_INVALID";
+      throw error;
+    }
+    vault = parsed;
+  }
+  vault.credentials = { ...vault.credentials, ...credentials };
+  vault.updatedAt = new Date().toISOString();
+  atomicJson(vaultPath, vault);
+  try {
+    fs.chmodSync(vaultPath, 0o600);
+  } catch {}
+  return vaultPath;
+}
+
+function stripEnrollmentCredentials(result) {
+  return {
+    ...result,
+    connectionString: undefined,
+    enrolledFlocks: (result?.enrolledFlocks || []).map((flock) => {
+      const sanitized = { ...flock };
+      for (const field of [
+        "hubToken",
+        "clientToken",
+        "tokenExpiresAt",
+        "credentialExpiresAt",
+        "serverNonce",
+      ]) {
+        delete sanitized[field];
+      }
+      return sanitized;
+    }),
+  };
+}
+
 export function reconcileAuthoritativeFlockMemberships(
   cfg,
   authResult,
@@ -3807,6 +3868,18 @@ export function reconcileAuthoritativeFlockMemberships(
 }
 
 export function applyV3EnrollmentResult(cfg, result, customPath = getFlocksConfigPath()) {
+  if (
+    isTokenLocalAuthEnabled(cfg) &&
+    typeof result?.connectionString === "string" &&
+    /(?:^|;)AccessKey=/i.test(result.connectionString)
+  ) {
+    const error = new Error(
+      "Token-local enrollment response exposed a master SignalR AccessKey connection string"
+    );
+    error.code = "MASTER_CREDENTIAL_EXPOSURE_REJECTED";
+    error.stage = "invite_redemption";
+    throw error;
+  }
   if (result?.connectionString && cfg && !cfg.connectionString) {
     try {
       const activeConfigPath = cfg.configPath || getConfigPath();
@@ -3827,7 +3900,10 @@ export function applyV3EnrollmentResult(cfg, result, customPath = getFlocksConfi
       if (result.githubUser && !cfg.githubUser) cfg.githubUser = normalizeGitHubUser(result.githubUser);
     } catch {}
   }
-  const reconciled = reconcileAuthoritativeFlockMemberships(cfg, result, customPath, {
+  const authoritativeResult = isTokenLocalAuthEnabled(cfg)
+    ? (persistTokenLocalCredentialVault(result, customPath), stripEnrollmentCredentials(result))
+    : result;
+  const reconciled = reconcileAuthoritativeFlockMemberships(cfg, authoritativeResult, customPath, {
     requireMemberProof: false,
   });
   const enrolledWithMembers = (reconciled.enrolledFlocks || []).filter(
@@ -3836,9 +3912,25 @@ export function applyV3EnrollmentResult(cfg, result, customPath = getFlocksConfi
   if (enrolledWithMembers.length > 0) {
     try {
       openFlockMembershipRegistry(customPath).reconcileV3Broker({ enrolledFlocks: enrolledWithMembers });
-    } catch {}
+    } catch (error) {
+      const partial = new Error(
+        `Authoritative roster registry commit failed after local policy reconciliation: ${error.message}`
+      );
+      partial.code = "PARTIAL_PERSISTENCE_ERROR";
+      partial.stage = "roster_registry";
+      partial.cause = error;
+      partial.reconciledFlockIds = reconciled.reconciledFlockIds || [];
+      throw partial;
+    }
   }
-  return { ...result, enrolledFlocks: reconciled.enrolledFlocks };
+  return {
+    ...authoritativeResult,
+    enrolledFlocks: reconciled.enrolledFlocks,
+    reconciledFlockIds: reconciled.reconciledFlockIds,
+    healedFlockIds: reconciled.healedFlockIds,
+    preservedOwnerFlockIds: reconciled.preservedOwnerFlockIds,
+    quarantinedFlockIds: reconciled.quarantinedFlockIds,
+  };
 }
 
 export function signV3MembershipSyncRequest(
@@ -3860,7 +3952,50 @@ export function signV3MembershipSyncRequest(
   };
 }
 
-export async function syncFlockMemberships(
+const membershipSyncFlights = new Map();
+
+export async function discoverBootstrapCapabilities(
+  cfg,
+  { callEndpoint = callBootstrapV3Endpoint, correlationId = crypto.randomUUID() } = {}
+) {
+  const response = await callEndpoint(cfg, "/capabilities", { method: "GET" });
+  if (!response?.ok || !response?.capabilities) {
+    const error = new Error(
+      response?.error || "Broker does not expose Copilot Flock v3 capability discovery"
+    );
+    error.code =
+      response?.code === "V3_ENDPOINT_UNSUPPORTED" ||
+      /unknown v3 endpoint|not found/i.test(response?.error || "")
+        ? "BROKER_UPGRADE_REQUIRED"
+        : "BROKER_CAPABILITY_UNAVAILABLE";
+    error.stage = "broker_capability";
+    error.correlationId = response?.correlationId || correlationId;
+    throw error;
+  }
+  return { ...response, correlationId: response.correlationId || correlationId };
+}
+
+export async function requireBootstrapCapabilities(
+  cfg,
+  required,
+  options = {}
+) {
+  const discovered = await discoverBootstrapCapabilities(cfg, options);
+  const missing = required.filter((name) => discovered.capabilities?.[name] !== true);
+  if (missing.length > 0) {
+    const error = new Error(
+      `Broker is incompatible with this operation; missing capabilities: ${missing.join(", ")}`
+    );
+    error.code = "BROKER_CAPABILITY_UNSUPPORTED";
+    error.stage = "broker_capability";
+    error.correlationId = discovered.correlationId;
+    error.missingCapabilities = missing;
+    throw error;
+  }
+  return discovered;
+}
+
+async function performFlockMembershipSync(
   cfg,
   {
     customPath = getFlocksConfigPath(),
@@ -3868,6 +4003,7 @@ export async function syncFlockMemberships(
     identityKeypair = null,
     sandbox = isSandboxV3Mode(),
     now = Date.now(),
+    correlationId = crypto.randomUUID(),
   } = {}
 ) {
   if (cfg?.protocol === "broker-free-v34") {
@@ -3875,24 +4011,206 @@ export async function syncFlockMemberships(
       "Broker-free installations use owner-signed MemberCert renewal, not broker membership sync"
     );
   }
+  await requireBootstrapCapabilities(
+    cfg,
+    ["rosterSync", "tokenLocalDeviceAuth", "deviceSignedOperations"],
+    { callEndpoint, correlationId }
+  );
   const idKey = identityKeypair || ensureMachineIdentityKeypair();
   const signedBody = signV3MembershipSyncRequest(
     { deviceId: idKey.fingerprint, machineId: cfg?.machineId || os.hostname() },
     idKey,
     now
   );
+  signedBody.correlationId = correlationId;
   const res = await callEndpoint(cfg, "/flocks/sync", {
     method: "POST",
     sandbox,
     body: signedBody,
   });
   if (!res?.ok) {
-    throw new Error(res?.error || "Failed to sync authoritative flock memberships from broker");
+    const error = new Error(
+      res?.error || "Failed to sync authoritative flock memberships from broker"
+    );
+    error.code = res?.code || "ROSTER_SYNC_FAILED";
+    error.stage = "roster_sync";
+    error.correlationId = res?.correlationId || correlationId;
+    throw error;
   }
-  return reconcileAuthoritativeFlockMemberships(cfg, res, customPath, {
-    requireMemberProof: true,
-    now,
+  try {
+    const authoritativeResult = isTokenLocalAuthEnabled(cfg)
+      ? (persistTokenLocalCredentialVault(res, customPath), stripEnrollmentCredentials(res))
+      : res;
+    const reconciled = reconcileAuthoritativeFlockMemberships(cfg, authoritativeResult, customPath, {
+      requireMemberProof: true,
+      now,
+    });
+    const enrolledWithMembers = (reconciled.enrolledFlocks || []).filter(
+      (flock) => Array.isArray(flock.members) && flock.members.length > 0
+    );
+    if (enrolledWithMembers.length > 0) {
+      openFlockMembershipRegistry(customPath).reconcileV3Broker({
+        enrolledFlocks: enrolledWithMembers,
+        now,
+      });
+    }
+    return { ...reconciled, correlationId, stage: "complete" };
+  } catch (cause) {
+    const error = new Error(`Roster convergence failed: ${cause.message}`);
+    error.code = cause.code || "ROSTER_CONVERGENCE_FAILED";
+    error.stage = cause.stage || "roster_convergence";
+    error.correlationId = correlationId;
+    error.cause = cause;
+    throw error;
+  }
+}
+
+export async function syncFlockMemberships(cfg, options = {}) {
+  const identity = options.identityKeypair || ensureMachineIdentityKeypair();
+  const key = `${String(cfg?.bootstrapUrl || DEFAULT_BOOTSTRAP_URL)}::${identity.fingerprint}::${
+    options.flockId || "*"
+  }`;
+  if (membershipSyncFlights.has(key)) return membershipSyncFlights.get(key);
+  const timeoutMs = Math.max(1000, Math.min(15000, Number(options.timeoutMs) || 10000));
+  let timeoutHandle;
+  const operation = Promise.race([
+    performFlockMembershipSync(cfg, { ...options, identityKeypair: identity }),
+    new Promise((_, reject) => {
+      timeoutHandle = setTimeout(() => {
+        const error = new Error(`Roster synchronization timed out after ${timeoutMs}ms`);
+        error.code = "ROSTER_SYNC_TIMEOUT";
+        error.stage = "roster_sync";
+        error.correlationId = options.correlationId || null;
+        reject(error);
+      }, timeoutMs);
+      timeoutHandle.unref?.();
+    }),
+  ]).finally(() => {
+    if (timeoutHandle) clearTimeout(timeoutHandle);
+    membershipSyncFlights.delete(key);
   });
+  membershipSyncFlights.set(key, operation);
+  return operation;
+}
+
+export async function verifyEnrollmentReadiness(
+  cfg,
+  enrolledFlocks,
+  {
+    invokeRpc = invokeRemoteRpc,
+    correlationId = crypto.randomUUID(),
+    timeoutMs = 5000,
+  } = {}
+) {
+  const stages = [
+    { stage: "invite_redemption", ok: true },
+    { stage: "identity_registration", ok: true },
+    { stage: "roster_convergence", ok: true },
+  ];
+  const selfMachine = String(cfg?.machineId || "").toLowerCase();
+  const candidates = [];
+  for (const flock of enrolledFlocks || []) {
+    for (const member of extractPolicyMembersList(flock)) {
+      if (
+        member &&
+        !member.removed &&
+        String(member.machineId || "").toLowerCase() !== selfMachine &&
+        (!member.membershipExpiresAtMs || Number(member.membershipExpiresAtMs) > Date.now())
+      ) {
+        candidates.push({ flock, member });
+      }
+    }
+  }
+  if (candidates.length === 0) {
+    return {
+      ok: false,
+      ready: false,
+      status: "enrolled_awaiting_peer_online",
+      correlationId,
+      stages: [
+        ...stages,
+        { stage: "transport", ok: false, code: "NO_ENROLLED_PEER" },
+        { stage: "authorization", ok: false, code: "NOT_PROVEN" },
+        { stage: "first_contact", ok: false, code: "NOT_PROVEN" },
+      ],
+      policyAssertions: {
+        unsharedThreadAccessDenied: true,
+        forbiddenMutationDenied: true,
+        fileMutationDenied: true,
+      },
+    };
+  }
+
+  const { flock, member } = candidates[0];
+  try {
+    const response = await invokeRpc(cfg, {
+      toMachine: member.machineId,
+      flockId: flock.flockId,
+      action: "ping",
+      params: {
+        flock: flock.flockId,
+        enrollmentReadiness: {
+          correlationId,
+          expectedRosterEpoch: Number(flock.rosterEpoch) || null,
+        },
+      },
+      timeoutMs,
+    });
+    const result = response?.result || response;
+    const ack = result?.enrollmentReadinessAck;
+    if (
+      !ack ||
+      ack.correlationId !== correlationId ||
+      String(ack.flockId).toLowerCase() !== String(flock.flockId).toLowerCase() ||
+      Number(ack.rosterEpoch) !== Number(flock.rosterEpoch)
+    ) {
+      const error = new Error("Peer readiness acknowledgement did not match flock identity and roster epoch");
+      error.code = "READINESS_ACK_MISMATCH";
+      throw error;
+    }
+    return {
+      ok: true,
+      ready: true,
+      status: "verified_bidirectional",
+      correlationId,
+      peerMachineId: member.machineId,
+      flockId: flock.flockId,
+      rosterEpoch: Number(flock.rosterEpoch),
+      stages: [
+        ...stages,
+        { stage: "transport", ok: true },
+        { stage: "authorization", ok: true },
+        { stage: "first_contact", ok: true },
+      ],
+      policyAssertions: {
+        unsharedThreadAccessDenied: true,
+        forbiddenMutationDenied: true,
+        fileMutationDenied: true,
+      },
+    };
+  } catch (cause) {
+    return {
+      ok: false,
+      ready: false,
+      status: "enrolled_first_contact_failed",
+      correlationId,
+      peerMachineId: member.machineId,
+      flockId: flock.flockId,
+      rosterEpoch: Number(flock.rosterEpoch) || null,
+      stages: [
+        ...stages,
+        { stage: "transport", ok: cause?.code !== "RPC_TIMEOUT", code: cause?.code || "RPC_FAILED" },
+        { stage: "authorization", ok: false, code: cause?.code || "AUTHORIZATION_NOT_PROVEN" },
+        { stage: "first_contact", ok: false, code: cause?.code || "FIRST_CONTACT_FAILED" },
+      ],
+      error: redactFlockSnapshot(cause?.message || "Enrollment readiness verification failed"),
+      policyAssertions: {
+        unsharedThreadAccessDenied: true,
+        forbiddenMutationDenied: true,
+        fileMutationDenied: true,
+      },
+    };
+  }
 }
 
 export function shareThreadWithFlock(
@@ -4475,12 +4793,14 @@ export function projectPublicEnrollmentResult(result) {
   return {
     ok: result?.ok !== false,
     machineId: result?.machineId || null,
+    correlationId: result?.correlationId || result?.readiness?.correlationId || null,
     enrolledFlockCount: Array.isArray(result?.enrolledFlocks) ? result.enrolledFlocks.length : 0,
     enrolledFlocks: (result?.enrolledFlocks || []).map((flock) => ({
       ...projectPublicFlockRecord(flock),
       tokenPresent: Boolean(flock?.hubToken || flock?.clientToken),
       credentialExpiresAt: flock?.credentialExpiresAt || flock?.tokenExpiresAt || null,
     })),
+    readiness: result?.readiness || null,
   };
 }
 
@@ -4849,6 +5169,27 @@ function resolveResponderFlockSelection(cfg, req) {
     localFlocks.flocks[k] = v;
   }
 
+  const applyAuthoritativeRoster = (policy) => {
+    if (!policy?.flockId) return policy;
+    const registryRecord = openFlockMembershipRegistry(customPath).read().flocks?.[
+      String(policy.flockId).toLowerCase()
+    ];
+    if (!registryRecord) return policy;
+    const members = Object.values(registryRecord.members || {}).map((member) => ({
+      ...member,
+      publicKey: member.publicKey || member.deviceEd25519Pub || null,
+      removed: false,
+    }));
+    return {
+      ...policy,
+      rosterEpoch: registryRecord.rosterEpoch,
+      members,
+      tombstones: registryRecord.tombstones || {},
+      authoritativeRosterHash: registryRecord.rosterHash,
+      authoritativeRosterSyncedAtMs: registryRecord.syncedAtMs,
+    };
+  };
+
   const rawFields = [];
   if (req?.flockId !== undefined && req?.flockId !== null) rawFields.push(["flockId", req.flockId]);
   if (req?.flock !== undefined && req?.flock !== null) rawFields.push(["flock", req.flock]);
@@ -4975,7 +5316,7 @@ function resolveResponderFlockSelection(cfg, req) {
   return {
     hasExplicitFlock: true,
     parsedSelector,
-    flockPolicy,
+    flockPolicy: applyAuthoritativeRoster(flockPolicy),
     localFlocks,
   };
 }
@@ -5920,7 +6261,12 @@ export function callBootstrapQueueApi({
           body: payload,
         })
       : null;
-    if (useTokenLocal && !devAuth) return null;
+    if (useTokenLocal && !devAuth) {
+      const error = new Error("Missing local device identity for token-local offline queue authentication");
+      error.code = "QUEUE_DEVICE_AUTH_UNAVAILABLE";
+      error.stage = "offline_queue_auth";
+      throw error;
+    }
     const inlineScript = `
       const https = require("node:https");
       const url = new URL(process.env.QUEUE_API_URL);
@@ -5945,7 +6291,13 @@ export function callBootstrapQueueApi({
         let data = "";
         res.on("data", (c) => data += c);
         res.on("end", () => {
-          if (res.statusCode >= 200 && res.statusCode < 300) process.stdout.write(data);
+          let parsed = null;
+          try { parsed = data ? JSON.parse(data) : null; } catch {}
+          process.stdout.write(JSON.stringify(
+            res.statusCode >= 200 && res.statusCode < 300
+              ? { ok: true, value: parsed }
+              : { ok: false, statusCode: res.statusCode, error: parsed?.error || ("Offline queue HTTP " + res.statusCode) }
+          ));
         });
       });
       req.on("error", () => {});
@@ -5969,8 +6321,23 @@ export function callBootstrapQueueApi({
         FLOCK_DEV_SIG: devAuth?.signature || "",
       },
     }).trim();
-    if (out) return JSON.parse(out);
-  } catch {}
+    if (out) {
+      const parsed = JSON.parse(out);
+      if (parsed?.ok) return parsed.value;
+      const error = new Error(parsed?.error || "Offline queue request failed");
+      error.code = "QUEUE_REQUEST_FAILED";
+      error.statusCode = parsed?.statusCode || null;
+      error.stage = "offline_queue";
+      throw error;
+    }
+  } catch (cause) {
+    if (cause?.stage === "offline_queue" || cause?.stage === "offline_queue_auth") throw cause;
+    const error = new Error(`Offline queue request failed: ${redactFlockSnapshot(cause.message)}`);
+    error.code = "QUEUE_REQUEST_FAILED";
+    error.stage = "offline_queue";
+    error.cause = cause;
+    throw error;
+  }
   return null;
 }
 
@@ -9746,16 +10113,34 @@ export function assertSafeTransferFilePath(targetPath) {
   return norm;
 }
 
-function findPinnedPeerInStoredFlocks(cfg, machineId, customPath = null) {
+function findPinnedPeerInStoredFlocks(cfg, machineId, customPath = null, flockId = null) {
   const cleanMachine = String(machineId || "").trim().toLowerCase();
   if (!cleanMachine) return null;
+  const resolvedPath = customPath || cfg?.flocksConfigPath || getFlocksConfigPath();
+  if (flockId) {
+    const exact = openFlockMembershipRegistry(resolvedPath).findActiveMember(flockId, {
+      machineId: cleanMachine,
+    });
+    if (exact) {
+      return {
+        peerId: exact.peerId,
+        machineId: exact.machineId,
+        githubUser: exact.githubUser || null,
+        scope: exact.scope || null,
+        publicKey: exact.publicKey || exact.deviceEd25519Pub || null,
+      };
+    }
+  }
   const rawStored = readRawStoredFlocksConfig(
     cfg,
-    customPath || cfg?.flocksConfigPath || getFlocksConfigPath()
+    resolvedPath
   );
   const now = Date.now();
   let matched = null;
   for (const policy of Object.values(rawStored?.flocks || {})) {
+    if (flockId && String(policy?.flockId || "").toLowerCase() !== String(flockId).toLowerCase()) {
+      continue;
+    }
     if (!policy || policy.revoked === true) continue;
     if (policy.membershipExpiresAtMs && Number(policy.membershipExpiresAtMs) <= now) continue;
     if (policy.expiresAtMs && Number(policy.expiresAtMs) <= now) continue;
@@ -9796,6 +10181,13 @@ export function resolveVerifiedSenderIdentity(cfg, req) {
 
   const rawClaimedMachine = req.auth?.fromMachine || req.fromMachine || params.fromMachine || "unknown";
   const rawClaimedScope = normalizeScope(params.fromScope, "work");
+  let exactFlockId = null;
+  const rawFlockSelector = params.flock ?? req.flock ?? req.flockId ?? req.flockPolicy?.flockId;
+  if (rawFlockSelector) {
+    try {
+      exactFlockId = parseFlockAddress(rawFlockSelector).flockId;
+    } catch {}
+  }
 
   let membersMap = null;
   if (Array.isArray(req.registryMembers)) {
@@ -9805,9 +10197,21 @@ export function resolveVerifiedSenderIdentity(cfg, req) {
         .map((m) => [String(m.machineId).toLowerCase(), m])
     );
   } else if (req.auth) {
-    membersMap = getCachedBootstrapMembersMap(cfg);
-    if (!membersMap.has(String(rawClaimedMachine).toLowerCase())) {
-      membersMap = getCachedBootstrapMembersMap(cfg, { forceRefresh: true });
+    if (exactFlockId) {
+      const storedPeer = findPinnedPeerInStoredFlocks(
+        cfg,
+        rawClaimedMachine,
+        req?.flocksConfigPath || cfg?.flocksConfigPath || null,
+        exactFlockId
+      );
+      membersMap = new Map(
+        storedPeer ? [[String(rawClaimedMachine).toLowerCase(), storedPeer]] : []
+      );
+    } else {
+      membersMap = getCachedBootstrapMembersMap(cfg);
+      if (!membersMap.has(String(rawClaimedMachine).toLowerCase())) {
+        membersMap = getCachedBootstrapMembersMap(cfg, { forceRefresh: true });
+      }
     }
   }
 
@@ -9821,14 +10225,17 @@ export function resolveVerifiedSenderIdentity(cfg, req) {
       !Array.isArray(req.registryMembers) &&
       (!regPubKey || (req.auth.publicKey && regPubKey.trim() !== String(req.auth.publicKey).trim()))
     ) {
-      membersMap = getCachedBootstrapMembersMap(cfg, { forceRefresh: true });
+      membersMap = exactFlockId
+        ? new Map()
+        : getCachedBootstrapMembersMap(cfg, { forceRefresh: true });
       regEntry = membersMap ? membersMap.get(String(rawClaimedMachine).toLowerCase()) : null;
       regPubKey = regEntry?.publicKey || regEntry?.specs?.publicKey || null;
       if (!regPubKey) {
         const storedPeer = findPinnedPeerInStoredFlocks(
           cfg,
           rawClaimedMachine,
-          req?.flocksConfigPath || cfg?.flocksConfigPath || null
+          req?.flocksConfigPath || cfg?.flocksConfigPath || null,
+          exactFlockId
         );
         if (storedPeer) {
           regEntry = storedPeer;
@@ -10117,11 +10524,54 @@ export function listLocalResourceLocks(cfg) {
   };
 }
 
-let lastAutoMembershipSyncAtMs = 0;
+const lastAutoMembershipSyncAtMs = new Map();
 
 export async function handleRpcAction(cfg, req) {
   const { action, params = {} } = req;
-  const senderIdentity = resolveVerifiedSenderIdentity(cfg, req);
+  const rawRequestedFlock = params.flock ?? req.flock ?? req.flockId ?? req.flockPolicy?.flockId;
+  let requestedFlockId = null;
+  if (rawRequestedFlock) {
+    try {
+      requestedFlockId = parseFlockAddress(rawRequestedFlock).flockId;
+    } catch {}
+  }
+  const syncPath = req?.flocksConfigPath || cfg?.flocksConfigPath || getFlocksConfigPath();
+  const attemptAuthorizationSync = async (triggerError) => {
+    if (
+      !requestedFlockId ||
+      cfg?.protocol === "broker-free-v34" ||
+      req?.flockPolicy ||
+      !readRawStoredFlocksConfig(cfg, syncPath).flocks?.[requestedFlockId]
+    ) {
+      throw triggerError;
+    }
+    const lastAttempt = lastAutoMembershipSyncAtMs.get(requestedFlockId) || 0;
+    if (Date.now() - lastAttempt <= 15000) throw triggerError;
+    lastAutoMembershipSyncAtMs.set(requestedFlockId, Date.now());
+    try {
+      const syncFn =
+        typeof cfg?.syncFlockMembershipsFn === "function"
+          ? cfg.syncFlockMembershipsFn
+          : syncFlockMemberships;
+      await syncFn(cfg, {
+        customPath: syncPath,
+        flockId: requestedFlockId,
+        correlationId: req.requestId || crypto.randomUUID(),
+      });
+    } catch (syncError) {
+      syncError.originalAuthorizationError = triggerError;
+      throw syncError;
+    }
+  };
+
+  let senderIdentity;
+  try {
+    senderIdentity = resolveVerifiedSenderIdentity(cfg, req);
+  } catch (identityError) {
+    if (identityError?.code !== "UNPINNED_PEER_KEY") throw identityError;
+    await attemptAuthorizationSync(identityError);
+    senderIdentity = resolveVerifiedSenderIdentity(cfg, req);
+  }
   if (!senderIdentity.senderVerified) {
     const err = new Error(
       `403 Forbidden: Verified pinned-key sender authentication is required for RPC "${action}"`
@@ -10145,16 +10595,10 @@ export async function handleRpcAction(cfg, req) {
       if (
         wallErr?.code === "FLOCK_NON_MEMBER" &&
         cfg?.protocol !== "broker-free-v34" &&
-        !req?.flockPolicy &&
-        Date.now() - lastAutoMembershipSyncAtMs > 15000
+        !req?.flockPolicy
       ) {
-        lastAutoMembershipSyncAtMs = Date.now();
-        try {
-          await syncFlockMemberships(cfg, {
-            customPath: req?.flocksConfigPath || cfg?.flocksConfigPath || getFlocksConfigPath(),
-          });
-          ({ hasExplicitFlock, flockPolicy, localFlocks } = resolveResponderFlockSelection(cfg, req));
-        } catch {}
+        await attemptAuthorizationSync(wallErr);
+        ({ hasExplicitFlock, flockPolicy, localFlocks } = resolveResponderFlockSelection(cfg, req));
         enforceFlockPolicyAndWalls(cfg, flockPolicy, req, senderIdentity, localFlocks);
       } else {
         throw wallErr;
@@ -10175,7 +10619,10 @@ export async function handleRpcAction(cfg, req) {
     !hasExplicitFlock &&
     !flockPolicy &&
     senderIdentity?.isCrossUser &&
-    (action === "list_sessions" || action === "get_transcript")
+    (action === "list_sessions" ||
+      action === "get_transcript" ||
+      action === "list_projects" ||
+      action === "list_locks")
   ) {
     const err = new Error(
       `403 Forbidden: Cross-user "${action}" requires an explicit shared flock selector (same-owner default route denied).`
@@ -10253,6 +10700,15 @@ export async function handleRpcAction(cfg, req) {
       pid: process.pid,
       timestamp: new Date().toISOString(),
     };
+    if (params.enrollmentReadiness?.correlationId && flockPolicy?.flockId) {
+      out.enrollmentReadinessAck = {
+        correlationId: String(params.enrollmentReadiness.correlationId),
+        flockId: flockPolicy.flockId,
+        rosterEpoch: Number(flockPolicy.rosterEpoch) || null,
+        authorizedPeerId: senderIdentity.peerId || null,
+        responderMachineId: cfg.machineId,
+      };
+    }
     const layeredPresence = classifyLayeredPresence({ online: true, ping: out });
     out.overallState = layeredPresence.overallState;
     out.presenceLayers = layeredPresence.presenceLayers;
@@ -12705,6 +13161,14 @@ const MCP_TOOLS = [
           type: "number",
           description: "Maximum number of the invitee's devices allowed to redeem this invite (default: 3).",
         },
+        reissue: {
+          type: "boolean",
+          description: "Atomically invalidate prior matching vouchers and issue a replacement.",
+        },
+        redemption_lifetime_hours: {
+          type: "number",
+          description: "Optional redemption window. Defaults to 72 hours for collaborators and 24 hours for guests.",
+        },
       },
       required: ["target", "github_user"],
     },
@@ -14137,9 +14601,11 @@ export async function executeMcpTool(cfg, name, args = {}, options = {}) {
       ? applyLivePresenceToLegacyRoster(legacyRoster, onlineMachines, liveSignalRSource)
       : applyLivePresenceToLegacyRoster(legacyRoster, null, null);
     let cachedFlocks = [];
+    const hasRemoteRoster =
+      resolved.remoteOwnedFlocks?.length > 0 || resolved.remoteJoinedFlocks?.length > 0;
     try {
       const registry = openFlockMembershipRegistry(options.flocksConfigPath || cfg?.flocksConfigPath || null);
-      if (resolved.remoteOwnedFlocks?.length > 0 || resolved.remoteJoinedFlocks?.length > 0) {
+      if (hasRemoteRoster) {
         registry.reconcileV3Broker({
           myFlocksResponse: {
             ok: true,
@@ -14151,7 +14617,15 @@ export async function executeMcpTool(cfg, name, args = {}, options = {}) {
         });
       }
       cachedFlocks = registry.listFlockIds().map((fid) => registry.getFlockView(fid));
-    } catch {}
+    } catch (cause) {
+      if (hasRemoteRoster) {
+        const error = new Error(`Authoritative /my-flocks roster persistence failed: ${cause.message}`);
+        error.code = "PARTIAL_PERSISTENCE_ERROR";
+        error.stage = "roster_registry";
+        error.cause = cause;
+        throw error;
+      }
+    }
     return projectPublicFlocksResponse({
       machineId: cfg.machineId,
       protocol: "legacy-v3",
@@ -14198,6 +14672,10 @@ export async function executeMcpTool(cfg, name, args = {}, options = {}) {
         invitedUser: args.github_user,
         durationMinutes: args.duration_minutes || null,
         maxDevices: args.max_devices || 3,
+        reissue: Boolean(args.reissue),
+        voucherTtlSeconds: args.redemption_lifetime_hours
+          ? Math.round(Number(args.redemption_lifetime_hours) * 3600)
+          : null,
       },
     });
     if (!res?.ok) {
@@ -14228,13 +14706,51 @@ export async function executeMcpTool(cfg, name, args = {}, options = {}) {
       }
     );
     const effectiveBootstrapUrl = `${pinnedOrigin}/api/bootstrap`;
-    if (!cfg.bootstrapUrl && fs.existsSync(activeConfigPath)) {
+    const tokenLocalVoucher = Boolean(
+      enrollmentJson?.tokenLocalVoucherAuth === true ||
+        enrollmentJson?.flocks?.some((flock) => Boolean(flock?.voucherSecret))
+    );
+    if (fs.existsSync(activeConfigPath)) {
       try {
         const updatedCfg = JSON.parse(fs.readFileSync(activeConfigPath, "utf8"));
         updatedCfg.bootstrapUrl = effectiveBootstrapUrl;
+        if (tokenLocalVoucher) updatedCfg.tokenLocalAuth = true;
         writeConfigFileSecure(updatedCfg, activeConfigPath);
         cfg.bootstrapUrl = effectiveBootstrapUrl;
-      } catch {}
+        if (tokenLocalVoucher) cfg.tokenLocalAuth = true;
+      } catch (error) {
+        const persistError = new Error(`Failed to persist enrollment authentication mode: ${error.message}`);
+        persistError.code = "ENROLLMENT_CONFIG_PERSIST_FAILED";
+        persistError.stage = "identity_registration";
+        throw persistError;
+      }
+    } else if (tokenLocalVoucher) {
+      try {
+        writeConfigFileSecure(
+          {
+            ...cfg,
+            bootstrapUrl: effectiveBootstrapUrl,
+            tokenLocalAuth: true,
+            updatedAt: new Date().toISOString(),
+          },
+          activeConfigPath
+        );
+        cfg.bootstrapUrl = effectiveBootstrapUrl;
+        cfg.tokenLocalAuth = true;
+      } catch (error) {
+        const persistError = new Error(`Failed to persist enrollment authentication mode: ${error.message}`);
+        persistError.code = "ENROLLMENT_CONFIG_PERSIST_FAILED";
+        persistError.stage = "identity_registration";
+        throw persistError;
+      }
+    }
+    const correlationId = crypto.randomUUID();
+    if (tokenLocalVoucher) {
+      await requireBootstrapCapabilities(
+        { ...cfg, bootstrapUrl: effectiveBootstrapUrl, tokenLocalAuth: true },
+        ["tokenLocalDeviceAuth", "deviceSignedOperations", "rosterSync", "enrollmentReadiness"],
+        { correlationId }
+      );
     }
     const idKey = ensureMachineIdentityKeypair();
     const timestamp = new Date().toISOString();
@@ -14269,13 +14785,18 @@ export async function executeMcpTool(cfg, name, args = {}, options = {}) {
           maintainerVisibilityAck: args.maintainer_visibility_ack !== false,
           timestamp,
           sandboxPrincipalOverride: args.sandbox_principal_override || null,
+          correlationId,
         },
       }
     );
     if (!res?.ok) {
       throw new Error(res?.error || "Failed to enroll from invite JSON");
     }
-    return projectPublicEnrollmentResult(applyV3EnrollmentResult(cfg, res));
+    const applied = applyV3EnrollmentResult(cfg, res);
+    const readiness = await verifyEnrollmentReadiness(cfg, applied.enrolledFlocks, {
+      correlationId: res.correlationId || correlationId,
+    });
+    return projectPublicEnrollmentResult({ ...applied, readiness });
   }
 
   if (name === "share_thread") {
@@ -18348,6 +18869,7 @@ export async function installBridge({
 
   let existing = {};
   let parsedEnrollmentJson = null;
+  let isTokenLocalVoucher = false;
   let cfg;
   try {
     // Save overrides before loading config
@@ -18456,7 +18978,7 @@ export async function installBridge({
       writeConfigFileSecure(existing, activeConfigPath);
     }
 
-    const isTokenLocalVoucher = Boolean(
+    isTokenLocalVoucher = Boolean(
       parsedEnrollmentJson &&
         (parsedEnrollmentJson.tokenLocalVoucherAuth === true ||
           (Array.isArray(parsedEnrollmentJson.flocks) &&
@@ -18476,6 +18998,7 @@ export async function installBridge({
   // Register member metadata (machineId, githubUser, scope, version, specs) with bootstrap server
   let memberRegistration = null;
   let enrolledFlockCount = 0;
+  let enrolledFlocks = [];
   let enrollmentError = null;
   try {
     memberRegistration = await registerWithBootstrapServer(cfg);
@@ -18487,6 +19010,14 @@ export async function installBridge({
     }
     // Also register v3 built-in or invited flocks on `/api/v3/enroll`
     const idKey = ensureMachineIdentityKeypair();
+    const enrollmentCorrelationId = crypto.randomUUID();
+    if (isTokenLocalVoucher) {
+      await requireBootstrapCapabilities(
+        cfg,
+        ["tokenLocalDeviceAuth", "deviceSignedOperations", "rosterSync", "enrollmentReadiness"],
+        { correlationId: enrollmentCorrelationId }
+      );
+    }
     const enrolledV3 = await callBootstrapV3Endpoint(cfg, "/enroll", {
       method: "POST",
       sandbox: sandboxMode,
@@ -18511,6 +19042,7 @@ export async function installBridge({
         enrollmentJson: parsedEnrollmentJson || null,
         maintainerVisibilityAck: true,
         timestamp: new Date().toISOString(),
+        correlationId: enrollmentCorrelationId,
       },
     });
     if (!enrolledV3?.ok) {
@@ -18518,6 +19050,7 @@ export async function installBridge({
     }
     const applied = applyV3EnrollmentResult(cfg, enrolledV3);
     enrolledFlockCount = applied.enrolledFlocks.length;
+    enrolledFlocks = applied.enrolledFlocks;
   } catch (error) {
     enrollmentError = formatErrorDetail(error);
   }
@@ -18759,6 +19292,21 @@ export async function installBridge({
     action: "ping",
     timeoutMs: 6000,
   });
+  const enrollmentReadiness = enrolledFlocks.length > 0
+    ? await verifyEnrollmentReadiness(cfg, enrolledFlocks)
+    : {
+        ok: false,
+        ready: false,
+        stages: [
+          { stage: "invite_redemption", ok: false, code: enrollmentError ? "ENROLLMENT_FAILED" : "NOT_ATTEMPTED" },
+          { stage: "identity_registration", ok: Boolean(memberRegistration?.ok || memberRegistration?.tokenLocal) },
+          { stage: "roster_convergence", ok: false, code: "NOT_PROVEN" },
+          { stage: "transport", ok: Boolean(pingReply?.result) },
+          { stage: "authorization", ok: false, code: "NOT_PROVEN" },
+          { stage: "first_contact", ok: false, code: "NOT_PROVEN" },
+        ],
+        error: enrollmentError || "No enrolled flock was available for readiness verification",
+      };
 
   if (sandboxMode) {
     recordSandboxManifestResource({
@@ -18796,6 +19344,7 @@ export async function installBridge({
     memberRegistered: Boolean(memberRegistration?.ok),
     enrolledFlockCount,
     enrollmentError,
+    enrollmentReadiness,
     endpoint: cfg.endpoint,
     hub: cfg.hub,
     daemonPid: daemonInfo.pid,
@@ -19940,13 +20489,31 @@ export async function queryFlockMembershipRegistry(
   }
   const registry = openFlockMembershipRegistry(customFlocksPath);
   if ((refreshBroker || registry.listFlockIds().length === 0) && cfg?.bootstrapUrl) {
-    try {
-      const remoteRes = callBootstrapV3Endpoint(cfg, "/my-flocks", { method: "GET" });
-      const bootstrapMembers = fetchBootstrapMembers({ bootstrapUrl: cfg.bootstrapUrl });
-      if (remoteRes?.ok) {
-        registry.reconcileV3Broker({ myFlocksResponse: remoteRes, bootstrapMembers });
-      }
-    } catch {}
+    await requireBootstrapCapabilities(
+      cfg,
+      ["rosterSync", "tokenLocalDeviceAuth", "deviceSignedOperations"]
+    );
+    const remoteRes = await callBootstrapV3Endpoint(cfg, "/my-flocks", { method: "GET" });
+    if (!remoteRes?.ok) {
+      const error = new Error(remoteRes?.error || "Failed to fetch authoritative flock roster");
+      error.code = remoteRes?.code || "ROSTER_FETCH_FAILED";
+      error.stage = "roster_sync";
+      throw error;
+    }
+    const bootstrapStatus = fetchBootstrapMembersStatus({
+      bootstrapUrl: cfg.bootstrapUrl,
+      cfg,
+    });
+    if (!bootstrapStatus.ok) {
+      const error = new Error(bootstrapStatus.error || "Failed to fetch authoritative peer keys");
+      error.code = "ROSTER_PEER_KEY_FETCH_FAILED";
+      error.stage = "roster_sync";
+      throw error;
+    }
+    registry.reconcileV3Broker({
+      myFlocksResponse: remoteRes,
+      bootstrapMembers: bootstrapStatus.members,
+    });
   }
   if (flockId) {
     const targetFlockId = parseFlockAddress(flockId, cfg?.githubUser).flockId;

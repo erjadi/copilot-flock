@@ -1748,11 +1748,11 @@ const EMBEDDED_RUNTIME_MANIFEST_FALLBACK = (() => {
   try {
     selfSha = hashRuntimeModule(fs.readFileSync(fileURLToPath(import.meta.url)));
   } catch {}
-  const entrypointSha = "2019c64608b757942698e790362c137aa26806c53f044d96ff82b8586cdc9472";
+  const entrypointSha = "3ab65033d9d76890b550f2316991830b70663c8b5b63edcd0b3f6807c695f49a";
   const fallback = {
     type: "copilot-flock-runtime-manifest-v1",
     schema: 1,
-    version: "3.5.0",
+    version: "3.6.0",
     entrypoints: ["flock.mjs", "bridge.mjs"],
     files: {
       "bridge.mjs": {
@@ -1787,7 +1787,7 @@ const EMBEDDED_RUNTIME_MANIFEST_FALLBACK = (() => {
       },
       "flock-membership.mjs": {
         role: "companion",
-        sha256: "fbafc26e11ff2ea33c1ecba5a647193b2bc3f607929d5505902c2ec960947abb",
+        sha256: "0e3e83fcd0cdcfd55ab64d78ddc56a71a0a4021dc4c8c048f43bc7aa49792de7",
         imports: [
           "./flock-lifecycle.mjs",
           "./flock-protocol.mjs",

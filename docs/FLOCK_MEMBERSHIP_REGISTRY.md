@@ -79,3 +79,17 @@ flowchart LR
 2. **Join Bootstrap (Welcome Ticket)**: During `approve_join`, the owner increments `rosterRevision`, signs the updated `roster-snapshot`, embeds it inside the X25519-sealed Welcome Ticket `metadata.rosterSnapshot`, and publishes a signed `roster-update` delta over Service Bus + SignalR when other peers are already enrolled. Accepting the Welcome Ticket immediately populates the new device's `flock-registry.json`—including offline collaborators—with zero peer pings.
 3. **Removal & Epoch Rotation**: During `removePeer` (kick or signed device leave), the owner increments both `epoch` and `rosterRevision`, records the removed `peerId` tombstone, and attaches `rosterDelta` and `rosterSnapshot` alongside the signed `rotation` message so retained peers atomically rotate their group key and record the removal tombstone.
 4. **Missed Delta Detection & Recovery (`ROSTER_DELTA_GAP`)**: Every `roster-delta` binds `(baseEpoch, baseRevision, baseRosterHash)`. If an offline peer missed an intermediate delta, `applySignedDelta` rejects the out-of-sequence delta with `ROSTER_DELTA_GAP` and persists `needsSnapshotSync = true`. Calling `syncRoster(flockId)` (`list_flock_members` with `sync_owner: true`, or receiving the next `rotation` carrying `rosterSnapshot`) fetches and verifies the latest owner-signed full snapshot from the designated owner without pinging any other member.
+## 4. Copilot Flock 3.6 Convergence
+
+Legacy broker-backed clients now reconcile `/enroll`, `/my-flocks`, and
+`/api/v3/flocks/sync` into the durable `FlockMembershipRegistry`. RPC
+authorization, exact-flock peer-key lookup, routing, and member listing consume
+that epoch/tombstone/expiry view; `flocks.json` remains the separate local store
+for sharing preferences and approved snapshots.
+
+Roster epochs are monotonic. Rollback, tombstone resurrection, expired
+memberships, mismatched flock identity, and ambiguous cross-flock hostname keys
+fail closed. A broker that does not advertise roster-sync, token-local, and
+device-signed capabilities returns `BROKER_UPGRADE_REQUIRED` before sync is
+attempted. Persistence failures are surfaced as `PARTIAL_PERSISTENCE_ERROR`
+rather than being converted into successful enrollment.

@@ -188,6 +188,7 @@ test("actual mirrored registration blocks report enrollment only after successfu
     const registration = new AsyncFunction("registerWithBootstrapServer", "ensureMachineIdentityKeypair",
       "callBootstrapV3Endpoint", "applyV3EnrollmentResult", "formatErrorDetail",
       `const cfg = {machineId:"DEMO-PC", scope:"personal"}; const sandboxMode=false; const parsedEnrollmentJson=null;
+      const isTokenLocalVoucher=false;
       ${source.slice(start, end)}
       return {memberRegistration, enrolledFlockCount, enrollmentError};`);
     const resultBlock = source.slice(source.indexOf("  return {", end),

@@ -938,13 +938,39 @@ export async function enrollV3Device(
           err.statusCode = 403;
           throw err;
         }
-        if (voucher.voucherExpiresAtMs && voucher.voucherExpiresAtMs <= now) {
-          const err = new Error(`Invite voucher for "${parsedAddr.flockId}" has expired`);
+        if (voucher.invalidatedAtMs) {
+          const err = new Error(
+            voucher.invalidationReason === "superseded"
+              ? `Invite voucher for "${parsedAddr.flockId}" was superseded by a newer invitation`
+              : `Invite voucher for "${parsedAddr.flockId}" is no longer valid`
+          );
+          err.code =
+            voucher.invalidationReason === "superseded"
+              ? "VOUCHER_SUPERSEDED"
+              : "VOUCHER_INVALIDATED";
           err.statusCode = 403;
           throw err;
         }
-        if (voucher.membershipExpiresAtMs && voucher.membershipExpiresAtMs <= now) {
-          const err = new Error(`Invite membership for "${parsedAddr.flockId}" has expired`);
+        if (voucher.voucherExpiresAtMs && voucher.voucherExpiresAtMs <= now) {
+          const err = new Error(`Invite voucher for "${parsedAddr.flockId}" has expired`);
+          err.code = "VOUCHER_EXPIRED";
+          err.statusCode = 403;
+          throw err;
+        }
+        if (!voucher.voucherSecret || !fInvite.voucherSecret) {
+          const err = new Error(`Invite voucher for "${parsedAddr.flockId}" requires voucherSecret`);
+          err.code = "VOUCHER_SECRET_REQUIRED";
+          err.statusCode = 403;
+          throw err;
+        }
+        const expectedSecret = Buffer.from(String(voucher.voucherSecret), "utf8");
+        const suppliedSecret = Buffer.from(String(fInvite.voucherSecret), "utf8");
+        if (
+          expectedSecret.length !== suppliedSecret.length ||
+          !crypto.timingSafeEqual(expectedSecret, suppliedSecret)
+        ) {
+          const err = new Error(`Invite voucher secret for "${parsedAddr.flockId}" is invalid`);
+          err.code = "VOUCHER_SECRET_INVALID";
           err.statusCode = 403;
           throw err;
         }
@@ -983,8 +1009,27 @@ export async function enrollV3Device(
         voucher.redeemedDeviceIds = Array.isArray(voucher.redeemedDeviceIds)
           ? voucher.redeemedDeviceIds
           : [];
+        voucher.redeemedAtByDevice =
+          voucher.redeemedAtByDevice && typeof voucher.redeemedAtByDevice === "object"
+            ? voucher.redeemedAtByDevice
+            : {};
+        voucher.membershipExpiresAtByDevice =
+          voucher.membershipExpiresAtByDevice &&
+          typeof voucher.membershipExpiresAtByDevice === "object"
+            ? voucher.membershipExpiresAtByDevice
+            : {};
         const maxDevices = Math.max(1, Number(voucher.maxDevices) || 3);
-        if (!voucher.redeemedDeviceIds.includes(cleanDevice)) {
+        if (voucher.redeemedDeviceIds.includes(cleanDevice)) {
+          const existingMember = targetFlock.members?.[peerId];
+          if (!existingMember || existingMember.publicKey !== publicKey) {
+            const err = new Error(
+              `Invite voucher replay rejected for device "${cleanDevice}" in flock "${parsedAddr.flockId}"`
+            );
+            err.code = "VOUCHER_REPLAY";
+            err.statusCode = 403;
+            throw err;
+          }
+        } else {
           if (voucher.redeemedDeviceIds.length >= maxDevices) {
             const err = new Error(
               `Invite voucher for "${parsedAddr.flockId}" has reached maxDevices (${maxDevices})`
@@ -993,13 +1038,24 @@ export async function enrollV3Device(
             throw err;
           }
           voucher.redeemedDeviceIds.push(cleanDevice);
+          voucher.redeemedAtByDevice[cleanDevice] = now;
         }
         const durationMs =
-          Number(voucher.durationMinutes) > 0 ? Number(voucher.durationMinutes) * 60000 : null;
+          Number(voucher.membershipDurationMinutes ?? voucher.durationMinutes) > 0
+            ? Number(voucher.membershipDurationMinutes ?? voucher.durationMinutes) * 60000
+            : null;
         const membershipExpiresAtMs = durationMs
-          ? voucher.membershipExpiresAtMs || now + durationMs
-          : voucher.membershipExpiresAtMs || null;
-        voucher.membershipExpiresAtMs = membershipExpiresAtMs;
+          ? voucher.membershipExpiresAtByDevice[cleanDevice] || now + durationMs
+          : null;
+        if (membershipExpiresAtMs) {
+          voucher.membershipExpiresAtByDevice[cleanDevice] = membershipExpiresAtMs;
+        }
+        if (targetFlock.flockType === "guest_pass" && membershipExpiresAtMs) {
+          targetFlock.expiresAtMs = Math.max(
+            Number(targetFlock.expiresAtMs) || 0,
+            membershipExpiresAtMs
+          );
+        }
 
         const trustTier = voucher.trustTier ||
           (targetFlock.flockType === "guest_pass" || targetFlock.targetMachineId ? "guest" : "collaborator");
@@ -1133,6 +1189,11 @@ export async function enrollV3Device(
       machineId: cleanMachine,
       scope: normScope,
       enrolledFlocks,
+      controlHints: enrolledFlocks.map((flock) => ({
+        type: "roster_epoch_changed",
+        flockId: flock.flockId,
+        rosterEpoch: flock.rosterEpoch,
+      })),
     };
   });
 }
@@ -1280,10 +1341,11 @@ export async function createV3FlockInvite(
     invitedUser,
     invitedGitHubUserId = null,
     durationMinutes = null,
-    voucherTtlSeconds = 86400,
+    voucherTtlSeconds = null,
     maxDevices = 3,
     allowedScopes = ["work"],
     trustTier = null,
+    reissue = false,
     voucherSignature = null,
     bootstrapUrl = process.env.PUBLIC_BOOTSTRAP_URL ||
       (process.env.WEBSITE_HOSTNAME
@@ -1346,7 +1408,14 @@ export async function createV3FlockInvite(
     }
 
     const durMins = Number(durationMinutes) > 0 ? Number(durationMinutes) : null;
-    const voucherExpiresAtMs = now + Math.max(60, Number(voucherTtlSeconds) || 86400) * 1000;
+    const effectiveTrust =
+      trustTier || (parsed.machineId || durMins ? "guest" : "collaborator");
+    const defaultVoucherTtlSeconds = effectiveTrust === "guest" ? 86400 : 259200;
+    const effectiveVoucherTtlSeconds = Math.max(
+      60,
+      Number(voucherTtlSeconds) || defaultVoucherTtlSeconds
+    );
+    const voucherExpiresAtMs = now + effectiveVoucherTtlSeconds * 1000;
     const f = ensureFlockRecord(store, {
       flockId: flockIdToUse,
       ownerGitHubUser: parsed.owner,
@@ -1354,7 +1423,7 @@ export async function createV3FlockInvite(
       flockType,
       allowedScopes: Array.isArray(allowedScopes) && allowedScopes.length > 0 ? allowedScopes : ["work"],
       targetMachineId: parsed.machineId || null,
-      expiresAtMs: durMins ? voucherExpiresAtMs : null,
+      expiresAtMs: null,
       sandbox,
     });
 
@@ -1375,9 +1444,24 @@ export async function createV3FlockInvite(
 
     const voucherId = crypto.randomUUID();
     const voucherSecret = crypto.randomBytes(24).toString("base64url");
-    const effectiveTrust =
-      trustTier || (parsed.machineId || durMins ? "guest" : "collaborator");
     const resolvedInvitedId = invitedGitHubUserId ? Number(invitedGitHubUserId) : null;
+    const supersededVoucherIds = [];
+    if (reissue) {
+      for (const existingVoucher of Object.values(f.vouchers || {})) {
+        if (
+          existingVoucher &&
+          !existingVoucher.invalidatedAtMs &&
+          String(existingVoucher.invitedUser || "").toLowerCase() === cleanInvited &&
+          String(existingVoucher.targetAddress || "") === parsed.canonicalPath
+        ) {
+          existingVoucher.invalidatedAtMs = now;
+          existingVoucher.invalidatedAt = new Date(now).toISOString();
+          existingVoucher.invalidationReason = "superseded";
+          existingVoucher.supersededByVoucherId = voucherId;
+          supersededVoucherIds.push(existingVoucher.voucherId);
+        }
+      }
+    }
     f.vouchers[voucherId] = {
       voucherId,
       voucherSecret,
@@ -1390,11 +1474,14 @@ export async function createV3FlockInvite(
       invitedBy: cleanCaller,
       trustTier: effectiveTrust,
       durationMinutes: durMins,
+      membershipDurationMinutes: durMins,
       maxDevices: Math.max(1, Number(maxDevices) || 3),
       redeemedDeviceIds: [],
+      redeemedAtByDevice: {},
       createdAt: new Date(now).toISOString(),
       voucherExpiresAt: new Date(voucherExpiresAtMs).toISOString(),
       voucherExpiresAtMs,
+      remainingRedemptionLifetimeSeconds: effectiveVoucherTtlSeconds,
       voucherSignature: voucherSignature || null,
     };
 
@@ -1408,6 +1495,8 @@ export async function createV3FlockInvite(
       invitedBy: cleanCaller,
       bootstrapUrl,
       voucherExpiresAt: new Date(voucherExpiresAtMs).toISOString(),
+      remainingRedemptionLifetimeSeconds: effectiveVoucherTtlSeconds,
+      membershipDurationMinutes: durMins,
       maxDevices: Math.max(1, Number(maxDevices) || 3),
       flocks: [
         {
@@ -1420,6 +1509,7 @@ export async function createV3FlockInvite(
           recommendedScope: f.allowedScopes?.[0] || "work",
           trustTier: effectiveTrust,
           durationMinutes: durMins,
+          membershipDurationMinutes: durMins,
           voucherSignature: voucherSignature || null,
         },
       ],
@@ -1435,6 +1525,7 @@ export async function createV3FlockInvite(
       flockUuid: f.flockUuid,
       targetAddress: parsed.canonicalPath,
       voucherId,
+      supersededVoucherIds,
       enrollmentJson,
       pasteablePrompt,
     };
@@ -1547,6 +1638,11 @@ export async function kickV3FlockMember(
         machineId: p.machineId,
       })),
       evictionResults,
+      controlHints: [{
+        type: "roster_epoch_changed",
+        flockId: f.flockId,
+        rosterEpoch: f.rosterEpoch,
+      }],
     };
   });
 }
@@ -1655,8 +1751,20 @@ export async function leaveV3Device(request, {
     }
     flock.leaveReceipts[request.requestId].confirmed = confirmed;
     saveV3FlockStore(store, storePath);
-    return { ok: confirmed, confirmed, flockId: request.flockId, peerId: member.peerId,
-      rosterEpoch: flock.rosterEpoch, subscription, eviction };
+    return {
+      ok: confirmed,
+      confirmed,
+      flockId: request.flockId,
+      peerId: member.peerId,
+      rosterEpoch: flock.rosterEpoch,
+      subscription,
+      eviction,
+      controlHints: [{
+        type: "roster_epoch_changed",
+        flockId: request.flockId,
+        rosterEpoch: flock.rosterEpoch,
+      }],
+    };
   });
 }
 
@@ -2089,7 +2197,7 @@ export function createBootstrapServer({
     sendJson(res, 200, {
       ok: true,
       service: "copilot-flock-bootstrap",
-      version: "3.5.0",
+      version: "3.6.0",
       allowedRepo: ALLOWED_REPO,
       hub: DEFAULT_HUB,
       serviceBusNamespace: SERVICEBUS_NAMESPACE,
@@ -2099,6 +2207,13 @@ export function createBootstrapServer({
       registeredMemberCount: Object.keys(registry).length,
       queuedOfflineMessageCount: qStore.items.length,
       v3FlockCount: Object.keys(v3Store.flocks || {}).length,
+      capabilities: {
+        rosterSync: true,
+        tokenLocalDeviceAuth: true,
+        deviceSignedOperations: true,
+        voucherReissue: true,
+        enrollmentReadiness: true,
+      },
     });
     return;
   }
@@ -2111,6 +2226,26 @@ export function createBootstrapServer({
     const storePath = isPreview ? v3PreviewStorePath : v3StorePath;
     const { raw: rawBody, parsed: bodyData } =
       req.method === "POST" ? await readRequestBodyWithRaw(req) : { raw: "", parsed: {} };
+    const correlationId =
+      String(req.headers["x-flock-correlation-id"] || bodyData.correlationId || "").trim() ||
+      crypto.randomUUID();
+
+    if (subPath === "/capabilities" && req.method === "GET") {
+      sendJson(res, 200, {
+        ok: true,
+        version: "3.6.0",
+        correlationId,
+        capabilities: {
+          rosterSync: true,
+          tokenLocalDeviceAuth: true,
+          deviceSignedOperations: true,
+          voucherReissue: true,
+          enrollmentReadiness: true,
+          offlineQueueDeviceAuth: true,
+        },
+      });
+      return;
+    }
 
     // Token refresh does not require a GitHub token (uses challenge-bound Ed25519 signature)
     if (subPath === "/token/refresh" && req.method === "POST") {
@@ -2177,14 +2312,16 @@ export function createBootstrapServer({
             sendJson(res, 403, { ok: false, error: `Invalid or unknown voucherId for flock "${parsedAddr.flockId}"` });
             return;
           }
-          if (voucher.voucherSecret) {
-            const suppliedSecret = String(fInvite.voucherSecret || "");
-            const expectedBuf = Buffer.from(String(voucher.voucherSecret), "utf8");
-            const suppliedBuf = Buffer.from(suppliedSecret, "utf8");
-            if (expectedBuf.length !== suppliedBuf.length || !crypto.timingSafeEqual(expectedBuf, suppliedBuf)) {
-              sendJson(res, 403, { ok: false, error: "Invalid or missing voucherSecret for token-local enrollment" });
-              return;
-            }
+          if (!voucher.voucherSecret || !fInvite.voucherSecret) {
+            sendJson(res, 403, { ok: false, code: "VOUCHER_SECRET_REQUIRED", error: "Invalid or missing voucherSecret for token-local enrollment" });
+            return;
+          }
+          const suppliedSecret = String(fInvite.voucherSecret);
+          const expectedBuf = Buffer.from(String(voucher.voucherSecret), "utf8");
+          const suppliedBuf = Buffer.from(suppliedSecret, "utf8");
+          if (expectedBuf.length !== suppliedBuf.length || !crypto.timingSafeEqual(expectedBuf, suppliedBuf)) {
+            sendJson(res, 403, { ok: false, code: "VOUCHER_SECRET_INVALID", error: "Invalid or missing voucherSecret for token-local enrollment" });
+            return;
           }
           const vUser = String(voucher.invitedUser || "").trim().toLowerCase();
           if (!vUser) {
@@ -2224,17 +2361,15 @@ export function createBootstrapServer({
             githubUser: matchedUser,
             githubName: null,
             scope: bodyData.scope || "work",
-            version: bodyData.version || "3.5.0",
+            version: bodyData.version || "3.6.0",
             hostname: bodyData.hostname || bodyData.machineId,
             platform: bodyData.platform || null,
             specs: bodyData.specs || null,
           }, membersPath);
         }
-        const connStr = process.env.SIGNALR_CONNECTION_STRING || "";
         sendJson(res, 200, {
           ...out,
           hub: DEFAULT_HUB,
-          ...(connStr ? { connectionString: connStr } : {}),
         });
         return;
       } catch (err) {
@@ -2484,7 +2619,12 @@ export function createBootstrapServer({
       return;
     }
 
-    sendJson(res, 404, { ok: false, error: `Unknown v3 endpoint: ${url.pathname}` });
+    sendJson(res, 404, {
+      ok: false,
+      code: "V3_ENDPOINT_UNSUPPORTED",
+      correlationId,
+      error: `Unknown v3 endpoint: ${url.pathname}`,
+    });
     return;
   }
 
@@ -2739,12 +2879,19 @@ export function createBootstrapServer({
     }
 
     if (url.pathname === "/api/register") {
+      const visibleMembers = deviceAuth
+        ? Object.values(registry).filter(
+            (member) =>
+              member?.machineId &&
+              deviceAuth.allowedPeerMachines.has(String(member.machineId).toLowerCase())
+          )
+        : Object.values(registry);
       sendJson(res, 200, {
         ok: true,
         repo: verification.repo,
         githubUser,
         registered: machineId ? registry[machineId] : null,
-        members: Object.values(registry),
+        members: visibleMembers,
       });
       return;
     }

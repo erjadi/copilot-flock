@@ -1,7 +1,7 @@
 {
   "type": "copilot-flock-runtime-manifest-v1",
   "schema": 1,
-  "version": "3.5.0",
+  "version": "3.6.0",
   "entrypoints": [
     "flock.mjs",
     "bridge.mjs"
@@ -9,7 +9,7 @@
   "files": {
     "bridge.mjs": {
       "role": "entrypoint",
-      "sha256": "2019c64608b757942698e790362c137aa26806c53f044d96ff82b8586cdc9472",
+      "sha256": "3ab65033d9d76890b550f2316991830b70663c8b5b63edcd0b3f6807c695f49a",
       "imports": [
         "./flock-broker-free.mjs",
         "./flock-lifecycle.mjs",
@@ -36,14 +36,14 @@
     },
     "flock-lifecycle.mjs": {
       "role": "companion",
-      "sha256": "76fbe34defb5988c9f24c6b115de3f09c1b71fb2f1c38c5ab2fc4553f76d36c0",
+      "sha256": "1a55a2fa2111ffd35732f97e652950d198ee2873844a99ac59ecb702e1bd241b",
       "imports": [
         "./flock-membership.mjs"
       ]
     },
     "flock-membership.mjs": {
       "role": "companion",
-      "sha256": "fbafc26e11ff2ea33c1ecba5a647193b2bc3f607929d5505902c2ec960947abb",
+      "sha256": "0e3e83fcd0cdcfd55ab64d78ddc56a71a0a4021dc4c8c048f43bc7aa49792de7",
       "imports": [
         "./flock-lifecycle.mjs",
         "./flock-protocol.mjs"
@@ -58,7 +58,7 @@
     },
     "flock.mjs": {
       "role": "entrypoint",
-      "sha256": "2019c64608b757942698e790362c137aa26806c53f044d96ff82b8586cdc9472",
+      "sha256": "3ab65033d9d76890b550f2316991830b70663c8b5b63edcd0b3f6807c695f49a",
       "imports": [
         "./flock-broker-free.mjs",
         "./flock-lifecycle.mjs",
@@ -67,5 +67,5 @@
       ]
     }
   },
-  "manifestDigest": "08394f64749895aaa780725350dc1efc337e78e5d9161b08be28e5a172624e94"
+  "manifestDigest": "a699fc63ed030a20e5aace5fa63047e5ce3906f336810e1d14b88390d8f5dcea"
 }

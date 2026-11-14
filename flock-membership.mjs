@@ -1371,6 +1371,28 @@ export class FlockMembershipRegistry {
     return Object.keys(this.read().flocks).sort();
   }
 
+  findActiveMember(flockId, {
+    peerId = null,
+    machineId = null,
+    now = this.clock(),
+  } = {}) {
+    const cleanFlockId = normalizeRegistryFlockId(flockId);
+    const stored = this.read().flocks[cleanFlockId];
+    if (!stored) return null;
+    const cleanPeerId = peerId ? String(peerId).trim().toLowerCase() : null;
+    const cleanMachineId = machineId ? String(machineId).trim().toLowerCase() : null;
+    const matches = Object.values(stored.members || {}).filter((member) => {
+      if (!member || stored.tombstones?.[member.identityKey]) return false;
+      if (cleanPeerId && String(member.peerId || "").trim().toLowerCase() !== cleanPeerId) return false;
+      if (cleanMachineId && String(member.machineId || "").trim().toLowerCase() !== cleanMachineId) return false;
+      if (member.membershipExpiresAtMs != null && Number(member.membershipExpiresAtMs) <= now) return false;
+      if (member.certExpiresAtMs != null && Number(member.certExpiresAtMs) <= now) return false;
+      return true;
+    });
+    if (matches.length !== 1) return null;
+    return structuredClone(matches[0]);
+  }
+
   applySignedSnapshot(snapshot, {
     ownerPublicKey,
     expectedFlockId = null,
