@@ -704,7 +704,8 @@ function activeSignalRTargetUserIds(flock, now = Date.now()) {
 
 function addOwnerMachinesToSharedFlock(store, flock, ownerGitHubUser, now = Date.now()) {
   const cleanOwner = String(ownerGitHubUser || "").trim().toLowerCase();
-  if (!cleanOwner || !flock || ["owner_root", "owner_scope"].includes(flock.flockType)) return;
+  if (!cleanOwner || !flock || ["owner_root", "owner_scope"].includes(flock.flockType)) return false;
+  let changed = false;
   for (const source of Object.values(store.flocks || {})) {
     if (
       !source ||
@@ -735,9 +736,11 @@ function addOwnerMachinesToSharedFlock(store, flock, ownerGitHubUser, now = Date
       };
       if (!previous || previous.publicKey !== member.publicKey || previous.trustTier !== "owner") {
         flock.rosterEpoch = (Number(flock.rosterEpoch) || 1) + 1;
+        changed = true;
       }
     }
   }
+  return changed;
 }
 
 export async function evictSignalRHubUserImmediate({
@@ -2058,6 +2061,15 @@ export async function syncV3DeviceMemberships(
           members: [],
         });
         continue;
+      }
+
+      if (
+        !["owner_root", "owner_scope"].includes(f.flockType) &&
+        !f.targetMachineId &&
+        String(f.ownerGitHubUser || "").toLowerCase() === cleanUser &&
+        (!f.ownerGitHubUserId || Number(f.ownerGitHubUserId) === numUserId)
+      ) {
+        mutated = addOwnerMachinesToSharedFlock(store, f, cleanUser, now) || mutated;
       }
 
       const memberEntry = Object.entries(f.members || {}).find(

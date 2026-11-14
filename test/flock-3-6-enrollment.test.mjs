@@ -10,6 +10,7 @@ import {
   createBootstrapServer,
   createV3FlockInvite,
   enrollV3Device,
+  syncV3DeviceMemberships,
 } from "../bootstrap-server.mjs";
 import {
   applyV3EnrollmentResult,
@@ -309,6 +310,24 @@ test("3.6 owner second workstation readiness uses positive assertions and shared
   const shared = stored.flocks["owner/shared-team"];
   assert.equal(Object.values(shared.members).some((member) => member.machineId === "OWNER-PC-2"), true);
   assert.equal(shared.sessionVisibility, undefined);
+
+  for (const [memberKey, member] of Object.entries(shared.members)) {
+    if (member.machineId === "OWNER-PC-2") delete shared.members[memberKey];
+  }
+  fs.writeFileSync(storePath, JSON.stringify(stored, null, 2));
+  const synced = await syncV3DeviceMemberships({
+    githubUser: "owner",
+    githubUserId: 1001,
+    deviceId: second.fingerprint,
+    machineId: "OWNER-PC-2",
+  }, { storePath, connectionString: "" });
+  assert.ok(synced.enrolledFlocks.some((flock) => flock.flockId === "owner/shared-team"));
+  const afterSync = JSON.parse(fs.readFileSync(storePath, "utf8"));
+  assert.equal(
+    Object.values(afterSync.flocks["owner/shared-team"].members)
+      .some((member) => member.machineId === "OWNER-PC-2" && member.trustTier === "owner"),
+    true
+  );
 
   const ownerScope = enrolled.enrolledFlocks.find((flock) => flock.flockId === "owner/work");
   const readiness = await verifyEnrollmentReadiness(

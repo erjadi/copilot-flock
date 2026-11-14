@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
+import { execFileSync } from "node:child_process";
 import { atomicJson, inspectProcess } from "./flock-lifecycle.mjs";
 
 const TERMINAL_STATES = new Set(["completed", "failed", "cancelled"]);
@@ -22,12 +23,71 @@ function boundedText(value, max = 4096) {
   return text.length <= max ? text : `${text.slice(0, max)}...`;
 }
 
-function requesterKey({ flockId = null, requesterMachine, requesterSession = null }) {
+function requesterKey({
+  flockId = null,
+  requesterMachine,
+  requesterSession = null,
+  requesterGitHubUser = null,
+  requesterPeerId = null,
+}) {
   return [
     String(flockId || "").toLowerCase(),
     String(requesterMachine || "").toLowerCase(),
     String(requesterSession || "").toLowerCase(),
+    String(requesterGitHubUser || "").toLowerCase(),
+    String(requesterPeerId || "").toLowerCase(),
   ].join("|");
+}
+
+function redactOperationContent(value, max = 8192) {
+  return boundedText(value, max)
+    .replace(/-----BEGIN [^-]+ PRIVATE KEY-----[\s\S]*?-----END [^-]+ PRIVATE KEY-----/gi, "[REDACTED PRIVATE KEY]")
+    .replace(/\b(AccessKey|SharedAccessKey|SharedAccessSignature|sig)=([^;\s&]+)/gi, "$1=[REDACTED]")
+    .replace(/\b(?:gh[opsu]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,})\b/g, "[REDACTED TOKEN]")
+    .replace(/\bBearer\s+[A-Za-z0-9._~+/-]+=*/gi, "Bearer [REDACTED]");
+}
+
+function terminateVerifiedProcessTree(identity, inspectProcessFn = inspectProcess, platform = process.platform) {
+  if (!identity?.pid || identity.start == null) return false;
+  const live = inspectProcessFn(identity.pid);
+  if (!live || live.start !== identity.start) return false;
+  if (platform === "win32") {
+    execFileSync("taskkill.exe", ["/PID", String(identity.pid), "/T", "/F"], {
+      windowsHide: true,
+      stdio: "ignore",
+    });
+    return true;
+  }
+  const rows = execFileSync("ps", ["-eo", "pid=,ppid="], {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "ignore"],
+  });
+  const childrenByParent = new Map();
+  for (const line of String(rows).split(/\r?\n/)) {
+    const match = line.trim().match(/^(\d+)\s+(\d+)$/);
+    if (!match) continue;
+    const pid = Number(match[1]);
+    const ppid = Number(match[2]);
+    const children = childrenByParent.get(ppid) || [];
+    children.push(pid);
+    childrenByParent.set(ppid, children);
+  }
+  const descendants = [];
+  const visit = (pid) => {
+    for (const childPid of childrenByParent.get(pid) || []) {
+      visit(childPid);
+      descendants.push(childPid);
+    }
+  };
+  visit(Number(identity.pid));
+  for (const pid of [...descendants, Number(identity.pid)]) {
+    try {
+      process.kill(pid, "SIGTERM");
+    } catch (error) {
+      if (error?.code !== "ESRCH") throw error;
+    }
+  }
+  return true;
 }
 
 export class PersistentOperationStore {
@@ -68,13 +128,21 @@ export class PersistentOperationStore {
     flockId = null,
     requesterMachine,
     requesterSession = null,
+    requesterGitHubUser = null,
+    requesterPeerId = null,
     targetMachine,
     targetSession = null,
     metadata = null,
   }) {
     const data = this.read();
     const existing = data.operations[operationId];
-    const ownerKey = requesterKey({ flockId, requesterMachine, requesterSession });
+    const ownerKey = requesterKey({
+      flockId,
+      requesterMachine,
+      requesterSession,
+      requesterGitHubUser,
+      requesterPeerId,
+    });
     if (existing) {
       if (
         existing.requesterKey !== ownerKey ||
@@ -96,6 +164,8 @@ export class PersistentOperationStore {
       flockId,
       requesterMachine,
       requesterSession,
+      requesterGitHubUser,
+      requesterPeerId,
       requesterKey: ownerKey,
       targetMachine,
       targetSession,
@@ -244,12 +314,14 @@ export class HeadlessSessionSupervisor {
   constructor(root, {
     clock = Date.now,
     inspectProcessFn = inspectProcess,
+    terminateProcessTreeFn = terminateVerifiedProcessTree,
     maxQueueDepth = 32,
     leaseTtlMs = 10 * 60 * 1000,
   } = {}) {
     this.root = path.resolve(root);
     this.clock = clock;
     this.inspectProcess = inspectProcessFn;
+    this.terminateProcessTree = terminateProcessTreeFn;
     this.maxQueueDepth = Math.max(1, Number(maxQueueDepth) || 32);
     this.leaseTtlMs = Math.max(1000, Number(leaseTtlMs) || 600000);
     this.leasePath = path.join(this.root, "cli-leases.json");
@@ -370,8 +442,7 @@ export class HeadlessSessionSupervisor {
   cancel(operationId) {
     const active = this.children.get(operationId);
     if (!active || !this.processIdentityIsLive(active.identity)) return false;
-    active.child.kill();
-    return true;
+    return Boolean(this.terminateProcessTree(active.identity, this.inspectProcess));
   }
 }
 
@@ -390,6 +461,10 @@ export class PresenceStateTracker {
     coordinatorHealthy = null,
     trackerHealthy = null,
     reason = null,
+    removed = false,
+    revoked = false,
+    tombstoned = false,
+    membershipExpiresAtMs = null,
   }) {
     const now = this.clock();
     const seenMs = lastSeenAt == null
@@ -398,6 +473,21 @@ export class PresenceStateTracker {
         ? lastSeenAt
         : Date.parse(String(lastSeenAt));
     const ageMs = Number.isFinite(seenMs) ? Math.max(0, now - seenMs) : null;
+    const expired = membershipExpiresAtMs != null && Number(membershipExpiresAtMs) <= now;
+    if (removed || revoked || tombstoned || expired) {
+      const stateReason = removed || tombstoned
+        ? "membership_removed"
+        : revoked
+          ? "membership_revoked"
+          : "membership_expired";
+      return {
+        state: "offline",
+        lastSeenAt: seenMs == null ? null : new Date(seenMs).toISOString(),
+        ageMs,
+        reason: stateReason,
+        layer: "authorization",
+      };
+    }
     if (!transportOnline) {
       if (ageMs != null && ageMs <= this.reconnectGraceMs) {
         return { state: "reconnecting", lastSeenAt: new Date(seenMs).toISOString(), ageMs, reason: reason || "signalr_reconnect_grace", layer: "transport" };
@@ -432,6 +522,9 @@ export function compactOperation(operation) {
       ? {
           result: {
             completed: Boolean(operation.result?.completed),
+            ...(typeof operation.result?.content === "string"
+              ? { content: redactOperationContent(operation.result.content) }
+              : {}),
             contentBytes:
               typeof operation.result?.content === "string"
                 ? Buffer.byteLength(operation.result.content, "utf8")

@@ -3745,7 +3745,7 @@ test("legacy flock_status and list_flocks surface offline shared-flock collabora
   const rene = byMachine.get("DESKTOP-PSCVM1T");
   assert.ok(rene, "Recently enrolled collaborator DESKTOP-PSCVM1T must be surfaced during reconnect grace");
   assert.equal(rene.githubUser, "renepajta");
-  assert.equal(rene.online, true);
+  assert.equal(rene.online, false);
   assert.equal(rene.presence, "reconnecting");
   assert.equal(rene.overallState, "reconnecting");
   assert.equal(rene.heartbeatObserved, false);
@@ -3757,7 +3757,7 @@ test("legacy flock_status and list_flocks surface offline shared-flock collabora
 
   const ue3 = byMachine.get("DESKTOP-UE3B1TD");
   assert.ok(ue3, "Owner-root member DESKTOP-UE3B1TD from /api/members must be surfaced during reconnect grace");
-  assert.equal(ue3.online, true);
+  assert.equal(ue3.online, false);
   assert.equal(ue3.presence, "reconnecting");
   assert.equal(ue3.removed, false);
   assert.ok(ue3.flocks.includes("erjadi"));
