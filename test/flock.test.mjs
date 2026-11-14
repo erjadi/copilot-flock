@@ -5803,6 +5803,7 @@ test("reconcileAuthoritativeFlockMemberships heals downgraded owner roles, enfor
             ok: true,
             capabilities: {
               rosterSync: true,
+              scopedSignalRTransportTokens: true,
               tokenLocalDeviceAuth: true,
               deviceSignedOperations: true,
             },

@@ -626,8 +626,9 @@ function base64UrlEncode(buf) {
 
 export function mintSignalRHubToken({
   connectionString = process.env.SIGNALR_CONNECTION_STRING || "",
-  hub,
+  hub = DEFAULT_HUB,
   userId,
+  targetUserIds = [],
   expiresAtMs = Date.now() + 3600 * 1000,
   role = "peer",
 }) {
@@ -635,31 +636,108 @@ export function mintSignalRHubToken({
   if (!endpoint || !accessKey || !hub || !userId) {
     return null;
   }
-  const aud = `${endpoint}/client/?hub=${encodeURIComponent(hub)}`;
   const exp = Math.floor(expiresAtMs / 1000);
-  const header = base64UrlEncode(JSON.stringify({ alg: "HS256", typ: "JWT" }));
-  const payload = base64UrlEncode(
-    JSON.stringify({
+  const mint = (aud, claims = {}) => {
+    const header = base64UrlEncode(JSON.stringify({ alg: "HS256", typ: "JWT" }));
+    const payload = base64UrlEncode(JSON.stringify({
       aud,
-      sub: userId,
-      nameid: userId,
-      "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/nameidentifier": userId,
-      role,
       iat: Math.floor(Date.now() / 1000),
       exp,
-    })
-  );
-  const sig = base64UrlEncode(
-    crypto.createHmac("sha256", Buffer.from(accessKey, "utf8")).update(`${header}.${payload}`).digest()
-  );
+      ...claims,
+    }));
+    const sig = base64UrlEncode(
+      crypto
+        .createHmac("sha256", Buffer.from(accessKey, "utf8"))
+        .update(`${header}.${payload}`)
+        .digest()
+    );
+    return `${header}.${payload}.${sig}`;
+  };
+  const clientAudience = `${endpoint}/client/?hub=${encodeURIComponent(hub)}`;
+  const clientClaims = {
+    sub: userId,
+    nameid: userId,
+    "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/nameidentifier": userId,
+    role,
+  };
+  const broadcastAudience = `${endpoint}/api/v1/hubs/${encodeURIComponent(hub)}`;
+  const users = {};
+  for (const rawTarget of targetUserIds) {
+    const target = String(rawTarget || "").trim();
+    if (!target || users[target]) continue;
+    const audience = `${broadcastAudience}/users/${encodeURIComponent(target)}`;
+    users[target] = {
+      audience,
+      token: mint(audience),
+    };
+  }
+  const clientToken = mint(clientAudience, clientClaims);
   return {
     endpoint,
     hub,
     userId,
-    hubToken: `${header}.${payload}.${sig}`,
+    clientAudience,
+    clientToken,
+    hubToken: clientToken,
+    restTokens: {
+      broadcast: {
+        audience: broadcastAudience,
+        token: mint(broadcastAudience),
+      },
+      users,
+    },
     expiresAt: new Date(expiresAtMs).toISOString(),
     expiresAtMs,
   };
+}
+
+function activeSignalRTargetUserIds(flock, now = Date.now()) {
+  return Object.values(flock?.members || {})
+    .filter(
+      (member) =>
+        member &&
+        member.machineId &&
+        (!member.membershipExpiresAtMs || Number(member.membershipExpiresAtMs) > now)
+    )
+    .map((member) => String(member.machineId));
+}
+
+function addOwnerMachinesToSharedFlock(store, flock, ownerGitHubUser, now = Date.now()) {
+  const cleanOwner = String(ownerGitHubUser || "").trim().toLowerCase();
+  if (!cleanOwner || !flock || ["owner_root", "owner_scope"].includes(flock.flockType)) return;
+  for (const source of Object.values(store.flocks || {})) {
+    if (
+      !source ||
+      source === flock ||
+      String(source.ownerGitHubUser || "").toLowerCase() !== cleanOwner ||
+      !["owner_root", "owner_scope"].includes(source.flockType)
+    ) {
+      continue;
+    }
+    for (const [memberKey, member] of Object.entries(source.members || {})) {
+      if (
+        !member ||
+        String(member.githubUser || "").toLowerCase() !== cleanOwner ||
+        (member.membershipExpiresAtMs && Number(member.membershipExpiresAtMs) <= now) ||
+        (Array.isArray(flock.allowedScopes) &&
+          flock.allowedScopes.length > 0 &&
+          !flock.allowedScopes.includes(member.scope))
+      ) {
+        continue;
+      }
+      const previous = flock.members?.[memberKey];
+      flock.members ||= {};
+      flock.members[memberKey] = {
+        ...member,
+        trustTier: "owner",
+        membershipExpiresAt: null,
+        membershipExpiresAtMs: null,
+      };
+      if (!previous || previous.publicKey !== member.publicKey || previous.trustTier !== "owner") {
+        flock.rosterEpoch = (Number(flock.rosterEpoch) || 1) + 1;
+      }
+    }
+  }
 }
 
 export async function evictSignalRHubUserImmediate({
@@ -1144,8 +1222,9 @@ export async function enrollV3Device(
         : now + 3600 * 1000;
       const hubCred = mintSignalRHubToken({
         connectionString,
-        hub: f.hubName,
-        userId: peerId,
+        hub: DEFAULT_HUB,
+        userId: cleanMachine,
+        targetUserIds: activeSignalRTargetUserIds(f, now),
         expiresAtMs: tokenExpMs,
         role: item.trustTier,
       });
@@ -1171,6 +1250,10 @@ export async function enrollV3Device(
           : null,
         membershipExpiresAtMs: item.membershipExpiresAtMs || null,
         hubToken: hubCred?.hubToken || null,
+        clientToken: hubCred?.clientToken || null,
+        clientAudience: hubCred?.clientAudience || null,
+        restTokens: hubCred?.restTokens || null,
+        transportHub: hubCred?.hub || DEFAULT_HUB,
         endpoint: hubCred?.endpoint || null,
         tokenExpiresAt: hubCred?.expiresAt || null,
         serverNonce,
@@ -1252,8 +1335,8 @@ export async function refreshV3FlockToken(
       saveV3FlockStore(store, storePath);
       await evictSignalRHubUserImmediate({
         connectionString,
-        hub: f.hubName,
-        userId: member.peerId,
+        hub: DEFAULT_HUB,
+        userId: member.machineId,
       });
       const err = new Error(`Time-bound membership in flock "${f.flockId}" has expired`);
       err.code = "MEMBERSHIP_EXPIRED";
@@ -1309,8 +1392,9 @@ export async function refreshV3FlockToken(
       : now + 3600 * 1000;
     const hubCred = mintSignalRHubToken({
       connectionString,
-      hub: f.hubName,
-      userId: member.peerId,
+      hub: DEFAULT_HUB,
+      userId: member.machineId,
+      targetUserIds: activeSignalRTargetUserIds(f, now),
       expiresAtMs: tokenExpMs,
       role: member.trustTier,
     });
@@ -1324,10 +1408,25 @@ export async function refreshV3FlockToken(
       hubName: f.hubName,
       rosterEpoch: f.rosterEpoch,
       hubToken: hubCred?.hubToken || null,
+      clientToken: hubCred?.clientToken || null,
+      clientAudience: hubCred?.clientAudience || null,
+      restTokens: hubCred?.restTokens || null,
+      transportHub: hubCred?.hub || DEFAULT_HUB,
       endpoint: hubCred?.endpoint || null,
       tokenExpiresAt: hubCred?.expiresAt || null,
       membershipExpiresAt: member.membershipExpiresAt || null,
       serverNonce: nextNonce,
+      peerId: member.peerId,
+      githubUser: member.githubUser,
+      githubUserId: member.githubUserId,
+      deviceId: member.deviceId,
+      machineId: member.machineId,
+      flockType: f.flockType,
+      ownerGitHubUser: f.ownerGitHubUser,
+      ownerGitHubUserId: f.ownerGitHubUserId,
+      trustTier: member.trustTier,
+      allowedScopes: f.allowedScopes,
+      targetMachineId: f.targetMachineId || null,
       members: Object.values(f.members),
     };
   });
@@ -1441,24 +1540,33 @@ export async function createV3FlockInvite(
         }
       }
     }
+    addOwnerMachinesToSharedFlock(store, f, parsed.owner, now);
 
     const voucherId = crypto.randomUUID();
     const voucherSecret = crypto.randomBytes(24).toString("base64url");
     const resolvedInvitedId = invitedGitHubUserId ? Number(invitedGitHubUserId) : null;
     const supersededVoucherIds = [];
     if (reissue) {
-      for (const existingVoucher of Object.values(f.vouchers || {})) {
+      for (const candidateFlock of Object.values(store.flocks || {})) {
         if (
-          existingVoucher &&
-          !existingVoucher.invalidatedAtMs &&
-          String(existingVoucher.invitedUser || "").toLowerCase() === cleanInvited &&
-          String(existingVoucher.targetAddress || "") === parsed.canonicalPath
+          !candidateFlock ||
+          String(candidateFlock.ownerGitHubUser || "").toLowerCase() !== parsed.owner
         ) {
-          existingVoucher.invalidatedAtMs = now;
-          existingVoucher.invalidatedAt = new Date(now).toISOString();
-          existingVoucher.invalidationReason = "superseded";
-          existingVoucher.supersededByVoucherId = voucherId;
-          supersededVoucherIds.push(existingVoucher.voucherId);
+          continue;
+        }
+        for (const existingVoucher of Object.values(candidateFlock.vouchers || {})) {
+          if (
+            existingVoucher &&
+            !existingVoucher.invalidatedAtMs &&
+            String(existingVoucher.invitedUser || "").toLowerCase() === cleanInvited &&
+            String(existingVoucher.targetAddress || "") === parsed.canonicalPath
+          ) {
+            existingVoucher.invalidatedAtMs = now;
+            existingVoucher.invalidatedAt = new Date(now).toISOString();
+            existingVoucher.invalidationReason = "superseded";
+            existingVoucher.supersededByVoucherId = voucherId;
+            supersededVoucherIds.push(existingVoucher.voucherId);
+          }
         }
       }
     }
@@ -1574,6 +1682,7 @@ export async function kickV3FlockMember(
     }
 
     const kickedPeers = [];
+    const changedFlocks = new Map();
     for (const [peerKey, m] of Object.entries(f.members || {})) {
       if (matchesMember(m, { targetUser: cleanTargetUser, targetGitHubUserId,
         targetDeviceId, targetMachineId: cleanTargetMachine })) {
@@ -1587,7 +1696,7 @@ export async function kickV3FlockMember(
             peerId: m.peerId,
             deviceId: m.deviceId || null,
             keyFingerprint: m.keyFingerprint || m.deviceId || null,
-            removedAtEpoch: f.rosterEpoch,
+            removedAtEpoch: (Number(f.rosterEpoch) || 1) + 1,
             removedAt: new Date().toISOString(),
           };
         }
@@ -1597,6 +1706,64 @@ export async function kickV3FlockMember(
             if (m.githubUserId) f.revokedPrincipals[String(m.githubUserId)] = new Date().toISOString();
           }
           f.revokedPrincipals[peerKey] = new Date().toISOString();
+        }
+      }
+    }
+    if (kickedPeers.length > 0) {
+      changedFlocks.set(f.flockId, f);
+    }
+
+    const kickedOwnerDevices = kickedPeers.filter(
+      (member) =>
+        String(member.githubUser || "").toLowerCase() === f.ownerGitHubUser &&
+        member.trustTier === "owner"
+    );
+    if (
+      kickedOwnerDevices.length > 0 &&
+      ["owner_root", "owner_scope"].includes(f.flockType)
+    ) {
+      for (const related of Object.values(store.flocks || {})) {
+        if (
+          related === f ||
+          ["owner_root", "owner_scope"].includes(related.flockType) ||
+          String(related.ownerGitHubUser || "").toLowerCase() !== f.ownerGitHubUser
+        ) {
+          continue;
+        }
+        let changed = false;
+        for (const [peerKey, member] of Object.entries(related.members || {})) {
+          if (
+            !kickedOwnerDevices.some(
+              (kicked) =>
+                kicked.peerId === member.peerId ||
+                (kicked.deviceId && kicked.deviceId === member.deviceId) ||
+                (kicked.machineId &&
+                  String(kicked.machineId).toLowerCase() ===
+                    String(member.machineId || "").toLowerCase())
+            )
+          ) {
+            continue;
+          }
+          delete related.members[peerKey];
+          related.removedMachines ||= {};
+          related.removedMachines[
+            `${String(member.githubUser || "").toLowerCase()}:${String(member.machineId || "").toLowerCase()}`
+          ] = {
+            githubUser: member.githubUser,
+            machineId: member.machineId,
+            peerId: member.peerId,
+            deviceId: member.deviceId || null,
+            keyFingerprint: member.keyFingerprint || member.deviceId || null,
+            removedAtEpoch: (Number(related.rosterEpoch) || 1) + 1,
+            removedAt: new Date().toISOString(),
+          };
+          related.revokedPrincipals[peerKey] = new Date().toISOString();
+          kickedPeers.push(member);
+          changed = true;
+        }
+        if (changed) {
+          related.rosterEpoch = (Number(related.rosterEpoch) || 1) + 1;
+          changedFlocks.set(related.flockId, related);
         }
       }
     }
@@ -1614,14 +1781,15 @@ export async function kickV3FlockMember(
     }
 
     f.rosterEpoch = (Number(f.rosterEpoch) || 1) + 1;
+    changedFlocks.set(f.flockId, f);
     saveV3FlockStore(store, storePath);
 
     const evictionResults = [];
     for (const kp of kickedPeers) {
       const ev = await evictSignalRHubUserImmediate({
         connectionString,
-        hub: f.hubName,
-        userId: kp.peerId,
+        hub: DEFAULT_HUB,
+        userId: kp.machineId,
       });
       evictionResults.push({ peerId: kp.peerId, machineId: kp.machineId, ...ev });
     }
@@ -1638,11 +1806,11 @@ export async function kickV3FlockMember(
         machineId: p.machineId,
       })),
       evictionResults,
-      controlHints: [{
+      controlHints: Array.from(changedFlocks.values()).map((changed) => ({
         type: "roster_epoch_changed",
-        flockId: f.flockId,
-        rosterEpoch: f.rosterEpoch,
-      }],
+        flockId: changed.flockId,
+        rosterEpoch: changed.rosterEpoch,
+      })),
     };
   });
 }
@@ -1843,6 +2011,8 @@ export async function syncV3DeviceMemberships(
     const enrolledFlocks = [];
     const revokedFlockIds = [];
     const expiredFlockIds = [];
+    const revokedFlockSummaries = [];
+    const expiredFlockSummaries = [];
     let mutated = false;
 
     for (const f of Object.values(store.flocks || {})) {
@@ -1855,6 +2025,15 @@ export async function syncV3DeviceMemberships(
         })
       ) {
         revokedFlockIds.push(f.flockId);
+        revokedFlockSummaries.push({
+          flockId: f.flockId,
+          flockUuid: f.flockUuid,
+          flockType: f.flockType,
+          ownerGitHubUser: f.ownerGitHubUser,
+          ownerGitHubUserId: f.ownerGitHubUserId,
+          rosterEpoch: f.rosterEpoch,
+          members: [],
+        });
         continue;
       }
 
@@ -1876,10 +2055,19 @@ export async function syncV3DeviceMemberships(
         f.rosterEpoch = (Number(f.rosterEpoch) || 1) + 1;
         mutated = true;
         expiredFlockIds.push(f.flockId);
+        expiredFlockSummaries.push({
+          flockId: f.flockId,
+          flockUuid: f.flockUuid,
+          flockType: f.flockType,
+          ownerGitHubUser: f.ownerGitHubUser,
+          ownerGitHubUserId: f.ownerGitHubUserId,
+          rosterEpoch: f.rosterEpoch,
+          members: [],
+        });
         await evictSignalRHubUserImmediate({
           connectionString,
-          hub: f.hubName,
-          userId: member.peerId,
+          hub: DEFAULT_HUB,
+          userId: member.machineId,
         });
         continue;
       }
@@ -1907,8 +2095,9 @@ export async function syncV3DeviceMemberships(
         : now + 3600 * 1000;
       const hubCred = mintSignalRHubToken({
         connectionString,
-        hub: f.hubName,
-        userId: member.peerId,
+        hub: DEFAULT_HUB,
+        userId: member.machineId,
+        targetUserIds: activeSignalRTargetUserIds(f, now),
         expiresAtMs: tokenExpMs,
         role: member.trustTier,
       });
@@ -1934,6 +2123,10 @@ export async function syncV3DeviceMemberships(
         membershipExpiresAt: member.membershipExpiresAt || null,
         membershipExpiresAtMs: member.membershipExpiresAtMs || null,
         hubToken: hubCred?.hubToken || null,
+        clientToken: hubCred?.clientToken || null,
+        clientAudience: hubCred?.clientAudience || null,
+        restTokens: hubCred?.restTokens || null,
+        transportHub: hubCred?.hub || DEFAULT_HUB,
         endpoint: hubCred?.endpoint || null,
         tokenExpiresAt: hubCred?.expiresAt || null,
         serverNonce,
@@ -1956,6 +2149,9 @@ export async function syncV3DeviceMemberships(
       enrolledFlocks,
       revokedFlockIds,
       expiredFlockIds,
+      revokedFlockSummaries,
+      expiredFlockSummaries,
+      authoritativeSnapshot: true,
     };
   });
 }
@@ -1997,6 +2193,7 @@ export async function listV3UserFlocks(
       targetMachineId: f.targetMachineId || null,
       rosterEpoch: f.rosterEpoch,
       memberCount: activeMembers.length,
+      removedMachines: Object.values(f.removedMachines || {}),
       members: activeMembers.map((m) => ({
         peerId: m.peerId,
         githubUser: m.githubUser,
@@ -2018,10 +2215,7 @@ export async function listV3UserFlocks(
       f.ownerGitHubUser === cleanUser ||
       (numUserId && f.ownerGitHubUserId && Number(f.ownerGitHubUserId) === numUserId)
     ) {
-      ownedFlocks.push({
-        ...summary,
-        removedMachines: Object.values(f.removedMachines || {}),
-      });
+      ownedFlocks.push(summary);
     }
     if (
       !isPrincipalRevokedInFlock(f, {
@@ -2211,6 +2405,7 @@ export function createBootstrapServer({
         rosterSync: true,
         tokenLocalDeviceAuth: true,
         deviceSignedOperations: true,
+        scopedSignalRTransportTokens: true,
         voucherReissue: true,
         enrollmentReadiness: true,
       },
@@ -2239,6 +2434,7 @@ export function createBootstrapServer({
           rosterSync: true,
           tokenLocalDeviceAuth: true,
           deviceSignedOperations: true,
+          scopedSignalRTransportTokens: true,
           voucherReissue: true,
           enrollmentReadiness: true,
           offlineQueueDeviceAuth: true,

@@ -38,7 +38,7 @@ When a flock owner generates an invite, their Copilot produces a **1-step copy-p
 Notice that **`bootstrapUrl` is embedded directly inside the signed JSON**:
 - The recipient **never** needs an Azure subscription, Azure CLI login, or connection string.
 - Even if the recipient hasn't installed `copilot-flock` yet, they simply paste the invite message into their GitHub Copilot chat.
-- Their Copilot clones `https://github.com/erjadi/copilot-flock`, reads `AGENTS.md`, generates a local Ed25519 keypair (`~/.copilot/flock/keys/`), presents the signed voucher + their GitHub identity to `bootstrapUrl` (`/api/v3/enroll`), and receives a scoped 60-minute hub token!
+- Their Copilot clones `https://github.com/erjadi/copilot-flock`, reads `AGENTS.md`, generates a local Ed25519 keypair (`~/.copilot/flock/keys/`), presents the signed voucher + their GitHub identity to `bootstrapUrl` (`/api/v3/enroll`), and receives separate scoped 60-minute SignalR client and REST bearer tokens for the `copilotbridge` transport hub.
 
 ---
 
@@ -79,17 +79,18 @@ As a flock owner, you never have to construct JSON or run CLI flags manually—j
 ### A. Enroll Another One of Your Own Computers
 > *"Generate an invite so I can add my new Linux desktop to `erjadi/personal`."*
 
-The broker verifies the recipient's GitHub identity. An owner redeeming their own
-invite retains owner access to their built-in root and scope flocks, even when
-the voucher says `collaborator` or `guest`. Vouchers cannot grant owner trust to
-another user or to a shared team flock. Repeated flock records are applied once;
-cached permissions and caller-supplied identity labels never establish ownership.
+The broker verifies the recipient's GitHub identity. Owner devices are enrolled
+into owner-created shared and guest flocks as owner members so they can converge
+and authorize first contact, but those flocks retain explicit thread-sharing
+walls and never inherit owner-root visibility. Vouchers cannot grant owner trust
+to another user. Repeated flock records are applied once; cached permissions and
+caller-supplied identity labels never establish ownership.
 Rejected enrollment is reported as incomplete even if legacy local installation
 can still finish.
 
 ### B. Invite a Teammate to a Shared Team Flock (Up to 3 PCs Automatically)
 > *"Invite `@alice` to `erjadi/studio-team` so she can connect her work laptop and desktop."*
-- By default, collaborator vouchers include `maxDevices: 3`, so `@alice` can enroll up to 3 of her machines using the same pasteable JSON within 24 hours.
+- By default, collaborator vouchers include `maxDevices: 3`, so `@alice` can enroll up to 3 of her machines using the same pasteable JSON within 72 hours.
 
 ### C. Issue a Time-Bound Guest Pass to One Specific Machine (or Flock)
 > *"Give `@bob` a 4-hour guest pass to `erjadi/personal/LINUX-GPU-HOST` so his Copilot can inspect our shared calibration thread and check GPU status."*
@@ -128,9 +129,16 @@ default to a 72-hour redemption window; guest vouchers default to 24 hours.
 Post-redemption membership duration starts when each device redeems and is
 tracked independently from voucher expiry.
 
+Scoped client, broadcast REST, and per-peer REST tokens plus refresh nonces are
+stored only in the owner-readable `flock-credentials.json` vault. `config.json`
+and `flocks.json` remain credential-free. Daemon, MCP, installer, readiness, and
+reconnect paths load and refresh the vault without falling back to Azure keys or
+GitHub credentials.
+
 Reissuing an invitation with replacement semantics atomically supersedes prior
 matching vouchers. Superseded, replayed, expired, and secret-less vouchers fail
 with distinct errors. Enrollment reports `verified_bidirectional` only after a
 correlated peer acknowledgement proves matching flock identity and roster
-epoch. When no peer is online it remains enrolled but reports
+epoch and the joined flock's real policy engine denies unshared transcript,
+mutation, and file probes. When no peer is online it remains enrolled but reports
 `enrolled_awaiting_peer_online`, not ready.

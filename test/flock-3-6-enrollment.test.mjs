@@ -1,9 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
+import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import {
   createBootstrapServer,
   createV3FlockInvite,
@@ -12,12 +14,29 @@ import {
 import {
   applyV3EnrollmentResult,
   handleRpcAction,
+  loadFlockCredentialVault,
   openFlockMembershipRegistry,
+  refreshTokenLocalTransportCredentials,
   signV3EnrollmentRequest,
+  signV3MembershipSyncRequest,
   signRpcRequest,
   syncFlockMemberships,
   verifyEnrollmentReadiness,
 } from "../flock.mjs";
+
+function decodeJwtPayload(token) {
+  const encoded = String(token || "").split(".")[1];
+  return JSON.parse(Buffer.from(encoded, "base64url").toString("utf8"));
+}
+
+async function postJson(url, body, headers = {}) {
+  const response = await fetch(url, {
+    method: "POST",
+    headers: { "content-type": "application/json", ...headers },
+    body: JSON.stringify(body),
+  });
+  return { response, body: await response.json() };
+}
 
 function identity() {
   const pair = crypto.generateKeyPairSync("ed25519", {
@@ -176,7 +195,12 @@ test("3.6 membership sync capability preflight is bounded and single-flight", as
       await new Promise((resolve) => setTimeout(resolve, 10));
       return {
         ok: true,
-        capabilities: { rosterSync: true, tokenLocalDeviceAuth: true, deviceSignedOperations: true },
+        capabilities: {
+          rosterSync: true,
+          tokenLocalDeviceAuth: true,
+          deviceSignedOperations: true,
+          scopedSignalRTransportTokens: true,
+        },
       };
     }
     syncCalls++;
@@ -280,6 +304,26 @@ test("3.6 voucher reissue separates redemption lifetime, membership duration, re
     }, { storePath });
     assert.deepEqual(replacement.supersededVoucherIds, [first.voucherId]);
     assert.equal(replacement.enrollmentJson.remainingRedemptionLifetimeSeconds, 259200);
+
+    const firstGuest = await createV3FlockInvite({
+      callerGitHubUser: "owner",
+      callerGitHubUserId: 1001,
+      targetAddress: "owner/work/HOST-PC",
+      invitedUser: "carol",
+      invitedGitHubUserId: 4004,
+      durationMinutes: 30,
+    }, { storePath });
+    const reissuedGuest = await createV3FlockInvite({
+      callerGitHubUser: "owner",
+      callerGitHubUserId: 1001,
+      targetAddress: "owner/work/HOST-PC",
+      invitedUser: "carol",
+      invitedGitHubUserId: 4004,
+      durationMinutes: 30,
+      reissue: true,
+    }, { storePath });
+    assert.notEqual(firstGuest.flockId, reissuedGuest.flockId);
+    assert.ok(reissuedGuest.supersededVoucherIds.includes(firstGuest.voucherId));
     const missingSecret = structuredClone(replacement.enrollmentJson);
     delete missingSecret.flocks[0].voucherSecret;
     await assert.rejects(
@@ -428,6 +472,20 @@ test("3.6 broker advertises capabilities and never returns a master AccessKey to
     assert.equal(result.ok, true);
     assert.equal(result.connectionString, undefined);
     assert.doesNotMatch(JSON.stringify(result), /AccessKey=|master-secret/);
+    const shared = result.enrolledFlocks.find((flock) => flock.flockId === "owner/team");
+    assert.equal(shared.transportHub, "copilotbridge");
+    assert.equal(
+      decodeJwtPayload(shared.clientToken).aud,
+      "https://example.service.signalr.net/client/?hub=copilotbridge"
+    );
+    assert.equal(
+      decodeJwtPayload(shared.restTokens.broadcast.token).aud,
+      "https://example.service.signalr.net/api/v1/hubs/copilotbridge"
+    );
+    assert.equal(
+      decodeJwtPayload(shared.restTokens.users["ALICE-PC"].token).aud,
+      "https://example.service.signalr.net/api/v1/hubs/copilotbridge/users/ALICE-PC"
+    );
     const flocksPath = path.join(root, "flocks.json");
     const applied = applyV3EnrollmentResult(
       {
@@ -443,8 +501,349 @@ test("3.6 broker advertises capabilities and never returns a master AccessKey to
     const persistedPolicy = fs.readFileSync(flocksPath, "utf8");
     assert.doesNotMatch(persistedPolicy, /master-secret|hubToken|serverNonce/);
     const vault = JSON.parse(fs.readFileSync(path.join(root, "flock-credentials.json"), "utf8"));
-    assert.ok(Object.values(vault.credentials).some((entry) => entry.bearerToken));
+    assert.ok(Object.values(vault.credentials).some((entry) => entry.clientToken));
+    assert.ok(Object.values(vault.credentials).some((entry) => entry.restTokens?.broadcast?.token));
     assert.doesNotMatch(JSON.stringify(vault), /AccessKey=|master-secret/);
+  } finally {
+    server.closeAllConnections();
+    await new Promise((resolve) => server.close(resolve));
+    if (previousConnection === undefined) delete process.env.SIGNALR_CONNECTION_STRING;
+    else process.env.SIGNALR_CONNECTION_STRING = previousConnection;
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("3.6 token-local config and MCP load from the vault without a connection string", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "flock-36-config-vault-"));
+  const flockHome = path.join(root, "flock");
+  fs.mkdirSync(flockHome, { recursive: true });
+  const expiresAt = new Date(Date.now() + 3600000).toISOString();
+  fs.writeFileSync(path.join(flockHome, "config.json"), JSON.stringify({
+    machineId: "TOKEN-LOCAL-PC",
+    githubUser: "alice",
+    scope: "work",
+    tokenLocalAuth: true,
+    bootstrapUrl: "https://bootstrap.example.invalid/api/bootstrap",
+    connectionString:
+      "Endpoint=https://wrong.service.signalr.net;AccessKey=must-not-load;Version=1.0;",
+  }));
+  fs.writeFileSync(path.join(flockHome, "flocks.json"), JSON.stringify({ flocks: {} }));
+  fs.writeFileSync(path.join(flockHome, "flock-credentials.json"), JSON.stringify({
+    type: "copilot-flock-token-local-credentials-v1",
+    credentials: {
+      "owner/team": {
+        flockId: "owner/team",
+        flockUuid: "team-uuid",
+        endpoint: "https://example.service.signalr.net",
+        hubName: "copilotbridge",
+        clientToken: "header.payload.signature",
+        restTokens: {
+          broadcast: { token: "broadcast-token" },
+          users: { REMOTE: { token: "remote-token" } },
+        },
+        tokenExpiresAt: expiresAt,
+        credentialExpiresAtMs: Date.parse(expiresAt),
+        serverNonce: "nonce",
+        rosterEpoch: 4,
+        githubUser: "alice",
+        githubUserId: 2002,
+        deviceId: "device",
+        machineId: "TOKEN-LOCAL-PC",
+      },
+    },
+  }));
+  try {
+    const moduleUrl = pathToFileURL(path.resolve("flock.mjs")).href;
+    const script = `
+      const m = await import(${JSON.stringify(moduleUrl)});
+      const cfg = m.loadConfig({ autoFetchAz: false });
+      const self = await m.executeMcpTool(cfg, "mcp_self_info");
+      process.stdout.write(JSON.stringify({
+        machineId: cfg.machineId,
+        connectionString: cfg.connectionString,
+        accessKey: cfg.accessKey,
+        endpoint: cfg.endpoint,
+        hub: cfg.hub,
+        clientToken: cfg.clientToken,
+        restTarget: cfg.restTokens.users.REMOTE.token,
+        mcpLoaded: Boolean(self && typeof self === "object")
+      }));
+    `;
+    const output = JSON.parse(execFileSync(process.execPath, ["--input-type=module", "-e", script], {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        COPILOT_HOME: root,
+        SIGNALR_CONNECTION_STRING:
+          "Endpoint=https://wrong-env.service.signalr.net;AccessKey=must-not-load-env;Version=1.0;",
+        COPILOT_FLOCK_TOKEN_LOCAL: "1",
+        COPILOT_FLOCK_SANDBOX: "",
+        COPILOT_BRIDGE_SANDBOX: "",
+      },
+    }));
+    assert.deepEqual(output, {
+      machineId: "TOKEN-LOCAL-PC",
+      connectionString: null,
+      accessKey: null,
+      endpoint: "https://example.service.signalr.net",
+      hub: "copilotbridge",
+      clientToken: "header.payload.signature",
+      restTarget: "remote-token",
+      mcpLoaded: true,
+    });
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("3.6 all v3 paths vault credentials and reconcile empty, revoked, and expired rosters", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "flock-36-empty-rosters-"));
+  const flocksPath = path.join(root, "flocks.json");
+  const key = identity();
+  const cfg = {
+    githubUser: "alice",
+    machineId: "ALICE-PC",
+    scope: "work",
+    flocksConfigPath: flocksPath,
+  };
+  const member = {
+    peerId: `2002:${key.fingerprint}`,
+    githubUser: "alice",
+    githubUserId: 2002,
+    deviceId: key.fingerprint,
+    keyFingerprint: key.fingerprint,
+    machineId: "ALICE-PC",
+    scope: "work",
+    trustTier: "collaborator",
+    publicKey: key.publicKey,
+  };
+  const record = (flockId) => ({
+    flockId,
+    flockUuid: `${flockId}-uuid`,
+    flockType: "shared",
+    ownerGitHubUser: "owner",
+    ownerGitHubUserId: 1001,
+    trustTier: "collaborator",
+    rosterEpoch: 1,
+    members: [member],
+    hubToken: "legacy-client-token",
+    clientToken: "client-token",
+    restTokens: { broadcast: { token: "rest-token" }, users: {} },
+    serverNonce: "nonce",
+    endpoint: "https://example.service.signalr.net",
+    tokenExpiresAt: new Date(Date.now() + 3600000).toISOString(),
+  });
+  try {
+    applyV3EnrollmentResult(cfg, {
+      ok: true,
+      githubUser: "alice",
+      githubUserId: 2002,
+      deviceId: key.fingerprint,
+      machineId: "ALICE-PC",
+      enrolledFlocks: [
+        record("owner/empty"),
+        record("owner/revoked"),
+        record("owner/expired"),
+      ],
+    }, flocksPath);
+    const rawPolicy = fs.readFileSync(flocksPath, "utf8");
+    assert.doesNotMatch(rawPolicy, /client-token|rest-token|serverNonce|hubToken|restTokens/);
+    const vault = loadFlockCredentialVault(flocksPath);
+    assert.equal(vault.credentials["owner/empty"].clientToken, "client-token");
+
+    applyV3EnrollmentResult(cfg, {
+      ok: true,
+      githubUser: "alice",
+      githubUserId: 2002,
+      deviceId: key.fingerprint,
+      machineId: "ALICE-PC",
+      enrolledFlocks: [{
+        ...record("owner/empty"),
+        rosterEpoch: 2,
+        members: [],
+        hubToken: null,
+        clientToken: null,
+        restTokens: null,
+        serverNonce: null,
+      }],
+      revokedFlockIds: ["owner/revoked"],
+      expiredFlockIds: ["owner/expired"],
+      revokedFlockSummaries: [{
+        ...record("owner/revoked"),
+        rosterEpoch: 2,
+        members: [],
+        hubToken: null,
+        clientToken: null,
+        restTokens: null,
+        serverNonce: null,
+      }],
+      expiredFlockSummaries: [{
+        ...record("owner/expired"),
+        rosterEpoch: 2,
+        members: [],
+        hubToken: null,
+        clientToken: null,
+        restTokens: null,
+        serverNonce: null,
+      }],
+    }, flocksPath);
+
+    const registry = openFlockMembershipRegistry(flocksPath);
+    for (const flockId of ["owner/empty", "owner/revoked", "owner/expired"]) {
+      assert.equal(registry.findActiveMember(flockId, { machineId: "ALICE-PC" }), null);
+    }
+    const policy = JSON.parse(fs.readFileSync(flocksPath, "utf8")).flocks;
+    assert.equal(policy["owner/revoked"].revoked, true);
+    assert.ok(policy["owner/expired"].membershipExpiresAtMs <= Date.now());
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("3.6 unmocked HTTP broker converges owner and newcomer for immediate first contact", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "flock-36-http-first-contact-"));
+  const storePath = path.join(root, "broker.json");
+  const ownerFlocksPath = path.join(root, "owner", "flocks.json");
+  const newcomerFlocksPath = path.join(root, "newcomer", "flocks.json");
+  const owner = identity();
+  const newcomer = identity();
+  const previousConnection = process.env.SIGNALR_CONNECTION_STRING;
+  process.env.SIGNALR_CONNECTION_STRING =
+    "Endpoint=https://example.service.signalr.net;AccessKey=master-secret;Version=1.0;";
+  const principals = {
+    ownerToken: { login: "owner", id: 1001 },
+  };
+  const server = createBootstrapServer({
+    v3StorePath: storePath,
+    v3PreviewStorePath: path.join(root, "preview.json"),
+    membersPath: path.join(root, "members.json"),
+    apiGet: async (apiPath, token) => {
+      if (apiPath === "/user") {
+        return { statusCode: principals[token] ? 200 : 401, body: principals[token] || {} };
+      }
+      if (apiPath === "/users/alice") {
+        return { statusCode: 200, body: { login: "alice", id: 2002 } };
+      }
+      return {
+        statusCode: 200,
+        body: {
+          full_name: "erjadi/copilot-flock",
+          owner: { login: "erjadi" },
+          private: false,
+          permissions: { pull: true, push: true, admin: false },
+        },
+      };
+    },
+  });
+  try {
+    await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const base = `http://127.0.0.1:${server.address().port}/api/v3`;
+    const ownerEnrollBody = signV3EnrollmentRequest({
+      deviceId: owner.fingerprint,
+      machineId: "OWNER-PC",
+      scope: "work",
+      publicKey: owner.publicKey,
+      keyFingerprint: owner.fingerprint,
+      maintainerVisibilityAck: true,
+    }, 1001, owner);
+    const ownerEnrollment = await postJson(
+      `${base}/enroll`,
+      ownerEnrollBody,
+      { authorization: "Bearer ownerToken" }
+    );
+    assert.equal(ownerEnrollment.response.status, 200);
+    assert.equal(ownerEnrollment.body.ok, true);
+
+    const teamName = `japan-${crypto.randomBytes(4).toString("hex")}`;
+    const inviteResult = await postJson(
+      `${base}/flocks/invite`,
+      {
+        targetAddress: `owner/${teamName}`,
+        invitedUser: "alice",
+        invitedGitHubUserId: 2002,
+        allowedScopes: ["work"],
+      },
+      { authorization: "Bearer ownerToken" }
+    );
+    assert.equal(inviteResult.response.status, 200);
+    const invite = inviteResult.body.enrollmentJson;
+
+    const newcomerEnrollBody = signV3EnrollmentRequest({
+      deviceId: newcomer.fingerprint,
+      machineId: "JAPAN-STU",
+      scope: "work",
+      publicKey: newcomer.publicKey,
+      keyFingerprint: newcomer.fingerprint,
+      enrollmentJson: invite,
+      maintainerVisibilityAck: true,
+    }, 2002, newcomer);
+    const newcomerEnrollment = await postJson(`${base}/enroll`, newcomerEnrollBody);
+    assert.equal(newcomerEnrollment.response.status, 200);
+    assert.equal(newcomerEnrollment.body.ok, true);
+
+    const ownerCfg = {
+      githubUser: "owner",
+      machineId: "OWNER-PC",
+      scope: "work",
+      flocksConfigPath: ownerFlocksPath,
+    };
+    const newcomerCfg = {
+      tokenLocalAuth: true,
+      githubUser: "alice",
+      machineId: "JAPAN-STU",
+      scope: "work",
+      flocksConfigPath: newcomerFlocksPath,
+    };
+    applyV3EnrollmentResult(ownerCfg, ownerEnrollment.body, ownerFlocksPath);
+    const newcomerApplied = applyV3EnrollmentResult(
+      newcomerCfg,
+      newcomerEnrollment.body,
+      newcomerFlocksPath
+    );
+    const teamId = `owner/${teamName}`;
+    const joined = newcomerApplied.enrolledFlocks.find((flock) => flock.flockId === teamId);
+    assert.ok(joined.members.some((member) => member.machineId === "OWNER-PC"));
+    await refreshTokenLocalTransportCredentials(newcomerCfg, {
+      customPath: newcomerFlocksPath,
+      identityKeypair: newcomer,
+      callEndpoint: async (_cfg, subPath, options) => {
+        assert.equal(subPath, "/token/refresh");
+        return (await postJson(`${base}${subPath}`, options.body)).body;
+      },
+    });
+    assert.ok(newcomerCfg.clientToken);
+    assert.ok(newcomerCfg.restTokens.users["OWNER-PC"].token);
+
+    ownerCfg.syncFlockMembershipsFn = async () => {
+      const signed = signV3MembershipSyncRequest({
+        deviceId: owner.fingerprint,
+        machineId: "OWNER-PC",
+      }, owner);
+      const syncResponse = await postJson(`${base}/flocks/sync`, signed);
+      assert.equal(syncResponse.response.status, 200);
+      return applyV3EnrollmentResult(ownerCfg, syncResponse.body, ownerFlocksPath);
+    };
+    const request = signedRequest({
+      key: newcomer,
+      machineId: "JAPAN-STU",
+      action: "list_locks",
+      params: { flock: teamId },
+      toMachine: "OWNER-PC",
+    });
+    const result = await handleRpcAction(ownerCfg, {
+      ...request,
+      flocksConfigPath: ownerFlocksPath,
+    });
+    assert.equal(result.machineId, "OWNER-PC");
+    assert.equal(
+      openFlockMembershipRegistry(ownerFlocksPath)
+        .findActiveMember(teamId, { machineId: "JAPAN-STU" })
+        .githubUser,
+      "alice"
+    );
+    const ownerPolicy = JSON.parse(fs.readFileSync(ownerFlocksPath, "utf8")).flocks[teamId];
+    assert.equal(ownerPolicy.trustTier, "owner");
+    assert.equal(ownerPolicy.sessionVisibility, "explicit_opt_in_only");
   } finally {
     server.closeAllConnections();
     await new Promise((resolve) => server.close(resolve));
@@ -482,13 +881,17 @@ test("3.6 enrollment readiness requires correlated bidirectional epoch agreement
   );
   assert.equal(awaitingPeer.status, "enrolled_awaiting_peer_online");
   assert.equal(awaitingPeer.ready, false);
+  assert.equal(awaitingPeer.policyAssertions, null);
 
   const enrolledFlocks = [{
     flockId: "owner/team",
+    flockType: "shared",
+    trustTier: "collaborator",
+    sessionVisibility: "explicit_opt_in_only",
     rosterEpoch: 7,
     members: [
-      { machineId: "LOCAL", peerId: "1001:local" },
-      { machineId: "REMOTE", peerId: "2002:remote" },
+      { machineId: "LOCAL", peerId: "1001:local", githubUser: "owner" },
+      { machineId: "REMOTE", peerId: "2002:remote", githubUser: "alice" },
     ],
   }];
   const success = await verifyEnrollmentReadiness(
@@ -511,6 +914,20 @@ test("3.6 enrollment readiness requires correlated bidirectional epoch agreement
   assert.equal(success.status, "verified_bidirectional");
   assert.equal(success.stages.at(-1).stage, "first_contact");
   assert.equal(success.stages.at(-1).ok, true);
+  assert.deepEqual(
+    {
+      proven: success.policyAssertions.proven,
+      unsharedThreadAccessDenied: success.policyAssertions.unsharedThreadAccessDenied,
+      forbiddenMutationDenied: success.policyAssertions.forbiddenMutationDenied,
+      fileMutationDenied: success.policyAssertions.fileMutationDenied,
+    },
+    {
+      proven: true,
+      unsharedThreadAccessDenied: true,
+      forbiddenMutationDenied: true,
+      fileMutationDenied: true,
+    }
+  );
 
   const mismatch = await verifyEnrollmentReadiness(
     { machineId: "LOCAL" },
@@ -531,4 +948,5 @@ test("3.6 enrollment readiness requires correlated bidirectional epoch agreement
   assert.equal(mismatch.ready, false);
   assert.equal(mismatch.stages.at(-1).ok, false);
   assert.match(mismatch.error, /roster epoch/i);
+  assert.equal(mismatch.policyAssertions, null);
 });

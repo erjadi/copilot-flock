@@ -509,6 +509,18 @@ export function isSandboxV3Mode() {
   );
 }
 
+function resolveSignalRRestUserToken(cfg, userId) {
+  const exact = cfg?.restTokens?.users?.[userId]?.token;
+  if (exact) return exact;
+  const cleanTarget = String(userId || "").toLowerCase();
+  for (const [candidate, credential] of Object.entries(cfg?.restTokens?.users || {})) {
+    if (candidate.toLowerCase() === cleanTarget && credential?.token) {
+      return credential.token;
+    }
+  }
+  return null;
+}
+
 export function getBridgeHome() {
   return isSandboxV3Mode()
     ? path.join(getCopilotDir(), "signalr-bridge-v3")
@@ -3234,6 +3246,8 @@ export function loadConfig({ autoFetchAz = true, refreshSpecs = false, passive =
       : Object.prototype.hasOwnProperty.call(cfg, "bootstrapUrl")
       ? cfg.bootstrapUrl
       : DEFAULT_BOOTSTRAP_URL || null;
+  const tokenLocalAuth = Boolean(cfg.tokenLocalAuth);
+  const credentialFlocksPath = path.join(path.dirname(activeConfigPath), "flocks.json");
 
   let specs = cfg.specs || null;
   const needsSpecsProbe = refreshSpecs || !specs || !specs.cpu;
@@ -3242,11 +3256,13 @@ export function loadConfig({ autoFetchAz = true, refreshSpecs = false, passive =
   }
 
   let connectionString =
-    process.env.SIGNALR_CONNECTION_STRING ||
-    cfg.connectionString ||
-    null;
+    tokenLocalAuth
+      ? null
+      : process.env.SIGNALR_CONNECTION_STRING ||
+        cfg.connectionString ||
+        null;
 
-  if (!passive && !connectionString && autoFetchAz) {
+  if (!passive && !connectionString && autoFetchAz && !tokenLocalAuth) {
     const bootRes = fetchConnectionStringViaGitHubBootstrap({
       bootstrapUrl,
       machineId,
@@ -3308,6 +3324,51 @@ export function loadConfig({ autoFetchAz = true, refreshSpecs = false, passive =
     } catch {}
   }
 
+  if (!connectionString && tokenLocalAuth) {
+    const vaultConfig = applyCredentialVaultToConfig(
+      {
+        ...cfg,
+        machineId,
+        scope,
+        githubUser,
+        specs,
+        bootstrapUrl,
+        configPath: activeConfigPath,
+        tokenLocalAuth: true,
+        hub,
+        installedScriptPath: fs.existsSync(path.join(getBridgeHome(), "bridge.mjs"))
+          ? path.join(getBridgeHome(), "bridge.mjs")
+          : __filename,
+      },
+      credentialFlocksPath
+    );
+    if (vaultConfig.endpoint && vaultConfig.clientToken) {
+      const finalConfigSnap = computeConfigFileSnapshot(activeConfigPath);
+      Object.defineProperty(vaultConfig, "_callerSnapshot", {
+        value: {
+          ...MODULE_LOAD_SNAPSHOT,
+          loadedAtMs: Date.now(),
+          loadedAt: new Date().toISOString(),
+          configPath: finalConfigSnap.configPath,
+          configSha256: finalConfigSnap.sha256,
+          configMtimeMs: finalConfigSnap.mtimeMs,
+          configUpdatedAt: finalConfigSnap.updatedAt,
+          configGeneration: finalConfigSnap.generation,
+        },
+        enumerable: false,
+        configurable: true,
+      });
+      return vaultConfig;
+    }
+    if (!passive) {
+      const error = new Error(
+        `Token-local SignalR credentials are unavailable in ${vaultConfig.credentialVaultPath}`
+      );
+      error.code = "TOKEN_LOCAL_CREDENTIALS_UNAVAILABLE";
+      throw error;
+    }
+  }
+
   if (!connectionString) {
     if (passive) {
       return {
@@ -3317,7 +3378,7 @@ export function loadConfig({ autoFetchAz = true, refreshSpecs = false, passive =
         specs,
         bootstrapUrl,
         configPath: activeConfigPath,
-        tokenLocalAuth: Boolean(cfg.tokenLocalAuth),
+        tokenLocalAuth,
         hub,
         connectionString: null,
         endpoint: null,
@@ -3346,7 +3407,7 @@ export function loadConfig({ autoFetchAz = true, refreshSpecs = false, passive =
     specs,
     bootstrapUrl,
     configPath: activeConfigPath,
-    tokenLocalAuth: Boolean(cfg.tokenLocalAuth),
+    tokenLocalAuth,
     hub,
     connectionString,
     endpoint: parsed.endpoint,
@@ -3517,18 +3578,44 @@ export function persistTokenLocalCredentialVault(
   customFlocksPath = getFlocksConfigPath()
 ) {
   const credentials = {};
-  for (const flock of result?.enrolledFlocks || []) {
+  const records = Array.isArray(result?.enrolledFlocks)
+    ? result.enrolledFlocks
+    : result?.flockId
+      ? [result]
+      : [];
+  for (const flock of records) {
     if (!flock?.flockId) continue;
-    if (!flock.hubToken && !flock.clientToken && !flock.serverNonce) continue;
+    if (
+      !flock.hubToken &&
+      !flock.clientToken &&
+      !flock.restTokens &&
+      !flock.serverNonce
+    ) {
+      continue;
+    }
+    const expiresAt = flock.tokenExpiresAt || flock.credentialExpiresAt || null;
     credentials[flock.flockId] = {
       flockId: flock.flockId,
       flockUuid: flock.flockUuid || null,
       endpoint: flock.endpoint || null,
-      hubName: flock.hubName || null,
-      bearerToken: flock.hubToken || flock.clientToken || null,
-      tokenExpiresAt: flock.tokenExpiresAt || flock.credentialExpiresAt || null,
+      hubName: flock.transportHub || DEFAULT_HUB,
+      clientAudience: flock.clientAudience || null,
+      clientToken: flock.clientToken || flock.hubToken || null,
+      bearerToken: flock.clientToken || flock.hubToken || null,
+      restTokens:
+        flock.restTokens && typeof flock.restTokens === "object"
+          ? structuredClone(flock.restTokens)
+          : null,
+      tokenExpiresAt: expiresAt,
+      credentialExpiresAtMs: expiresAt ? Date.parse(expiresAt) : null,
       serverNonce: flock.serverNonce || null,
       rosterEpoch: Number(flock.rosterEpoch) || null,
+      peerId: flock.peerId || result?.peerId || null,
+      githubUser: flock.githubUser || result?.githubUser || null,
+      githubUserId: Number(flock.githubUserId || result?.githubUserId) || null,
+      deviceId: flock.deviceId || result?.deviceId || null,
+      machineId: flock.machineId || result?.machineId || null,
+      trustTier: flock.trustTier || null,
       updatedAt: new Date().toISOString(),
     };
   }
@@ -3546,11 +3633,85 @@ export function persistTokenLocalCredentialVault(
   }
   vault.credentials = { ...vault.credentials, ...credentials };
   vault.updatedAt = new Date().toISOString();
+  fs.mkdirSync(path.dirname(vaultPath), { recursive: true });
   atomicJson(vaultPath, vault);
   try {
     fs.chmodSync(vaultPath, 0o600);
   } catch {}
   return vaultPath;
+}
+
+export function loadFlockCredentialVault(customFlocksPath = getFlocksConfigPath()) {
+  const vaultPath = path.join(path.dirname(customFlocksPath), "flock-credentials.json");
+  if (!fs.existsSync(vaultPath)) {
+    return {
+      type: "copilot-flock-token-local-credentials-v1",
+      credentials: {},
+      vaultPath,
+    };
+  }
+  const parsed = JSON.parse(fs.readFileSync(assertNoLinks(vaultPath), "utf8"));
+  if (
+    parsed?.type !== "copilot-flock-token-local-credentials-v1" ||
+    !parsed.credentials ||
+    typeof parsed.credentials !== "object" ||
+    Array.isArray(parsed.credentials)
+  ) {
+    const error = new Error(`Invalid token-local credential vault: ${vaultPath}`);
+    error.code = "CREDENTIAL_VAULT_INVALID";
+    throw error;
+  }
+  return { ...parsed, vaultPath };
+}
+
+function applyCredentialVaultToConfig(cfg, customFlocksPath = getFlocksConfigPath()) {
+  const vault = loadFlockCredentialVault(customFlocksPath);
+  const entries = Object.values(vault.credentials || {}).filter(
+    (entry) => entry && entry.endpoint && (entry.clientToken || entry.bearerToken)
+  );
+  if (entries.length === 0) return { ...cfg, credentialVaultPath: vault.vaultPath };
+  const requestedFlock = cfg?.flockId ? String(cfg.flockId).toLowerCase() : null;
+  entries.sort((a, b) => {
+    const aRequested = requestedFlock && String(a.flockId).toLowerCase() === requestedFlock ? 1 : 0;
+    const bRequested = requestedFlock && String(b.flockId).toLowerCase() === requestedFlock ? 1 : 0;
+    return (
+      bRequested - aRequested ||
+      (Number(b.credentialExpiresAtMs) || Date.parse(b.tokenExpiresAt || "") || 0) -
+        (Number(a.credentialExpiresAtMs) || Date.parse(a.tokenExpiresAt || "") || 0)
+    );
+  });
+  const selected = entries[0];
+  const mergedRestTokens = { broadcast: null, users: {} };
+  for (const entry of entries) {
+    if (entry.endpoint !== selected.endpoint || (entry.hubName || DEFAULT_HUB) !== (selected.hubName || DEFAULT_HUB)) {
+      continue;
+    }
+    if (entry.restTokens?.broadcast?.token) {
+      mergedRestTokens.broadcast = entry.restTokens.broadcast;
+    }
+    Object.assign(mergedRestTokens.users, entry.restTokens?.users || {});
+  }
+  const endpointUrl = new URL(selected.endpoint);
+  return {
+    ...cfg,
+    endpoint: selected.endpoint.replace(/\/+$/, ""),
+    host: endpointUrl.host,
+    hub: selected.hubName || DEFAULT_HUB,
+    accessKey: null,
+    connectionString: null,
+    clientToken: selected.clientToken || selected.bearerToken,
+    clientAudience: selected.clientAudience || null,
+    restTokens: mergedRestTokens,
+    credentialExpiresAt:
+      Number(selected.credentialExpiresAtMs) ||
+      Date.parse(selected.tokenExpiresAt || "") ||
+      0,
+    credentialFlockId: selected.flockId,
+    credentialVaultPath: vault.vaultPath,
+    credentialsByFlock: Object.fromEntries(
+      entries.map((entry) => [String(entry.flockId).toLowerCase(), entry])
+    ),
+  };
 }
 
 function stripEnrollmentCredentials(result) {
@@ -3562,6 +3723,9 @@ function stripEnrollmentCredentials(result) {
       for (const field of [
         "hubToken",
         "clientToken",
+        "clientAudience",
+        "restTokens",
+        "transportHub",
         "tokenExpiresAt",
         "credentialExpiresAt",
         "serverNonce",
@@ -3604,8 +3768,7 @@ export function reconcileAuthoritativeFlockMemberships(
     !principal ||
     !Number.isSafeInteger(principalId) ||
     principalId <= 0 ||
-    !incomingList ||
-    (incomingList.length === 0 && revokedFlockIds.length === 0 && expiredFlockIds.length === 0)
+    !incomingList
   ) {
     const err = new Error(
       "Enrollment response is missing its authenticated GitHub principal or flock records"
@@ -3756,6 +3919,9 @@ export function reconcileAuthoritativeFlockMemberships(
           flock.allowFileTransfer === true ||
           (!wasDowngradedOrStale && existingSource?.allowFileTransfer === true)
       );
+      const isBuiltInOwnerAuthority =
+        flock.trustTier === "owner" &&
+        ["owner_root", "owner_scope"].includes(flock.flockType);
       const nextEntry = {
         ...flock,
         ...(isUnrestricted ? { unrestrictedAccess: true } : {}),
@@ -3763,13 +3929,13 @@ export function reconcileAuthoritativeFlockMemberships(
         sharedSessionIds: preservedSharedIds,
         sharedSnapshots: preservedSnapshots,
         sessionVisibility:
-          flock.trustTier === "owner" || isUnrestricted
+          isBuiltInOwnerAuthority || isUnrestricted
             ? (previousHasVerifiedOwner || isUnrestricted) && persistedPrevious?.sessionVisibility
               ? persistedPrevious.sessionVisibility
               : "all"
             : "explicit_opt_in_only",
         shareSpecs:
-          flock.trustTier === "owner" || isUnrestricted
+          isBuiltInOwnerAuthority || isUnrestricted
             ? (previousHasVerifiedOwner || isUnrestricted) && persistedPrevious?.shareSpecs
               ? persistedPrevious.shareSpecs
               : "full"
@@ -3834,6 +4000,9 @@ export function reconcileAuthoritativeFlockMemberships(
               : (existing.membershipExpiresAtMs ?? null),
         };
         delete nextQuarantined.hubToken;
+        delete nextQuarantined.clientToken;
+        delete nextQuarantined.clientAudience;
+        delete nextQuarantined.restTokens;
         delete nextQuarantined.tokenExpiresAt;
         delete nextQuarantined.serverNonce;
         localFlocks.flocks[normId] = nextQuarantined;
@@ -3900,18 +4069,24 @@ export function applyV3EnrollmentResult(cfg, result, customPath = getFlocksConfi
       if (result.githubUser && !cfg.githubUser) cfg.githubUser = normalizeGitHubUser(result.githubUser);
     } catch {}
   }
-  const authoritativeResult = isTokenLocalAuthEnabled(cfg)
-    ? (persistTokenLocalCredentialVault(result, customPath), stripEnrollmentCredentials(result))
-    : result;
+  persistTokenLocalCredentialVault(result, customPath);
+  if (isTokenLocalAuthEnabled(cfg)) {
+    Object.assign(cfg, applyCredentialVaultToConfig(cfg, customPath));
+  }
+  const authoritativeResult = stripEnrollmentCredentials(result);
   const reconciled = reconcileAuthoritativeFlockMemberships(cfg, authoritativeResult, customPath, {
     requireMemberProof: false,
   });
-  const enrolledWithMembers = (reconciled.enrolledFlocks || []).filter(
-    (flock) => Array.isArray(flock.members) && flock.members.length > 0
-  );
-  if (enrolledWithMembers.length > 0) {
+  const registryRecords = [
+    ...(reconciled.enrolledFlocks || []),
+    ...(Array.isArray(result?.revokedFlockSummaries) ? result.revokedFlockSummaries : []),
+    ...(Array.isArray(result?.expiredFlockSummaries) ? result.expiredFlockSummaries : []),
+  ];
+  if (registryRecords.length > 0) {
     try {
-      openFlockMembershipRegistry(customPath).reconcileV3Broker({ enrolledFlocks: enrolledWithMembers });
+      openFlockMembershipRegistry(customPath).reconcileV3Broker({
+        enrolledFlocks: registryRecords,
+      });
     } catch (error) {
       const partial = new Error(
         `Authoritative roster registry commit failed after local policy reconciliation: ${error.message}`
@@ -4013,7 +4188,12 @@ async function performFlockMembershipSync(
   }
   await requireBootstrapCapabilities(
     cfg,
-    ["rosterSync", "tokenLocalDeviceAuth", "deviceSignedOperations"],
+    [
+      "rosterSync",
+      "tokenLocalDeviceAuth",
+      "deviceSignedOperations",
+      "scopedSignalRTransportTokens",
+    ],
     { callEndpoint, correlationId }
   );
   const idKey = identityKeypair || ensureMachineIdentityKeypair();
@@ -4038,19 +4218,23 @@ async function performFlockMembershipSync(
     throw error;
   }
   try {
-    const authoritativeResult = isTokenLocalAuthEnabled(cfg)
-      ? (persistTokenLocalCredentialVault(res, customPath), stripEnrollmentCredentials(res))
-      : res;
+    persistTokenLocalCredentialVault(res, customPath);
+    if (isTokenLocalAuthEnabled(cfg)) {
+      Object.assign(cfg, applyCredentialVaultToConfig(cfg, customPath));
+    }
+    const authoritativeResult = stripEnrollmentCredentials(res);
     const reconciled = reconcileAuthoritativeFlockMemberships(cfg, authoritativeResult, customPath, {
       requireMemberProof: true,
       now,
     });
-    const enrolledWithMembers = (reconciled.enrolledFlocks || []).filter(
-      (flock) => Array.isArray(flock.members) && flock.members.length > 0
-    );
-    if (enrolledWithMembers.length > 0) {
+    const registryRecords = [
+      ...(reconciled.enrolledFlocks || []),
+      ...(Array.isArray(res?.revokedFlockSummaries) ? res.revokedFlockSummaries : []),
+      ...(Array.isArray(res?.expiredFlockSummaries) ? res.expiredFlockSummaries : []),
+    ];
+    if (registryRecords.length > 0) {
       openFlockMembershipRegistry(customPath).reconcileV3Broker({
-        enrolledFlocks: enrolledWithMembers,
+        enrolledFlocks: registryRecords,
         now,
       });
     }
@@ -4093,6 +4277,172 @@ export async function syncFlockMemberships(cfg, options = {}) {
   return operation;
 }
 
+export function signV3TokenRefreshRequest(
+  credential,
+  identity = ensureMachineIdentityKeypair(),
+  now = Date.now()
+) {
+  if (
+    !credential?.flockUuid ||
+    !credential?.githubUserId ||
+    !credential?.deviceId ||
+    !credential?.rosterEpoch ||
+    !credential?.serverNonce
+  ) {
+    const error = new Error("Token-local credential vault entry is incomplete for refresh");
+    error.code = "TOKEN_LOCAL_REFRESH_STATE_INVALID";
+    throw error;
+  }
+  const timestamp = new Date(now).toISOString();
+  const canonical = `refresh|v3|${credential.flockUuid}|${credential.githubUserId}|${credential.deviceId}|${credential.rosterEpoch}|${credential.serverNonce}|${timestamp}`;
+  return {
+    flockId: credential.flockId,
+    flockUuid: credential.flockUuid,
+    githubUserId: credential.githubUserId,
+    deviceId: credential.deviceId,
+    rosterEpoch: credential.rosterEpoch,
+    serverNonce: credential.serverNonce,
+    timestamp,
+    signature: crypto
+      .sign(null, Buffer.from(canonical, "utf8"), identity.privateKey)
+      .toString("base64"),
+  };
+}
+
+export async function refreshTokenLocalTransportCredentials(
+  cfg,
+  {
+    flockId = cfg?.credentialFlockId || cfg?.flockId || null,
+    callEndpoint = callBootstrapV3Endpoint,
+    identityKeypair = null,
+    customPath = cfg?.flocksConfigPath || getFlocksConfigPath(),
+    now = Date.now(),
+  } = {}
+) {
+  if (!isTokenLocalAuthEnabled(cfg)) return cfg;
+  const vault = loadFlockCredentialVault(customPath);
+  const requested = flockId ? String(flockId).toLowerCase() : null;
+  const credential =
+    (requested && vault.credentials?.[requested]) ||
+    Object.values(vault.credentials || {}).find((entry) => entry?.serverNonce);
+  if (!credential) {
+    const error = new Error("No refreshable token-local SignalR credential is available");
+    error.code = "TOKEN_LOCAL_CREDENTIALS_UNAVAILABLE";
+    throw error;
+  }
+  const body = signV3TokenRefreshRequest(
+    credential,
+    identityKeypair || ensureMachineIdentityKeypair(),
+    now
+  );
+  const response = await callEndpoint(cfg, "/token/refresh", {
+    method: "POST",
+    body,
+  });
+  if (!response?.ok) {
+    const error = new Error(response?.error || "Token-local SignalR credential refresh failed");
+    error.code = response?.code || "TOKEN_LOCAL_REFRESH_FAILED";
+    error.stage = "credential_refresh";
+    throw error;
+  }
+  const authoritative = {
+    ok: true,
+    peerId: response.peerId || credential.peerId,
+    githubUser: response.githubUser || credential.githubUser || cfg?.githubUser,
+    githubUserId: response.githubUserId || credential.githubUserId,
+    deviceId: response.deviceId || credential.deviceId,
+    machineId: response.machineId || credential.machineId || cfg?.machineId,
+    enrolledFlocks: [response],
+  };
+  applyV3EnrollmentResult(cfg, authoritative, customPath);
+  Object.assign(cfg, applyCredentialVaultToConfig(cfg, customPath));
+  return cfg;
+}
+
+async function ensureTokenLocalTransportCredentials(
+  cfg,
+  { targetUserId = null, requireBroadcast = false } = {}
+) {
+  if (!isTokenLocalAuthEnabled(cfg)) return cfg;
+  const targetToken = targetUserId ? resolveSignalRRestUserToken(cfg, targetUserId) : null;
+  const broadcastToken = requireBroadcast ? cfg?.restTokens?.broadcast?.token : null;
+  const expiresSoon = !cfg?.credentialExpiresAt || cfg.credentialExpiresAt <= Date.now() + 30000;
+  if (!cfg?.clientToken || expiresSoon || (targetUserId && !targetToken) || (requireBroadcast && !broadcastToken)) {
+    await refreshTokenLocalTransportCredentials(cfg);
+  }
+  return cfg;
+}
+
+function hasSignalRSendCredentials(cfg) {
+  return Boolean(
+    cfg?.accessKey ||
+      cfg?.connectionString ||
+      cfg?.restTokens?.broadcast?.token ||
+      Object.keys(cfg?.restTokens?.users || {}).length > 0
+  );
+}
+
+function evaluateEnrollmentPolicyAssertions(cfg, flock, member) {
+  const senderIdentity = {
+    fromMachine: member.machineId,
+    fromGitHubUser: member.githubUser || null,
+    isCrossUser:
+      normalizeGitHubUser(member.githubUser)?.toLowerCase() !==
+      normalizeGitHubUser(cfg?.githubUser)?.toLowerCase(),
+    senderVerified: true,
+    peerId: member.peerId || null,
+  };
+  const localFlocks = {
+    flocks: { [flock.flockId]: flock },
+    threadBindings: {},
+  };
+  const probes = [
+    {
+      key: "unsharedThreadAccessDenied",
+      request: {
+        action: "get_transcript",
+        params: {
+          flock: flock.flockId,
+          session: `readiness-unshared-${crypto.randomUUID()}`,
+        },
+      },
+      expectedCode: "SESSION_NOT_SHARED",
+    },
+    {
+      key: "forbiddenMutationDenied",
+      request: {
+        action: "create_session",
+        params: { flock: flock.flockId },
+      },
+      expectedCode: "FLOCK_MUTATION_FORBIDDEN",
+    },
+    {
+      key: "fileMutationDenied",
+      request: {
+        action: "send_file_chunk",
+        params: {
+          flock: flock.flockId,
+          remotePath: "readiness-policy-probe.bin",
+        },
+      },
+      expectedCode: "FLOCK_MUTATION_FORBIDDEN",
+    },
+  ];
+  const assertions = { proven: true };
+  for (const probe of probes) {
+    try {
+      enforceFlockPolicyAndWalls(cfg, flock, probe.request, senderIdentity, localFlocks);
+      assertions[probe.key] = false;
+      assertions[`${probe.key}Code`] = "ALLOWED";
+    } catch (error) {
+      assertions[probe.key] = error?.code === probe.expectedCode;
+      assertions[`${probe.key}Code`] = error?.code || "UNKNOWN_POLICY_ERROR";
+    }
+  }
+  assertions.ok = probes.every((probe) => assertions[probe.key] === true);
+  return assertions;
+}
+
 export async function verifyEnrollmentReadiness(
   cfg,
   enrolledFlocks,
@@ -4121,6 +4471,19 @@ export async function verifyEnrollmentReadiness(
       }
     }
   }
+  candidates.sort((a, b) => {
+    const rank = ({ flock }) => {
+      let parsed;
+      try {
+        parsed = parseFlockAddress(flock.flockId);
+      } catch {
+        return 3;
+      }
+      if (!parsed.isOwnerRoot && !parsed.isBuiltInScope) return 0;
+      return 1;
+    };
+    return rank(a) - rank(b);
+  });
   if (candidates.length === 0) {
     return {
       ok: false,
@@ -4133,11 +4496,7 @@ export async function verifyEnrollmentReadiness(
         { stage: "authorization", ok: false, code: "NOT_PROVEN" },
         { stage: "first_contact", ok: false, code: "NOT_PROVEN" },
       ],
-      policyAssertions: {
-        unsharedThreadAccessDenied: true,
-        forbiddenMutationDenied: true,
-        fileMutationDenied: true,
-      },
+      policyAssertions: null,
     };
   }
 
@@ -4168,6 +4527,14 @@ export async function verifyEnrollmentReadiness(
       error.code = "READINESS_ACK_MISMATCH";
       throw error;
     }
+    const policyAssertions = evaluateEnrollmentPolicyAssertions(cfg, flock, member);
+    if (!policyAssertions.ok) {
+      const error = new Error(
+        "Enrollment readiness policy-wall assertions did not deny all forbidden operations"
+      );
+      error.code = "READINESS_POLICY_ASSERTION_FAILED";
+      throw error;
+    }
     return {
       ok: true,
       ready: true,
@@ -4182,11 +4549,7 @@ export async function verifyEnrollmentReadiness(
         { stage: "authorization", ok: true },
         { stage: "first_contact", ok: true },
       ],
-      policyAssertions: {
-        unsharedThreadAccessDenied: true,
-        forbiddenMutationDenied: true,
-        fileMutationDenied: true,
-      },
+      policyAssertions,
     };
   } catch (cause) {
     return {
@@ -4204,11 +4567,7 @@ export async function verifyEnrollmentReadiness(
         { stage: "first_contact", ok: false, code: cause?.code || "FIRST_CONTACT_FAILED" },
       ],
       error: redactFlockSnapshot(cause?.message || "Enrollment readiness verification failed"),
-      policyAssertions: {
-        unsharedThreadAccessDenied: true,
-        forbiddenMutationDenied: true,
-        fileMutationDenied: true,
-      },
+      policyAssertions: null,
     };
   }
 }
@@ -6485,14 +6844,29 @@ const signalrKeepAliveAgent = new https.Agent({
   lookup: ipv4Lookup,
 });
 
-export function signalrRestPost({ endpoint, accessKey, apiPath, target, argumentsList }) {
+export function signalrRestPost({
+  endpoint,
+  accessKey,
+  bearerToken = null,
+  apiPath,
+  target,
+  argumentsList,
+}) {
   return new Promise((resolve, reject) => {
     const fullUrl = `${endpoint}${apiPath}`;
-    const token = createSignalRJwt({
-      endpoint,
-      accessKey,
-      audience: fullUrl,
-    });
+    const token =
+      bearerToken ||
+      (accessKey
+        ? createSignalRJwt({
+            endpoint,
+            accessKey,
+            audience: fullUrl,
+          })
+        : null);
+    if (!token) {
+      reject(new Error(`No SignalR REST credential is available for ${fullUrl}`));
+      return;
+    }
     const body = Buffer.from(
       JSON.stringify({
         target,
@@ -6540,10 +6914,12 @@ export function signalrRestPost({ endpoint, accessKey, apiPath, target, argument
 }
 
 export async function sendSignalRToUser(cfg, userId, target, payload) {
+  await ensureTokenLocalTransportCredentials(cfg, { targetUserId: userId });
   const encodedUser = encodeURIComponent(userId);
   return signalrRestPost({
     endpoint: cfg.endpoint,
     accessKey: cfg.accessKey,
+    bearerToken: resolveSignalRRestUserToken(cfg, userId),
     apiPath: `/api/v1/hubs/${cfg.hub}/users/${encodedUser}`,
     target,
     argumentsList: [payload],
@@ -6551,9 +6927,11 @@ export async function sendSignalRToUser(cfg, userId, target, payload) {
 }
 
 export async function sendSignalRBroadcast(cfg, target, payload) {
+  await ensureTokenLocalTransportCredentials(cfg, { requireBroadcast: true });
   return signalrRestPost({
     endpoint: cfg.endpoint,
     accessKey: cfg.accessKey,
+    bearerToken: cfg.restTokens?.broadcast?.token || null,
     apiPath: `/api/v1/hubs/${cfg.hub}`,
     target,
     argumentsList: [payload],
@@ -6798,16 +7176,30 @@ export class RawWebSocketClient {
 // ---------------------------------------------------------------------------
 
 export async function connectSignalRClient(cfg, { userId, onInvocation, onClose }) {
+  await ensureTokenLocalTransportCredentials(cfg);
   const clientAudience = `${cfg.endpoint}/client/?hub=${cfg.hub}`;
   if (cfg.protocol === "broker-free-v34" && (!cfg.clientToken || cfg.credentialExpiresAt <= Date.now())) {
     throw new Error("Owner-issued scoped SignalR client credentials expired or unavailable");
   }
-  const accessToken = cfg.protocol === "broker-free-v34" ? cfg.clientToken : createSignalRJwt({
-    endpoint: cfg.endpoint,
-    accessKey: cfg.accessKey,
-    audience: clientAudience,
-    userId,
-  });
+  if (
+    isTokenLocalAuthEnabled(cfg) &&
+    String(userId || "").toLowerCase() !== String(cfg.machineId || "").toLowerCase()
+  ) {
+    const error = new Error(
+      `Token-local SignalR client credential is scoped to machine "${cfg.machineId}", not "${userId}"`
+    );
+    error.code = "TOKEN_LOCAL_USER_SCOPE_MISMATCH";
+    throw error;
+  }
+  const accessToken =
+    cfg.protocol === "broker-free-v34" || isTokenLocalAuthEnabled(cfg)
+      ? cfg.clientToken
+      : createSignalRJwt({
+          endpoint: cfg.endpoint,
+          accessKey: cfg.accessKey,
+          audience: clientAudience,
+          userId,
+        });
 
   const wsUrl = `wss://${cfg.host}/client/?hub=${encodeURIComponent(cfg.hub)}&access_token=${encodeURIComponent(accessToken)}`;
   const ws = new RawWebSocketClient(wsUrl, { timeoutMs: 12000 });
@@ -8874,7 +9266,7 @@ export async function injectLocalSessionMessage({
             }
           } catch {}
           ws.close();
-          if (admitted && cfg?.connectionString) {
+          if (admitted && hasSignalRSendCredentials(cfg)) {
             try {
               await sendSignalRBroadcast(cfg, "bridgeDeliveryReceipt", {
                 requestId,
@@ -8962,7 +9354,7 @@ export async function injectLocalSessionMessage({
       deliveredAt: new Date().toISOString(),
     };
 
-    if (cfg?.connectionString) {
+    if (hasSignalRSendCredentials(cfg)) {
       sendSignalRBroadcast(cfg, "bridgeDeliveryReceipt", {
         requestId,
         stage: "admitted_to_events_jsonl",
@@ -9550,7 +9942,7 @@ export async function invokeRemoteRpc(
   }
 
   const requestId = crypto.randomUUID();
-  const replyUserId = `rpc-${requestId}`;
+  const replyUserId = isTokenLocalAuthEnabled(cfg) ? cfg.machineId : `rpc-${requestId}`;
   const sentAt = new Date().toISOString();
   let auth = null;
   try {
@@ -9677,7 +10069,9 @@ export async function invokeRemoteRpcBatch(cfg, items, timeoutMs = 18000, { pass
       rawFlock !== undefined && rawFlock !== null ? authorizeCallerFlockSelection(cfg, rawFlock) : null;
     return { item, flockSel };
   });
-  const replyUserId = `rpc-batch-${crypto.randomUUID()}`;
+  const replyUserId = isTokenLocalAuthEnabled(cfg)
+    ? cfg.machineId
+    : `rpc-batch-${crypto.randomUUID()}`;
   const pending = new Map();
 
   const client = await connectSignalRClient(cfg, {
@@ -10537,11 +10931,23 @@ export async function handleRpcAction(cfg, req) {
   }
   const syncPath = req?.flocksConfigPath || cfg?.flocksConfigPath || getFlocksConfigPath();
   const attemptAuthorizationSync = async (triggerError) => {
+    let ownerCreatedRequestedFlock = false;
+    try {
+      const requested = parseFlockAddress(requestedFlockId);
+      ownerCreatedRequestedFlock = Boolean(
+        normalizeGitHubUser(cfg?.githubUser)?.toLowerCase() === requested.owner &&
+          !requested.isOwnerRoot &&
+          !requested.isBuiltInScope
+      );
+    } catch {}
+    const locallyKnown = Boolean(
+      readRawStoredFlocksConfig(cfg, syncPath).flocks?.[requestedFlockId]
+    );
     if (
       !requestedFlockId ||
       cfg?.protocol === "broker-free-v34" ||
       req?.flockPolicy ||
-      !readRawStoredFlocksConfig(cfg, syncPath).flocks?.[requestedFlockId]
+      (!locallyKnown && !ownerCreatedRequestedFlock)
     ) {
       throw triggerError;
     }
@@ -11674,7 +12080,7 @@ export async function drainAndProcessOfflineQueue(
             toAckIds.push(reqId);
             persistCurrentState();
           }
-          if (cfg?.connectionString) {
+          if (hasSignalRSendCredentials(cfg)) {
             sendSignalRBroadcast(cfg, "bridgeDeliveryReceipt", {
               requestId: reqId,
               stage: "admitted_from_servicebus_queue",
@@ -11727,7 +12133,7 @@ export function createDaemonHeartbeatMonitor({
   const effectivePublishPresence =
     publishPresenceFn ||
     (async (selfInfo) => {
-      if (cfg?.connectionString || cfg?.accessKey) {
+      if (hasSignalRSendCredentials(cfg)) {
         await sendSignalRBroadcast(cfg, "bridgePresence", selfInfo);
       }
     });
@@ -12304,7 +12710,12 @@ export async function ensureDaemonStarted(cfg) {
   const daemonArgs = sandboxMode ? [scriptToRun, "daemon", "--sandbox", "v3"] : [scriptToRun, "daemon"];
   const daemonEnv = {
     ...process.env,
-    SIGNALR_CONNECTION_STRING: cfg.connectionString,
+    ...(cfg.tokenLocalAuth
+      ? { SIGNALR_CONNECTION_STRING: "" }
+      : cfg.connectionString
+        ? { SIGNALR_CONNECTION_STRING: cfg.connectionString }
+        : {}),
+    ...(cfg.tokenLocalAuth ? { COPILOT_FLOCK_TOKEN_LOCAL: "1" } : {}),
     COPILOT_FLOCK_MACHINE_ID: cfg.machineId,
     COPILOT_BRIDGE_MACHINE_ID: cfg.machineId,
     COPILOT_FLOCK_SCOPE: cfg.scope,
@@ -13657,7 +14068,8 @@ export async function executeMcpTool(cfg, name, args = {}, options = {}) {
       const endpoint = cfg?.endpoint || null;
       const localCopilotWs = getLocalWsConnectionInfo() ? "online" : "offline";
       const hasTransport =
-        cfg?.protocol === "broker-free-v34" || Boolean(cfg?.connectionString);
+        cfg?.protocol === "broker-free-v34" ||
+        Boolean(cfg?.connectionString || cfg?.clientToken);
 
       if (!daemonStatus.running || !hasTransport) {
         const effectiveDaemon = !daemonStatus.running
@@ -14369,7 +14781,7 @@ export async function executeMcpTool(cfg, name, args = {}, options = {}) {
     const dispatchTimeoutMs = 8000;
     const rpcTimeoutMs = waitForReply ? waitTimeoutMs + 10000 : dispatchTimeoutMs + 7000;
 
-    if (cfg?.connectionString) {
+    if (hasSignalRSendCredentials(cfg)) {
       sendSignalRBroadcast(cfg, "bridgeDeliveryReceipt", {
         stage: "clarification_requested",
         fromMachine: cfg.machineId,
@@ -14748,7 +15160,13 @@ export async function executeMcpTool(cfg, name, args = {}, options = {}) {
     if (tokenLocalVoucher) {
       await requireBootstrapCapabilities(
         { ...cfg, bootstrapUrl: effectiveBootstrapUrl, tokenLocalAuth: true },
-        ["tokenLocalDeviceAuth", "deviceSignedOperations", "rosterSync", "enrollmentReadiness"],
+        [
+          "tokenLocalDeviceAuth",
+          "deviceSignedOperations",
+          "rosterSync",
+          "enrollmentReadiness",
+          "scopedSignalRTransportTokens",
+        ],
         { correlationId }
       );
     }
@@ -14839,7 +15257,9 @@ export async function executeMcpTool(cfg, name, args = {}, options = {}) {
     }
     if (Array.isArray(res.kickedPeers) && res.kickedPeers.length > 0 && res.flockId) {
       try {
-        const registry = openFlockMembershipRegistry();
+        const registryPath =
+          options.flocksConfigPath || cfg?.flocksConfigPath || getFlocksConfigPath();
+        const registry = openFlockMembershipRegistry(registryPath);
         if (registry.hasFlock(res.flockId)) {
           for (const kp of res.kickedPeers) {
             registry.recordRemovalTombstone(res.flockId, {
@@ -14851,7 +15271,15 @@ export async function executeMcpTool(cfg, name, args = {}, options = {}) {
             });
           }
         }
-      } catch {}
+      } catch (cause) {
+        const error = new Error(
+          `Member was kicked remotely but the local authoritative registry was not updated: ${cause.message}`
+        );
+        error.code = "PARTIAL_PERSISTENCE_ERROR";
+        error.stage = "roster_registry";
+        error.cause = cause;
+        throw error;
+      }
     }
     return res;
   }
@@ -18187,7 +18615,8 @@ export async function diagnoseFleetMachines(
   if (effectivePassive) {
     daemonStatus = inspectLocalDaemonPassive(cfg);
     const hasTransport =
-      cfg?.protocol === "broker-free-v34" || Boolean(cfg?.connectionString);
+      cfg?.protocol === "broker-free-v34" ||
+      Boolean(cfg?.connectionString || cfg?.clientToken);
     if (!daemonStatus.running || !hasTransport) {
       const effectiveDaemon = !daemonStatus.running
         ? daemonStatus
@@ -19014,7 +19443,13 @@ export async function installBridge({
     if (isTokenLocalVoucher) {
       await requireBootstrapCapabilities(
         cfg,
-        ["tokenLocalDeviceAuth", "deviceSignedOperations", "rosterSync", "enrollmentReadiness"],
+        [
+          "tokenLocalDeviceAuth",
+          "deviceSignedOperations",
+          "rosterSync",
+          "enrollmentReadiness",
+          "scopedSignalRTransportTokens",
+        ],
         { correlationId: enrollmentCorrelationId }
       );
     }

@@ -154,7 +154,8 @@ test("v3 hotfix both clients apply duplicate owner records in either order witho
             assert.equal(stored.flocks[record.flockId].trustTier, "owner");
             assert.equal(stored.flocks[record.flockId].sessionVisibility, "all");
             assert.equal(stored.flocks[record.flockId].shareSpecs, "full");
-            assert.equal(stored.flocks[record.flockId].serverNonce, record.serverNonce);
+            assert.equal(stored.flocks[record.flockId].serverNonce, undefined);
+            assert.equal(stored.flocks[record.flockId].hubToken, undefined);
             assert.equal(stored.flocks[record.flockId].membershipExpiresAtMs, null);
           }
           assert.equal(stored.flocks[shared.flockId].trustTier, "collaborator");
@@ -206,7 +207,6 @@ test("v3 hotfix owner application rejects spoofed identity, shared roles and sta
       { result: { githubUserId: 2002 } },
       { result: { peerId: "wrong-peer" } },
       { result: { deviceId: "wrong-device" } },
-      { record: { flockId: "demo-owner/studio-team", flockType: "shared" } },
       { record: { targetMachineId: "DEMO-PC" } },
       { record: { ownerGitHubUser: "someone-else" } },
       { record: { ownerGitHubUserId: 2002 } },
@@ -237,6 +237,22 @@ test("v3 hotfix owner application rejects spoofed identity, shared roles and sta
       delete legacyRecord.ownerGitHubUserId;
       api.applyV3EnrollmentResult(cfg, { ...result, enrolledFlocks: [legacyRecord] }, storePath);
       assert.equal(JSON.parse(fs.readFileSync(storePath, "utf8")).flocks[record.flockId].trustTier, "owner");
+
+      const sharedOwnerPath = path.join(directory, `${filename}-shared-owner.json`);
+      const sharedOwnerRecord = {
+        ...record,
+        flockId: "demo-owner/studio-team",
+        flockType: "shared",
+      };
+      api.applyV3EnrollmentResult(
+        cfg,
+        { ...result, enrolledFlocks: [sharedOwnerRecord] },
+        sharedOwnerPath
+      );
+      const sharedOwner = JSON.parse(fs.readFileSync(sharedOwnerPath, "utf8"))
+        .flocks[sharedOwnerRecord.flockId];
+      assert.equal(sharedOwner.trustTier, "owner");
+      assert.equal(sharedOwner.sessionVisibility, "explicit_opt_in_only");
     }
   } finally {
     fs.rmSync(directory, { recursive: true, force: true });

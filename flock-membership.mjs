@@ -304,7 +304,6 @@ export function hasVerifiedOwnerAuthority(flock, auth = {}) {
   } catch {
     return false;
   }
-  if (address.machineId || flock.targetMachineId) return false;
   if (flock.trustTier !== "owner") return false;
   if (address.owner !== principal) return false;
   if (normalizeLogin(flock.ownerGitHubUser) !== principal) return false;
@@ -314,7 +313,12 @@ export function hasVerifiedOwnerAuthority(flock, auth = {}) {
   const validBuiltInType =
     (address.isOwnerRoot && flock.flockType === "owner_root") ||
     (!address.isOwnerRoot && address.isBuiltInScope && flock.flockType === "owner_scope");
-  if (!validBuiltInType) return false;
+  const validOwnerCreatedSharedType =
+    !address.isOwnerRoot &&
+    !address.isBuiltInScope &&
+    ["shared", "guest_pass"].includes(flock.flockType);
+  if (!validBuiltInType && !validOwnerCreatedSharedType) return false;
+  if (validBuiltInType && flock.targetMachineId) return false;
   if (isPrincipalRevokedInFlock(flock, { githubUser: principal, githubUserId: principalId, peerId, deviceId })) {
     return false;
   }

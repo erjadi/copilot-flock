@@ -72,7 +72,7 @@ flowchart LR
 ### 3.1 Legacy Broker-Backed v3 (`/api/v3/my-flocks` + `/api/members`)
 1. **Enrollment & Discovery**: `applyV3EnrollmentResult` and `list_flocks` / `list_flock_members(refresh_broker: true)` reconcile per-flock authorization records from `GET /api/v3/my-flocks` (`rosterEpoch`, `peerId`, `keyFingerprint`, `publicKey`, `trustTier`, `membershipExpiresAt`).
 2. **Hardware Metadata Enrichment**: Optional host records from `GET /api/members` enrich non-authoritative display fields (`specs`, `version`, `platform`, `githubName`) only when cryptographic `keyFingerprint` / `publicKey` aligns (or unambiguous `(githubUser, machineId)` when no conflicting key exists). `/api/members` `lastSeenAt` is recorded with `liveVerified: false` so `presenceStatus` remains `"unknown"` until a live SignalR frame is observed.
-3. **Epoch Advancement & Kicks**: When `kick_flock_member` succeeds or `/api/v3/my-flocks` returns a higher `rosterEpoch` omitting a previously cached member, the registry removes the member from `members` and writes a revisioned tombstone at `removedAtEpoch`.
+3. **Epoch Advancement & Kicks**: When `kick_flock_member` succeeds or `/api/v3/my-flocks` returns a higher `rosterEpoch` omitting a previously cached member, the registry removes the member from `members` and writes a revisioned tombstone at `removedAtEpoch`. Empty authoritative rosters and explicit revoked/expired flock summaries are reconciled too; they cannot leave stale active keys behind.
 
 ### 3.2 Broker-Free v3.4 (Owner-Signed Snapshots & Deltas)
 1. **Owner Authority**: Only the pinned flock rotation owner (`ownerFingerprint(ownerPublicKey)`) can sign `copilot-flock/3.4/control/roster-snapshot` and `copilot-flock/3.4/control/roster-delta` control artifacts.
@@ -86,6 +86,11 @@ Legacy broker-backed clients now reconcile `/enroll`, `/my-flocks`, and
 authorization, exact-flock peer-key lookup, routing, and member listing consume
 that epoch/tombstone/expiry view; `flocks.json` remains the separate local store
 for sharing preferences and approved snapshots.
+
+Owner-created shared and guest flocks include the owner's eligible enrolled
+devices in their authoritative roster. Owner authority in those flocks is
+verified against exact device membership but remains an explicit-opt-in sharing
+context; it does not confer owner-root transcript visibility.
 
 Roster epochs are monotonic. Rollback, tombstone resurrection, expired
 memberships, mismatched flock identity, and ambiguous cross-flock hostname keys
