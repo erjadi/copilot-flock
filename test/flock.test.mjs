@@ -72,6 +72,14 @@ import {
   assertVerifiedExecutionAuthorization,
   shouldGrantRemoteAllowAll,
   classifyLayeredPresence,
+  repairStoredConfigScopeBeforeLoad,
+  reprovisionFleetMachines,
+  sendRemoteFile,
+  pullRemoteFile,
+  syncRemoteGitBranch,
+  invokeRemoteRpc,
+  discoverMachines,
+  brokerFreeRuntime,
   validatePinnedBootstrapOrigin,
   recordSandboxManifestResource,
   teardownLocalSandbox,
@@ -1005,23 +1013,49 @@ test(
       lastTick = now;
     }, 10);
 
+    const hugePeerKey = crypto.generateKeyPairSync("ed25519", {
+      publicKeyEncoding: { type: "spki", format: "pem" },
+      privateKeyEncoding: { type: "pkcs8", format: "pem" },
+    });
+    const hugeRegistryMembers = [
+      {
+        machineId: "PEER-PC",
+        githubUser: "erjadi",
+        scope: "personal",
+        publicKey: hugePeerKey.publicKey,
+      },
+    ];
+    const signedHugeRead = (requestId, action, params) => {
+      const sentAt = new Date().toISOString();
+      return {
+        requestId,
+        sentAt,
+        fromMachine: "PEER-PC",
+        toMachine: cfg.machineId,
+        action,
+        params,
+        auth: signRpcRequest({
+          requestId,
+          sentAt,
+          fromMachine: "PEER-PC",
+          toMachine: cfg.machineId,
+          action,
+          params,
+          identity: {
+            publicKey: hugePeerKey.publicKey,
+            privateKey: hugePeerKey.privateKey,
+            fingerprint: "huge-peer",
+          },
+        }),
+        registryMembers: hugeRegistryMembers,
+      };
+    };
+
     const tConcurrent0 = performance.now();
     const [transcriptRes, pingRes, listRes, nonWaitSendRes, waitSendRes] = await Promise.all([
-      handleRpcAction(cfg, {
-        requestId: "req-transcript-1",
-        action: "get_transcript",
-        params: { session: hugeSessionId, limit: 8 },
-      }),
-      handleRpcAction(cfg, {
-        requestId: "req-ping-1",
-        action: "ping",
-        params: {},
-      }),
-      handleRpcAction(cfg, {
-        requestId: "req-list-1",
-        action: "list_sessions",
-        params: { limit: 10 },
-      }),
+      handleRpcAction(cfg, signedHugeRead("req-transcript-1", "get_transcript", { session: hugeSessionId, limit: 8 })),
+      handleRpcAction(cfg, signedHugeRead("req-ping-1", "ping", {})),
+      handleRpcAction(cfg, signedHugeRead("req-list-1", "list_sessions", { limit: 10 })),
       injectLocalSessionMessage({
         cfg,
         targetSession: hugeSessionId,
@@ -1282,7 +1316,7 @@ test("refreshLiveSpecs and ping include githubUser and live hardware specs", asy
       githubUser: "erjadi",
       specs,
     },
-    { action: "ping", params: {} }
+    { action: "ping", inProcessSelfPing: true, params: {} }
   );
   assert.equal(pingRes.version, BRIDGE_VERSION);
   assert.equal(pingRes.githubUser, "erjadi");
@@ -1521,15 +1555,33 @@ test("v1.8.0: daemon deduplication, chunked SHA-256 file transfer, and --message
 
     // 6. Test cross-user informational-only policy blocks config/file/state-changing RPCs
     for (const blockedAction of ["self_update", "send_file_chunk", "pull_file_chunk", "create_session"]) {
+      const blockedParams = { fromGitHubUser: "alice", remotePath: "test.txt" };
+      const blockedSentAt = new Date().toISOString();
+      const blockedReqId = `req-block-${blockedAction}`;
       await assert.rejects(
         () =>
           handleRpcAction(
             { machineId: "MAIN-WORKSTATION", githubUser: "erjadi", scope: "personal" },
             {
-              requestId: `req-block-${blockedAction}`,
+              requestId: blockedReqId,
+              sentAt: blockedSentAt,
               fromMachine: "ALICE-PC",
+              toMachine: "MAIN-WORKSTATION",
               action: blockedAction,
-              params: { fromGitHubUser: "alice", remotePath: "test.txt" },
+              params: blockedParams,
+              auth: signRpcRequest({
+                requestId: blockedReqId,
+                sentAt: blockedSentAt,
+                fromMachine: "ALICE-PC",
+                toMachine: "MAIN-WORKSTATION",
+                action: blockedAction,
+                params: blockedParams,
+                identity: {
+                  publicKey: aliceKey.publicKey,
+                  privateKey: aliceKey.privateKey,
+                  fingerprint: "alice-fp",
+                },
+              }),
               registryMembers,
             }
           ),
@@ -2388,35 +2440,59 @@ test("v3.0.0 multi-flock platform: universal <owner>/<flock>[/<machineId>] addre
 
     const loadedFlocks = loadLocalFlocksConfig(hostCfg, testFlocksCfgPath);
     const teamPolicy = loadedFlocks.flocks["erjadi/studio-team"];
+    const collabWallKey = crypto.generateKeyPairSync("ed25519", {
+      publicKeyEncoding: { type: "spki", format: "pem" },
+      privateKeyEncoding: { type: "pkcs8", format: "pem" },
+    });
+    const collabWallMembers = [
+      { machineId: "COLLAB-PC", githubUser: "erjadi", scope: "work", publicKey: collabWallKey.publicKey },
+    ];
+    const signedWallRpc = (action, params, flockPolicyOverride) => {
+      const requestId = crypto.randomUUID();
+      const sentAt = new Date().toISOString();
+      const signedParams = { ...params, flock: flockPolicyOverride.flockId };
+      return {
+        requestId,
+        sentAt,
+        fromMachine: "COLLAB-PC",
+        toMachine: hostCfg.machineId,
+        action,
+        flockPolicy: flockPolicyOverride,
+        params: signedParams,
+        auth: signRpcRequest({
+          requestId,
+          sentAt,
+          fromMachine: "COLLAB-PC",
+          toMachine: hostCfg.machineId,
+          action,
+          params: signedParams,
+          identity: {
+            publicKey: collabWallKey.publicKey,
+            privateKey: collabWallKey.privateKey,
+            fingerprint: "collab-wall",
+          },
+        }),
+        registryMembers: collabWallMembers,
+      };
+    };
 
     // Unshared session request in collaborator flock must throw 403 SESSION_NOT_SHARED
     await assert.rejects(
-      () =>
-        handleRpcAction(hostCfg, {
-          action: "get_transcript",
-          flockPolicy: teamPolicy,
-          params: { session: "private-unshared-sess" },
-        }),
+      () => handleRpcAction(hostCfg, signedWallRpc("get_transcript", { session: "private-unshared-sess" }, teamPolicy)),
       (err) => err.code === "SESSION_NOT_SHARED" && err.statusCode === 403
     );
 
     // Mutating RPC (`self_update`) in collaborator flock must throw 403 FLOCK_MUTATION_FORBIDDEN even for same-owner
     await assert.rejects(
-      () =>
-        handleRpcAction(hostCfg, {
-          action: "self_update",
-          flockPolicy: teamPolicy,
-          params: {},
-        }),
+      () => handleRpcAction(hostCfg, signedWallRpc("self_update", {}, teamPolicy)),
       (err) => err.code === "FLOCK_MUTATION_FORBIDDEN" && err.statusCode === 403
     );
 
     // Shared session returns the clean approved snapshot deterministically
-    const sharedTranscript = await handleRpcAction(hostCfg, {
-      action: "get_transcript",
-      flockPolicy: teamPolicy,
-      params: { session: "shared-sess-1" },
-    });
+    const sharedTranscript = await handleRpcAction(
+      hostCfg,
+      signedWallRpc("get_transcript", { session: "shared-sess-1" }, teamPolicy)
+    );
     assert.equal(
       sharedTranscript.messages[0].content,
       "Approved summary: service-api uses Entra DefaultAzureCredential."
@@ -2430,12 +2506,7 @@ test("v3.0.0 multi-flock platform: universal <owner>/<flock>[/<machineId>] addre
     );
     const updatedPolicy = loadLocalFlocksConfig(hostCfg, testFlocksCfgPath).flocks["erjadi/studio-team"];
     await assert.rejects(
-      () =>
-        handleRpcAction(hostCfg, {
-          action: "get_transcript",
-          flockPolicy: updatedPolicy,
-          params: { session: "shared-sess-1" },
-        }),
+      () => handleRpcAction(hostCfg, signedWallRpc("get_transcript", { session: "shared-sess-1" }, updatedPolicy)),
       (err) => err.code === "SESSION_NOT_SHARED" && err.statusCode === 403
     );
 
@@ -2999,14 +3070,27 @@ test("TODO #9: legacy two-flock list_remote_sessions and get_remote_session_tran
     );
     // Direct responder check: even if @alice bypasses caller check and sends `flock: "owner/work"` or omits `flock` on wire, responder rejects pre-body!
     transcriptReadCalls.length = 0;
+    const aliceStealSentAt = new Date().toISOString();
+    const aliceStealParams = { flock: "owner/work", session: "sess-private-owner" };
     await assert.rejects(
       () =>
         handleRpcAction(workHostCfg, {
           requestId: "req-alice-owner-steal",
+          sentAt: aliceStealSentAt,
           fromMachine: "ALICE-LAPTOP",
+          toMachine: "HOST-WORK-VM",
           action: "get_transcript",
           flockId: "owner/work",
-          params: { flock: "owner/work", session: "sess-private-owner" },
+          params: aliceStealParams,
+          auth: signRpcRequest({
+            requestId: "req-alice-owner-steal",
+            sentAt: aliceStealSentAt,
+            fromMachine: "ALICE-LAPTOP",
+            toMachine: "HOST-WORK-VM",
+            action: "get_transcript",
+            params: aliceStealParams,
+            identity: aliceKey,
+          }),
           registryMembers,
         }),
       (err) => err.code === "UNAUTHORIZED_FLOCK" && err.statusCode === 403
@@ -3015,9 +3099,20 @@ test("TODO #9: legacy two-flock list_remote_sessions and get_remote_session_tran
       () =>
         handleRpcAction(workHostCfg, {
           requestId: "req-alice-omitted-steal",
+          sentAt: aliceStealSentAt,
           fromMachine: "ALICE-LAPTOP",
+          toMachine: "HOST-WORK-VM",
           action: "list_sessions",
           params: {},
+          auth: signRpcRequest({
+            requestId: "req-alice-omitted-steal",
+            sentAt: aliceStealSentAt,
+            fromMachine: "ALICE-LAPTOP",
+            toMachine: "HOST-WORK-VM",
+            action: "list_sessions",
+            params: {},
+            identity: aliceKey,
+          }),
           registryMembers,
         }),
       (err) => err.code === "UNAUTHORIZED_FLOCK" && err.statusCode === 403
@@ -3124,11 +3219,33 @@ test("TODO #9: legacy two-flock list_remote_sessions and get_remote_session_tran
     );
 
     const diskHostCfg = { machineId: "DISK-WORK-VM", githubUser: "owner", scope: "work" };
-    const diskExpSessions = await handleRpcAction(diskHostCfg, {
-      action: "list_sessions",
-      flockId: "owner/experimental",
-      params: { flock: "owner/experimental" },
-    });
+    const signedDiskRpc = (action, params) => {
+      const requestId = crypto.randomUUID();
+      const sentAt = new Date().toISOString();
+      return {
+        requestId,
+        sentAt,
+        fromMachine: "CALLER-LAPTOP",
+        toMachine: diskHostCfg.machineId,
+        action,
+        flockId: params.flock,
+        params,
+        auth: signRpcRequest({
+          requestId,
+          sentAt,
+          fromMachine: "CALLER-LAPTOP",
+          toMachine: diskHostCfg.machineId,
+          action,
+          params,
+          identity: callerKey,
+        }),
+        registryMembers,
+      };
+    };
+    const diskExpSessions = await handleRpcAction(
+      diskHostCfg,
+      signedDiskRpc("list_sessions", { flock: "owner/experimental" })
+    );
     assert.deepEqual(
       diskExpSessions.sessions.map((s) => s.session_id),
       ["disk-sess-exp"]
@@ -3143,20 +3260,18 @@ test("TODO #9: legacy two-flock list_remote_sessions and get_remote_session_tran
     try {
       await assert.rejects(
         () =>
-          handleRpcAction(diskHostCfg, {
-            action: "get_transcript",
-            flockId: "owner/experimental",
-            params: { flock: "owner/experimental", session: "disk-sess-alpha" },
-          }),
+          handleRpcAction(
+            diskHostCfg,
+            signedDiskRpc("get_transcript", { flock: "owner/experimental", session: "disk-sess-alpha" })
+          ),
         (err) => err.code === "SESSION_NOT_SHARED" && err.statusCode === 403
       );
       await assert.rejects(
         () =>
-          handleRpcAction(diskHostCfg, {
-            action: "get_transcript",
-            flockId: "owner/experimental",
-            params: { flock: "owner/experimental", session: "disk-sess-owner" },
-          }),
+          handleRpcAction(
+            diskHostCfg,
+            signedDiskRpc("get_transcript", { flock: "owner/experimental", session: "disk-sess-owner" })
+          ),
         (err) => err.code === "SESSION_NOT_SHARED" && err.statusCode === 403
       );
       assert.deepEqual(
@@ -3165,11 +3280,10 @@ test("TODO #9: legacy two-flock list_remote_sessions and get_remote_session_tran
         "events.jsonl must never be opened when get_transcript is denied for an unauthorized flock"
       );
 
-      const allowedDiskTx = await handleRpcAction(diskHostCfg, {
-        action: "get_transcript",
-        flockId: "owner/experimental",
-        params: { flock: "owner/experimental", session: "disk-sess-exp" },
-      });
+      const allowedDiskTx = await handleRpcAction(
+        diskHostCfg,
+        signedDiskRpc("get_transcript", { flock: "owner/experimental", session: "disk-sess-exp" })
+      );
       assert.equal(allowedDiskTx.messages[0].content, "DISK_EXP_AUTHORIZED_TRANSCRIPT_BODY");
       assert.equal(openedFiles.length, 1);
       assert.match(openedFiles[0], /disk-sess-exp[\\/]events\.jsonl$/);
@@ -4479,12 +4593,38 @@ test("durable v3 broker-backed membership registry: offline collaborators, crypt
     localFlocksPath
   );
   const teamPolicy = loadLocalFlocksConfig(hostCfg, localFlocksPath).flocks["erjadi/studio-team"];
+  const regCollabKey = crypto.generateKeyPairSync("ed25519", {
+    publicKeyEncoding: { type: "spki", format: "pem" },
+    privateKeyEncoding: { type: "pkcs8", format: "pem" },
+  });
+  const regSentAt = new Date().toISOString();
+  const regParams = { flock: "erjadi/studio-team", session: "private-local-thread" };
   await assert.rejects(
     () =>
       handleRpcAction(hostCfg, {
+        requestId: "req-private-local-thread",
+        sentAt: regSentAt,
+        fromMachine: "ALICE-DEV",
+        toMachine: hostCfg.machineId,
         action: "get_transcript",
         flockPolicy: teamPolicy,
-        params: { session: "private-local-thread" },
+        params: regParams,
+        auth: signRpcRequest({
+          requestId: "req-private-local-thread",
+          sentAt: regSentAt,
+          fromMachine: "ALICE-DEV",
+          toMachine: hostCfg.machineId,
+          action: "get_transcript",
+          params: regParams,
+          identity: {
+            publicKey: regCollabKey.publicKey,
+            privateKey: regCollabKey.privateKey,
+            fingerprint: "alice-dev",
+          },
+        }),
+        registryMembers: [
+          { machineId: "ALICE-DEV", githubUser: "alice", scope: "work", publicKey: regCollabKey.publicKey },
+        ],
       }),
     (err) => err.code === "SESSION_NOT_SHARED" && err.statusCode === 403
   );
@@ -6543,7 +6683,7 @@ test("fleet runtime staging rejects omitted modules, partial copies, interrupted
     assert.equal(postRestartStates.verified.residentMatchesInstalled, true);
     assert.equal(postRestartStates.verified.fullyActive, true);
 
-    const pingStatus = await handleRpcAction(testCfg, { action: "ping", params: {} });
+    const pingStatus = await handleRpcAction(testCfg, { action: "ping", inProcessSelfPing: true, params: {} });
     assert.equal(pingStatus.staged.version, "3.5.0-rc1");
     assert.equal(pingStatus.staged.digest, v2Manifest.manifestDigest);
     assert.equal(pingStatus.installed.version, "3.5.0-rc1");
@@ -7186,8 +7326,35 @@ test("release voter extracts complete modular dependency closure into isolated f
     }
 
     assert.equal(buildCanonicalVoteBallotPayload(passBallot), passBallot.ballotPayload);
+    const badVoteSentAt = new Date().toISOString();
+    const badVoteParams = { branch: "../bad" };
     await assert.rejects(
-      () => handleRpcAction(voterCfg, { action: "review_release", params: { branch: "../bad" } }),
+      () =>
+        handleRpcAction(voterCfg, {
+          requestId: "req-bad-branch",
+          sentAt: badVoteSentAt,
+          fromMachine: voterCfg.machineId,
+          toMachine: voterCfg.machineId,
+          action: "review_release",
+          params: badVoteParams,
+          auth: signRpcRequest({
+            requestId: "req-bad-branch",
+            sentAt: badVoteSentAt,
+            fromMachine: voterCfg.machineId,
+            toMachine: voterCfg.machineId,
+            action: "review_release",
+            params: badVoteParams,
+            identity: voterKey,
+          }),
+          registryMembers: [
+            {
+              machineId: voterCfg.machineId,
+              githubUser: voterCfg.githubUser,
+              scope: voterCfg.scope,
+              publicKey: voterKey.publicKey,
+            },
+          ],
+        }),
       /Invalid branch name/
     );
   } finally {
@@ -7379,6 +7546,13 @@ test("passive diagnostics report live fleet when daemon is running while non-pas
   try {
     const flockDir = path.join(env.tempRoot, "flock");
     fs.mkdirSync(flockDir, { recursive: true });
+    const passiveIdentity = (() => {
+      const kp = crypto.generateKeyPairSync("ed25519", {
+        publicKeyEncoding: { type: "spki", format: "pem" },
+        privateKeyEncoding: { type: "pkcs8", format: "pem" },
+      });
+      return { publicKey: kp.publicKey, privateKey: kp.privateKey, fingerprint: "passive-self" };
+    })();
     const cfg = {
       machineId: "PASSIVE-RUNNING-PC",
       scope: "personal",
@@ -7390,6 +7564,7 @@ test("passive diagnostics report live fleet when daemon is running while non-pas
       connectionString:
         "Endpoint=https://running-fixture.service.signalr.net;AccessKey=MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=;Version=1.0;",
       specs: null,
+      identity: passiveIdentity,
     };
 
     // Simulate a live connected local daemon in daemon.pid + state.json
@@ -7443,7 +7618,15 @@ test("passive diagnostics report live fleet when daemon is running while non-pas
                 const rpcReq = msg.arguments[0];
                 const result = await handleRpcAction(cfg, {
                   ...rpcReq,
-                  senderVerified: true,
+                  registryMembers: [
+                    {
+                      machineId: cfg.machineId,
+                      githubUser: cfg.githubUser,
+                      scope: cfg.scope,
+                      publicKey: passiveIdentity.publicKey,
+                    },
+                  ],
+                  enforceSignature: true,
                 });
                 const replyClient = clientsByUser.get(rpcReq.replyUserId);
                 if (replyClient?.onTextMessage) {
@@ -7534,9 +7717,7 @@ setTimeout(() => process.exit(0), 15000);
     assert.equal(fs.existsSync(path.join(flockDir, "daemon.pid")), true);
     spawnedDaemonChild = Number(fs.readFileSync(path.join(flockDir, "daemon.pid"), "utf8").trim());
     assert.ok(spawnedDaemonChild > 0);
-    assert.equal(activeDiag.daemon.running, true);
-    assert.equal(activeDiag.onlineCount, 0);
-    assert.match(activeDiag.reason, /No SignalR ping responses/);
+    assert.equal(activeDiag.onlineCount, 1);
   } finally {
     if (spawnedDaemonChild) {
       try {
@@ -8943,13 +9124,43 @@ assert.equal(windowsStore.entry, replacement, "Old WMI completion must not publi
   assert.ok(liveSpecs.thermal && typeof liveSpecs.thermal.sampledAt === "string");
 
   // 4. Flock specs-sharing boundaries: owner receives thermal; collaborator/guest/cross-user/none never do
+  const thermalPeerKey = crypto.generateKeyPairSync("ed25519", {
+    publicKeyEncoding: { type: "spki", format: "pem" },
+    privateKeyEncoding: { type: "pkcs8", format: "pem" },
+  });
+  const thermalSigned = (action, flockPolicy, params) => {
+    const requestId = crypto.randomUUID();
+    const sentAt = new Date().toISOString();
+    const signedParams = { ...params, flock: flockPolicy.flockId };
+    return {
+      requestId,
+      sentAt,
+      fromMachine: "PEER-PROBE",
+      toMachine: "GPU-TOWER",
+      action,
+      flockPolicy,
+      params: signedParams,
+      auth: signRpcRequest({
+        requestId,
+        sentAt,
+        fromMachine: "PEER-PROBE",
+        toMachine: "GPU-TOWER",
+        action,
+        params: signedParams,
+        identity: {
+          publicKey: thermalPeerKey.publicKey,
+          privateKey: thermalPeerKey.privateKey,
+          fingerprint: "thermal-peer",
+        },
+      }),
+      registryMembers: [
+        { machineId: "PEER-PROBE", githubUser: "erjadi", scope: "work", publicKey: thermalPeerKey.publicKey },
+      ],
+    };
+  };
   const ownerPing = await handleRpcAction(
     { machineId: "GPU-TOWER", scope: "work", githubUser: "erjadi", specs: liveSpecs },
-    {
-      action: "ping",
-      flockPolicy: { flockId: "erjadi/work", trustTier: "owner", shareSpecs: "full" },
-      params: {},
-    }
+    thermalSigned("ping", { flockId: "erjadi/work", trustTier: "owner", shareSpecs: "full" }, {})
   );
   assert.ok(ownerPing.specs.thermal, "Owner flock ping should include thermal telemetry");
 
@@ -8961,7 +9172,7 @@ assert.equal(windowsStore.entry, replacement, "Old WMI completion must not publi
   };
   const collabPing = await handleRpcAction(
     { machineId: "GPU-TOWER", scope: "work", githubUser: "erjadi", specs: liveSpecs },
-    { action: "ping", flockPolicy: collabPolicy, params: {} }
+    thermalSigned("ping", collabPolicy, {})
   );
   assert.equal("thermal" in collabPing.specs, false);
   assert.equal(collabPing.specs.disks.some((d) => d.type === "network"), false);
@@ -8970,7 +9181,7 @@ assert.equal(windowsStore.entry, replacement, "Old WMI completion must not publi
 
   const collabDiagnose = await handleRpcAction(
     { machineId: "GPU-TOWER", scope: "work", githubUser: "erjadi", specs: liveSpecs },
-    { action: "diagnose", flockPolicy: collabPolicy, params: { fix: false } }
+    thermalSigned("diagnose", collabPolicy, { fix: false })
   );
   assert.equal("thermal" in collabDiagnose.specs, false);
 
@@ -9235,6 +9446,913 @@ test("3.6 foundation: public DTOs, exact flock execution, shared-thread isolatio
   assert.equal(ue3Presence.presenceLayers.tracker.state, "unknown");
 });
 
+test("3.6 conformance blockers: signed outbound protected RPCs, unsigned read rejection, status secret stripping, mixed-version quarantine/repair, and presence parity", async (t) => {
+  const env = setupTempCopilotEnv();
+  const prevCopilotHome = process.env.COPILOT_HOME;
+  const prevDisableOsProbe = process.env.COPILOT_FLOCK_DISABLE_OS_WS_PROBE;
+  const prevPath = process.env.PATH;
+  const prevCliPath = process.env.COPILOT_CLI_PATH;
+  process.env.COPILOT_HOME = env.tempRoot;
+  process.env.COPILOT_FLOCK_DISABLE_OS_WS_PROBE = "1";
+  invalidateLocalWsConnectionCache();
+
+  let wsServer = null;
+  let bootServer = null;
+  try {
+    const flockDir = path.join(env.tempRoot, "flock");
+    fs.mkdirSync(flockDir, { recursive: true });
+    fs.writeFileSync(path.join(flockDir, "daemon.pid"), String(process.pid), "utf8");
+    fs.writeFileSync(
+      path.join(flockDir, "state.json"),
+      JSON.stringify({
+        pid: process.pid,
+        status: "connected",
+        updatedAt: new Date().toISOString(),
+        knownPeers: [
+          {
+            machineId: "PEER-A",
+            scope: "work",
+            hubToken: "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJkYWVtb24tcGVlciJ9.sig",
+            serverNonce: "DAEMON_STATE_NONCE_CANARY",
+          },
+        ],
+      }),
+      "utf8"
+    );
+
+    const makeIdentity = (fp) => {
+      const kp = crypto.generateKeyPairSync("ed25519", {
+        publicKeyEncoding: { type: "spki", format: "pem" },
+        privateKeyEncoding: { type: "pkcs8", format: "pem" },
+      });
+      return { publicKey: kp.publicKey, privateKey: kp.privateKey, fingerprint: fp };
+    };
+    const callerIdentity = makeIdentity("caller-fp");
+    const peerIdentity = makeIdentity("peer-fp");
+    const collabIdentity = makeIdentity("collab-fp");
+
+    const registryMembers = [
+      {
+        machineId: "CALLER-PC",
+        githubUser: "erjadi",
+        scope: "personal",
+        publicKey: callerIdentity.publicKey,
+      },
+      {
+        machineId: "PEER-WORK-PC",
+        githubUser: "erjadi",
+        scope: "work",
+        publicKey: peerIdentity.publicKey,
+      },
+      {
+        machineId: "ALICE-PC",
+        githubUser: "alice",
+        scope: "work",
+        publicKey: collabIdentity.publicKey,
+      },
+    ];
+
+    const targetSessionId = "36363636-1111-4222-8333-444444444444";
+    const targetEventsPath = env.insertSession({
+      id: targetSessionId,
+      title: "Protected RPC Target",
+    });
+    fs.writeFileSync(
+      targetEventsPath,
+      JSON.stringify({
+        type: "assistant.message",
+        id: "evt-secret-tx",
+        data: { content: "TOP_SECRET_TRANSCRIPT_DO_NOT_SPOOF" },
+        timestamp: "2026-11-14T16:00:00.000Z",
+      }) + "\n",
+      "utf8"
+    );
+
+    wsServer = await startMockCopilotWsServer((frame) => {
+      if (frame.type === "send_message") {
+        setTimeout(() => {
+          fs.appendFileSync(
+            targetEventsPath,
+            [
+              JSON.stringify({
+                type: "user.message",
+                id: `evt-u-${frame.request_id}`,
+                data: {
+                  content: frame.prompt,
+                  displayContent: frame.display_prompt,
+                  requestId: frame.request_id,
+                  turnId: `turn-${frame.request_id}`,
+                },
+              }),
+              JSON.stringify({
+                type: "assistant.message",
+                id: `evt-a-${frame.request_id}`,
+                data: {
+                  content: "Idle worker reply body",
+                  turnId: `turn-${frame.request_id}`,
+                },
+              }),
+              JSON.stringify({
+                type: "session.idle",
+                id: `evt-idle-${frame.request_id}`,
+                data: { turnId: `turn-${frame.request_id}` },
+              }),
+            ].join("\n") + "\n",
+            "utf8"
+          );
+        }, 15);
+      }
+    });
+    env.writeWsConfig(wsServer.port);
+
+    const flocksConfigPath = path.join(flockDir, "flocks.json");
+    writeConfigFileSecure(
+      {
+        ownerGitHubUser: "erjadi",
+        scope: "personal",
+        flocks: {
+          erjadi: {
+            flockId: "erjadi",
+            flockType: "owner_root",
+            ownerGitHubUser: "erjadi",
+            trustTier: "owner",
+            sessionVisibility: "all",
+            shareSpecs: "full",
+            hubToken: "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJvd25lci1qd3QifQ.sig",
+            serverNonce: "NONCE_CANARY_DO_NOT_LEAK",
+            voucherSecret: "VOUCHER_CANARY_DO_NOT_LEAK",
+            connectionString:
+              "Endpoint=https://secret.service.signalr.net;AccessKey=SIGNALR_KEY_CANARY;Version=1.0;",
+            serviceBusSas: "SharedAccessSignature sr=sb%3A%2F%2Fsecret&sig=SAS_CANARY",
+            members: registryMembers.slice(0, 2),
+          },
+          "erjadi/studio-team": {
+            flockId: "erjadi/studio-team",
+            flockType: "shared",
+            ownerGitHubUser: "erjadi",
+            trustTier: "collaborator",
+            sessionVisibility: "explicit_opt_in_only",
+            sharedSessionIds: [targetSessionId],
+            sharedSnapshots: {
+              [targetSessionId]: {
+                title: "Protected RPC Target",
+                summarySnapshot: "Approved summary",
+                sharedAt: "2026-11-14T16:00:00.000Z",
+              },
+            },
+            members: [registryMembers[0], registryMembers[1], registryMembers[2]],
+          },
+        },
+        threadBindings: {
+          "bound-collab-thread": "erjadi/studio-team",
+        },
+      },
+      flocksConfigPath
+    );
+
+    // --- 2. P1 unsigned read spoofing: reject all unsigned read RPCs (network, direct, offline-queue) ---
+    const spoofAttempt = resolveVerifiedSenderIdentity(
+      { machineId: "PEER-WORK-PC", githubUser: "erjadi", scope: "work" },
+      {
+        requestId: "req-spoof-user",
+        fromMachine: "SPOOF-PC",
+        action: "get_transcript",
+        params: { fromGitHubUser: "erjadi", session: targetSessionId },
+      }
+    );
+    assert.equal(spoofAttempt.senderVerified, false);
+    assert.equal(spoofAttempt.fromGitHubUser, null);
+    assert.equal(spoofAttempt.trustLevel, "unverified");
+
+    const peerHostCfg = {
+      machineId: "PEER-WORK-PC",
+      githubUser: "erjadi",
+      scope: "work",
+      flocksConfigPath,
+      identity: peerIdentity,
+      specs: {
+        os: "Windows 11",
+        cpu: { model: "Ryzen", logicalCores: 16 },
+        memory: { totalGb: 64, freeGb: 32 },
+        gpus: [{ name: "RTX 4090", vramGb: 24, vramFreeGb: 20, utilizationPct: 10 }],
+        disks: [{ mount: "C:", type: "fixed", totalGb: 1000, freeGb: 500 }],
+      },
+    };
+
+    for (const [unsignedAction, unsignedParams] of [
+      ["get_transcript", { fromGitHubUser: "erjadi", session: targetSessionId }],
+      ["list_sessions", { fromGitHubUser: "erjadi" }],
+      ["list_projects", { fromGitHubUser: "erjadi" }],
+      ["list_locks", { fromGitHubUser: "erjadi" }],
+      ["ping", { fromGitHubUser: "erjadi" }], // remote specs via ping without inProcessSelfPing
+      ["diagnose", { fromGitHubUser: "erjadi", fix: false }], // remote specs via diagnose
+      ["get_transcript", { fromGitHubUser: "erjadi", session: targetSessionId }], // smuggling inProcessSelfPing on non-ping
+    ]) {
+      await assert.rejects(
+        () =>
+          handleRpcAction(peerHostCfg, {
+            requestId: `unsigned-${unsignedAction}`,
+            fromMachine: "CALLER-PC",
+            action: unsignedAction,
+            inProcessSelfPing: unsignedAction === "get_transcript",
+            params: unsignedParams,
+            registryMembers,
+          }),
+        (err) => err.statusCode === 403 && (err.code === "SENDER_NOT_VERIFIED" || err.code === "UNAUTHENTICATED_RPC")
+      );
+    }
+
+    // Offline queue also rejects unsigned or smuggled-self-ping read/write payloads
+    let offlineAcked = [];
+    const offlineStatePath = path.join(env.tempRoot, "offline-unsigned-state.json");
+    const offlineExecuted = await drainAndProcessOfflineQueue(peerHostCfg, {
+      statePath: offlineStatePath,
+      drainFn: async () => ({
+        messages: [
+          {
+            requestId: "offline-unsigned-read-1",
+            rpcPayload: {
+              requestId: "offline-unsigned-read-1",
+              fromMachine: "CALLER-PC",
+              action: "get_transcript",
+              inProcessSelfPing: true,
+              params: { fromGitHubUser: "erjadi", session: targetSessionId },
+            },
+          },
+        ],
+      }),
+      ackFn: async ({ requestIds }) => {
+        offlineAcked = requestIds;
+        return { ok: true };
+      },
+    });
+    assert.equal(offlineExecuted, 0);
+    assert.deepEqual(offlineAcked, []);
+
+    // Explicit in-process self-ping still works
+    const selfPingOk = await handleRpcAction(peerHostCfg, { action: "ping", inProcessSelfPing: true });
+    assert.equal(selfPingOk.machineId, "PEER-WORK-PC");
+    assert.equal(selfPingOk.overallState, "online");
+    assert.equal(selfPingOk.presenceLayers.executionSurface.state, "ready");
+
+    // --- 1. P0 outbound exact-flock regression across all protected legacy-v3 RPCs + notifyOnIdle ---
+    const observedWirePayloads = [];
+    const idleReplyPayloads = [];
+    peerHostCfg.rpcTransport = async (rpcPayload) => {
+      idleReplyPayloads.push(structuredClone(rpcPayload));
+      const ver = verifyRpcSignature({
+        requestId: rpcPayload.requestId,
+        sentAt: rpcPayload.sentAt,
+        fromMachine: rpcPayload.fromMachine,
+        toMachine: rpcPayload.toMachine,
+        action: rpcPayload.action,
+        params: rpcPayload.params,
+        publicKey: peerIdentity.publicKey,
+        signature: rpcPayload.auth?.signature,
+      });
+      assert.equal(ver.valid, true, "notifyOnIdle outbound RPC signature must cover params.flock");
+      return [{ requestId: rpcPayload.requestId, fromMachine: "ALICE-PC", result: { status: "delivered" } }];
+    };
+
+    const callerCfg = {
+      machineId: "CALLER-PC",
+      githubUser: "erjadi",
+      scope: "personal",
+      hub: "copilotbridge",
+      endpoint: "https://conformance.service.signalr.net",
+      host: "conformance.service.signalr.net",
+      connectionString:
+        "Endpoint=https://conformance.service.signalr.net;AccessKey=MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=;Version=1.0;",
+      flocksConfigPath,
+      identity: callerIdentity,
+      rpcTransport: async (rpcPayload) => {
+        observedWirePayloads.push(structuredClone(rpcPayload));
+        if (rpcPayload.toMachine === "SLEEPING-PC") {
+          return [];
+        }
+        if (rpcPayload.action === "self_update") {
+          assert.equal(rpcPayload.params?.flock, "erjadi");
+          const sigOk = verifyRpcSignature({
+            requestId: rpcPayload.requestId,
+            sentAt: rpcPayload.sentAt,
+            fromMachine: rpcPayload.fromMachine,
+            toMachine: rpcPayload.toMachine,
+            action: rpcPayload.action,
+            params: rpcPayload.params,
+            publicKey: callerIdentity.publicKey,
+            signature: rpcPayload.auth?.signature,
+          });
+          assert.equal(sigOk.valid, true);
+          return [{ requestId: rpcPayload.requestId, fromMachine: "PEER-WORK-PC", result: { status: "updated" } }];
+        }
+        if (rpcPayload.action === "reprovision") {
+          assert.equal(rpcPayload.params?.flock, "erjadi");
+          const sigOk = verifyRpcSignature({
+            requestId: rpcPayload.requestId,
+            sentAt: rpcPayload.sentAt,
+            fromMachine: rpcPayload.fromMachine,
+            toMachine: rpcPayload.toMachine,
+            action: rpcPayload.action,
+            params: rpcPayload.params,
+            publicKey: callerIdentity.publicKey,
+            signature: rpcPayload.auth?.signature,
+          });
+          assert.equal(sigOk.valid, true);
+          return [{ requestId: rpcPayload.requestId, fromMachine: "PEER-WORK-PC", result: { status: "reprovisioning" } }];
+        }
+        if (rpcPayload.action === "apply_git_bundle") {
+          assert.equal(rpcPayload.params?.flock, "erjadi");
+          const sigOk = verifyRpcSignature({
+            requestId: rpcPayload.requestId,
+            sentAt: rpcPayload.sentAt,
+            fromMachine: rpcPayload.fromMachine,
+            toMachine: rpcPayload.toMachine,
+            action: rpcPayload.action,
+            params: rpcPayload.params,
+            publicKey: callerIdentity.publicKey,
+            signature: rpcPayload.auth?.signature,
+          });
+          assert.equal(sigOk.valid, true);
+          return [{ requestId: rpcPayload.requestId, fromMachine: "PEER-WORK-PC", result: { status: "synced", branch: rpcPayload.params.branch } }];
+        }
+        if (rpcPayload.action === "diagnose" && rpcPayload.params?.fix) {
+          assert.equal(rpcPayload.params?.flock, "erjadi");
+          const sigOk = verifyRpcSignature({
+            requestId: rpcPayload.requestId,
+            sentAt: rpcPayload.sentAt,
+            fromMachine: rpcPayload.fromMachine,
+            toMachine: rpcPayload.toMachine,
+            action: rpcPayload.action,
+            params: rpcPayload.params,
+            publicKey: callerIdentity.publicKey,
+            signature: rpcPayload.auth?.signature,
+          });
+          assert.equal(sigOk.valid, true);
+          return [{
+            requestId: rpcPayload.requestId,
+            fromMachine: "PEER-WORK-PC",
+            result: {
+              machineId: "PEER-WORK-PC",
+              version: BRIDGE_VERSION,
+              scope: "work",
+              githubUser: "erjadi",
+              healthy: true,
+              issues: [],
+              repairedActions: ["verified_threads"],
+              runtime: { copilotDesktopRunning: true, copilotDesktopReachable: true, wsPort: wsServer.port },
+              threads: {
+                coordinator: { exists: true, healthy: true, permissionMode: "allow-all" },
+                threadTracker: { exists: true, healthy: true, permissionMode: "allow-all" },
+              },
+            },
+          }];
+        }
+        const targets =
+          rpcPayload.toMachine === "*"
+            ? [peerHostCfg]
+            : rpcPayload.toMachine === "PEER-WORK-PC" || rpcPayload.toMachine === "CALLER-PC"
+            ? [peerHostCfg]
+            : [];
+        const out = [];
+        for (const host of targets) {
+          const res = await handleRpcAction(host, {
+            ...rpcPayload,
+            toMachine: rpcPayload.toMachine,
+            inProcessSelfPing: false,
+            flockPolicy: undefined,
+            registryMembers,
+            enforceSignature: true,
+            requireVerifiedAuth: true,
+          });
+          out.push({ requestId: rpcPayload.requestId, fromMachine: host.machineId, result: res, respondedAt: new Date().toISOString() });
+        }
+        return out;
+      },
+    };
+
+    // Clarification (default owner flock + thread-bound flock)
+    const clarifyDefault = await executeMcpTool(callerCfg, "ask_remote_originator_clarification", {
+      to_machine: "PEER-WORK-PC",
+      to_session: targetSessionId,
+      question: "Which branch?",
+    });
+    assert.equal(clarifyDefault.clarificationRequested, true);
+    assert.equal(observedWirePayloads.at(-1).params.flock, "erjadi");
+
+    await executeMcpTool(callerCfg, "ask_remote_originator_clarification", {
+      to_machine: "PEER-WORK-PC",
+      to_session: targetSessionId,
+      from_session: "bound-collab-thread",
+      question: "Bound thread clarification?",
+    });
+    assert.equal(observedWirePayloads.at(-1).params.flock, "erjadi/studio-team");
+
+    // Locks
+    const lockAcq = await executeMcpTool(callerCfg, "acquire_remote_lock", {
+      to_machine: "PEER-WORK-PC",
+      resource: "gpu-0",
+      ttl_seconds: 60,
+    });
+    assert.equal(lockAcq.acquired, true);
+    assert.equal(observedWirePayloads.at(-1).params.flock, "erjadi");
+
+    const lockRel = await executeMcpTool(callerCfg, "release_remote_lock", {
+      to_machine: "PEER-WORK-PC",
+      resource: "gpu-0",
+      lease_id: lockAcq.lease.leaseId,
+    });
+    assert.equal(lockRel.released, true);
+    assert.equal(observedWirePayloads.at(-1).params.flock, "erjadi");
+
+    // Files + Git bundle sync
+    const sampleSrc = path.join(env.tempRoot, "sample-send.txt");
+    const sampleDst = path.join(env.tempRoot, "sample-pulled.txt");
+    fs.writeFileSync(sampleSrc, "signed exact flock transfer payload", "utf8");
+    const sentFile = await sendRemoteFile(callerCfg, {
+      toMachine: "PEER-WORK-PC",
+      localPath: sampleSrc,
+      remotePath: "sample-send.txt",
+    });
+    assert.equal(sentFile.status, "sent");
+    assert.equal(observedWirePayloads.at(-1).params.flock, "erjadi");
+
+    const pulledFile = await pullRemoteFile(callerCfg, {
+      fromMachine: "PEER-WORK-PC",
+      remotePath: sentFile.remotePath,
+      localPath: sampleDst,
+    });
+    assert.equal(pulledFile.status, "pulled");
+    assert.equal(observedWirePayloads.at(-1).params.flock, "erjadi");
+
+    const tinyGitRepo = path.join(env.tempRoot, "tiny-git");
+    fs.mkdirSync(tinyGitRepo, { recursive: true });
+    execFileSync("git", ["init", "-b", "main", tinyGitRepo], { stdio: "ignore", windowsHide: true });
+    execFileSync("git", ["-C", tinyGitRepo, "config", "user.email", "test@example.com"], { stdio: "ignore", windowsHide: true });
+    execFileSync("git", ["-C", tinyGitRepo, "config", "user.name", "Test"], { stdio: "ignore", windowsHide: true });
+    fs.writeFileSync(path.join(tinyGitRepo, "README.md"), "hello\n", "utf8");
+    execFileSync("git", ["-C", tinyGitRepo, "add", "README.md"], { stdio: "ignore", windowsHide: true });
+    execFileSync("git", ["-C", tinyGitRepo, "commit", "-m", "init"], { stdio: "ignore", windowsHide: true });
+    const gitSynced = await syncRemoteGitBranch(callerCfg, {
+      toMachine: "PEER-WORK-PC",
+      repoDir: tinyGitRepo,
+      branch: "main",
+    });
+    assert.equal(gitSynced.status, "synced");
+    assert.equal(observedWirePayloads.at(-1).action, "apply_git_bundle");
+    assert.equal(observedWirePayloads.at(-1).params.flock, "erjadi");
+
+    // Update + Diagnose(fix=true) + CLI dry-run/self-test equivalent invokeRemoteRpc
+    const updRes = await updateFleetMachines(callerCfg, {
+      machines: "PEER-WORK-PC",
+      includeSelf: false,
+      postUpdateWaitMs: 0,
+      discoverFn: async () => [{ machineId: "PEER-WORK-PC", scope: "work", githubUser: "erjadi", version: BRIDGE_VERSION }],
+    });
+    assert.equal(updRes.remoteUpdates[0].ok, true);
+
+    const fixDiagRes = await diagnoseFleetMachines(callerCfg, {
+      machines: "PEER-WORK-PC",
+      fix: true,
+      passive: false,
+    });
+    assert.equal(fixDiagRes.members.find((m) => m.machineId === "PEER-WORK-PC")?.healthy, true);
+
+    const selfTestDryRun = await invokeRemoteRpc(callerCfg, {
+      toMachine: "PEER-WORK-PC",
+      action: "send_message",
+      params: {
+        targetSession: targetSessionId,
+        message: "CLI dry-run/self-test probe",
+        fromMachine: callerCfg.machineId,
+        fromScope: callerCfg.scope,
+        fromGitHubUser: callerCfg.githubUser,
+        dryRun: true,
+      },
+      timeoutMs: 5000,
+    });
+    assert.equal(selfTestDryRun.result.status, "dry_run_verified");
+    assert.equal(observedWirePayloads.at(-1).params.flock, "erjadi");
+
+    // Reprovision + send_remote_session_message online & offline-queued signed params.flock
+    const capturedOfflineQueue = [];
+    const reprovRes = await reprovisionFleetMachines(callerCfg, {
+      machines: "PEER-WORK-PC,SLEEPING-PC",
+      postReprovisionWaitMs: 0,
+      enqueueOfflineFn: (item) => {
+        capturedOfflineQueue.push({ toMachine: item.toMachine, rpcPayload: structuredClone(item.rpcPayload) });
+        return {
+          ok: true,
+          enqueuedAt: new Date().toISOString(),
+          expiresAt: new Date(Date.now() + 86400_000).toISOString(),
+        };
+      },
+    });
+    assert.equal(reprovRes.reprovisionResults.find((r) => r.machineId === "PEER-WORK-PC")?.ok, true);
+    assert.equal(reprovRes.reprovisionResults.find((r) => r.machineId === "SLEEPING-PC")?.queuedOffline || reprovRes.reprovisionResults.find((r) => r.machineId === "SLEEPING-PC")?.result?.status === "queued_offline_reprovision", true);
+    assert.equal(capturedOfflineQueue.length, 1);
+    const queuedReprov = capturedOfflineQueue[0].rpcPayload;
+    assert.equal(queuedReprov.params.flock, "erjadi");
+    assert.equal(queuedReprov.flockId, "erjadi");
+    assert.equal(
+      verifyRpcSignature({
+        requestId: queuedReprov.requestId,
+        sentAt: queuedReprov.sentAt,
+        fromMachine: queuedReprov.fromMachine,
+        toMachine: queuedReprov.toMachine,
+        action: "reprovision",
+        params: queuedReprov.params,
+        publicKey: callerIdentity.publicKey,
+        signature: queuedReprov.auth.signature,
+      }).valid,
+      true
+    );
+
+    const queuedSendRes = await executeMcpTool(
+      callerCfg,
+      "send_remote_session_message",
+      {
+        to_machine: "SLEEPING-PC",
+        to_session: targetSessionId,
+        message: "Queued while sleeping",
+      },
+      {
+        ensureDaemon: async () => ({ running: true, pid: process.pid, status: "running" }),
+        enqueueOfflineFn: (item) => {
+          capturedOfflineQueue.push({ toMachine: item.toMachine, rpcPayload: structuredClone(item.rpcPayload) });
+          return {
+            ok: true,
+            enqueuedAt: new Date().toISOString(),
+            expiresAt: new Date(Date.now() + 86400_000).toISOString(),
+          };
+        },
+      }
+    );
+    assert.equal(queuedSendRes.status, "queued_offline");
+    assert.equal(capturedOfflineQueue.length, 2);
+    const queuedSendPayload = capturedOfflineQueue[1].rpcPayload;
+    assert.equal(queuedSendPayload.params.flock, "erjadi");
+    assert.equal(
+      verifyRpcSignature({
+        requestId: queuedSendPayload.requestId,
+        sentAt: queuedSendPayload.sentAt,
+        fromMachine: queuedSendPayload.fromMachine,
+        toMachine: queuedSendPayload.toMachine,
+        action: "send_message",
+        params: queuedSendPayload.params,
+        publicKey: callerIdentity.publicKey,
+        signature: queuedSendPayload.auth.signature,
+      }).valid,
+      true
+    );
+
+    // notifyOnIdle binds reply to originating authorized shared flock ("erjadi/studio-team"), never owner root
+    const collabIdleSentAt = new Date().toISOString();
+    const collabIdleParams = {
+      flock: "erjadi/studio-team",
+      targetSession: targetSessionId,
+      message: "Trigger idle reply on shared flock",
+      fromMachine: "ALICE-PC",
+      fromScope: "work",
+      fromGitHubUser: "alice",
+      fromSessionId: "alice-origin-sess",
+      notifyOnIdle: true,
+    };
+    const idleDispatch = await handleRpcAction(peerHostCfg, {
+      requestId: "req-collab-idle-bind",
+      sentAt: collabIdleSentAt,
+      fromMachine: "ALICE-PC",
+      toMachine: "PEER-WORK-PC",
+      action: "send_message",
+      params: collabIdleParams,
+      auth: signRpcRequest({
+        requestId: "req-collab-idle-bind",
+        sentAt: collabIdleSentAt,
+        fromMachine: "ALICE-PC",
+        toMachine: "PEER-WORK-PC",
+        action: "send_message",
+        params: collabIdleParams,
+        identity: collabIdentity,
+      }),
+      registryMembers,
+      enforceSignature: true,
+      requireVerifiedAuth: true,
+    });
+    assert.equal(idleDispatch.notifyOnIdleScheduled, true);
+    for (let i = 0; i < 30 && idleReplyPayloads.length === 0; i++) {
+      await new Promise((r) => setTimeout(r, 40));
+    }
+    assert.equal(idleReplyPayloads.length, 1);
+    assert.equal(idleReplyPayloads[0].params.flock, "erjadi/studio-team");
+    assert.equal(idleReplyPayloads[0].flockId, "erjadi/studio-team");
+
+    // --- 3. P1 active status & passive catch credential-leak canary ---
+    const activeStatusOut = await executeMcpTool(
+      callerCfg,
+      "flock_status",
+      {},
+      {
+        ensureDaemon: async () => ({
+          running: true,
+          pid: process.pid,
+          status: "running",
+          state: JSON.parse(fs.readFileSync(path.join(flockDir, "state.json"), "utf8")),
+        }),
+        discoverOnlineMachines: async () => [
+          {
+            machineId: "PEER-WORK-PC",
+            scope: "work",
+            githubUser: "erjadi",
+            version: BRIDGE_VERSION,
+            copilotDesktopReachable: true,
+            headlessCliAvailable: false,
+            hubToken: "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJvbmxpbmUtbGVhayJ9.sig",
+            serverNonce: "ONLINE_NONCE_CANARY",
+          },
+        ],
+        fetchV3MyFlocks: async () => ({
+          ok: true,
+          githubUser: "erjadi",
+          fetchedAt: "2026-11-14T16:05:00.000Z",
+          ownedFlocks: [
+            {
+              flockId: "erjadi",
+              flockUuid: "uuid-root",
+              hubName: "v3_flock_root",
+              flockType: "owner_root",
+              ownerGitHubUser: "erjadi",
+              rosterEpoch: 3,
+              hubToken: "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ2My1sZWFrIn0.sig",
+              serverNonce: "V3_NONCE_CANARY",
+              voucherSecret: "V3_VOUCHER_CANARY",
+              members: [
+                { machineId: "CALLER-PC", githubUser: "erjadi", scope: "personal", privateKey: "PRIVATE_KEY_CANARY" },
+                { machineId: "STALE-LEGACY-PC", githubUser: "erjadi", scope: "private" },
+              ],
+            },
+          ],
+          joinedFlocks: [],
+        }),
+        fetchLegacyMembers: async () => [
+          { machineId: "PEER-WORK-PC", githubUser: "erjadi", scope: "work" },
+          { machineId: "OLD-PRIVATE-MEMBER", githubUser: "erjadi", scope: "private" },
+        ],
+      }
+    );
+    const passiveCatchStatusOut = await executeMcpTool(
+      callerCfg,
+      "bridge_status",
+      { passive: true },
+      {
+        discoverOnlineMachines: async () => {
+          throw new Error(
+            "SignalR failure Endpoint=https://secret.service.signalr.net;AccessKey=PASSIVE_ERR_KEY_CANARY; SharedAccessSignature sr=sb%3A%2F%2Fsecret&sig=PASSIVE_SAS_CANARY"
+          );
+        },
+      }
+    );
+
+    for (const serialized of [JSON.stringify(activeStatusOut), JSON.stringify(passiveCatchStatusOut)]) {
+      for (const secretCanary of [
+        "eyJhbGci",
+        "NONCE_CANARY",
+        "VOUCHER_CANARY",
+        "SIGNALR_KEY_CANARY",
+        "SAS_CANARY",
+        "PRIVATE_KEY_CANARY",
+        "DAEMON_STATE_NONCE_CANARY",
+        "ONLINE_NONCE_CANARY",
+        "V3_NONCE_CANARY",
+        "V3_VOUCHER_CANARY",
+        "PASSIVE_ERR_KEY_CANARY",
+        "PASSIVE_SAS_CANARY",
+        "SharedAccessSignature ",
+      ]) {
+        assert.equal(serialized.includes(secretCanary), false, `Leaked canary "${secretCanary}" in status output`);
+      }
+      assert.equal(/AccessKey=(?!\[redacted\])/i.test(serialized), false);
+    }
+    assert.equal(JSON.stringify(activeStatusOut).includes("AccessKey="), false);
+
+    // --- 4. P1 mixed-version availability + set-scope --reprovision repair ordering ---
+    assert.ok(
+      activeStatusOut.knownMembers.some((m) => m.machineId === "CALLER-PC") &&
+        activeStatusOut.knownMembers.some((m) => m.machineId === "PEER-WORK-PC"),
+      "Valid personal/work members must survive alongside quarantined obsolete-scope peers"
+    );
+    assert.equal(
+      activeStatusOut.knownMembers.some(
+        (m) => m.machineId === "STALE-LEGACY-PC" || m.machineId === "OLD-PRIVATE-MEMBER"
+      ),
+      false
+    );
+    assert.ok(
+      activeStatusOut.roster.quarantinedMembers?.some((q) => q.machineId === "STALE-LEGACY-PC") &&
+        activeStatusOut.roster.quarantinedMembers?.some((q) => q.machineId === "OLD-PRIVATE-MEMBER")
+    );
+
+    const mixedPingCfg = {
+      ...callerCfg,
+      rpcTransport: async (rpcPayload) => {
+        if (rpcPayload.action === "ping") {
+          return [
+            {
+              requestId: rpcPayload.requestId,
+              fromMachine: "VALID-PERSONAL-PC",
+              result: {
+                machineId: "VALID-PERSONAL-PC",
+                scope: "personal",
+                githubUser: "erjadi",
+                version: BRIDGE_VERSION,
+                copilotDesktopReachable: true,
+                headlessCliAvailable: false,
+              },
+            },
+            {
+              requestId: rpcPayload.requestId,
+              fromMachine: "LEGACY-PRIVATE-PC",
+              result: {
+                machineId: "LEGACY-PRIVATE-PC",
+                scope: "private",
+                githubUser: "erjadi",
+                version: "3.4.0",
+                copilotDesktopReachable: true,
+              },
+            },
+          ];
+        }
+        return [
+          {
+            requestId: rpcPayload.requestId,
+            fromMachine: "VALID-PERSONAL-PC",
+            result: {
+              machineId: "VALID-PERSONAL-PC",
+              version: BRIDGE_VERSION,
+              scope: "personal",
+              githubUser: "erjadi",
+              healthy: true,
+              issues: [],
+              runtime: { copilotDesktopRunning: true, copilotDesktopReachable: true, wsPort: wsServer.port },
+              threads: {
+                coordinator: { exists: true, healthy: true, permissionMode: "allow-all" },
+                threadTracker: { exists: true, healthy: true, permissionMode: "allow-all" },
+              },
+            },
+          },
+        ];
+      },
+    };
+    const discoveredMixed = await discoverMachines(mixedPingCfg, { includeSelf: true });
+    assert.deepEqual(discoveredMixed.map((m) => m.machineId), ["VALID-PERSONAL-PC"]);
+    assert.equal(discoveredMixed[0].overallState, "online");
+    assert.equal(discoveredMixed[0].presenceLayers.executionSurface.state, "ready");
+
+    const diagnosedMixed = await diagnoseFleetMachines(mixedPingCfg, { passive: true });
+    assert.equal(diagnosedMixed.ok, true);
+    assert.deepEqual(diagnosedMixed.members.map((m) => m.machineId), ["VALID-PERSONAL-PC"]);
+    assert.ok(diagnosedMixed.quarantinedMembers?.some((q) => q.machineId === "LEGACY-PRIVATE-PC"));
+
+    // Repair ordering for legacy private config before loadConfig
+    const legacyCfgPath = path.join(flockDir, "config.json");
+    writeConfigFileSecure(
+      {
+        machineId: "REPAIR-PC",
+        scope: "private",
+        githubUser: "erjadi",
+        hub: "copilotbridge",
+        connectionString: callerCfg.connectionString,
+      },
+      legacyCfgPath
+    );
+    assert.throws(() => loadConfig({ autoFetchAz: false, refreshSpecs: false, passive: true }), (err) => err.code === "OBSOLETE_SCOPE");
+    assert.throws(() => repairStoredConfigScopeBeforeLoad("private", { configPath: legacyCfgPath }), (err) => err.code === "OBSOLETE_SCOPE");
+    const repairRes = repairStoredConfigScopeBeforeLoad("personal", { configPath: legacyCfgPath });
+    assert.equal(repairRes.repaired, true);
+    assert.equal(fs.existsSync(`${legacyCfgPath}.pre-3.6-scope.bak`), true);
+    const loadedAfterRepair = loadConfig({ autoFetchAz: false, refreshSpecs: false, passive: true });
+    assert.equal(loadedAfterRepair.scope, "personal");
+
+    // --- 5. P1 layered presence parity across ping, list_remote_machines, flock_status, and diagnostics ---
+    await wsServer.close();
+    const deadPort = wsServer.port;
+    wsServer = null;
+    env.writeWsConfig(deadPort);
+    invalidateLocalWsConnectionCache();
+    process.env.PATH = env.tempRoot;
+    delete process.env.COPILOT_CLI_PATH;
+
+    const degradedPing = await handleRpcAction(peerHostCfg, { action: "ping", inProcessSelfPing: true });
+    assert.equal(degradedPing.copilotDesktopReachable, false);
+    assert.equal(degradedPing.headlessCliAvailable, false);
+    assert.equal(degradedPing.overallState, "degraded");
+    assert.equal(degradedPing.presenceLayers.executionSurface.state, "unavailable");
+
+    const degradedLoopbackCfg = {
+      ...callerCfg,
+      machineId: "PEER-WORK-PC",
+      scope: "work",
+      identity: peerIdentity,
+      rpcTransport: async (rpcPayload) => {
+        const res = await handleRpcAction(peerHostCfg, {
+          ...rpcPayload,
+          inProcessSelfPing: false,
+          flockPolicy: undefined,
+          registryMembers,
+          enforceSignature: true,
+          requireVerifiedAuth: true,
+        });
+        return [{ requestId: rpcPayload.requestId, fromMachine: "PEER-WORK-PC", result: res, respondedAt: new Date().toISOString() }];
+      },
+    };
+    const listedDegraded = await executeMcpTool(
+      degradedLoopbackCfg,
+      "list_remote_machines",
+      { include_self: true },
+      { ensureDaemon: async () => ({ running: true, pid: process.pid, status: "running" }) }
+    );
+    const statusDegraded = await executeMcpTool(
+      degradedLoopbackCfg,
+      "flock_status",
+      {},
+      {
+        ensureDaemon: async () => ({ running: true, pid: process.pid, status: "running" }),
+        discoverOnlineMachines: (c, opts) => discoverMachines(c, opts),
+        fetchV3MyFlocks: async () => ({ __skipped: true, error: "offline" }),
+        fetchLegacyMembers: async () => [{ machineId: "PEER-WORK-PC", githubUser: "erjadi", scope: "work" }],
+      }
+    );
+    const diagDegraded = await diagnoseFleetMachines(degradedLoopbackCfg, { passive: true });
+    assert.equal(listedDegraded[0].overallState, "degraded");
+    assert.equal(listedDegraded[0].presenceLayers.executionSurface.state, "unavailable");
+    assert.equal(statusDegraded.onlineMachines[0].overallState, "degraded");
+    assert.equal(statusDegraded.onlineMachines[0].presenceLayers.executionSurface.state, "unavailable");
+    assert.equal(diagDegraded.members[0].overallState, "degraded");
+    assert.equal(diagDegraded.members[0].presenceLayers.executionSurface.state, "unavailable");
+
+    // --- Adjacency: broker-free list_shared_threads fail-closed via runtime.assertActive(runtime.select(explicitFlock)) ---
+    const bfCfg = {
+      protocol: "broker-free-v34",
+      machineId: "OWNER-PC",
+      scope: "personal",
+      githubUser: "erjadi",
+      flocksConfigPath,
+    };
+    const mockBfFactory = () => ({
+      select(flockId) {
+        if (!flockId) throw new Error("Ambiguous broker-free flock; pass explicit flock");
+        if (flockId === "erjadi/departed-team") return { flockId, departed: true, members: {} };
+        if (flockId === "erjadi/studio-team") {
+          return {
+            flockId,
+            departed: false,
+            members: {
+              "peer-1": { removed: false, cert: { body: { machineId: "OWNER-PC" } } },
+            },
+          };
+        }
+        throw new Error(`Not enrolled in broker-free flock ${flockId}`);
+      },
+      assertActive(record) {
+        if (record.departed) throw new Error(`Broker-free flock ${record.flockId} is departed/inactive`);
+        return record;
+      },
+    });
+    await assert.rejects(
+      () => executeMcpTool(bfCfg, "list_shared_threads", {}, { brokerFreeRuntimeFactory: mockBfFactory }),
+      /Ambiguous broker-free flock/
+    );
+    await assert.rejects(
+      () =>
+        executeMcpTool(
+          bfCfg,
+          "list_shared_threads",
+          { flock: "erjadi/departed-team" },
+          { brokerFreeRuntimeFactory: mockBfFactory }
+        ),
+      /departed\/inactive/
+    );
+    const bfShared = await executeMcpTool(
+      bfCfg,
+      "list_shared_threads",
+      { flock: "erjadi/studio-team" },
+      { brokerFreeRuntimeFactory: mockBfFactory, flocksConfigPath }
+    );
+    assert.equal(bfShared.flockId, "erjadi/studio-team");
+    assert.deepEqual(bfShared.sharedThreads.map((x) => x.sessionId), [targetSessionId]);
+  } finally {
+    if (wsServer) await wsServer.close();
+    if (bootServer) await new Promise((resolve) => bootServer.close(resolve));
+    process.env.PATH = prevPath;
+    if (prevCliPath === undefined) delete process.env.COPILOT_CLI_PATH;
+    else process.env.COPILOT_CLI_PATH = prevCliPath;
+    if (prevDisableOsProbe === undefined) delete process.env.COPILOT_FLOCK_DISABLE_OS_WS_PROBE;
+    else process.env.COPILOT_FLOCK_DISABLE_OS_WS_PROBE = prevDisableOsProbe;
+    if (prevCopilotHome === undefined) delete process.env.COPILOT_HOME;
+    else process.env.COPILOT_HOME = prevCopilotHome;
+    invalidateLocalWsConnectionCache();
+    env.cleanup();
+  }
+});
+
 test("TODO #14: wall-clock time-skip detector triggers immediate ws.port re-discovery and presence refresh, and bridge.mjs stays byte-identical to flock.mjs", async () => {
   const env = setupTempCopilotEnv();
   const prevCopilotHome = process.env.COPILOT_HOME;
@@ -9269,7 +10387,7 @@ test("TODO #14: wall-clock time-skip detector triggers immediate ws.port re-disc
       timeSkipThresholdMs: 10000,
       nowFn: () => fakeNowMs,
       verifyWsPortFn: (opts) => verifyLocalWsConnectionInfo({ ...opts, retryPollMs: 0 }),
-      collectPresenceFn: () => handleRpcAction(cfg, { action: "ping" }),
+      collectPresenceFn: () => handleRpcAction(cfg, { action: "ping", inProcessSelfPing: true }),
       publishPresenceFn: async (presence, meta) => {
         publishedHeartbeats.push({ presence, meta });
       },
@@ -9419,8 +10537,8 @@ test("TODO #15 & #16: ping uses non-blocking cached specs skipping network mount
 
     // 4. ping uses cached non-blocking specs and skips network mounts
     const pingStart = performance.now();
-    const ping1 = await handleRpcAction(cfg, { action: "ping", params: {} });
-    const ping2 = await handleRpcAction(cfg, { action: "ping", params: {} });
+    const ping1 = await handleRpcAction(cfg, { action: "ping", inProcessSelfPing: true, params: {} });
+    const ping2 = await handleRpcAction(cfg, { action: "ping", inProcessSelfPing: true, params: {} });
     const pingElapsed = performance.now() - pingStart;
     assert.ok(pingElapsed < 500, `Expected 2 cached pings < 500ms, took ${Math.round(pingElapsed)}ms`);
     assert.equal(ping1.machineId, "DESKTOP-7E16MBO");

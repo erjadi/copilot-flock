@@ -4115,7 +4115,12 @@ export function unshareThreadFromFlock(
   };
 }
 
-export function listSharedThreadsForMachine(cfg, customPath = getFlocksConfigPath(), flockId = null) {
+export function listSharedThreadsForMachine(
+  cfg,
+  customPath = getFlocksConfigPath(),
+  flockId = null,
+  { allowMissingSelectedFlock = false } = {}
+) {
   const fCfg = loadLocalFlocksConfig(cfg, customPath);
   const parsedSelector = flockId ? parseExplicitFlockSelector(flockId) : null;
   const selectedFlockId = parsedSelector?.flockId || null;
@@ -4131,6 +4136,14 @@ export function listSharedThreadsForMachine(cfg, customPath = getFlocksConfigPat
     throw err;
   }
   if (selectedFlockId && !fCfg.flocks?.[selectedFlockId]) {
+    if (allowMissingSelectedFlock) {
+      return {
+        machineId: cfg?.machineId || os.hostname(),
+        flockId: selectedFlockId,
+        sharedCount: 0,
+        sharedThreads: [],
+      };
+    }
     const err = new Error(`Machine "${cfg?.machineId || os.hostname()}" is not enrolled in flock "${selectedFlockId}"`);
     err.code = "FLOCK_NOT_ENROLLED";
     err.statusCode = 403;
@@ -4186,7 +4199,7 @@ function projectPublicMember(member) {
     "addedAtRevision", "updatedAtRevision", "removed", "removedAtMs", "removedAtEpoch",
     "removedAtRevision", "reason", "presenceStatus", "lastSeenAt", "online", "presence",
     "heartbeatObserved", "membershipAuthenticated", "membershipStatus", "credentialExpired",
-    "rosterSource", "rosterEpoch",
+    "rosterSource", "rosterEpoch", "overallState", "presenceLayers",
   ]) {
     if (member[key] !== undefined) out[key] = member[key];
   }
@@ -4194,16 +4207,76 @@ function projectPublicMember(member) {
   return out;
 }
 
+function projectPublicQuarantinedMember(entry) {
+  if (!entry || typeof entry !== "object") return null;
+  const out = {};
+  for (const key of ["flockId", "machineId", "peerId", "githubUser", "reason"]) {
+    if (entry[key] !== undefined) out[key] = entry[key];
+  }
+  return out;
+}
+
+function projectPublicDaemonStatus(daemon) {
+  if (!daemon || typeof daemon !== "object") return daemon ?? null;
+  const out = {};
+  for (const key of [
+    "running", "pid", "stalePid", "staleHeartbeat", "killedStalePid", "startedNew",
+    "status", "passive", "startedAt", "updatedAt",
+    "scriptPath", "scriptSha256", "codeDigest", "configSha256", "configGeneration",
+    "manifestDigest", "version", "machineId", "scope", "endpoint", "hub",
+  ]) {
+    if (daemon[key] !== undefined) out[key] = daemon[key];
+  }
+  if (daemon.reason !== undefined) {
+    out.reason = typeof daemon.reason === "string" ? redactFlockSnapshot(daemon.reason) : daemon.reason;
+  }
+  if (daemon.transportError !== undefined) {
+    out.transportError =
+      typeof daemon.transportError === "string"
+        ? redactFlockSnapshot(daemon.transportError)
+        : daemon.transportError;
+  }
+  if (daemon.state && typeof daemon.state === "object") {
+    const stateOut = {};
+    for (const key of [
+      "status", "protocol", "machineId", "scope", "version", "manifestDigest",
+      "startedAt", "updatedAt", "scriptPath", "scriptSha256", "codeDigest",
+      "configSha256", "configGeneration", "endpoint", "hub", "pid",
+      "wsPort", "lastHeartbeatReason",
+    ]) {
+      if (daemon.state[key] !== undefined) stateOut[key] = daemon.state[key];
+    }
+    if (daemon.state.residentRuntime && typeof daemon.state.residentRuntime === "object") {
+      stateOut.residentRuntime = { ...daemon.state.residentRuntime };
+    }
+    if (Array.isArray(daemon.state.knownPeers)) {
+      stateOut.knownPeers = daemon.state.knownPeers.map(projectPublicOnlineMachine).filter(Boolean);
+    }
+    out.state = stateOut;
+  }
+  return out;
+}
+
 export function projectPublicStatusResponse(result) {
   const out = {};
   for (const key of [
-    "status", "passive", "reason", "localMachineId", "machineId", "protocol", "flockId",
+    "status", "passive", "localMachineId", "machineId", "protocol", "flockId",
     "version", "manifestDigest", "scope", "githubUser", "hub", "endpoint", "localCopilotWs",
     "onlineMachinesStatus", "runtimeStates", "staged", "installed", "resident", "verified",
-    "daemon", "installedOnDisk", "residentDaemon", "callerMcpProcess",
+    "installedOnDisk", "residentDaemon", "callerMcpProcess",
   ]) {
     if (result?.[key] !== undefined) out[key] = result[key];
   }
+  if (result?.reason !== undefined) {
+    out.reason = typeof result.reason === "string" ? redactFlockSnapshot(result.reason) : result.reason;
+  }
+  if (result?.discoveryError !== undefined) {
+    out.discoveryError =
+      typeof result.discoveryError === "string"
+        ? redactFlockSnapshot(result.discoveryError)
+        : result.discoveryError;
+  }
+  if (result?.daemon !== undefined) out.daemon = projectPublicDaemonStatus(result.daemon);
   if (result?.specs) out.specs = projectPublicSpecs(result.specs);
   if (Array.isArray(result?.onlineMachines)) {
     out.onlineMachines = result.onlineMachines.map(projectPublicOnlineMachine).filter(Boolean);
@@ -4342,6 +4415,9 @@ function projectPublicRoster(roster) {
   if (Array.isArray(roster.offlineMembers)) {
     out.offlineMembers = roster.offlineMembers.map(projectPublicMember).filter(Boolean);
   }
+  if (Array.isArray(roster.quarantinedMembers)) {
+    out.quarantinedMembers = roster.quarantinedMembers.map(projectPublicQuarantinedMember).filter(Boolean);
+  }
   return out;
 }
 
@@ -4356,7 +4432,9 @@ export function projectPublicFlocksResponse(result) {
     knownMembers: (result.knownMembers || []).map(projectPublicMember).filter(Boolean),
     roster: projectPublicRoster(result.roster),
   };
-  if (result.localFlocks) {
+  if (Array.isArray(result.localFlocks)) {
+    projected.localFlocks = result.localFlocks.map(projectPublicFlockRecord).filter(Boolean);
+  } else if (result.localFlocks) {
     projected.localFlocks = {
       ownerGitHubUser: result.localFlocks.ownerGitHubUser || null,
       scope: result.localFlocks.scope || null,
@@ -4364,6 +4442,11 @@ export function projectPublicFlocksResponse(result) {
         Object.entries(result.localFlocks.flocks || {}).map(([id, record]) => [id, projectPublicFlockRecord(record)])
       ),
     };
+  }
+  if (Array.isArray(result.quarantinedMembers)) {
+    projected.quarantinedMembers = result.quarantinedMembers
+      .map(projectPublicQuarantinedMember)
+      .filter(Boolean);
   }
   if (Array.isArray(result.remoteOwnedFlocks)) {
     projected.remoteOwnedFlocks = result.remoteOwnedFlocks.map(projectPublicFlockRecord).filter(Boolean);
@@ -4449,6 +4532,64 @@ export function isExplicitOptInFlockPolicy(flockPolicy) {
   return false;
 }
 
+const PROTECTED_RPC_ACTIONS = new Set([
+  "create_session",
+  "send_message",
+  "send_file_chunk",
+  "pull_file_chunk",
+  "self_update",
+  "reprovision",
+  "acquire_lock",
+  "release_lock",
+  "apply_git_bundle",
+]);
+
+export function isProtectedRpcAction(action, params = {}) {
+  return PROTECTED_RPC_ACTIONS.has(action) || (action === "diagnose" && Boolean(params?.fix));
+}
+
+export function resolveDefaultLegacyProtectedFlockSelector(
+  cfg,
+  { toMachine = "*", action = null, params = {} } = {}
+) {
+  if (cfg?.protocol === "broker-free-v34") return undefined;
+  if (cfg?.flockId) return cfg.flockId;
+  if (cfg?.boundFlockId) return cfg.boundFlockId;
+
+  const rawStored = readRawStoredFlocksConfig(cfg);
+  const fromSid = params?.fromSessionId ? String(params.fromSessionId).trim() : "";
+  if (fromSid && rawStored?.threadBindings?.[fromSid]) {
+    return rawStored.threadBindings[fromSid];
+  }
+
+  const callerOwner = normalizeGitHubUser(
+    cfg?.githubUser || rawStored?.ownerGitHubUser || resolveLocalGitHubUser({ allowCli: false })
+  )?.toLowerCase() || null;
+  const targetClean = String(toMachine || "*").trim();
+  const now = Date.now();
+  if (targetClean && targetClean !== "*" && targetClean.toLowerCase() !== "all") {
+    const externalMatches = Object.values(rawStored?.flocks || {}).filter((policy) => {
+      if (!policy?.flockId || policy.revoked === true) return false;
+      if (policy.membershipExpiresAtMs && Number(policy.membershipExpiresAtMs) <= now) return false;
+      if (policy.expiresAtMs && Number(policy.expiresAtMs) <= now) return false;
+      const pOwner = normalizeGitHubUser(policy.ownerGitHubUser)?.toLowerCase() || null;
+      if (callerOwner && pOwner === callerOwner) return false;
+      const members = extractPolicyMembersList(policy);
+      return members.some(
+        (m) => !m?.removed && String(m?.machineId || "").toLowerCase() === targetClean.toLowerCase()
+      );
+    });
+    if (externalMatches.length === 1) {
+      return externalMatches[0].flockId;
+    }
+  }
+
+  if (callerOwner) return callerOwner;
+  const activeFlockIds = Object.keys(rawStored?.flocks || {});
+  if (activeFlockIds.length === 1) return activeFlockIds[0];
+  return undefined;
+}
+
 export function assertVerifiedExecutionAuthorization({
   action,
   params = {},
@@ -4457,18 +4598,7 @@ export function assertVerifiedExecutionAuthorization({
   flockPolicy,
   localGitHubUser = null,
 }) {
-  const protectedActions = new Set([
-    "create_session",
-    "send_message",
-    "send_file_chunk",
-    "pull_file_chunk",
-    "self_update",
-    "reprovision",
-    "acquire_lock",
-    "release_lock",
-    "apply_git_bundle",
-  ]);
-  if (!protectedActions.has(action) && !(action === "diagnose" && Boolean(params.fix))) return;
+  if (!isProtectedRpcAction(action, params)) return;
   if (!senderIdentity?.senderVerified) {
     const err = new Error(`403 Forbidden: Verified sender identity is required before remote "${action}" execution`);
     err.code = "SENDER_NOT_VERIFIED";
@@ -7933,6 +8063,7 @@ async function injectHeadlessCliSessionMessage({
   displayPrompt,
   fromMachine = null,
   fromSessionId = null,
+  replyFlockId = null,
   mode = "immediate",
   waitForReply = false,
   notifyOnIdle = false,
@@ -8084,7 +8215,9 @@ async function injectHeadlessCliSessionMessage({
         await invokeRemoteRpc(cfg, {
           toMachine: fromMachine,
           action: "send_message",
+          ...(replyFlockId ? { flockId: replyFlockId } : {}),
           params: {
+            ...(replyFlockId ? { flock: replyFlockId } : {}),
             targetSession: fromSessionId || "latest",
             message: `[Async Idle Notification from @${cfg.machineId} / "${resolved.title}" (${resolved.session_id})]:\n${text}`,
             messageType: "async_idle_reply",
@@ -8156,6 +8289,7 @@ export async function injectLocalSessionMessage({
   unrestrictedCollaborator = false,
   fromSessionId,
   fromSessionName,
+  replyFlockId = null,
   mode = "immediate",
   waitForReply = false,
   notifyOnIdle = false,
@@ -8212,6 +8346,7 @@ export async function injectLocalSessionMessage({
       displayPrompt,
       fromMachine,
       fromSessionId,
+      replyFlockId,
       mode,
       waitForReply,
       notifyOnIdle,
@@ -8273,6 +8408,7 @@ export async function injectLocalSessionMessage({
         displayPrompt,
         fromMachine,
         fromSessionId,
+        replyFlockId,
         mode,
         waitForReply,
         notifyOnIdle,
@@ -8397,7 +8533,9 @@ export async function injectLocalSessionMessage({
                 await invokeRemoteRpc(cfg, {
                   toMachine: fromMachine,
                   action: "send_message",
+                  ...(replyFlockId ? { flockId: replyFlockId } : {}),
                   params: {
+                    ...(replyFlockId ? { flock: replyFlockId } : {}),
                     targetSession: fromSessionId || "latest",
                     message: `[Async Idle Notification from @${cfg.machineId} / "${resolved.title}" (${resolved.session_id})]:\n${reply.content}`,
                     messageType: "async_idle_reply",
@@ -8493,7 +8631,9 @@ export async function injectLocalSessionMessage({
             await invokeRemoteRpc(cfg, {
               toMachine: fromMachine,
               action: "send_message",
+              ...(replyFlockId ? { flockId: replyFlockId } : {}),
               params: {
+                ...(replyFlockId ? { flock: replyFlockId } : {}),
                 targetSession: fromSessionId || "latest",
                 message: `[Async Idle Notification from @${cfg.machineId} / "${resolved.title}" (${resolved.session_id})]:\n${reply.content}`,
                 messageType: "async_idle_reply",
@@ -9001,6 +9141,15 @@ export async function invokeRemoteRpc(
     flockSel = authorizeCallerFlockSelection(cfg, flockId);
   } else if (hasParamFlock) {
     flockSel = authorizeCallerFlockSelection(cfg, params.flock);
+  } else if (cfg?.protocol !== "broker-free-v34" && isProtectedRpcAction(action, params)) {
+    const defaultSelector = resolveDefaultLegacyProtectedFlockSelector(cfg, {
+      toMachine,
+      action,
+      params,
+    });
+    if (defaultSelector !== undefined && defaultSelector !== null) {
+      flockSel = authorizeCallerFlockSelection(cfg, defaultSelector);
+    }
   }
 
   let effectiveToMachine = toMachine || "*";
@@ -9145,7 +9294,18 @@ export async function invokeRemoteRpcBatch(cfg, items, timeoutMs = 18000, { pass
     }));
   }
   const preparedItems = items.map((item) => {
-    const rawFlock = item.flockId ?? item.params?.flock ?? cfg.flockId;
+    const baseParams = item.params || {};
+    const rawFlock =
+      item.flockId ??
+      baseParams.flock ??
+      cfg.flockId ??
+      (cfg?.protocol !== "broker-free-v34" && isProtectedRpcAction(item.action, baseParams)
+        ? resolveDefaultLegacyProtectedFlockSelector(cfg, {
+            toMachine: item.toMachine,
+            action: item.action,
+            params: baseParams,
+          })
+        : undefined);
     const flockSel =
       rawFlock !== undefined && rawFlock !== null ? authorizeCallerFlockSelection(cfg, rawFlock) : null;
     return { item, flockSel };
@@ -9363,6 +9523,10 @@ export async function discoverMachines(
     passive = false,
   } = {}
 ) {
+  const normalizedScopeFilter =
+    scope && String(scope).toLowerCase() !== "all" && String(scope).trim() !== "*"
+      ? normalizeScope(scope, "")
+      : null;
   const effectiveTimeoutMs =
     process.env.BRIDGE_FAST_VOTE_TEST === "1" ? Math.min(timeoutMs, 150) : timeoutMs;
   const replies = await invokeRemoteRpc(cfg, {
@@ -9379,23 +9543,38 @@ export async function discoverMachines(
   for (const r of replies) {
     if (!includeSelf && r.fromMachine === cfg.machineId) continue;
     if (r.result) {
-      const item = {
+      let peerScope;
+      try {
+        peerScope = normalizeScope(r.result.scope, "work");
+      } catch (err) {
+        if (err?.code === "OBSOLETE_SCOPE" || err?.code === "INVALID_SCOPE") continue;
+        throw err;
+      }
+      const respondedAt = r.respondedAt || r.result.respondedAt || r.result.timestamp || null;
+      const baseItem = {
         machineId: r.result.machineId || r.fromMachine,
         version: r.result.version || "1.0.0-pre",
-        scope: normalizeScope(r.result.scope, "work"),
+        scope: peerScope,
         githubUser: normalizeGitHubUser(r.result.githubUser) || null,
         ...r.result,
+        ...(respondedAt ? { respondedAt } : {}),
       };
-      item.version = r.result.version || "1.0.0-pre";
-      item.scope = normalizeScope(r.result.scope, "work");
-      item.githubUser = normalizeGitHubUser(r.result.githubUser) || null;
+      baseItem.version = r.result.version || "1.0.0-pre";
+      baseItem.scope = peerScope;
+      baseItem.githubUser = normalizeGitHubUser(r.result.githubUser) || null;
+      const layeredPresence = classifyLayeredPresence({ online: true, ping: baseItem });
+      const item = {
+        ...baseItem,
+        overallState: layeredPresence.overallState,
+        presenceLayers: layeredPresence.presenceLayers,
+      };
       byMachine.set(r.fromMachine, item);
     }
   }
   return filterBroadcastTargets(Array.from(byMachine.values()), {
     localMachineId: cfg.machineId,
     includeSelf,
-    scope,
+    scope: normalizedScopeFilter,
     githubUser,
     gpu,
     minRamGb,
@@ -9567,10 +9746,55 @@ export function assertSafeTransferFilePath(targetPath) {
   return norm;
 }
 
+function findPinnedPeerInStoredFlocks(cfg, machineId, customPath = null) {
+  const cleanMachine = String(machineId || "").trim().toLowerCase();
+  if (!cleanMachine) return null;
+  const rawStored = readRawStoredFlocksConfig(
+    cfg,
+    customPath || cfg?.flocksConfigPath || getFlocksConfigPath()
+  );
+  const now = Date.now();
+  let matched = null;
+  for (const policy of Object.values(rawStored?.flocks || {})) {
+    if (!policy || policy.revoked === true) continue;
+    if (policy.membershipExpiresAtMs && Number(policy.membershipExpiresAtMs) <= now) continue;
+    if (policy.expiresAtMs && Number(policy.expiresAtMs) <= now) continue;
+    for (const member of extractPolicyMembersList(policy)) {
+      if (!member || member.removed) continue;
+      if (String(member.machineId || "").trim().toLowerCase() !== cleanMachine) continue;
+      if (member.membershipExpiresAtMs && Number(member.membershipExpiresAtMs) <= now) continue;
+      const pubKey = member.publicKey || member.specs?.publicKey || null;
+      if (!pubKey) continue;
+      if (matched && matched.publicKey.trim() !== String(pubKey).trim()) {
+        return null;
+      }
+      matched = {
+        machineId: member.machineId,
+        githubUser: member.githubUser || null,
+        scope: member.scope || null,
+        publicKey: String(pubKey),
+      };
+    }
+  }
+  return matched;
+}
+
 export function resolveVerifiedSenderIdentity(cfg, req) {
   const params = req.params || {};
+  if (req?.inProcessSelfPing === true && req?.action === "ping" && !req?.auth) {
+    const selfUser = normalizeGitHubUser(cfg?.githubUser) || null;
+    return {
+      fromMachine: cfg?.machineId || os.hostname(),
+      fromGitHubUser: selfUser,
+      fromScope: normalizeScope(cfg?.scope, "work"),
+      senderVerified: true,
+      inProcessSelfPing: true,
+      isCrossUser: false,
+      trustLevel: "same_user_verified",
+    };
+  }
+
   const rawClaimedMachine = req.auth?.fromMachine || req.fromMachine || params.fromMachine || "unknown";
-  const rawClaimedUser = normalizeGitHubUser(params.fromGitHubUser);
   const rawClaimedScope = normalizeScope(params.fromScope, "work");
 
   let membersMap = null;
@@ -9600,6 +9824,17 @@ export function resolveVerifiedSenderIdentity(cfg, req) {
       membersMap = getCachedBootstrapMembersMap(cfg, { forceRefresh: true });
       regEntry = membersMap ? membersMap.get(String(rawClaimedMachine).toLowerCase()) : null;
       regPubKey = regEntry?.publicKey || regEntry?.specs?.publicKey || null;
+      if (!regPubKey) {
+        const storedPeer = findPinnedPeerInStoredFlocks(
+          cfg,
+          rawClaimedMachine,
+          req?.flocksConfigPath || cfg?.flocksConfigPath || null
+        );
+        if (storedPeer) {
+          regEntry = storedPeer;
+          regPubKey = storedPeer.publicKey;
+        }
+      }
     }
 
     if (!regPubKey) {
@@ -9633,16 +9868,18 @@ export function resolveVerifiedSenderIdentity(cfg, req) {
       );
     }
     senderVerified = true;
-  } else if (regPubKey && req.enforceSignature) {
-    throw new Error(
-      `Security error: unsigned RPC claiming registered machine "${rawClaimedMachine}" rejected.`
+  } else if (req.enforceSignature || req.requireVerifiedAuth) {
+    const err = new Error(
+      `Security error: unsigned RPC "${req.action || "unknown"}" claiming machine "${rawClaimedMachine}" rejected; pinned-key signature is required.`
     );
+    err.code = "UNAUTHENTICATED_RPC";
+    err.statusCode = 403;
+    throw err;
   }
 
-  // Always prefer the GitHub-verified bootstrap registry identity for machineId and githubUser;
-  // for same-user verified machines, prefer the sender's own signed fromScope over a potentially stale registry scope.
-  const verifiedMachine = regEntry?.machineId || rawClaimedMachine;
-  const verifiedGitHubUser = normalizeGitHubUser(regEntry?.githubUser || rawClaimedUser);
+  // Never trust params.fromGitHubUser or unverified machine claims when auth is absent.
+  const verifiedMachine = senderVerified ? (regEntry?.machineId || rawClaimedMachine) : rawClaimedMachine;
+  const verifiedGitHubUser = senderVerified ? (normalizeGitHubUser(regEntry?.githubUser) || null) : null;
   const localGitHubUser = normalizeGitHubUser(cfg?.githubUser);
 
   const isCrossUser = Boolean(
@@ -9650,10 +9887,18 @@ export function resolveVerifiedSenderIdentity(cfg, req) {
       localGitHubUser &&
       verifiedGitHubUser.toLowerCase() !== localGitHubUser.toLowerCase()
   );
+  let registryScope = null;
+  if (senderVerified && regEntry?.scope) {
+    try {
+      registryScope = normalizeScope(regEntry.scope, "work");
+    } catch (err) {
+      if (err?.code !== "OBSOLETE_SCOPE" && err?.code !== "INVALID_SCOPE") throw err;
+    }
+  }
   const verifiedScope =
     senderVerified && !isCrossUser && params.fromScope
-      ? normalizeScope(params.fromScope, regEntry?.scope || "work")
-      : normalizeScope(regEntry?.scope || rawClaimedScope, "work");
+      ? normalizeScope(params.fromScope, registryScope || "work")
+      : registryScope || rawClaimedScope;
 
   return {
     fromMachine: verifiedMachine,
@@ -9661,11 +9906,11 @@ export function resolveVerifiedSenderIdentity(cfg, req) {
     fromScope: verifiedScope,
     senderVerified,
     isCrossUser,
-    trustLevel: isCrossUser
+    trustLevel: !senderVerified
+      ? "unverified"
+      : isCrossUser
       ? "cross_user_informational_only"
-      : senderVerified
-      ? "same_user_verified"
-      : "same_user",
+      : "same_user_verified",
   };
 }
 
@@ -9877,6 +10122,14 @@ let lastAutoMembershipSyncAtMs = 0;
 export async function handleRpcAction(cfg, req) {
   const { action, params = {} } = req;
   const senderIdentity = resolveVerifiedSenderIdentity(cfg, req);
+  if (!senderIdentity.senderVerified) {
+    const err = new Error(
+      `403 Forbidden: Verified pinned-key sender authentication is required for RPC "${action}"`
+    );
+    err.code = "SENDER_NOT_VERIFIED";
+    err.statusCode = 403;
+    throw err;
+  }
 
   let { hasExplicitFlock, flockPolicy, localFlocks } = resolveResponderFlockSelection(cfg, req);
   if (!flockPolicy && senderIdentity?.isCrossUser) {
@@ -9943,7 +10196,7 @@ export async function handleRpcAction(cfg, req) {
 
   if (action === "ping") {
     const wsInfo = await verifyLocalWsConnectionInfo({ forceRefresh: false, retryPollMs: 0 });
-    const headlessCliAvailable = wsInfo ? false : Boolean(resolveCopilotCliBin());
+    const headlessCliAvailable = Boolean(resolveCopilotCliBin());
     const sessionLimit = params.includeSessions ? Math.max(8, Number(params.sessionLimit) || 25) : 8;
     let sessions = queryLocalSessionsFromDb({
       limit: flockPolicy ? Math.max(200, sessionLimit) : sessionLimit,
@@ -10000,6 +10253,9 @@ export async function handleRpcAction(cfg, req) {
       pid: process.pid,
       timestamp: new Date().toISOString(),
     };
+    const layeredPresence = classifyLayeredPresence({ online: true, ping: out });
+    out.overallState = layeredPresence.overallState;
+    out.presenceLayers = layeredPresence.presenceLayers;
     if (params.includeSessions) {
       out.sessions = sessions;
     }
@@ -10357,6 +10613,7 @@ export async function handleRpcAction(cfg, req) {
             fromGitHubUser: inboxRecord.fromGitHubUser,
             fromSessionId: inboxRecord.fromSessionId,
             fromSessionName: inboxRecord.fromSessionName,
+            replyFlockId: flockPolicy?.flockId || null,
             mode: params.mode || "immediate",
             waitForReply: Boolean(params.waitForReply),
             waitTimeoutMs: Number(params.waitTimeoutMs) || 90000,
@@ -10413,6 +10670,7 @@ export async function handleRpcAction(cfg, req) {
         unrestrictedCollaborator: isUnrestrictedCollaboratorFlock,
         fromSessionId: inboxRecord.fromSessionId,
         fromSessionName: inboxRecord.fromSessionName,
+        replyFlockId: flockPolicy?.flockId || null,
         mode: params.mode || "immediate",
         waitForReply: Boolean(params.waitForReply),
         notifyOnIdle: Boolean(params.notifyOnIdle),
@@ -10935,6 +11193,11 @@ export async function drainAndProcessOfflineQueue(
           const ttlMs = Math.max(300000, ((Number(item.ttlSeconds) || 86400) + 300) * 1000);
           await handleFn(cfg, {
             ...item.rpcPayload,
+            inProcessSelfPing: false,
+            flockPolicy: undefined,
+            registryMembers: undefined,
+            enforceSignature: true,
+            requireVerifiedAuth: true,
             maxSkewMs: ttlMs,
           });
           handleSucceeded = true;
@@ -11004,7 +11267,7 @@ export function createDaemonHeartbeatMonitor({
   checkPidSupersession = null,
 } = {}) {
   const effectiveCollectPresence =
-    collectPresenceFn || (() => handleRpcAction(cfg, { action: "ping" }));
+    collectPresenceFn || (() => handleRpcAction(cfg, { action: "ping", inProcessSelfPing: true }));
   const effectivePublishPresence =
     publishPresenceFn ||
     (async (selfInfo) => {
@@ -11268,7 +11531,14 @@ export async function runDaemon(cfg) {
               });
             }
             try {
-              const result = await handleRpcAction(cfg, payload);
+              const result = await handleRpcAction(cfg, {
+                ...payload,
+                inProcessSelfPing: false,
+                flockPolicy: undefined,
+                registryMembers: undefined,
+                enforceSignature: true,
+                requireVerifiedAuth: true,
+              });
               await sendSignalRToUser(cfg, replyUserId, "bridgeRpcResponse", {
                 requestId,
                 fromMachine: cfg.machineId,
@@ -11301,7 +11571,7 @@ export async function runDaemon(cfg) {
 
       // Announce presence & drain any offline Service Bus messages queued while offline
       try {
-        const selfInfo = await handleRpcAction(cfg, { action: "ping" });
+        const selfInfo = await handleRpcAction(cfg, { action: "ping", inProcessSelfPing: true });
         await sendSignalRBroadcast(cfg, "bridgePresence", selfInfo);
       } catch {}
       drainAndProcessOfflineQueue(cfg).catch(() => {});
@@ -11330,7 +11600,7 @@ export async function runDaemon(cfg) {
             }
           );
         },
-        collectPresenceFn: () => handleRpcAction(cfg, { action: "ping" }),
+        collectPresenceFn: () => handleRpcAction(cfg, { action: "ping", inProcessSelfPing: true }),
         publishPresenceFn: async (selfInfo) => {
           await sendSignalRBroadcast(cfg, "bridgePresence", selfInfo);
         },
@@ -12712,6 +12982,34 @@ export async function executeMcpTool(cfg, name, args = {}, options = {}) {
       "share_thread", "unshare_thread", "list_shared_threads"]);
     if (!supported.has(name)) throw new Error(`Tool ${name} is not a broker-free operation; legacy broker fallback is forbidden`);
 
+    if (name === "list_shared_threads") {
+      const selected = runtime.assertActive(runtime.select(explicitFlock));
+      if (targetMachineFromFlock) {
+        const hasTargetMember = Object.values(selected.members || {}).some(
+          (entry) =>
+            !entry?.removed &&
+            String(entry?.cert?.body?.machineId || "").toLowerCase() === targetMachineFromFlock.toLowerCase()
+        );
+        if (!hasTargetMember) {
+          const err = new Error(
+            `Target machine "${targetMachineFromFlock}" is not an active member of broker-free flock "${selected.flockId}"`
+          );
+          err.code = "FLOCK_NON_MEMBER";
+          err.statusCode = 403;
+          throw err;
+        }
+      }
+      const effectiveSelector = targetMachineFromFlock
+        ? `${selected.flockId}/${targetMachineFromFlock}`
+        : selected.flockId;
+      return listSharedThreadsForMachine(
+        cfg,
+        options.flocksConfigPath || cfg?.flocksConfigPath || getFlocksConfigPath(),
+        effectiveSelector,
+        { allowMissingSelectedFlock: true }
+      );
+    }
+
     if (name === "flock_status" || name === "bridge_status") {
       if (args.passive === true) {
         const daemonStatus = inspectLocalDaemonPassive(cfg);
@@ -12977,7 +13275,7 @@ export async function executeMcpTool(cfg, name, args = {}, options = {}) {
           bridgeHome: deps.bridgeHome || null,
           configPath: deps.configPath || cfg?.configPath || null,
         });
-        return {
+        return projectPublicStatusResponse({
           status: "unavailable",
           passive: true,
           reason,
@@ -12995,7 +13293,7 @@ export async function executeMcpTool(cfg, name, args = {}, options = {}) {
           localCopilotWs,
           onlineMachines: [],
           onlineMachinesStatus: "unavailable",
-        };
+        });
       }
     }
 
@@ -13058,7 +13356,7 @@ export async function executeMcpTool(cfg, name, args = {}, options = {}) {
       liveOutcome.machines,
       liveOutcome.source
     );
-    return {
+    return projectPublicStatusResponse({
       localMachineId: cfg.machineId,
       protocol: "legacy-v3",
       ...(targetFlock ? { flockId: merged.flocks[0]?.flockId || targetFlock } : {}),
@@ -13085,7 +13383,7 @@ export async function executeMcpTool(cfg, name, args = {}, options = {}) {
       flocks: merged.flocks,
       roster: merged.roster,
       ...(discoveryError ? { discoveryError } : {}),
-    };
+    });
   }
 
   if (name === "list_remote_machines") {
@@ -13268,8 +13566,8 @@ export async function executeMcpTool(cfg, name, args = {}, options = {}) {
       : 8000;
     const rpcTimeoutMs = waitForReply ? waitTimeoutMs + 12000 : dispatchTimeoutMs + 7000;
 
-    const rpcParams = {
-      flock: args.flock || cfg.flockId || normalizeGitHubUser(cfg.githubUser),
+    const baseSendParams = {
+      ...(args.flock !== undefined && args.flock !== null ? { flock: args.flock } : {}),
       targetSession: args.to_session,
       message: args.message,
       fromMachine: cfg.machineId,
@@ -13286,6 +13584,21 @@ export async function executeMcpTool(cfg, name, args = {}, options = {}) {
       delegateTitle: args.delegate_title || null,
       delegateRepo: args.delegate_repo || null,
     };
+    const resolvedSendFlock =
+      cfg.protocol !== "broker-free-v34"
+        ? authorizeCallerFlockSelection(
+            cfg,
+            baseSendParams.flock ??
+              resolveDefaultLegacyProtectedFlockSelector(cfg, {
+                toMachine: targetMachine,
+                action: "send_message",
+                params: baseSendParams,
+              })
+          )
+        : null;
+    const rpcParams = resolvedSendFlock
+      ? { ...baseSendParams, flock: resolvedSendFlock.canonicalPath }
+      : baseSendParams;
 
     let res;
     try {
@@ -13308,17 +13621,22 @@ export async function executeMcpTool(cfg, name, args = {}, options = {}) {
           toMachine: targetMachine,
           action: "send_message",
           params: rpcParams,
+          identity: cfg.identity || null,
         });
-        const queued = enqueueOfflineMessage({
+        const queued = (options.enqueueOfflineFn || enqueueOfflineMessage)({
           bootstrapUrl: cfg.bootstrapUrl || DEFAULT_BOOTSTRAP_URL,
           toMachine: targetMachine,
           ttlSeconds: Number(args.ttl_seconds) || 86400,
+          cfg,
           rpcPayload: {
             requestId: reqId,
             fromMachine: cfg.machineId,
             toMachine: targetMachine,
             action: "send_message",
             params: rpcParams,
+            ...(resolvedSendFlock
+              ? { flockId: resolvedSendFlock.flockId, flock: resolvedSendFlock.canonicalPath }
+              : {}),
             sentAt,
             auth,
           },
@@ -13382,7 +13700,7 @@ export async function executeMcpTool(cfg, name, args = {}, options = {}) {
       toMachine: targetMachine,
       action: "create_session",
       params: {
-        flock: args.flock || cfg.flockId || normalizeGitHubUser(cfg.githubUser),
+        ...(args.flock !== undefined && args.flock !== null ? { flock: args.flock } : {}),
         title: args.title || null,
         repo: args.repo || null,
         workspaceType: args.workspace_type || "branch",
@@ -13472,7 +13790,7 @@ export async function executeMcpTool(cfg, name, args = {}, options = {}) {
       action: isNewSession ? "create_session" : "send_message",
       params: isNewSession
         ? {
-            flock: args.flock || cfg.flockId || normalizeGitHubUser(cfg.githubUser),
+            ...(args.flock !== undefined && args.flock !== null ? { flock: args.flock } : {}),
             title: args.title || null,
             repo: args.repo || null,
             message: args.message,
@@ -13486,7 +13804,7 @@ export async function executeMcpTool(cfg, name, args = {}, options = {}) {
             waitTimeoutMs,
           }
         : {
-            flock: args.flock || cfg.flockId || normalizeGitHubUser(cfg.githubUser),
+            ...(args.flock !== undefined && args.flock !== null ? { flock: args.flock } : {}),
             targetSession: toSession,
             message: args.message,
             fromMachine: cfg.machineId,
@@ -13564,6 +13882,7 @@ export async function executeMcpTool(cfg, name, args = {}, options = {}) {
     await ensureDaemonStarted(cfg);
     const targetMachine = await resolveTargetMachine(cfg, args.to_machine, {
       allowLoopback: Boolean(args.allow_loopback),
+      ...(args.flock ? { flockId: args.flock } : {}),
     });
     let senderSessionId = args.from_session || "latest";
     let senderSessionName = null;
@@ -13601,7 +13920,9 @@ export async function executeMcpTool(cfg, name, args = {}, options = {}) {
     const res = await invokeRemoteRpc(cfg, {
       toMachine: targetMachine,
       action: "send_message",
+      ...(args.flock !== undefined && args.flock !== null ? { flockId: args.flock } : {}),
       params: {
+        ...(args.flock !== undefined && args.flock !== null ? { flock: args.flock } : {}),
         targetSession: args.to_session,
         message: formattedQuestion,
         messageType: "clarification_request",
@@ -16682,7 +17003,14 @@ export async function reprovisionLocalBridge(
   };
 }
 
-export async function reprovisionFleetMachines(cfg, { machines = "*" } = {}) {
+export async function reprovisionFleetMachines(
+  cfg,
+  {
+    machines = "*",
+    enqueueOfflineFn = enqueueOfflineMessage,
+    postReprovisionWaitMs = 5000,
+  } = {}
+) {
   const [discovered, bootstrapMembers] = await Promise.all([
     discoverMachines(cfg, { includeSelf: true, timeoutMs: 2500 }),
     fetchBootstrapMembers(),
@@ -16736,24 +17064,40 @@ export async function reprovisionFleetMachines(cfg, { machines = "*" } = {}) {
       // Target machine is currently offline/sleeping — queue signed `reprovision` RPC in Service Bus / Bootstrap store-and-forward queue
       const reqId = crypto.randomUUID();
       const sentAt = new Date().toISOString();
+      const reprovisionFlockRaw = resolveDefaultLegacyProtectedFlockSelector(cfg, {
+        toMachine: mId,
+        action: "reprovision",
+      });
+      const reprovisionFlockSel =
+        reprovisionFlockRaw !== undefined && reprovisionFlockRaw !== null
+          ? authorizeCallerFlockSelection(cfg, reprovisionFlockRaw)
+          : null;
+      const reprovisionParams = reprovisionFlockSel
+        ? { flock: reprovisionFlockSel.canonicalPath }
+        : {};
       const auth = signRpcRequest({
         requestId: reqId,
         sentAt,
         fromMachine: cfg.machineId,
         toMachine: mId,
         action: "reprovision",
-        params: {},
+        params: reprovisionParams,
+        identity: cfg.identity || null,
       });
-      const queued = enqueueOfflineMessage({
+      const queued = enqueueOfflineFn({
         bootstrapUrl: cfg.bootstrapUrl || DEFAULT_BOOTSTRAP_URL,
         toMachine: mId,
         ttlSeconds: 86400,
+        cfg,
         rpcPayload: {
           requestId: reqId,
           fromMachine: cfg.machineId,
           toMachine: mId,
           action: "reprovision",
-          params: {},
+          params: reprovisionParams,
+          ...(reprovisionFlockSel
+            ? { flockId: reprovisionFlockSel.flockId, flock: reprovisionFlockSel.canonicalPath }
+            : {}),
           sentAt,
           auth,
         },
@@ -16786,8 +17130,8 @@ export async function reprovisionFleetMachines(cfg, { machines = "*" } = {}) {
     }
   }
 
-  if (anyOnlineSucceeded) {
-    await new Promise((r) => setTimeout(r, 5000));
+  if (anyOnlineSucceeded && postReprovisionWaitMs > 0) {
+    await new Promise((r) => setTimeout(r, postReprovisionWaitMs));
   }
 
   const diag = await diagnoseFleetMachines(cfg, { machines, fix: anyOnlineSucceeded });
@@ -16956,12 +17300,8 @@ export async function diagnoseLocalBridgeState(
   }
 
   let sessions = queryLocalSessionsFromDb({ limit: 150, runningOnly: false });
-  const wsInfo = getLocalWsConnectionInfo();
-  const copilotCliBin = effectivePassive && !inDaemonRpc
-    ? process.env.COPILOT_CLI_PATH && fs.existsSync(process.env.COPILOT_CLI_PATH)
-      ? process.env.COPILOT_CLI_PATH
-      : null
-    : resolveCopilotCliBin();
+  const wsInfo = await verifyLocalWsConnectionInfo({ forceRefresh: false, retryPollMs: 0 });
+  const copilotCliBin = resolveCopilotCliBin();
 
   const isCoordMatch = (s) => {
     const tl = String(s.title || "").trim().toLowerCase();
@@ -17228,6 +17568,8 @@ export async function diagnoseLocalBridgeState(
     runtime: {
       type: wsInfo ? "copilot-desktop" : "copilot-cli",
       copilotDesktopRunning: Boolean(wsInfo),
+      copilotDesktopReachable: Boolean(wsInfo),
+      headlessCliAvailable: Boolean(copilotCliBin),
       wsPort: wsInfo?.port || null,
       copilotCliBin: copilotCliBin || null,
     },
@@ -17266,8 +17608,18 @@ export function classifyLayeredPresence({ online, member = {}, ping = {}, diagno
     }
     return { state: "degraded", reason: thread.exists ? "configuration_unhealthy" : "missing" };
   };
-  const executionState = runtime
-    ? runtime.copilotDesktopRunning || runtime.copilotCliBin
+  const hasPingExecutionProbe =
+    ping?.copilotDesktopReachable !== undefined ||
+    ping?.copilotDesktopRunning !== undefined ||
+    ping?.headlessCliAvailable !== undefined;
+  const desktopReady = runtime
+    ? Boolean(runtime.copilotDesktopReachable ?? runtime.copilotDesktopRunning)
+    : Boolean(ping?.copilotDesktopReachable ?? ping?.copilotDesktopRunning);
+  const cliReady = runtime
+    ? Boolean(runtime.copilotCliBin ?? runtime.headlessCliAvailable)
+    : Boolean(ping?.headlessCliAvailable);
+  const executionState = runtime || hasPingExecutionProbe
+    ? desktopReady || cliReady
       ? "ready"
       : "unavailable"
     : "unknown";
@@ -17305,6 +17657,10 @@ export async function diagnoseFleetMachines(
 ) {
   const effectiveFix = passive ? false : Boolean(fix);
   const effectivePassive = Boolean(passive) || !effectiveFix;
+  const requestedScope =
+    scope && String(scope).toLowerCase() !== "all" && String(scope).trim() !== "*"
+      ? normalizeScope(scope, "")
+      : null;
   let daemonStatus = null;
 
   if (effectivePassive) {
@@ -17382,17 +17738,52 @@ export async function diagnoseFleetMachines(
     throw err;
   }
 
+  const quarantinedMembers = [];
+  const quarantinedKeys = new Set();
+  const quarantineObsoletePeer = (entry, source) => {
+    const key = `${String(entry?.machineId || "unknown").toLowerCase()}:${source}`;
+    if (quarantinedKeys.has(key)) return;
+    quarantinedKeys.add(key);
+    quarantinedMembers.push({
+      machineId: entry?.machineId || null,
+      githubUser: normalizeGitHubUser(entry?.githubUser) || null,
+      reason: "obsolete_private_scope",
+      source,
+    });
+  };
+
   const pingsByMachine = new Map();
   for (const r of pingReplies) {
     if (!r.result?.machineId) continue;
+    let pingScope = "work";
+    try {
+      pingScope = normalizeScope(r.result.scope, "work");
+    } catch (err) {
+      if (err?.code === "OBSOLETE_SCOPE" || err?.code === "INVALID_SCOPE") {
+        quarantineObsoletePeer(r.result, "live_ping");
+        continue;
+      }
+      throw err;
+    }
     const key = String(r.result.machineId).toLowerCase();
     if (!pingsByMachine.has(key)) pingsByMachine.set(key, []);
-    pingsByMachine.get(key).push(r.result);
+    pingsByMachine.get(key).push({ ...r.result, scope: pingScope });
   }
 
   const allMachineIds = new Map();
   for (const bm of bootstrapMembers) {
-    if (bm?.machineId) allMachineIds.set(String(bm.machineId).toLowerCase(), bm);
+    if (!bm?.machineId) continue;
+    let bmScope = "work";
+    try {
+      bmScope = normalizeScope(bm.scope, "work");
+    } catch (err) {
+      if (err?.code === "OBSOLETE_SCOPE" || err?.code === "INVALID_SCOPE") {
+        quarantineObsoletePeer(bm, "bootstrap_members");
+        continue;
+      }
+      throw err;
+    }
+    allMachineIds.set(String(bm.machineId).toLowerCase(), { ...bm, scope: bmScope });
   }
   for (const [key, list] of pingsByMachine.entries()) {
     if (!allMachineIds.has(key)) {
@@ -17408,10 +17799,7 @@ export async function diagnoseFleetMachines(
   const targetKeys = Array.from(allMachineIds.keys()).filter((k) => {
     const entry = allMachineIds.get(k);
     if (!matchesSelectorList(entry.machineId, machines)) return false;
-    if (scope && scope !== "all") {
-      const norm = normalizeScope(scope, "");
-      if (norm && normalizeScope(entry.scope, "work") !== norm) return false;
-    }
+    if (requestedScope && entry.scope !== requestedScope) return false;
     return true;
   });
 
@@ -17584,6 +17972,7 @@ export async function diagnoseFleetMachines(
     offlineCount: memberReports.filter((m) => !m.online).length,
     healthyCount: memberReports.filter((m) => m.healthy).length,
     unhealthyCount: memberReports.filter((m) => m.online && !m.healthy).length,
+    ...(quarantinedMembers.length > 0 ? { quarantinedMembers } : {}),
     members: memberReports,
   };
 }
@@ -18043,7 +18432,14 @@ export async function installBridge({
     }
     if (machineIdArg) existing.machineId = machineIdArg;
     if (scopeArg) {
-      existing.scope = normalizeScope(scopeArg, existing.scope || "work");
+      const nextScope = normalizeScope(scopeArg, "work");
+      if (String(existing.scope || "").trim().toLowerCase() === "private") {
+        const backupPath = `${activeConfigPath}.pre-3.6-scope.bak`;
+        if (!fs.existsSync(backupPath)) {
+          writeConfigFileSecure(existing, backupPath);
+        }
+      }
+      existing.scope = nextScope;
     } else if (existing.scope) {
       existing.scope = normalizeScope(existing.scope, "work");
     } else {
@@ -18581,6 +18977,53 @@ export async function resolveLegacyFlockRoster(cfg, options = {}) {
   const reconciledFlocksMap = new Map();
   const revokedOwnerMachines = new Set();
   const persistedFlocksOut = { ...(localFlocksCfg.flocks || {}) };
+  const quarantinedMembers = [];
+  const quarantinedRosterKeys = new Set();
+  const recordQuarantinedRosterMember = (flockId, member, source) => {
+    const qKey = `${flockId || "*"}:${String(member?.machineId || member?.peerId || "unknown").toLowerCase()}:${source}`;
+    if (quarantinedRosterKeys.has(qKey)) return;
+    quarantinedRosterKeys.add(qKey);
+    quarantinedMembers.push({
+      flockId: flockId || null,
+      machineId: member?.machineId || null,
+      peerId: member?.peerId || null,
+      githubUser: normalizeGitHubUser(member?.githubUser) || null,
+      reason: "obsolete_private_scope",
+    });
+    warnings.push(
+      `Quarantined peer "${member?.machineId || member?.peerId || "unknown"}"${flockId ? ` in "${flockId}"` : ""}: obsolete scope "${member?.scope}"`
+    );
+  };
+  const filterValidScopedMembers = (flockId, list, source) =>
+    (Array.isArray(list) ? list : []).filter((m) => {
+      if (!m?.machineId || !isNonExpiredIsoOrMs(m.membershipExpiresAt, m.membershipExpiresAtMs, nowMs)) {
+        return false;
+      }
+      if (m.scope === undefined || m.scope === null || m.scope === "") return true;
+      try {
+        normalizeScope(m.scope, "work");
+        return true;
+      } catch (err) {
+        if (err?.code === "OBSOLETE_SCOPE" || err?.code === "INVALID_SCOPE") {
+          recordQuarantinedRosterMember(flockId, m, source);
+          return false;
+        }
+        throw err;
+      }
+    });
+  const sanitizeAllowedScopes = (scopes, fallbackScope) => {
+    if (!Array.isArray(scopes)) return [fallbackScope];
+    const valid = scopes
+      .map((s) => {
+        try {
+          return normalizeScope(s, "");
+        } catch {
+          return "";
+        }
+      })
+      .filter(Boolean);
+    return valid.length > 0 ? valid : [fallbackScope];
+  };
 
   if (v3Source.ok) {
     const ownedList = Array.isArray(v3Res?.ownedFlocks) ? v3Res.ownedFlocks : [];
@@ -18634,16 +19077,12 @@ export async function resolveLegacyFlockRoster(cfg, options = {}) {
         warnings.push(
           `Rejected roster epoch rollback for "${flockId}" (remote epoch ${remoteEpoch} < local epoch ${localEpoch})`
         );
-        chosenMembers = (localPrev.members || []).filter(
-          (m) => m?.machineId && isNonExpiredIsoOrMs(m.membershipExpiresAt, m.membershipExpiresAtMs, nowMs)
-        );
+        chosenMembers = filterValidScopedMembers(flockId, localPrev.members, "local_cache");
         chosenEpoch = localEpoch;
         flockSource = "local_cache_higher_epoch";
         flockFetchedAt = localPrev.rosterFetchedAt || null;
       } else {
-        chosenMembers = (rf.members || []).filter(
-          (m) => m?.machineId && isNonExpiredIsoOrMs(m.membershipExpiresAt, m.membershipExpiresAtMs, nowMs)
-        );
+        chosenMembers = filterValidScopedMembers(flockId, rf.members, "broker_v3_my_flocks");
         chosenEpoch = remoteEpoch;
         flockSource = "broker_v3_my_flocks";
         flockFetchedAt = v3Source.fetchedAt;
@@ -18656,7 +19095,7 @@ export async function resolveLegacyFlockRoster(cfg, options = {}) {
         hubName: rf.hubName || localPrev?.hubName || null,
         flockType: rf.flockType || localPrev?.flockType || "shared",
         ownerGitHubUser: rf.ownerGitHubUser || localPrev?.ownerGitHubUser || effectiveOwner,
-        allowedScopes: rf.allowedScopes || localPrev?.allowedScopes || [localScope],
+        allowedScopes: sanitizeAllowedScopes(rf.allowedScopes || localPrev?.allowedScopes, localScope),
         targetMachineId: rf.targetMachineId ?? localPrev?.targetMachineId ?? null,
         trustTier: effectiveTrust,
         sessionVisibility: isBuiltInOwner ? "all" : "explicit_opt_in_only",
@@ -18750,13 +19189,10 @@ export async function resolveLegacyFlockRoster(cfg, options = {}) {
     for (const [flockId, lf] of Object.entries(localFlocksCfg.flocks || {})) {
       const isBuiltIn = flockId === builtInRootId || flockId === builtInScopeId;
       if (!isBuiltIn && !storedFlockIds.has(flockId)) continue;
-      const activeCachedMembers = Array.isArray(lf.members)
-        ? lf.members.filter(
-            (m) => m?.machineId && isNonExpiredIsoOrMs(m.membershipExpiresAt, m.membershipExpiresAtMs, nowMs)
-          )
-        : [];
+      const activeCachedMembers = filterValidScopedMembers(flockId, lf.members, "local_cache");
       reconciledFlocksMap.set(flockId, {
         ...lf,
+        allowedScopes: sanitizeAllowedScopes(lf.allowedScopes, localScope),
         members: activeCachedMembers,
         rosterFetchedAt: lf.rosterFetchedAt || null,
         rosterSource: storedFlockIds.has(flockId) && Array.isArray(lf.members) ? "local_cache" : "local_default",
@@ -18778,7 +19214,16 @@ export async function resolveLegacyFlockRoster(cfg, options = {}) {
       if (revokedOwnerMachines.has(bmMachineKey)) {
         continue;
       }
-      const bmScope = normalizeScope(bm.scope, "work");
+      let bmScope;
+      try {
+        bmScope = normalizeScope(bm.scope, "work");
+      } catch (err) {
+        if (err?.code === "OBSOLETE_SCOPE" || err?.code === "INVALID_SCOPE") {
+          recordQuarantinedRosterMember(builtInRootId, bm, "bootstrap_members");
+          continue;
+        }
+        throw err;
+      }
       const targetBuiltIns = [builtInRootId, `${effectiveOwner}/${bmScope}`];
       for (const bFlockId of targetBuiltIns) {
         let fEntry = reconciledFlocksMap.get(bFlockId);
@@ -18903,6 +19348,7 @@ export async function resolveLegacyFlockRoster(cfg, options = {}) {
     localFlocks: localFlocksView,
     remoteOwnedFlocks: remoteOwnedView,
     remoteJoinedFlocks: remoteJoinedView,
+    quarantinedMembers,
     v3Source,
     membersSource,
     localCacheSource: {
@@ -18962,13 +19408,30 @@ function applyLivePresenceToLegacyRoster(baseState, onlineMachines, liveSignalRS
   const knownMap = new Map();
   const allowedLiveKeys = new Set();
   const allowedLiveMachines = new Set();
+  const quarantinedMembers = [...(baseState.quarantinedMembers || [])];
 
   const flocksOut = baseState.scopedFlocks.map((f) => {
     const callerHasOwnerSpecs = f.trustTier === "owner" && f.shareSpecs === "full";
     const flockEpoch = Number(f.rosterEpoch) || 1;
-    const flockMembers = (f.members || []).map((m) => {
+    const flockMembers = (f.members || []).flatMap((m) => {
       const mUser = normalizeGitHubUser(m.githubUser || f.ownerGitHubUser)?.toLowerCase() || "unknown";
       const live = findLiveMatch(mUser, m.machineId);
+      let resolvedScope;
+      try {
+        resolvedScope = normalizeScope(live?.scope || m.scope, "work");
+      } catch (err) {
+        if (err?.code === "OBSOLETE_SCOPE" || err?.code === "INVALID_SCOPE") {
+          quarantinedMembers.push({
+            flockId: f.flockId,
+            machineId: m.machineId || null,
+            peerId: m.peerId || null,
+            githubUser: mUser,
+            reason: "obsolete_private_scope",
+          });
+          return [];
+        }
+        throw err;
+      }
       const memberSource = m.__source || f.rosterSource || "local_cache";
       const memberKey = `${mUser}:${String(m.machineId).toLowerCase()}`;
       allowedLiveKeys.add(memberKey);
@@ -18983,12 +19446,15 @@ function applyLivePresenceToLegacyRoster(baseState, onlineMachines, liveSignalRS
       const rankRole = (r) => (r === "owner" ? 3 : r === "collaborator" ? 2 : 1);
       const mRole = m.trustTier || (mUser === f.ownerGitHubUser ? "owner" : "collaborator");
       const bestRole = prev && rankRole(prev.trustTier) >= rankRole(mRole) ? prev.trustTier : mRole;
+      const layeredPresence = livePresenceProbed
+        ? classifyLayeredPresence({ online: Boolean(live), member: m, ping: live || {} })
+        : null;
 
       const entry = {
         machineId: live?.machineId || m.machineId,
         peerId: m.peerId || prev?.peerId || null,
         githubUser: mUser,
-        scope: normalizeScope(live?.scope || m.scope, "work"),
+        scope: resolvedScope,
         role: bestRole,
         trustTier: bestRole,
         flocks: mergedFlocks,
@@ -18997,6 +19463,12 @@ function applyLivePresenceToLegacyRoster(baseState, onlineMachines, liveSignalRS
         membershipExpiresAt: m.membershipExpiresAt ?? prev?.membershipExpiresAt ?? null,
         online: livePresenceProbed ? Boolean(live) : null,
         presence: livePresenceProbed ? (live ? "online" : "offline") : "unprobed",
+        ...(layeredPresence
+          ? {
+              overallState: layeredPresence.overallState,
+              presenceLayers: layeredPresence.presenceLayers,
+            }
+          : {}),
         heartbeatObserved: livePresenceProbed ? Boolean(live) : false,
         removed: false,
         rosterSource: prev?.rosterSource === "broker_v3_my_flocks" ? "broker_v3_my_flocks" : memberSource,
@@ -19007,21 +19479,27 @@ function applyLivePresenceToLegacyRoster(baseState, onlineMachines, liveSignalRS
       };
       knownMap.set(memberKey, entry);
 
-      return {
+      return [{
         peerId: m.peerId || null,
         githubUser: mUser,
         machineId: live?.machineId || m.machineId,
-        scope: normalizeScope(live?.scope || m.scope, "work"),
+        scope: resolvedScope,
         trustTier: mRole,
         membershipAuthenticated: true,
         membershipStatus: "active",
         membershipExpiresAt: m.membershipExpiresAt || null,
         online: livePresenceProbed ? Boolean(live) : null,
         presence: livePresenceProbed ? (live ? "online" : "offline") : "unprobed",
+        ...(layeredPresence
+          ? {
+              overallState: layeredPresence.overallState,
+              presenceLayers: layeredPresence.presenceLayers,
+            }
+          : {}),
         heartbeatObserved: livePresenceProbed ? Boolean(live) : false,
         removed: false,
         lastSeenAt: live?.respondedAt || live?.timestamp || m.lastSeenAt || null,
-      };
+      }];
     });
 
     return {
@@ -19050,19 +19528,37 @@ function applyLivePresenceToLegacyRoster(baseState, onlineMachines, liveSignalRS
 
   let filteredOnlineMachines = onlineMachines;
   if (livePresenceProbed) {
-    filteredOnlineMachines = onlineMachines.filter((lm) => {
-      if (!lm?.machineId) return false;
-      const mLower = String(lm.machineId).toLowerCase();
-      const uLower = normalizeGitHubUser(lm.githubUser)?.toLowerCase() || null;
-      if (baseState.scopedTargetFlockId) {
-        if (uLower) return allowedLiveKeys.has(`${uLower}:${mLower}`);
-        return allowedLiveMachines.has(mLower);
-      }
-      if (uLower && uLower !== baseState.effectiveOwner) {
-        return allowedLiveKeys.has(`${uLower}:${mLower}`);
-      }
-      return true;
-    });
+    filteredOnlineMachines = onlineMachines
+      .filter((lm) => {
+        if (!lm?.machineId) return false;
+        try {
+          if (lm.scope !== undefined && lm.scope !== null && lm.scope !== "") {
+            normalizeScope(lm.scope, "work");
+          }
+        } catch (err) {
+          if (err?.code === "OBSOLETE_SCOPE" || err?.code === "INVALID_SCOPE") return false;
+          throw err;
+        }
+        const mLower = String(lm.machineId).toLowerCase();
+        const uLower = normalizeGitHubUser(lm.githubUser)?.toLowerCase() || null;
+        if (baseState.scopedTargetFlockId) {
+          if (uLower) return allowedLiveKeys.has(`${uLower}:${mLower}`);
+          return allowedLiveMachines.has(mLower);
+        }
+        if (uLower && uLower !== baseState.effectiveOwner) {
+          return allowedLiveKeys.has(`${uLower}:${mLower}`);
+        }
+        return true;
+      })
+      .map((lm) => {
+        if (lm.overallState && lm.presenceLayers) return lm;
+        const layered = classifyLayeredPresence({ online: true, ping: lm });
+        return {
+          ...lm,
+          overallState: layered.overallState,
+          presenceLayers: layered.presenceLayers,
+        };
+      });
   }
 
   const cachedTimestamps = flocksOut
@@ -19148,6 +19644,7 @@ function applyLivePresenceToLegacyRoster(baseState, onlineMachines, liveSignalRS
     presenceNote: ROSTER_PRESENCE_NOTE,
     flocks: flocksOut,
     knownMembers,
+    ...(quarantinedMembers.length > 0 ? { quarantinedMembers } : {}),
     ...(livePresenceProbed ? { offlineMembers } : {}),
   };
 
@@ -19159,6 +19656,7 @@ function applyLivePresenceToLegacyRoster(baseState, onlineMachines, liveSignalRS
     flocks: flocksOut,
     knownMembers,
     offlineMembers,
+    ...(quarantinedMembers.length > 0 ? { quarantinedMembers } : {}),
     onlineMachines: filteredOnlineMachines,
     roster,
   };
@@ -19304,7 +19802,17 @@ function applyLivePresenceToBrokerFreeRoster(baseState, onlineMachines, liveSign
 
   const offlineMembers = livePresenceProbed ? knownMembers.filter((m) => m.online === false) : [];
   const filteredOnlineMachines = livePresenceProbed
-    ? onlineMachines.filter((lm) => lm?.machineId && allowedMachines.has(String(lm.machineId).toLowerCase()))
+    ? onlineMachines
+        .filter((lm) => lm?.machineId && allowedMachines.has(String(lm.machineId).toLowerCase()))
+        .map((lm) => {
+          if (lm.overallState && lm.presenceLayers) return lm;
+          const layered = classifyLayeredPresence({ online: true, ping: lm });
+          return {
+            ...lm,
+            overallState: layered.overallState,
+            presenceLayers: layered.presenceLayers,
+          };
+        })
     : null;
 
   const single = baseState.inspectedList.length === 1 ? baseState.inspectedList[0] : null;
@@ -19840,6 +20348,45 @@ export function resolveCliMessage(flags = {}, positional = []) {
   return flags.message || flags.prompt || (positional.length > 0 ? positional.join(" ") : "");
 }
 
+export function repairStoredConfigScopeBeforeLoad(
+  scopeArg,
+  { githubUserArg = null, configPath = null } = {}
+) {
+  const repairedScope = normalizeScope(scopeArg, "work");
+  const activeConfigPath = configPath || getConfigPath();
+  const targetPath = fs.existsSync(activeConfigPath)
+    ? activeConfigPath
+    : isSandboxV3Mode() && fs.existsSync(CONFIG_PATH)
+    ? CONFIG_PATH
+    : activeConfigPath;
+  if (!fs.existsSync(targetPath)) {
+    return { repaired: false, scope: repairedScope, configPath: targetPath, backupPath: null };
+  }
+  const rawContent = fs.readFileSync(targetPath, "utf8");
+  const parsed = JSON.parse(rawContent);
+  if (parsed?.protocol === "broker-free-v34") {
+    return { repaired: false, scope: repairedScope, configPath: targetPath, backupPath: null };
+  }
+  let backupPath = null;
+  if (String(parsed?.scope || "").trim().toLowerCase() === "private") {
+    backupPath = `${targetPath}.pre-3.6-scope.bak`;
+    if (!fs.existsSync(backupPath)) {
+      writeConfigFileSecure(parsed, backupPath);
+    }
+  }
+  parsed.scope = repairedScope;
+  if (githubUserArg) {
+    parsed.githubUser = normalizeGitHubUser(githubUserArg);
+  }
+  writeConfigFileSecure(parsed, targetPath);
+  return {
+    repaired: true,
+    scope: repairedScope,
+    configPath: targetPath,
+    backupPath,
+  };
+}
+
 async function main() {
   try {
     if (fs.existsSync(getBridgeHome())) {
@@ -19957,6 +20504,11 @@ Usage:
         ? flags.scope || flags.profile || positional[0] || "work"
         : flags.scope || flags.profile;
     if (flags.reprovision || flags.clean || flags["from-scratch"]) {
+      if (scopeArg) {
+        repairStoredConfigScopeBeforeLoad(scopeArg, {
+          githubUserArg: flags["github-user"] || flags.user || null,
+        });
+      }
       const cfg = loadConfig({ autoFetchAz: true, refreshSpecs: true });
       if (scopeArg) cfg.scope = normalizeScope(scopeArg, "work");
       if (flags["github-user"] || flags.user) {
@@ -20803,6 +21355,7 @@ Usage:
         message: "Self-test over Azure SignalR copilot-flock",
         fromMachine: cfg.machineId,
         fromScope: cfg.scope,
+        fromGitHubUser: cfg.githubUser || null,
         fromSessionId: "self-test",
         fromSessionName: "Self Test",
         dryRun: true,

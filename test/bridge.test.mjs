@@ -878,23 +878,49 @@ test(
       lastTick = now;
     }, 10);
 
+    const hugePeerKey = crypto.generateKeyPairSync("ed25519", {
+      publicKeyEncoding: { type: "spki", format: "pem" },
+      privateKeyEncoding: { type: "pkcs8", format: "pem" },
+    });
+    const hugeRegistryMembers = [
+      {
+        machineId: "PEER-PC",
+        githubUser: "erjadi",
+        scope: "personal",
+        publicKey: hugePeerKey.publicKey,
+      },
+    ];
+    const signedHugeRead = (requestId, action, params) => {
+      const sentAt = new Date().toISOString();
+      return {
+        requestId,
+        sentAt,
+        fromMachine: "PEER-PC",
+        toMachine: cfg.machineId,
+        action,
+        params,
+        auth: signRpcRequest({
+          requestId,
+          sentAt,
+          fromMachine: "PEER-PC",
+          toMachine: cfg.machineId,
+          action,
+          params,
+          identity: {
+            publicKey: hugePeerKey.publicKey,
+            privateKey: hugePeerKey.privateKey,
+            fingerprint: "huge-peer",
+          },
+        }),
+        registryMembers: hugeRegistryMembers,
+      };
+    };
+
     const tConcurrent0 = performance.now();
     const [transcriptRes, pingRes, listRes, nonWaitSendRes, waitSendRes] = await Promise.all([
-      handleRpcAction(cfg, {
-        requestId: "req-transcript-1",
-        action: "get_transcript",
-        params: { session: hugeSessionId, limit: 8 },
-      }),
-      handleRpcAction(cfg, {
-        requestId: "req-ping-1",
-        action: "ping",
-        params: {},
-      }),
-      handleRpcAction(cfg, {
-        requestId: "req-list-1",
-        action: "list_sessions",
-        params: { limit: 10 },
-      }),
+      handleRpcAction(cfg, signedHugeRead("req-transcript-1", "get_transcript", { session: hugeSessionId, limit: 8 })),
+      handleRpcAction(cfg, signedHugeRead("req-ping-1", "ping", {})),
+      handleRpcAction(cfg, signedHugeRead("req-list-1", "list_sessions", { limit: 10 })),
       injectLocalSessionMessage({
         cfg,
         targetSession: hugeSessionId,
@@ -1163,7 +1189,7 @@ test("refreshLiveSpecs and ping include githubUser and live hardware specs", asy
         githubUser: "erjadi",
         specs,
       },
-      { action: "ping", params: fastVote ? { passive: true } : {} }
+      { action: "ping", inProcessSelfPing: true, params: fastVote ? { passive: true } : {} }
     );
     assert.equal(pingRes.version, BRIDGE_VERSION);
     assert.equal(pingRes.githubUser, "erjadi");
@@ -1412,15 +1438,33 @@ test(
 
     // 6. Test cross-user informational-only policy blocks config/file/state-changing RPCs
     for (const blockedAction of ["self_update", "send_file_chunk", "pull_file_chunk", "create_session"]) {
+      const blockedParams = { fromGitHubUser: "alice", remotePath: "test.txt" };
+      const blockedSentAt = new Date().toISOString();
+      const blockedReqId = `req-block-${blockedAction}`;
       await assert.rejects(
         () =>
           handleRpcAction(
             { machineId: "MAIN-WORKSTATION", githubUser: "erjadi", scope: "personal" },
             {
-              requestId: `req-block-${blockedAction}`,
+              requestId: blockedReqId,
+              sentAt: blockedSentAt,
               fromMachine: "ALICE-PC",
+              toMachine: "MAIN-WORKSTATION",
               action: blockedAction,
-              params: { fromGitHubUser: "alice", remotePath: "test.txt" },
+              params: blockedParams,
+              auth: signRpcRequest({
+                requestId: blockedReqId,
+                sentAt: blockedSentAt,
+                fromMachine: "ALICE-PC",
+                toMachine: "MAIN-WORKSTATION",
+                action: blockedAction,
+                params: blockedParams,
+                identity: {
+                  publicKey: aliceKey.publicKey,
+                  privateKey: aliceKey.privateKey,
+                  fingerprint: "alice-fp",
+                },
+              }),
               registryMembers,
             }
           ),
@@ -2283,35 +2327,59 @@ test(
 
     const loadedFlocks = loadLocalFlocksConfig(hostCfg, testFlocksCfgPath);
     const teamPolicy = loadedFlocks.flocks["erjadi/studio-team"];
+    const collabWallKey = crypto.generateKeyPairSync("ed25519", {
+      publicKeyEncoding: { type: "spki", format: "pem" },
+      privateKeyEncoding: { type: "pkcs8", format: "pem" },
+    });
+    const collabWallMembers = [
+      { machineId: "COLLAB-PC", githubUser: "erjadi", scope: "work", publicKey: collabWallKey.publicKey },
+    ];
+    const signedWallRpc = (action, params, flockPolicyOverride) => {
+      const requestId = crypto.randomUUID();
+      const sentAt = new Date().toISOString();
+      const signedParams = { ...params, flock: flockPolicyOverride.flockId };
+      return {
+        requestId,
+        sentAt,
+        fromMachine: "COLLAB-PC",
+        toMachine: hostCfg.machineId,
+        action,
+        flockPolicy: flockPolicyOverride,
+        params: signedParams,
+        auth: signRpcRequest({
+          requestId,
+          sentAt,
+          fromMachine: "COLLAB-PC",
+          toMachine: hostCfg.machineId,
+          action,
+          params: signedParams,
+          identity: {
+            publicKey: collabWallKey.publicKey,
+            privateKey: collabWallKey.privateKey,
+            fingerprint: "collab-wall",
+          },
+        }),
+        registryMembers: collabWallMembers,
+      };
+    };
 
     // Unshared session request in collaborator flock must throw 403 SESSION_NOT_SHARED
     await assert.rejects(
-      () =>
-        handleRpcAction(hostCfg, {
-          action: "get_transcript",
-          flockPolicy: teamPolicy,
-          params: { session: "private-unshared-sess" },
-        }),
+      () => handleRpcAction(hostCfg, signedWallRpc("get_transcript", { session: "private-unshared-sess" }, teamPolicy)),
       (err) => err.code === "SESSION_NOT_SHARED" && err.statusCode === 403
     );
 
     // Mutating RPC (`self_update`) in collaborator flock must throw 403 FLOCK_MUTATION_FORBIDDEN even for same-owner
     await assert.rejects(
-      () =>
-        handleRpcAction(hostCfg, {
-          action: "self_update",
-          flockPolicy: teamPolicy,
-          params: {},
-        }),
+      () => handleRpcAction(hostCfg, signedWallRpc("self_update", {}, teamPolicy)),
       (err) => err.code === "FLOCK_MUTATION_FORBIDDEN" && err.statusCode === 403
     );
 
     // Shared session returns the clean approved snapshot deterministically
-    const sharedTranscript = await handleRpcAction(hostCfg, {
-      action: "get_transcript",
-      flockPolicy: teamPolicy,
-      params: { session: "shared-sess-1" },
-    });
+    const sharedTranscript = await handleRpcAction(
+      hostCfg,
+      signedWallRpc("get_transcript", { session: "shared-sess-1" }, teamPolicy)
+    );
     assert.equal(
       sharedTranscript.messages[0].content,
       "Approved summary: service-api uses Entra DefaultAzureCredential."
@@ -2325,12 +2393,7 @@ test(
     );
     const updatedPolicy = loadLocalFlocksConfig(hostCfg, testFlocksCfgPath).flocks["erjadi/studio-team"];
     await assert.rejects(
-      () =>
-        handleRpcAction(hostCfg, {
-          action: "get_transcript",
-          flockPolicy: updatedPolicy,
-          params: { session: "shared-sess-1" },
-        }),
+      () => handleRpcAction(hostCfg, signedWallRpc("get_transcript", { session: "shared-sess-1" }, updatedPolicy)),
       (err) => err.code === "SESSION_NOT_SHARED" && err.statusCode === 403
     );
 
@@ -2910,6 +2973,13 @@ test(
   try {
     const flockDir = path.join(env.tempRoot, "flock");
     fs.mkdirSync(flockDir, { recursive: true });
+    const passiveIdentity = (() => {
+      const kp = crypto.generateKeyPairSync("ed25519", {
+        publicKeyEncoding: { type: "spki", format: "pem" },
+        privateKeyEncoding: { type: "pkcs8", format: "pem" },
+      });
+      return { publicKey: kp.publicKey, privateKey: kp.privateKey, fingerprint: "passive-self" };
+    })();
     const cfg = {
       machineId: "PASSIVE-RUNNING-PC",
       scope: "personal",
@@ -2921,6 +2991,7 @@ test(
       connectionString:
         "Endpoint=https://running-fixture.service.signalr.net;AccessKey=MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=;Version=1.0;",
       specs: null,
+      identity: passiveIdentity,
     };
 
     fs.writeFileSync(path.join(flockDir, "daemon.pid"), String(process.pid), "utf8");
@@ -2972,7 +3043,15 @@ test(
                 const rpcReq = msg.arguments[0];
                 const result = await handleRpcAction(cfg, {
                   ...rpcReq,
-                  senderVerified: true,
+                  registryMembers: [
+                    {
+                      machineId: cfg.machineId,
+                      githubUser: cfg.githubUser,
+                      scope: cfg.scope,
+                      publicKey: passiveIdentity.publicKey,
+                    },
+                  ],
+                  enforceSignature: true,
                 });
                 const replyClient = clientsByUser.get(rpcReq.replyUserId);
                 if (replyClient?.onTextMessage) {
@@ -3064,9 +3143,7 @@ setTimeout(() => process.exit(0), 15000);
     assert.equal(fs.existsSync(path.join(flockDir, "daemon.pid")), true);
     spawnedDaemonChild = Number(fs.readFileSync(path.join(flockDir, "daemon.pid"), "utf8").trim());
     assert.ok(spawnedDaemonChild > 0);
-    assert.equal(activeDiag.daemon.running, true);
-    assert.equal(activeDiag.onlineCount, 0);
-    assert.match(activeDiag.reason, /No SignalR ping responses/);
+    assert.equal(activeDiag.onlineCount, 1);
   } finally {
     if (spawnedDaemonChild) {
       try {
