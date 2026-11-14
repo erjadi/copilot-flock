@@ -36,6 +36,8 @@ const runtimeFiles = [
   "installation.json", "uninstall-progress.json",
   "flock-protocol.mjs", "flock-azure.mjs", "flock-broker-free.mjs", "broker-free.json",
   RUNTIME_MANIFEST_FILENAME, RUNTIME_STATE_FILENAME,
+  "update-activation.json",
+  "update-verification.json",
 ];
 
 export function lifecyclePaths({ home = os.homedir(), copilotHome = process.env.COPILOT_HOME || path.join(home, ".copilot"),
@@ -216,15 +218,29 @@ export function pinDaemonIdentity(root, script, inspect = inspectProcess) {
   atomicJson(path.join(root, "daemon-identity.json"), { ...identity, script: path.resolve(script) });
 }
 
-export function commandIsDaemon(identity, scripts) {
+export function commandIsDaemon(identity, scripts, { platform = process.platform } = {}) {
   const argv = identity?.argv || parseWindowsCommandLine(identity?.command);
   if (!Array.isArray(argv) || argv.length !== 3 || argv[2] !== "daemon") return false;
+  if (platform === "win32") {
+    const normalize = (filename) => {
+      const resolved = path.win32.resolve(filename);
+      return (fs.existsSync(resolved) ? fs.realpathSync.native(resolved) : resolved).toLowerCase();
+    };
+    const bareNode = /^(?:node|node\.exe)$/i.test(argv[0]);
+    let executable = argv[0];
+    if (bareNode) {
+      executable = identity?.executable;
+      if (!executable) {
+        executable = String(process.env.PATH || "").split(path.delimiter)
+          .map((dir) => path.join(dir, "node.exe")).find((filename) => fs.existsSync(filename));
+      }
+      if (!executable || path.win32.basename(executable).toLowerCase() !== "node.exe") return false;
+    }
+    if (normalize(executable) !== normalize(identity?.executable || executable)) return false;
+    return scripts.some((script) => normalize(argv[1]) === normalize(script));
+  }
   const executable = path.resolve(argv[0]);
   const expectedExecutable = path.resolve(identity?.executable || argv[0]);
-  if (process.platform === "win32") {
-    if (executable.toLowerCase() !== expectedExecutable.toLowerCase()) return false;
-    return scripts.some((script) => path.resolve(argv[1]).toLowerCase() === path.resolve(script).toLowerCase());
-  }
   if (executable !== expectedExecutable) return false;
   return scripts.includes(path.resolve(argv[1]));
 }
@@ -1265,6 +1281,10 @@ export async function uninstallFlock({
   // Preflight links before stopping processes or changing any shared configuration.
   for (const filename of [...paths.skills, ...paths.persistence, ...paths.configs.map((config) => config.path)]) assertNoLinks(filename);
   for (const { root, ownedRuntimeFiles, manifest } of installations) {
+    for (const relative of [
+      path.join(".data", "support-quarantine", "device", "support-device.json"),
+      path.join(".data", "support-quarantine", "mailbox", "support-mailbox.json"),
+    ]) assertNoLinks(path.join(root, relative));
     for (const filename of ownedRuntimeFiles) {
       const target = assertNoLinks(path.join(root, filename));
       if (filename.endsWith(".mjs") && fs.existsSync(target)) {
@@ -1343,6 +1363,23 @@ export async function uninstallFlock({
   if (report.retained.some(({ path: filename }) => paths.configs.some((config) => config.path === filename))) return report;
   for (const { root, ownedRuntimeFiles, manifest } of installations) {
     // Unknown files are never erased, even inside a dedicated runtime directory.
+    for (const [relative, type] of [
+      [path.join(".data", "support-quarantine", "device", "support-device.json"), "copilot-flock-support-device-v1"],
+      [path.join(".data", "support-quarantine", "mailbox", "support-mailbox.json"), "copilot-flock-support-mailbox-v1"],
+    ]) {
+      const target = assertNoLinks(path.join(root, relative));
+      if (!fs.existsSync(target)) continue;
+      try {
+        if (!fs.lstatSync(target).isFile() || JSON.parse(fs.readFileSync(target, "utf8"))?.type !== type) {
+          throw new Error("Unproven support artifact ownership; preserved");
+        }
+        fs.unlinkSync(target);
+        report.removed.push(target);
+        removeEmptyParents(target, root);
+      } catch (error) {
+        report.retained.push({ path: target, reason: error.message });
+      }
+    }
     for (const filename of ownedRuntimeFiles.filter((name) => name !== "flock.mjs" && name !== "bridge.mjs" && name !== "installation.json")
       .concat(["bridge.mjs", "flock.mjs", "installation.json"])) {
       const target = path.join(root, filename);
@@ -1801,7 +1838,7 @@ const EMBEDDED_RUNTIME_MANIFEST_FALLBACK = (() => {
     operationsSha = hashRuntimeModule(fs.readFileSync(path.join(__lifecycleDir, "flock-operations.mjs")));
     supportSha = hashRuntimeModule(fs.readFileSync(path.join(__lifecycleDir, "flock-support.mjs")));
   } catch {}
-  const entrypointSha = "a399902119c80c86744ed16567cb30cc52ee0aab83eaa388f2d49f9b87b703e9";
+  const entrypointSha = "04b135fea4fcf5090af0526c6b03eeebb3bfade231ae4cb977f43b4ed07d9d90";
   const fallback = {
     type: "copilot-flock-runtime-manifest-v1",
     schema: 1,
@@ -1822,7 +1859,7 @@ const EMBEDDED_RUNTIME_MANIFEST_FALLBACK = (() => {
       },
       "flock-azure.mjs": {
         role: "companion",
-        sha256: "6dd60ee4f5f10a7e6d6438d650d71063514a5b8c3675ddb6c15eced6165effab",
+        sha256: "cce5b56a64877e35df0f93f8d81a7e09c95827056d83eccfde9f7b1443026d5f",
         imports: ["./flock-protocol.mjs"],
       },
       "flock-broker-free.mjs": {
@@ -1847,7 +1884,7 @@ const EMBEDDED_RUNTIME_MANIFEST_FALLBACK = (() => {
       },
       "flock-membership.mjs": {
         role: "companion",
-        sha256: "01b78c41f52193332aa44af190cea838a5d92b12f089989432c59e230dabbb37",
+        sha256: "05ae04e148b610fb7b2d1d86914f5373ede6262b45188427c5949c11cb64773a",
         imports: [
           "./flock-lifecycle.mjs",
           "./flock-protocol.mjs",
@@ -2206,7 +2243,8 @@ function updateRuntimeState(targetDir, patch) {
 
 function redactRuntimeError(error) {
   return String(error?.message || error || "")
-    .replace(/-----BEGIN [^-]+ PRIVATE KEY-----[\s\S]*?-----END [^-]+ PRIVATE KEY-----/gi, "[REDACTED PRIVATE KEY]")
+    .replace(/-----BEGIN (?:[A-Z]+ )?PRIVATE KEY-----[\s\S]*?-----END (?:[A-Z]+ )?PRIVATE KEY-----/gi, "[REDACTED PRIVATE KEY]")
+    .replace(/\bBearer\s+[A-Za-z0-9._~+/-]+=*/gi, "Bearer [REDACTED]")
     .replace(/\b(?:gh[opsu]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,})\b/g, "[REDACTED TOKEN]")
     .replace(/\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/g, "[REDACTED JWT]")
     .replace(/\b(AccessKey|SharedAccessKey|SharedAccessSignature|sig)=([^;\s&]+)/gi, "$1=[REDACTED]")

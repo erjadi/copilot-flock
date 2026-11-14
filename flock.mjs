@@ -78,7 +78,7 @@ import {
   PresenceStateTracker,
   compactOperation,
 } from "./flock-operations.mjs";
-import { SupportMailbox, ensureSupportDeviceKey } from "./flock-support.mjs";
+import { SupportMailbox, createSupportTicket, ensureSupportDeviceKey, validateSupportReport, validateSupportText } from "./flock-support.mjs";
 
 export {
   FlockMembershipRegistry,
@@ -4974,7 +4974,7 @@ function projectPublicQuarantinedMember(entry) {
   return out;
 }
 
-function projectPublicDaemonStatus(daemon) {
+function projectPublicDaemonStatus(daemon, options = {}) {
   if (!daemon || typeof daemon !== "object") return daemon ?? null;
   const out = {};
   for (const key of [
@@ -5008,7 +5008,10 @@ function projectPublicDaemonStatus(daemon) {
       stateOut.residentRuntime = { ...daemon.state.residentRuntime };
     }
     if (Array.isArray(daemon.state.knownPeers)) {
-      stateOut.knownPeers = daemon.state.knownPeers.map(projectPublicOnlineMachine).filter(Boolean);
+      stateOut.knownPeerCount = daemon.state.knownPeers.length;
+      if (options.detail === "full" || options.full === true) {
+        stateOut.knownPeers = daemon.state.knownPeers.map(projectPublicOnlineMachine).filter(Boolean);
+      }
     }
     out.state = stateOut;
   }
@@ -5051,7 +5054,7 @@ export function projectPublicStatusResponse(result, options = {}) {
         ? redactFlockSnapshot(result.discoveryError)
         : result.discoveryError;
   }
-  if (result?.daemon !== undefined) out.daemon = projectPublicDaemonStatus(result.daemon);
+  if (result?.daemon !== undefined) out.daemon = projectPublicDaemonStatus(result.daemon, options);
   if (result?.specs) out.specs = projectPublicSpecs(result.specs);
   if (Array.isArray(result?.onlineMachines)) {
     const page = boundedPage(result.onlineMachines, {
@@ -5072,20 +5075,32 @@ export function projectPublicStatusResponse(result, options = {}) {
     out.knownMembersPage = page.page;
   }
   if (Array.isArray(result?.offlineMembers)) {
-    out.offlineMembers = boundedPage(result.offlineMembers, {
+    const page = boundedPage(result.offlineMembers, {
       cursor: options.cursor,
       limit: options.limit,
       full: options.full === true || options.detail === "full",
-    }).items.map(projectPublicMember).filter(Boolean);
+    });
+    out.offlineMembers = page.items.map(projectPublicMember).filter(Boolean);
+    out.offlineMembersPage = page.page;
   }
   if (Array.isArray(result?.flocks)) {
-    out.flocks = boundedPage(result.flocks, {
+    const page = boundedPage(result.flocks, {
       cursor: options.cursor,
       limit: options.limit,
       full: options.full === true || options.detail === "full",
-    }).items.map(projectPublicFlockRecord).filter(Boolean);
+    });
+    out.flocksPage = page.page;
+    out.flocks = page.items.map((flock) => {
+      const record = projectPublicFlockRecord(flock, options);
+      if (options.detail !== "full" && options.full !== true && record) { delete record.members; delete record.tombstones; }
+      return record;
+    }).filter(Boolean);
   }
-  if (result?.roster) out.roster = projectPublicRoster(result.roster);
+  if (result?.roster) out.roster = projectPublicRoster(result.roster, options);
+  if (options.detail !== "full" && options.full !== true && out.runtimeStates) {
+    if (out.runtimeStates.update) out.update = out.runtimeStates.update;
+    delete out.runtimeStates;
+  }
   return out;
 }
 
@@ -5150,7 +5165,7 @@ function projectPublicOnlineMachine(machine) {
   return out;
 }
 
-function projectPublicFlockRecord(record) {
+function projectPublicFlockRecord(record, options = {}) {
   if (!record || typeof record !== "object") return null;
   const out = {};
   for (const key of [
@@ -5164,12 +5179,20 @@ function projectPublicFlockRecord(record) {
     if (record[key] !== undefined) out[key] = record[key];
   }
   if (Array.isArray(record.allowedScopes)) out.allowedScopes = [...record.allowedScopes];
-  if (Array.isArray(record.members)) out.members = record.members.map(projectPublicMember).filter(Boolean);
-  if (Array.isArray(record.tombstones)) out.tombstones = record.tombstones.map(projectPublicMember).filter(Boolean);
+  if (Array.isArray(record.members)) {
+    const page = boundedPage(record.members, { ...options, full: options.detail === "full" || options.full === true });
+    out.members = page.items.map(projectPublicMember).filter(Boolean);
+    out.membersPage = page.page;
+  }
+  if (Array.isArray(record.tombstones)) {
+    const page = boundedPage(record.tombstones, { ...options, full: options.detail === "full" || options.full === true });
+    out.tombstones = page.items.map(projectPublicMember).filter(Boolean);
+    out.tombstonesPage = page.page;
+  }
   return out;
 }
 
-function projectPublicRoster(roster) {
+function projectPublicRoster(roster, options = {}) {
   if (!roster || typeof roster !== "object") return roster || null;
   const out = {};
   for (const key of ["protocol", "livePresenceProbed", "source", "presenceNote"]) {
@@ -5203,15 +5226,20 @@ function projectPublicRoster(roster) {
       ])
     );
   }
-  if (Array.isArray(roster.flocks)) out.flocks = roster.flocks.map(projectPublicFlockRecord).filter(Boolean);
+  if (Array.isArray(roster.quarantinedMembers)) {
+    const page = boundedPage(roster.quarantinedMembers, {
+      ...options, full: options.detail === "full" || options.full === true,
+    });
+    out.quarantinedMembers = page.items.map(projectPublicQuarantinedMember).filter(Boolean);
+    out.quarantinedMembersPage = page.page;
+  }
+  if (options.detail !== "full" && options.full !== true) return out;
+  if (Array.isArray(roster.flocks)) out.flocks = roster.flocks.map((flock) => projectPublicFlockRecord(flock, options)).filter(Boolean);
   if (Array.isArray(roster.knownMembers)) {
     out.knownMembers = roster.knownMembers.map(projectPublicMember).filter(Boolean);
   }
   if (Array.isArray(roster.offlineMembers)) {
     out.offlineMembers = roster.offlineMembers.map(projectPublicMember).filter(Boolean);
-  }
-  if (Array.isArray(roster.quarantinedMembers)) {
-    out.quarantinedMembers = roster.quarantinedMembers.map(projectPublicQuarantinedMember).filter(Boolean);
   }
   return out;
 }
@@ -5226,42 +5254,50 @@ export function projectPublicFlocksResponse(result, options = {}) {
     canonicalAddress: result.canonicalAddress,
     scope: result.scope,
     effectiveOwner: result.effectiveOwner,
-    flocks: flockPage.items.map(projectPublicFlockRecord).filter(Boolean),
+    flocks: flockPage.items.map((flock) => {
+      const record = projectPublicFlockRecord(flock, options);
+      if (!full && record) { delete record.members; delete record.tombstones; }
+      return record;
+    }).filter(Boolean),
     flocksPage: flockPage.page,
     knownMembers: memberPage.items.map(projectPublicMember).filter(Boolean),
     knownMembersPage: memberPage.page,
-    roster: projectPublicRoster(result.roster),
+    roster: projectPublicRoster(result.roster, options),
   };
-  if (Array.isArray(result.localFlocks)) {
-    projected.localFlocks = result.localFlocks.map(projectPublicFlockRecord).filter(Boolean);
-  } else if (result.localFlocks) {
+  if (full && Array.isArray(result.localFlocks)) {
+    projected.localFlocks = result.localFlocks.map((flock) => projectPublicFlockRecord(flock, options)).filter(Boolean);
+  } else if (full && result.localFlocks) {
     projected.localFlocks = {
       ownerGitHubUser: result.localFlocks.ownerGitHubUser || null,
       scope: result.localFlocks.scope || null,
       flocks: Object.fromEntries(
-        Object.entries(result.localFlocks.flocks || {}).map(([id, record]) => [id, projectPublicFlockRecord(record)])
+        Object.entries(result.localFlocks.flocks || {}).map(([id, record]) => [id, projectPublicFlockRecord(record, options)])
       ),
     };
   }
   if (Array.isArray(result.quarantinedMembers)) {
-    projected.quarantinedMembers = result.quarantinedMembers
-      .map(projectPublicQuarantinedMember)
-      .filter(Boolean);
+    const page = boundedPage(result.quarantinedMembers, { ...options, full });
+    projected.quarantinedMembers = page.items.map(projectPublicQuarantinedMember).filter(Boolean);
+    projected.quarantinedMembersPage = page.page;
   }
-  if (Array.isArray(result.remoteOwnedFlocks)) {
-    projected.remoteOwnedFlocks = result.remoteOwnedFlocks.map(projectPublicFlockRecord).filter(Boolean);
+  if (full && Array.isArray(result.remoteOwnedFlocks)) {
+    projected.remoteOwnedFlocks = result.remoteOwnedFlocks.map((flock) => projectPublicFlockRecord(flock, options)).filter(Boolean);
   }
-  if (Array.isArray(result.remoteJoinedFlocks)) {
-    projected.remoteJoinedFlocks = result.remoteJoinedFlocks.map(projectPublicFlockRecord).filter(Boolean);
+  if (full && Array.isArray(result.remoteJoinedFlocks)) {
+    projected.remoteJoinedFlocks = result.remoteJoinedFlocks.map((flock) => projectPublicFlockRecord(flock, options)).filter(Boolean);
   }
-  if (Array.isArray(result.cachedFlocks)) {
-    projected.cachedFlocks = result.cachedFlocks.map(projectPublicFlockRecord).filter(Boolean);
+  if (full && Array.isArray(result.cachedFlocks)) {
+    projected.cachedFlocks = result.cachedFlocks.map((flock) => projectPublicFlockRecord(flock, options)).filter(Boolean);
   }
   if (Array.isArray(result.onlineMachines)) {
-    projected.onlineMachines = result.onlineMachines.map(projectPublicOnlineMachine).filter(Boolean);
+    const page = boundedPage(result.onlineMachines, { ...options, full });
+    projected.onlineMachines = page.items.map(projectPublicOnlineMachine).filter(Boolean);
+    projected.onlineMachinesPage = page.page;
   }
   if (Array.isArray(result.offlineMembers)) {
-    projected.offlineMembers = result.offlineMembers.map(projectPublicMember).filter(Boolean);
+    const page = boundedPage(result.offlineMembers, { ...options, full });
+    projected.offlineMembers = page.items.map(projectPublicMember).filter(Boolean);
+    projected.offlineMembersPage = page.page;
   }
   for (const key of [
     "reconciledFlockIds", "healedFlockIds", "preservedOwnerFlockIds", "quarantinedFlockIds",
@@ -5269,6 +5305,29 @@ export function projectPublicFlocksResponse(result, options = {}) {
     if (result[key] !== undefined) projected[key] = result[key];
   }
   return projected;
+}
+
+function projectPublicMembersResponse(result, options) {
+  if (Array.isArray(result.flocks)) {
+    const page = boundedPage(result.flocks, { ...options, full: options.detail === "full" });
+    return { totalFlocks: result.totalFlocks, flocks: page.items.map((flock) => projectPublicFlockRecord(flock, options)), flocksPage: page.page };
+  }
+  return projectPublicFlockRecord(result, options);
+}
+
+function projectPublicDiagnosticsResponse(result, options) {
+  const full = options.detail === "full";
+  const page = boundedPage(result.members, { ...options, full });
+  return {
+    ...result,
+    ...(result.daemon ? { daemon: projectPublicDaemonStatus(result.daemon, options) } : {}),
+    members: page.items.map((member) => full ? member : Object.fromEntries(
+      ["machineId", "scope", "online", "healthy", "version", "expectedVersion", "overallState",
+        "presenceLayers", "reason", "issues", "remediation", "duplicateInstances", "daemonInstanceCount"]
+        .filter((key) => member[key] !== undefined).map((key) => [key, member[key]])
+    )),
+    membersPage: page.page,
+  };
 }
 
 export function projectPublicEnrollmentResult(result) {
@@ -13310,11 +13369,12 @@ const MCP_TOOLS = [
     inputSchema: { type: "object", properties: {
       flock: { type: "string" }, support_public_key: { type: "string" },
       ttl_seconds: { type: "number" },
-    }, required: ["flock", "support_public_key"] } },
+    }, required: ["support_public_key"] } },
   { name: "revoke_support_ticket", description: "Revoke an unredeemed support ticket issued by this maintainer device.",
-    inputSchema: { type: "object", properties: { ticket_id: { type: "string" } }, required: ["ticket_id"] } },
+    inputSchema: { type: "object", properties: { flock: { type: "string" }, ticket_id: { type: "string" } }, required: ["ticket_id"] } },
   { name: "submit_support_report", description: "Redeem one support ticket and submit bounded text plus schema-validated inert diagnostics. This grants no membership or execution rights.",
     inputSchema: { type: "object", properties: {
+      bootstrap_url: { type: "string", description: "Explicit trusted maintainer support endpoint for an unenrolled device." },
       ticket: { type: "object" }, text: { type: "string", maxLength: 4096 },
       diagnostics: {
         type: "object",
@@ -13334,16 +13394,16 @@ const MCP_TOOLS = [
     }, required: ["ticket", "text"] } },
   { name: "list_support_attempts", description: "List quarantined support attempts issued by this maintainer device with cursor pagination.",
     inputSchema: { type: "object", properties: {
-      cursor: { type: "number" }, limit: { type: "number" }, include_closed: { type: "boolean" },
+      flock: { type: "string" }, cursor: { type: "number" }, limit: { type: "number" }, include_closed: { type: "boolean" },
     } } },
   { name: "read_support_attempt", description: "Read inert support report data for an attempt issued by this maintainer device.",
-    inputSchema: { type: "object", properties: { attempt_id: { type: "string" } }, required: ["attempt_id"] } },
+    inputSchema: { type: "object", properties: { flock: { type: "string" }, attempt_id: { type: "string" } }, required: ["attempt_id"] } },
   { name: "reply_support_attempt", description: "Append a bounded maintainer text reply to a quarantined support attempt.",
     inputSchema: { type: "object", properties: {
-      attempt_id: { type: "string" }, text: { type: "string" },
+      flock: { type: "string" }, attempt_id: { type: "string" }, text: { type: "string" },
     }, required: ["attempt_id", "text"] } },
   { name: "close_support_attempt", description: "Close a quarantined support attempt without enrolling or promoting the ticket holder.",
-    inputSchema: { type: "object", properties: { attempt_id: { type: "string" } }, required: ["attempt_id"] } },
+    inputSchema: { type: "object", properties: { flock: { type: "string" }, attempt_id: { type: "string" } }, required: ["attempt_id"] } },
   { name: "approve_join", description: "Designated owner approves independently verified device keys and seals a scoped Welcome Ticket.",
     inputSchema: { type: "object", properties: { flock: { type: "string" }, join_code: { type: "object" },
       device_fingerprint: { type: "string" }, role: { type: "string", enum: ["collaborator", "guest"] },
@@ -14291,7 +14351,7 @@ for (const tool of MCP_TOOLS) {
       "Explicit <owner>/<flock> membership selector (validated first when supplied). Required for multi-flock broker-free calls unless an explicit to_machine has a single active, non-expired authorized route.",
   };
 }
-for (const name of ["flock_status", "bridge_status", "list_flocks", "list_flock_members", "diagnose_bridge_fleet"]) {
+for (const name of ["flock_status", "bridge_status", "list_flocks", "list_flock_members", "diagnose_bridge_fleet", "diagnose_flock_fleet"]) {
   const tool = MCP_TOOLS.find((entry) => entry.name === name);
   if (!tool) continue;
   tool.inputSchema.properties.detail ||= {
@@ -14322,6 +14382,8 @@ Object.assign(MCP_TOOLS.find((tool) => tool.name === "kick_flock_member").inputS
 });
 
 export async function executeMcpTool(cfg, name, args = {}, options = {}) {
+  const projectStatus = (result) => projectPublicStatusResponse(result, args);
+  const projectFlocks = (result) => projectPublicFlocksResponse(result, args);
   const deps = options;
   if (name === "mcp_self_info") {
     return getMcpSelfInfo(cfg);
@@ -14357,18 +14419,40 @@ export async function executeMcpTool(cfg, name, args = {}, options = {}) {
       const identity = readMachineIdentityKeypairPassive() || ensureMachineIdentityKeypair();
       return {
         ...identity,
-        deviceId: cfg?.identity?.deviceId || cfg?.deviceId || cfg?.machineId || identity.fingerprint,
+        deviceId: cfg?.identity?.deviceId || cfg?.deviceId || identity.fingerprint,
       };
     };
+    const supportEndpoint = cfg?.bootstrapUrl || (name === "submit_support_report" ? args.bootstrap_url : null);
+    const supportCall = async (route, body, authenticated = true) => {
+      const origin = validatePinnedBootstrapOrigin(supportEndpoint, cfg?.bootstrapUrl || null);
+      const url = new URL(`/api/v3/support/${route}`, origin);
+      const rawBody = JSON.stringify(body);
+      if (Buffer.byteLength(rawBody) > 16384) throw new Error("Support payload exceeds 16384 bytes");
+      const headers = { "Content-Type": "application/json" };
+      if (authenticated) {
+        const key = maintainerKey();
+        const timestamp = new Date().toISOString();
+        const hash = crypto.createHash("sha256").update(rawBody).digest("hex");
+        const canonical = `http|v3|POST|${url.pathname}|${hash}|${key.deviceId}|${timestamp}`;
+        headers["X-Flock-Device-Id"] = key.deviceId;
+        headers["X-Flock-Timestamp"] = timestamp;
+        headers["X-Flock-Signature"] = crypto.sign(null, Buffer.from(canonical), key.privateKey).toString("base64");
+      }
+      const response = await (options.supportFetch || fetch)(url, {
+        method: "POST", redirect: "error", signal: AbortSignal.timeout(10000), headers, body: rawBody,
+      });
+      const result = await response.json();
+      if (!response.ok) throw Object.assign(new Error(result.error || "Support request rejected"), { code: result.code });
+      return result;
+    };
     const assertMaintainer = (flockSelector = null) => {
-      if (options.supportMaintainerAuthorized === true) return;
+      if (options.supportMaintainerAuthorized === true) return flockSelector || cfg?.flockId;
       if (cfg?.protocol === "broker-free-v34") {
         const runtime = (options.brokerFreeRuntimeFactory || brokerFreeRuntime)(cfg, options.runtimeOptions || {});
-        runtime.assertOwner(runtime.select(flockSelector || cfg?.flockId));
-        return;
+        return runtime.assertOwner(runtime.select(flockSelector || cfg?.flockId)).flockId;
       }
-      const selected = authorizeCallerFlockSelection(cfg, flockSelector || cfg?.flockId);
-      const policy = loadLocalFlocksConfig(cfg).flocks?.[selected.canonicalPath];
+      const selected = authorizeCallerFlockSelection(cfg, flockSelector || resolveDefaultOperationFlockSelector(cfg));
+      const policy = loadLocalFlocksConfig(cfg).flocks?.[selected.flockId];
       const caller = normalizeGitHubUser(cfg?.githubUser)?.toLowerCase();
       if (!caller || normalizeGitHubUser(policy?.ownerGitHubUser)?.toLowerCase() !== caller) {
         const error = new Error("Support mailbox maintainer access requires verified flock owner authority");
@@ -14376,6 +14460,7 @@ export async function executeMcpTool(cfg, name, args = {}, options = {}) {
         error.statusCode = 403;
         throw error;
       }
+      return selected.flockId;
     };
     if (name === "create_support_device_key") {
       const key = ensureSupportDeviceKey(path.join(supportRoot, "device"));
@@ -14388,16 +14473,21 @@ export async function executeMcpTool(cfg, name, args = {}, options = {}) {
       };
     }
     if (name === "issue_support_ticket") {
-      assertMaintainer(args.flock);
-      return mailbox.issue({
+      const flockId = assertMaintainer(args.flock);
+      const input = {
         maintainerIdentity: maintainerKey(),
-        flockId: args.flock,
+        flockId,
         supportPublicKey: args.support_public_key,
         ttlSeconds: args.ttl_seconds,
+      };
+      if (supportEndpoint) return supportCall("tickets/issue", {
+        flock: flockId, supportPublicKey: input.supportPublicKey, ticket: createSupportTicket(input),
       });
+      return mailbox.issue(input);
     }
     if (name === "revoke_support_ticket") {
-      assertMaintainer(args.flock);
+      const flockId = assertMaintainer(args.flock);
+      if (supportEndpoint) return supportCall("tickets/revoke", { flock: flockId, ticketId: args.ticket_id });
       return mailbox.revoke({
         ticketId: args.ticket_id,
         maintainerDeviceId: maintainerKey().deviceId,
@@ -14405,25 +14495,30 @@ export async function executeMcpTool(cfg, name, args = {}, options = {}) {
     }
     if (name === "submit_support_report") {
       const key = ensureSupportDeviceKey(path.join(supportRoot, "device"));
-      const report = {
+      const report = validateSupportReport({
         text: args.text,
         diagnostics: args.diagnostics || {},
         submittedAt: new Date().toISOString(),
-      };
+      });
       const signature = crypto.sign(null, Buffer.from(JSON.stringify({
         ticketId: args.ticket?.body?.ticketId,
         nonce: args.ticket?.body?.nonce,
         report,
       })), key.privateKey).toString("base64");
-      return mailbox.submit({
+      const input = {
         ticket: args.ticket,
         supportPublicKey: key.publicKey,
         report,
         signature,
-      });
+      };
+      if (supportEndpoint) return supportCall("reports", input, false);
+      return mailbox.submit(input);
     }
     if (name === "list_support_attempts") {
-      assertMaintainer(args.flock);
+      const flockId = assertMaintainer(args.flock);
+      if (supportEndpoint) return supportCall("attempts", {
+        flock: flockId, cursor: args.cursor, limit: args.limit, includeClosed: Boolean(args.include_closed),
+      });
       return mailbox.list({
         maintainerDeviceId: maintainerKey().deviceId,
         cursor: args.cursor,
@@ -14432,11 +14527,13 @@ export async function executeMcpTool(cfg, name, args = {}, options = {}) {
       });
     }
     if (name === "read_support_attempt") {
-      assertMaintainer(args.flock);
+      const flockId = assertMaintainer(args.flock);
+      if (supportEndpoint) return supportCall("attempts/read", { flock: flockId, attemptId: args.attempt_id });
       return mailbox.get({ attemptId: args.attempt_id, maintainerDeviceId: maintainerKey().deviceId });
     }
     if (name === "reply_support_attempt") {
-      assertMaintainer(args.flock);
+      const flockId = assertMaintainer(args.flock);
+      if (supportEndpoint) return supportCall("attempts/reply", { flock: flockId, attemptId: args.attempt_id, text: validateSupportText(args.text) });
       return mailbox.reply({
         attemptId: args.attempt_id,
         maintainerDeviceId: maintainerKey().deviceId,
@@ -14444,7 +14541,8 @@ export async function executeMcpTool(cfg, name, args = {}, options = {}) {
       });
     }
     if (name === "close_support_attempt") {
-      assertMaintainer(args.flock);
+      const flockId = assertMaintainer(args.flock);
+      if (supportEndpoint) return supportCall("attempts/close", { flock: flockId, attemptId: args.attempt_id });
       return mailbox.close({ attemptId: args.attempt_id, maintainerDeviceId: maintainerKey().deviceId });
     }
   }
@@ -14495,9 +14593,9 @@ export async function executeMcpTool(cfg, name, args = {}, options = {}) {
     if (name === "list_flock_members") {
       const selected = runtime.select(explicitFlock);
       if (args.sync_owner === true) await runtime.syncRoster(selected.flockId);
-      return runtime.getFlockRegistryView(selected.flockId, {
+      return projectPublicMembersResponse(runtime.getFlockRegistryView(selected.flockId, {
         includeRemoved: Boolean(args.include_removed),
-      });
+      }), args);
     }
     if (name === "list_flocks") {
       let onlineMachines = null;
@@ -14528,7 +14626,7 @@ export async function executeMcpTool(cfg, name, args = {}, options = {}) {
           };
         }
       }
-      return projectPublicFlocksResponse(await resolveBrokerFreeFlockRoster(cfg, {
+      return projectFlocks(await resolveBrokerFreeFlockRoster(cfg, {
         ...options,
         runtime,
         targetFlock: explicitFlock || null,
@@ -14587,7 +14685,7 @@ export async function executeMcpTool(cfg, name, args = {}, options = {}) {
         const scope = cfg?.scope ? normalizeScope(cfg.scope, "work") : "work";
         const localCopilotWs = getLocalWsConnectionInfo() ? "online" : "offline";
         if (!daemonStatus.running) {
-          return projectPublicStatusResponse({
+          return projectStatus({
             status: "unavailable",
             passive: true,
             reason:
@@ -14664,7 +14762,7 @@ export async function executeMcpTool(cfg, name, args = {}, options = {}) {
         residentOverride: selfPing?.resident || null,
       });
       const merged = applyLivePresenceToBrokerFreeRoster(rosterOut, machines, liveSignalRSource);
-      return projectPublicStatusResponse({
+      return projectStatus({
         ...(args.passive === true ? { status: "ok", passive: true } : {}),
         localMachineId: scopedCfg.machineId,
         protocol: "broker-free-v34",
@@ -14791,7 +14889,7 @@ export async function executeMcpTool(cfg, name, args = {}, options = {}) {
           bridgeHome: deps.bridgeHome || null,
           configPath: deps.configPath || cfg?.configPath || null,
         });
-        return projectPublicStatusResponse({
+        return projectStatus({
           status: "unavailable",
           passive: true,
           reason:
@@ -14829,7 +14927,7 @@ export async function executeMcpTool(cfg, name, args = {}, options = {}) {
           bridgeHome: deps.bridgeHome || null,
           configPath: deps.configPath || cfg?.configPath || null,
         });
-        return projectPublicStatusResponse({
+        return projectStatus({
           status: "ok",
           passive: true,
           localMachineId,
@@ -14855,7 +14953,7 @@ export async function executeMcpTool(cfg, name, args = {}, options = {}) {
           bridgeHome: deps.bridgeHome || null,
           configPath: deps.configPath || cfg?.configPath || null,
         });
-        return projectPublicStatusResponse({
+        return projectStatus({
           status: "unavailable",
           passive: true,
           reason,
@@ -14936,7 +15034,7 @@ export async function executeMcpTool(cfg, name, args = {}, options = {}) {
       liveOutcome.machines,
       liveOutcome.source
     );
-    return projectPublicStatusResponse({
+    return projectStatus({
       localMachineId: cfg.machineId,
       protocol: "legacy-v3",
       ...(targetFlock ? { flockId: merged.flocks[0]?.flockId || targetFlock } : {}),
@@ -15610,12 +15708,12 @@ export async function executeMcpTool(cfg, name, args = {}, options = {}) {
     if (!passive) {
       await ensureDaemonStarted(cfg);
     }
-    return await diagnoseFleetMachines(cfg, {
+    return projectPublicDiagnosticsResponse(await (options.diagnoseFleet || diagnoseFleetMachines)(cfg, {
       machines: args.machines || "*",
       scope: args.scope || null,
       fix,
       passive,
-    });
+    }), args);
   }
 
   if (name === "acquire_remote_lock") {
@@ -15775,7 +15873,7 @@ export async function executeMcpTool(cfg, name, args = {}, options = {}) {
         throw error;
       }
     }
-    return projectPublicFlocksResponse({
+    return projectFlocks({
       machineId: cfg.machineId,
       protocol: "legacy-v3",
       canonicalAddress: `${(resolved.effectiveOwner || cfg.githubUser || "unknown").toLowerCase()}/${normalizeScope(cfg.scope, "work")}/${cfg.machineId}`,
@@ -15805,12 +15903,13 @@ export async function executeMcpTool(cfg, name, args = {}, options = {}) {
   }
 
   if (name === "list_flock_members") {
-    return await queryFlockMembershipRegistry(cfg, {
+    return projectPublicMembersResponse(await queryFlockMembershipRegistry(cfg, {
       flockId: args.flock || null,
       includeRemoved: Boolean(args.include_removed),
       refreshBroker: Boolean(args.refresh_broker),
       syncOwner: Boolean(args.sync_owner),
-    });
+      customFlocksPath: options.flocksConfigPath || cfg.flocksConfigPath,
+    }), args);
   }
 
   if (name === "invite_to_flock") {
@@ -18019,6 +18118,108 @@ export function reapOrphanedMcpProcesses() {
   return [];
 }
 
+export async function activateRuntimeUpdate(cfg, {
+  root = getBridgeHome(), updateId,
+}, {
+  restartRuntime = async () => {
+    const paths = lifecyclePaths();
+    if (process.platform === "linux" && paths.persistence.some((filename) => filename.endsWith(".service") && fs.existsSync(filename))) {
+      await activateLinuxSystemdDaemon({ root, paths });
+    } else {
+      await stopPinnedDaemon(root, paths);
+      await ensureDaemonStarted(cfg);
+    }
+    const deadline = Date.now() + 20000;
+    while (Date.now() < deadline) {
+      const status = inspectLocalDaemonPassive(cfg);
+      if (status.running) {
+        const reply = await invokeRemoteRpc(cfg, {
+          toMachine: cfg.machineId, action: "ping", params: { passive: true },
+          timeoutMs: 2000, allowLoopback: true, passive: true,
+        });
+        const resident = reply?.result?.resident;
+        if (resident?.running && resident.pid === status.pid) return resident;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 200));
+    }
+    throw new Error("Updated daemon readiness and runtime digest could not be verified");
+  },
+  selfTest = async () => {
+    const result = await runBoundedSubprocess(process.execPath, [path.join(root, "flock.mjs"), "self-test"], {
+      timeoutMs: 30000, maxOutputBytes: 8192,
+    });
+    if (!result.ok) throw new Error("Updated runtime self-test failed; inspect daemon health and retry activation");
+    const body = JSON.parse(result.stdout);
+    if (body.ok !== true || body.machineId !== cfg.machineId) throw new Error("Updated runtime self-test returned an invalid identity");
+  },
+} = {}) {
+  const journalPath = assertNoLinks(path.join(root, "update-activation.json"));
+  const journal = JSON.parse(fs.readFileSync(journalPath, "utf8"));
+  if (journal.type !== "copilot-flock-update-activation-v1" || journal.updateId !== updateId) {
+    throw new Error("Activation journal update identity mismatch");
+  }
+  if (journal.rollbackSource) {
+    const source = assertNoLinks(path.resolve(journal.rollbackSource));
+    if (path.dirname(source) !== fs.realpathSync(os.tmpdir()) ||
+        !path.basename(source).startsWith(`flock-update-rollback-${updateId}-`) ||
+        fs.existsSync(path.join(source, ".git"))) {
+      throw new Error("Rollback source ownership is unproven");
+    }
+  }
+  const phase = (value, extra = {}) => recordRuntimeUpdatePhase(root, {
+    updateId, correlationId: journal.correlationId, phase: value, ...extra,
+  });
+  const verifyRuntime = async (manifestDigest) => {
+    const installed = loadRuntimeManifest(root);
+    if (installed.manifestDigest !== manifestDigest) throw new Error("Activation manifest changed");
+    const resident = await restartRuntime();
+    phase("activated", { manifestDigest, version: installed.version });
+    await selfTest();
+    const state = await getLocalRuntimeStatesAsync({ targetDir: root, residentOverride: resident });
+    if (!state.verified?.fullyActive || state.installed?.digest !== manifestDigest ||
+        !state.verified.importVerified || !state.verified.closureVerified) {
+      throw new Error("Resident runtime does not match the installed verified import closure");
+    }
+    return state;
+  };
+  try {
+    const state = await verifyRuntime(journal.manifestDigest);
+    atomicJson(path.join(root, "update-verification.json"), {
+      updateId, manifestDigest: journal.manifestDigest, resident: state.resident,
+      processIdentity: inspectProcess(state.resident.pid),
+      selfTest: true, closureVerified: true, importVerified: true,
+    });
+    phase("verified", { manifestDigest: journal.manifestDigest, version: state.installed.version });
+    fs.unlinkSync(journalPath);
+    if (journal.rollbackSource) fs.rmSync(assertNoLinks(journal.rollbackSource), { recursive: true, force: true });
+    return state;
+  } catch (error) {
+    let rolledBack = false;
+    let rollbackError = null;
+    if (journal.rollbackSource) {
+      try {
+        const previous = loadRuntimeManifest(assertNoLinks(journal.rollbackSource));
+        if (previous.manifestDigest !== journal.previousManifestDigest) throw new Error("Rollback manifest changed");
+        stageAndActivateRuntime({ sourceDir: journal.rollbackSource, targetDir: root, updateId, correlationId: journal.correlationId });
+        await verifyRuntime(journal.previousManifestDigest);
+        rolledBack = true;
+      } catch (failure) { rollbackError = failure; }
+    }
+    phase(rolledBack ? "rolled_back" : "failed", {
+      error: rollbackError ? `${error.message}; rollback failed: ${rollbackError.message}` : error,
+      code: rolledBack ? "RUNTIME_ACTIVATION_ROLLED_BACK" : "RUNTIME_ACTIVATION_FAILED",
+      reason: "activation_verification_failed",
+    });
+    if (rolledBack) {
+      fs.unlinkSync(journalPath);
+      fs.rmSync(assertNoLinks(journal.rollbackSource), { recursive: true, force: true });
+    }
+    throw Object.assign(new Error("Runtime activation verification failed; see the redacted update journal"), {
+      code: rolledBack ? "RUNTIME_ACTIVATION_ROLLED_BACK" : "RUNTIME_ACTIVATION_FAILED",
+    });
+  }
+}
+
 export async function performLocalSelfUpdate(
   cfg,
   {
@@ -18037,8 +18238,10 @@ export async function performLocalSelfUpdate(
     repoDirOverride = null,
     gitExecFileSync = execFileSync,
     spawnProcess = spawnSessionSafeProcess,
+    activationTimeoutMs = 120000,
   } = {}
 ) {
+  if (!/^[A-Za-z0-9-]{1,128}$/.test(updateId)) throw new Error("Invalid runtime update ID");
   if (cfg?.protocol === "broker-free-v34") {
     const err = new Error("Remote self_update is not permitted in broker-free-v34 mode; existing protocol and credentials retained");
     err.code = "BROKER_FREE_MUTATION_FORBIDDEN";
@@ -18169,15 +18372,18 @@ export async function performLocalSelfUpdate(
 
   const targetScript = path.join(resolvedTargetDir, "flock.mjs");
   if (spawnInstall) {
+    atomicJson(path.join(resolvedTargetDir, "update-activation.json"), {
+      type: "copilot-flock-update-activation-v1", updateId, correlationId,
+      manifestDigest: activated.installed.digest, rollbackSource,
+      previousManifestDigest: previousStates.installed?.digest || null,
+    });
     try {
       const child = spawnProcess(
         process.execPath,
         [
           targetScript,
-          "install",
-          "--scope",
-          cfg.scope || "work",
-          ...(cfg.githubUser ? ["--github-user", cfg.githubUser] : []),
+          "activate-update",
+          "--update-id", updateId,
         ],
         {
           detached: true,
@@ -18187,11 +18393,14 @@ export async function performLocalSelfUpdate(
         { unitPrefix: "copilot-flock-install", unitId: updateId }
       );
       await new Promise((resolve, reject) => {
-        const timer = setTimeout(resolve, 250);
-        timer.unref?.();
-        child.once("spawn", () => {
+        const timer = setTimeout(() => reject(Object.assign(
+          new Error("Activation is still pending; inspect the persisted update ID before retrying"),
+          { code: "UPDATE_ACTIVATION_PENDING" }
+        )), activationTimeoutMs);
+        child.once("exit", (code) => {
           clearTimeout(timer);
-          resolve();
+          if (code === 0) resolve();
+          else reject(new Error("Runtime activator exited without successful verification"));
         });
         child.once("error", (error) => {
           clearTimeout(timer);
@@ -18199,7 +18408,22 @@ export async function performLocalSelfUpdate(
         });
       });
       child.unref();
+      const state = readRuntimeState(resolvedTargetDir);
+      if (state.update?.updateId !== updateId || state.update?.phase !== "verified") {
+        throw new Error("Activator exited without a verified update journal");
+      }
+      const proof = JSON.parse(fs.readFileSync(assertNoLinks(path.join(resolvedTargetDir, "update-verification.json")), "utf8"));
+      const live = proof.processIdentity ? inspectProcess(proof.processIdentity.pid) : null;
+      if (proof.updateId !== updateId || proof.manifestDigest !== activated.installed.digest || proof.selfTest !== true ||
+          !live || live.start !== proof.processIdentity.start || live.executable !== proof.processIdentity.executable) {
+        throw new Error("Activator runtime process identity verification failed");
+      }
     } catch (error) {
+      if (error.code === "UPDATE_ACTIVATION_PENDING") throw error;
+      const state = readRuntimeState(resolvedTargetDir);
+      if (state.update?.updateId === updateId && ["failed", "rolled_back"].includes(state.update.phase)) {
+        throw Object.assign(new Error("Runtime activation failed; see the redacted update journal"), { code: state.update.code });
+      }
       let rolledBack = false;
       let rollbackError = null;
       if (rollbackSource) {
@@ -18221,7 +18445,7 @@ export async function performLocalSelfUpdate(
         updateId,
         correlationId,
         phase: rolledBack ? "rolled_back" : "failed",
-        error: rollbackError || error,
+        error: rollbackError ? `${error.message}; rollback failed: ${rollbackError.message}` : error,
         code: rollbackError
           ? "RUNTIME_ROLLBACK_FAILED"
           : rolledBack
@@ -18234,7 +18458,9 @@ export async function performLocalSelfUpdate(
       if (rollbackSource && fs.existsSync(rollbackSource)) {
         fs.rmSync(rollbackSource, { recursive: true, force: true });
       }
-      throw Object.assign(new Error(`Runtime activation launcher failed: ${error.message}`), {
+      const activationJournal = path.join(resolvedTargetDir, "update-activation.json");
+      if (rolledBack && fs.existsSync(activationJournal)) fs.unlinkSync(activationJournal);
+      throw Object.assign(new Error(`Runtime activation launcher failed: ${redactFlockSnapshot(error.message)}`), {
         code: rolledBack ? "RUNTIME_ACTIVATION_SPAWN_ROLLED_BACK" : "RUNTIME_ACTIVATION_SPAWN_FAILED",
         cause: error,
       });
@@ -18252,8 +18478,19 @@ export async function performLocalSelfUpdate(
     fs.rmSync(rollbackSource, { recursive: true, force: true });
   }
 
+  const proof = spawnInstall
+    ? JSON.parse(fs.readFileSync(assertNoLinks(path.join(resolvedTargetDir, "update-verification.json")), "utf8")) : null;
+  const finalStates = spawnInstall
+    ? getLocalRuntimeStates({ targetDir: resolvedTargetDir, residentOverride: proof.resident }) : activated.runtimeStates;
+  if (spawnInstall && !finalStates.verified?.fullyActive) {
+    recordRuntimeUpdatePhase(resolvedTargetDir, {
+      updateId, correlationId, phase: "failed", error: "Installed artifacts changed after activation verification",
+      code: "RUNTIME_POST_ACTIVATION_DRIFT",
+    });
+    throw Object.assign(new Error("Installed runtime changed after activation verification"), { code: "RUNTIME_POST_ACTIVATION_DRIFT" });
+  }
   return {
-    status: activated.verified?.fullyActive ? "verified" : "activated",
+    status: spawnInstall || activated.verified?.fullyActive ? "verified" : "activated",
     updateId,
     correlationId,
     machineId: cfg.machineId,
@@ -18261,11 +18498,11 @@ export async function performLocalSelfUpdate(
     previousDigest: RUNTIME_MODULE_MANIFEST?.manifestDigest || null,
     repoDir,
     targetCommit: newCommit,
-    runtimeStates: activated.runtimeStates,
-    staged: activated.staged,
-    installed: activated.installed,
-    resident: activated.resident,
-    verified: activated.verified,
+    runtimeStates: finalStates,
+    staged: spawnInstall ? finalStates.staged : activated.staged,
+    installed: spawnInstall ? finalStates.installed : activated.installed,
+    resident: spawnInstall ? finalStates.resident : activated.resident,
+    verified: spawnInstall ? finalStates.verified : activated.verified,
   };
 }
 
@@ -21334,6 +21571,7 @@ export async function resolveLegacyFlockRoster(cfg, options = {}) {
     : [];
 
   const baseState = {
+    registryPath: options.flocksConfigPath || cfg?.flocksConfigPath || null,
     effectiveOwner,
     scopedTargetFlockId,
     scopedFlocks,
@@ -21403,6 +21641,7 @@ function applyLivePresenceToLegacyRoster(baseState, onlineMachines, liveSignalRS
   const allowedLiveMachines = new Set();
   const quarantinedMembers = [...(baseState.quarantinedMembers || [])];
   const revokedOwnerMachines = baseState.revokedOwnerMachines || new Set();
+  const registryFlocks = openFlockMembershipRegistry(baseState.registryPath).read().flocks || {};
 
   const flocksOut = baseState.scopedFlocks.map((f) => {
     const callerHasOwnerSpecs = f.trustTier === "owner" && f.shareSpecs === "full";
@@ -21410,6 +21649,14 @@ function applyLivePresenceToLegacyRoster(baseState, onlineMachines, liveSignalRS
     const flockMembers = (f.members || []).flatMap((m) => {
       const mUser = normalizeGitHubUser(m.githubUser || f.ownerGitHubUser)?.toLowerCase() || "unknown";
       if (revokedOwnerMachines.has(`${mUser}:${String(m.machineId || "").toLowerCase()}`)) {
+        return [];
+      }
+      const authoritative = registryFlocks[f.flockId];
+      if (Object.values(authoritative?.tombstones || {}).some((tombstone) =>
+        (m.peerId && tombstone.peerId === m.peerId) ||
+        (m.keyFingerprint && tombstone.keyFingerprint === m.keyFingerprint) ||
+        (String(tombstone.machineId || "").toLowerCase() === String(m.machineId || "").toLowerCase() &&
+          String(tombstone.githubUser || "").toLowerCase() === mUser))) {
         return [];
       }
       const live = findLiveMatch(mUser, m.machineId);
@@ -21993,7 +22240,9 @@ export function redactFlockSnapshot(text) {
     .replace(/((?:AccessKey|SharedAccessKey|api[_-]?key|password|client[_-]?secret|token)\s*["']?\s*[:=]\s*["']?)[^\s;"',}]+/gi, "$1[redacted]");
 }
 
-export async function dispatchBrokerFreeRpc(cfg, { member, payload, action, assertAuthorized, flockId }) {
+export async function dispatchBrokerFreeRpc(cfg, { member, payload, action, assertAuthorized, flockId }, {
+  injectMessage = injectLocalSessionMessage,
+} = {}) {
   const params = payload.params || {};
   if (params.flock !== undefined && params.flock !== null) {
     const parsed = parseExplicitFlockSelector(params.flock);
@@ -22094,15 +22343,36 @@ export async function dispatchBrokerFreeRpc(cfg, { member, payload, action, asse
     snapshot();
     if (params.dryRun === true) return { dryRun: true, targetSession: params.targetSession, dispatchedToRuntime: false };
     if (params.delegate || params.newSession || params.notifyOnIdle) throw new Error("Broker-free shared-thread dispatch cannot create delegated sessions or unguarded background notifications");
-    const result = await injectLocalSessionMessage({ cfg: { ...cfg, flockId, remotePeerId: member.peerId }, targetSession: params.targetSession,
-      message: params.message, fromMachine: member.machineId, fromScope: member.scope,
-      senderVerified: true, trustLevel: "cross_user_informational_only",
-      fromSessionId: params.fromSessionId, mode: params.mode, waitForReply: Boolean(params.waitForReply),
-      waitTimeoutMs: Math.min(90000, Number(params.waitTimeoutMs) || 90000),
-      assertAuthorized: () => { snapshot(); } });
-    snapshot();
-    if (result.reply?.content) result.reply.content = redactFlockSnapshot(result.reply.content);
-    return result;
+    const operationId = String(params.operationId || payload.operationId || payload.requestId || crypto.randomUUID());
+    const correlationId = String(params.correlationId || payload.correlationId || operationId);
+    const store = getRemoteOperationStore();
+    const admitted = store.admit({
+      operationId, correlationId, action: "send_message", flockId,
+      requesterMachine: member.machineId, requesterPeerId: member.peerId || null,
+      requesterSession: params.fromSessionId || null, requesterGitHubUser: null,
+      targetMachine: cfg.machineId, targetSession: params.targetSession,
+      cancelOnTimeout: Boolean(params.cancelOnTimeout),
+    });
+    if (admitted.replayed) return {
+      deduplicated: true, operationId, correlationId, operation: compactOperation(admitted.operation),
+    };
+    try {
+      const result = await injectMessage({ cfg: { ...cfg, flockId, remotePeerId: member.peerId }, targetSession: params.targetSession,
+        message: params.message, fromMachine: member.machineId, fromScope: member.scope,
+        senderVerified: true, trustLevel: "cross_user_informational_only",
+        fromSessionId: params.fromSessionId, mode: params.mode, waitForReply: Boolean(params.waitForReply),
+        replyFlockId: flockId, operationId, correlationId, cancelOnTimeout: Boolean(params.cancelOnTimeout),
+        waitTimeoutMs: Math.min(90000, Number(params.waitTimeoutMs) || 90000),
+        assertAuthorized: () => { snapshot(); } });
+      snapshot();
+      if (result.reply?.content) result.reply.content = redactFlockSnapshot(result.reply.content);
+      return { ...result, operationId, correlationId, operation: compactOperation(store.get(operationId)) };
+    } catch (error) {
+      if (!["completed", "failed", "cancelled", "interrupted"].includes(store.get(operationId)?.state)) {
+        store.transition(operationId, "failed", { error: error.message });
+      }
+      throw error;
+    }
   }
   throw new Error(`Unsupported broker-free RPC action: ${action}; no legacy dispatch fallback`);
 }
@@ -22456,6 +22726,14 @@ async function main() {
     }
   } catch {}
   const { command, positional, flags } = parseCliArgs(process.argv.slice(2));
+  if (command === "activate-update") {
+    if (path.resolve(__dirname) !== path.resolve(getBridgeHome())) throw new Error("Activator must run from the owned installed runtime");
+    const cfg = loadConfig({ autoFetchAz: false, refreshSpecs: false, passive: true });
+    if (cfg.protocol === "broker-free-v34") throw new Error("Legacy update activation cannot change broker-free installations");
+    const result = await activateRuntimeUpdate(cfg, { updateId: flags["update-id"] });
+    console.log(JSON.stringify({ status: "verified", manifestDigest: result.installed.digest }));
+    return;
+  }
   if (command === "join-request") {
     if (fs.existsSync(getConfigPath()) && JSON.parse(fs.readFileSync(getConfigPath(), "utf8")).protocol !== "broker-free-v34") {
       throw new Error("Existing legacy installation remains unchanged; broker-free enrollment requires a separately configured home");

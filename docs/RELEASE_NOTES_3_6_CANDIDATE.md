@@ -37,6 +37,46 @@ performing cloud mutation, remote-machine update, deployment, or a release vote.
 - Release review now requires all repository and viewer tests, entrypoint byte
   parity, dependency closure, and runtime manifest verification.
 
+## Milestone 4 conformance corrections
+
+- The existing bootstrap service exposes an isolated `/api/v3/support/`
+  mailbox: `tickets/issue`, `tickets/revoke`, `reports`, `attempts`,
+  `attempts/read`, `attempts/reply`, and `attempts/close` (POST JSON).
+  Maintainer requests use the enrolled owner's signed device HTTP identity;
+  the broker registers an owner-signed capability without receiving its
+  private key. Newcomer reports use only the ticket and support-only device
+  signature. These routes never enter GitHub credential, membership, SignalR,
+  Service Bus, ordinary inbox, or autopilot handlers.
+- Ask Copilot on the newcomer PC to create its support-only key. Send that
+  public key to the independently verified maintainer, who can ask Copilot to
+  issue a support ticket. On the newcomer PC, ask Copilot to submit the report
+  using that ticket and the explicitly trusted maintainer bootstrap URL.
+  The maintainer can ask Copilot to list, read, reply to, or close the attempt.
+  No step enrolls or promotes the newcomer.
+- Support HTTP bodies are limited to 16 KiB, report redemption is single-use,
+  request quotas apply by hashed source IP and ticket, and signed maintainer
+  requests are replay-protected. Both client and server reject credential-like
+  text and absolute paths. Traceless removal deletes only recognized owned
+  support state/key artifacts, retaining unrelated files.
+- MCP status, flock, member, and diagnostic calls honor `detail`, `cursor`,
+  and `limit`. Summary mode omits duplicate raw roster sources; `detail=full`
+  intentionally restores full projected data. Pagination metadata identifies
+  the next cursor.
+- Broker-free message admission persists the exact peer, flock, origin session,
+  target session, operation/correlation IDs, and timeout-cancellation policy
+  before dispatch. Query/cancel checks the same requester identity.
+- The update launcher runs a dedicated activator rather than a general
+  installer. Successful process creation alone is not verification. The
+  activator checks daemon identity/digest, runtime imports/closure, and self-test,
+  persists verification evidence, and rolls back a failed activation when safe.
+  If the caller's bounded wait expires, activation remains explicitly pending
+  under the same update ID rather than racing an in-flight activator.
+- Windows ownership checks accept bare `node`/`node.exe` launch syntax against
+  the observed executable, without relaxing script or daemon argument checks.
+  All recovery shims restore the operations and support modules in dependency
+  order. Authoritative registry tombstones also suppress collaborator presence
+  before broker refresh.
+
 ## Qualification still required
 
 1. Run the complete repository suite on the exact candidate commit.

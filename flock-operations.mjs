@@ -131,6 +131,7 @@ export class PersistentOperationStore {
     requesterSession = null,
     requesterGitHubUser = null,
     requesterPeerId = null,
+    cancelOnTimeout = false,
     targetMachine,
     targetSession = null,
     metadata = null,
@@ -148,6 +149,7 @@ export class PersistentOperationStore {
       if (
         existing.requesterKey !== ownerKey ||
         existing.action !== action ||
+        Boolean(existing.cancelOnTimeout) !== Boolean(cancelOnTimeout) ||
         existing.targetMachine !== targetMachine ||
         existing.targetSession !== targetSession
       ) {
@@ -173,6 +175,7 @@ export class PersistentOperationStore {
       state: "accepted",
       waitState: null,
       cancellationRequested: false,
+      cancelOnTimeout: Boolean(cancelOnTimeout),
       createdAt: new Date(now).toISOString(),
       createdAtMs: now,
       updatedAt: new Date(now).toISOString(),
@@ -517,6 +520,7 @@ export function compactOperation(operation) {
     targetSession: operation.targetSession || null,
     deliveryStage: operation.deliveryStage || null,
     cancellationRequested: Boolean(operation.cancellationRequested),
+    cancelOnTimeout: Boolean(operation.cancelOnTimeout),
     createdAt: operation.createdAt,
     updatedAt: operation.updatedAt,
     ...(operation.result !== undefined

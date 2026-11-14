@@ -15,6 +15,7 @@ import http from "node:http";
 import https from "node:https";
 import crypto from "node:crypto";
 import { matchesMember, verifyLeave, isPrincipalRevokedInFlock } from "./flock-membership.mjs";
+import { SupportMailbox } from "./flock-support.mjs";
 
 const PORT = Number(process.env.PORT) || 8080;
 const ALLOWED_REPO = (
@@ -2415,9 +2416,92 @@ export function createBootstrapServer({
   v3StorePath = V3_FLOCKS_PATH,
   v3PreviewStorePath = V3_PREVIEW_FLOCKS_PATH,
   membersPath = MEMBERS_PATH,
+  supportRoot = path.join(path.dirname(v3StorePath), "support-quarantine", "mailbox"),
+  supportOptions = {},
 } = {}) {
+  const supportMailbox = new SupportMailbox(supportRoot, supportOptions);
   return http.createServer(async (req, res) => {
   const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
+
+  if (url.pathname.startsWith("/api/v3/support/")) {
+    try {
+      // Support never enters ordinary enrollment, transport, queue or GitHub authentication paths.
+      if (req.headers.authorization) throw Object.assign(new Error("Support routes do not accept GitHub or bearer credentials"), { statusCode: 401 });
+      supportMailbox.consumeRequest({ ip: req.socket.remoteAddress });
+      const rawBody = await new Promise((resolve, reject) => {
+        const chunks = [];
+        let bytes = 0;
+        req.on("data", (chunk) => {
+          bytes += chunk.length;
+          if (bytes <= 16384) chunks.push(chunk);
+        });
+        req.on("end", () => bytes > 16384
+          ? reject(Object.assign(new Error("Support payload exceeds 16384 bytes"), { statusCode: 413 }))
+          : resolve(Buffer.concat(chunks).toString("utf8")));
+        req.on("error", reject);
+      });
+      let body;
+      try { body = rawBody ? JSON.parse(rawBody) : {}; }
+      catch { throw new Error("Invalid support JSON"); }
+      if (!body || typeof body !== "object" || Array.isArray(body)) throw new Error("Support body must be an object");
+      const route = url.pathname.slice("/api/v3/support/".length);
+      const fields = {
+        "tickets/issue": ["flock", "ticket", "supportPublicKey"],
+        "tickets/revoke": ["flock", "ticketId"],
+        reports: ["ticket", "supportPublicKey", "report", "signature"],
+        attempts: ["flock", "cursor", "limit", "includeClosed"],
+        "attempts/read": ["flock", "attemptId"],
+        "attempts/reply": ["flock", "attemptId", "text"],
+        "attempts/close": ["flock", "attemptId"],
+      }[route];
+      if (req.method !== "POST" || !fields) throw Object.assign(new Error("Unsupported support route"), { statusCode: 404 });
+      if (Object.keys(body).some((key) => !fields.includes(key))) throw new Error("Unsupported support field");
+      if (route === "reports") {
+        supportMailbox.consumeRequest({ ip: req.socket.remoteAddress, ticketId: body.ticket?.body?.ticketId || "missing" });
+        sendJson(res, 200, supportMailbox.submit(body));
+        return;
+      }
+      const auth = verifyTokenLocalDeviceHttpAuth(req, url, rawBody, { storePath: v3StorePath });
+      if (!auth?.ok) throw Object.assign(new Error("Verified owner device authentication required"), { statusCode: 403 });
+      const store = loadV3FlockStore(v3StorePath);
+      const owned = Object.values(store.flocks || {}).filter((flock) =>
+        (!body.flock || flock.flockId === body.flock) &&
+        (!flock.expiresAtMs || Number(flock.expiresAtMs) > Date.now()) &&
+        String(flock.ownerGitHubUser).toLowerCase() === auth.githubUser &&
+        Number(flock.ownerGitHubUserId) === auth.githubUserId &&
+        Object.values(flock.members || {}).some((member) => member.deviceId === auth.deviceId &&
+          member.trustTier === "owner" && member.publicKey &&
+          (!member.membershipExpiresAtMs || Number(member.membershipExpiresAtMs) > Date.now()) &&
+          !isPrincipalRevokedInFlock(flock, member)));
+      if (owned.length !== 1) throw Object.assign(new Error("Select exactly one flock owned by this verified maintainer"), { statusCode: 403 });
+      const flock = owned[0];
+      const owner = Object.values(flock.members).find((member) => member.deviceId === auth.deviceId && member.trustTier === "owner");
+      supportMailbox.consumeRequest({ ip: req.socket.remoteAddress, requestSignature: req.headers["x-flock-signature"] });
+      const maintainerDeviceId = auth.deviceId;
+      const entry = body.ticketId ? supportMailbox.read().tickets[body.ticketId]
+        : body.attemptId ? supportMailbox.read().attempts[body.attemptId] : null;
+      if ((body.ticketId || body.attemptId) && (!entry || entry.flockId !== flock.flockId)) {
+        throw Object.assign(new Error("Support record is outside the selected flock"), { statusCode: 403 });
+      }
+      let result;
+      if (route === "tickets/issue") result = supportMailbox.issue({
+        maintainerIdentity: { publicKey: owner.publicKey, deviceId: auth.deviceId },
+        flockId: flock.flockId, supportPublicKey: body.supportPublicKey, signedTicket: body.ticket,
+      });
+      if (route === "tickets/revoke") result = supportMailbox.revoke({ ticketId: body.ticketId, maintainerDeviceId });
+      if (route === "attempts") result = supportMailbox.list({ ...body, maintainerDeviceId, flockId: flock.flockId });
+      if (route === "attempts/read") result = supportMailbox.get({ attemptId: body.attemptId, maintainerDeviceId });
+      if (route === "attempts/reply") result = supportMailbox.reply({ attemptId: body.attemptId, text: body.text, maintainerDeviceId });
+      if (route === "attempts/close") result = supportMailbox.close({ attemptId: body.attemptId, maintainerDeviceId });
+      sendJson(res, 200, result);
+    } catch (error) {
+      sendJson(res, error.statusCode || 400, {
+        ok: false, code: error.statusCode === 429 ? "SUPPORT_RATE_LIMITED" : "SUPPORT_REQUEST_REJECTED",
+        error: "Support request rejected; verify schema, device signature, ticket state, expiry and quotas.",
+      });
+    }
+    return;
+  }
 
   if (url.pathname === "/" || url.pathname === "/healthz" || url.pathname === "/health") {
     const registry = loadMembersRegistry(membersPath);

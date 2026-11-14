@@ -46,6 +46,8 @@ import { validateCert, peerSubscription } from "./flock-protocol.mjs";
     "runtime-manifest.json",
     "flock-registry.mjs",
     "flock-broker-free.mjs",
+    "flock-operations.mjs",
+    "flock-support.mjs",
     "flock-protocol.mjs",
     "flock-lifecycle.mjs",
     "flock-membership.mjs",
