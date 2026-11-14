@@ -627,6 +627,33 @@ function startMockCopilotWsServer(onFrameReceived) {
   });
 }
 
+test("Desktop session creation with allowAll=false never requests allow-all, auto-approval or autopilot", async () => {
+  const env = setupTempCopilotEnv();
+  const previous = process.env.COPILOT_HOME;
+  process.env.COPILOT_HOME = env.tempRoot;
+  const frames = [];
+  const server = await startMockCopilotWsServer((frame, client) => {
+    frames.push(frame);
+    if (frame.type === "create_session") client.sendJson({
+      type: "session_created", request_id: frame.request_id, session_id: "restricted-session", session_type: "general_chat",
+    });
+  });
+  try {
+    env.writeWsConfig(server.port);
+    invalidateLocalWsConnectionCache();
+    const { createLocalSession } = await import("../flock.mjs");
+    const result = await createLocalSession({ cfg: { machineId: "HOST", scope: "work" }, allowAll: false, cwd: env.tempRoot });
+    assert.equal(result.sessionId, "restricted-session");
+    assert.ok(frames.some((frame) => frame.type === "create_session"));
+    assert.equal(frames.some((frame) => frame.permission_mode === "allow-all" || frame.auto_approve === true || frame.mode === "autopilot"), false);
+  } finally {
+    await server.close();
+    invalidateLocalWsConnectionCache();
+    if (previous === undefined) delete process.env.COPILOT_HOME; else process.env.COPILOT_HOME = previous;
+    env.cleanup();
+  }
+});
+
 function setupTempCopilotEnv() {
   const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-test-"));
   fs.mkdirSync(path.join(tempRoot, "run"), { recursive: true });
@@ -6879,7 +6906,7 @@ assert.deepEqual(calls.map(([, args]) => args[2]), ["ls-tree", "cat-file", "ls-t
   }
 });
 
-test("release voter extracts complete modular dependency closure into isolated fixture and produces signed machine-readable ballots across pass, missing-module, failure, timeout, and infrastructure errors", async () => {
+test("release voter extracts complete modular dependency closure into isolated fixture and produces signed machine-readable ballots across pass, missing-module, failure, timeout, and infrastructure errors", async (t) => {
   const env = setupTempCopilotEnv();
   const prevCopilotHome = process.env.COPILOT_HOME;
   process.env.COPILOT_HOME = env.tempRoot;
@@ -7037,8 +7064,20 @@ test("release voter extracts complete modular dependency closure into isolated f
     const passCommit = gitRun(originWorkDir, ["rev-parse", "HEAD"]);
 
     let passBallot;
+    const childProcess = (await import("node:child_process")).default;
+    const { syncBuiltinESMExports } = await import("node:module");
+    const actualSpawn = childProcess.spawn;
+    const reviewGitCalls = [];
+    const spawnSpy = t.mock.method(childProcess, "spawn", (command, args, options) => {
+      if (command === "git" && args.includes("fetch")) reviewGitCalls.push({ args, env: options.env });
+      return actualSpawn(command, args, options);
+    });
+    syncBuiltinESMExports();
+    const previousTrace = process.env.GIT_TRACE;
+    const gitTracePath = path.join(env.tempRoot, "review-git.trace");
     try {
       Object.assign(process.env, inheritedReviewOverrides);
+      process.env.GIT_TRACE = gitTracePath;
       passBallot = await reviewReleaseCandidate(
         voterCfg,
         { branch: "rc-modular-pass" },
@@ -7048,12 +7087,26 @@ test("release voter extracts complete modular dependency closure into isolated f
         assert.equal(process.env[name], value, "Review must not mutate the host environment");
       }
     } finally {
+      spawnSpy.mock.restore();
+      syncBuiltinESMExports();
+      if (previousTrace === undefined) delete process.env.GIT_TRACE; else process.env.GIT_TRACE = previousTrace;
       for (const [name, value] of Object.entries(previousReviewOverrides)) {
         if (value === undefined) delete process.env[name];
         else process.env[name] = value;
       }
     }
     assert.equal(passBallot.vote, "ACCEPT");
+    assert.ok(reviewGitCalls.length >= 2);
+    for (const call of reviewGitCalls) {
+      assert.equal(call.env.GIT_TERMINAL_PROMPT, "0");
+      assert.equal(call.env.GCM_INTERACTIVE, "Never");
+      assert.equal(call.env.GIT_ASKPASS, "");
+      assert.equal(call.env.VSCODE_GIT_IPC_HANDLE, undefined);
+      assert.ok(call.args.includes("credential.interactive=never"));
+      assert.ok(call.args.includes("core.askPass="));
+    }
+    const gitTrace = fs.readFileSync(gitTracePath, "utf8");
+    assert.match(gitTrace, /refs\/heads\/rc-modular-pass/);
     assert.equal(passBallot.failureCategory, "passed");
     assert.equal(passBallot.candidateCommit, passCommit);
     assert.equal(passBallot.voterVersion, BRIDGE_VERSION);
@@ -7367,7 +7420,7 @@ test("release voter extracts complete modular dependency closure into isolated f
 
     assert.equal(buildCanonicalVoteBallotPayload(passBallot), passBallot.ballotPayload);
     const badVoteSentAt = new Date().toISOString();
-    const badVoteParams = { branch: "../bad" };
+    const badVoteParams = { branch: "../bad", flock: "erjadi/personal" };
     await assert.rejects(
       () =>
         handleRpcAction(voterCfg, {
@@ -7906,7 +7959,7 @@ test("mcp_self_info tool and self-info CLI report in-memory loadTimeDigest and d
     assert.equal(mcpAfterEntryReplace.reloadPending, true);
 
     // 4. Also replace a sibling module on disk and confirm currentDiskDigest advances again while loadTimeDigest stays pinned
-    const siblingPath = path.join(installDir, "flock-protocol.mjs");
+    const siblingPath = path.join(installDir, "flock-support.mjs");
     fs.appendFileSync(siblingPath, "\n// sibling module update\n", "utf8");
 
     const mcpAfterSiblingReplace = await callSelfInfo();
@@ -9223,11 +9276,10 @@ assert.equal(windowsStore.entry, replacement, "Old WMI completion must not publi
   assert.equal("vramFreeGb" in (collabPing.specs.gpus[0] || {}), false);
   assert.equal("utilizationPct" in (collabPing.specs.gpus[0] || {}), false);
 
-  const collabDiagnose = await handleRpcAction(
+  await assert.rejects(handleRpcAction(
     { machineId: "GPU-TOWER", scope: "work", githubUser: "erjadi", specs: liveSpecs },
     thermalSigned("diagnose", collabPolicy, { fix: false })
-  );
-  assert.equal("thermal" in collabDiagnose.specs, false);
+  ), (error) => error.code === "HOST_DATA_FORBIDDEN" && error.statusCode === 403);
 
   const crossUserSanitized = sanitizeSpecsForFlockPolicy(liveSpecs, null, {
     isCrossUser: true,

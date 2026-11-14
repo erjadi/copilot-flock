@@ -176,6 +176,7 @@ const __dirname = path.dirname(__filename);
 const PROCESS_STARTED_AT = new Date().toISOString();
 
 const RUNTIME_SIBLING_MODULES = [
+  "flock-support.mjs",
   "flock-lifecycle.mjs",
   "flock-operations.mjs",
   "flock-membership.mjs",
@@ -5395,6 +5396,7 @@ export function isExplicitOptInFlockPolicy(flockPolicy) {
 }
 
 const PROTECTED_RPC_ACTIONS = new Set([
+  "review_release",
   "create_session",
   "send_message",
   "send_file_chunk",
@@ -6060,6 +6062,7 @@ export function enforceFlockPolicyAndWalls(
       flockPolicy.unrestrictedAccess === true || flockPolicy.allowFileTransfer === true
     );
     const mutatingActions = new Set([
+      "review_release",
       "self_update",
       "reprovision",
       ...(allowFileTransfer ? [] : ["send_file_chunk", "pull_file_chunk"]),
@@ -10027,7 +10030,7 @@ export async function createLocalSession({
       request_id: expectedSessionReqId,
       cwd: targetCwd,
       session_type: sessionType,
-      permission_mode: "allow-all",
+      ...(allowAll ? { permission_mode: "allow-all" } : {}),
     };
     if (createdWorkspace?.id) createSessionFrame.workspace_id = createdWorkspace.id;
     if (model) createSessionFrame.model = model;
@@ -10038,7 +10041,7 @@ export async function createLocalSession({
     createdSession = await sessionPromise;
 
     if (createdSession?.session_id) {
-      // Explicitly enable "Approve all tool calls" (allow-all) and autopilot mode on the new session
+      if (allowAll) {
       ws.sendText(
         JSON.stringify({
           type: "set_session_auto_approve",
@@ -10056,6 +10059,7 @@ export async function createLocalSession({
           mode: "autopilot",
         })
       );
+      }
       if (title) {
         ws.sendText(
           JSON.stringify({
@@ -11191,6 +11195,7 @@ export function enforceCrossUserInformationalPolicy(cfg, req, senderIdentity, fl
   );
 
   const mutatingActions = new Set([
+    "review_release",
     "self_update",
     "reprovision",
     ...(allowFileTransfer ? [] : ["send_file_chunk", "pull_file_chunk"]),
@@ -11206,9 +11211,9 @@ export function enforceCrossUserInformationalPolicy(cfg, req, senderIdentity, fl
     (Boolean(params.delegate) || targetLower === "auto-worker" || targetLower === "new-worker");
 
   if (mutatingActions.has(action) || isMutatingDiagnose || isMutatingDelegate) {
-    throw new Error(
+    throw Object.assign(new Error(
       `Cross-user security policy violation: action "${action}" is forbidden across GitHub user domains (@${remoteUser} -> @${localUser}). Requests across GitHub user domains must be strictly informational (no config-changing or file-changing tasks).`
-    );
+    ), { code: "CROSS_USER_ACTION_FORBIDDEN", statusCode: 403 });
   }
 }
 
@@ -11470,6 +11475,12 @@ export async function handleRpcAction(cfg, req) {
     throw err;
   }
   const isRestrictedFlock = isExplicitOptInFlockPolicy(flockPolicy);
+  if ((senderIdentity?.isCrossUser || isRestrictedFlock || (flockPolicy && flockPolicy.trustTier !== "owner")) &&
+      ["list_projects", "list_locks", "diagnose"].includes(action)) {
+    throw Object.assign(new Error(`403 Forbidden: "${action}" exposes host-wide data and requires same-user owner authority`), {
+      code: "HOST_DATA_FORBIDDEN", statusCode: 403,
+    });
+  }
   const isUnrestrictedCollaboratorFlock = Boolean(
     flockPolicy?.unrestrictedAccess === true || flockPolicy?.allowFileTransfer === true
   );
@@ -11521,7 +11532,7 @@ export async function handleRpcAction(cfg, req) {
     const wsInfo = await verifyLocalWsConnectionInfo({ forceRefresh: false, retryPollMs: 0 });
     const headlessCliAvailable = Boolean(resolveCopilotCliBin());
     const sessionLimit = params.includeSessions ? Math.max(8, Number(params.sessionLimit) || 25) : 8;
-    let sessions = queryLocalSessionsFromDb({
+    let sessions = senderIdentity?.isCrossUser && !hasExplicitFlock ? [] : queryLocalSessionsFromDb({
       limit: flockPolicy ? Math.max(200, sessionLimit) : sessionLimit,
     });
     if (flockPolicy) {
@@ -11593,6 +11604,10 @@ export async function handleRpcAction(cfg, req) {
     out.presenceLayers = layeredPresence.presenceLayers;
     if (params.includeSessions) {
       out.sessions = sessions;
+    }
+    if (senderIdentity?.isCrossUser) {
+      delete out.username;
+      delete out.wsPort;
     }
     return out;
   }
@@ -12301,6 +12316,11 @@ export async function handleRpcAction(cfg, req) {
   }
 
   if (action === "review_release") {
+    if (!hasExplicitFlock || !shouldGrantRemoteAllowAll({ senderIdentity, flockPolicy, localGitHubUser: cfg.githubUser })) {
+      throw Object.assign(new Error("403 Forbidden: release candidate execution requires verified same-user owner authority"), {
+        code: "RELEASE_REVIEW_FORBIDDEN", statusCode: 403,
+      });
+    }
     return await reviewReleaseCandidate(cfg, params);
   }
 
@@ -12819,6 +12839,36 @@ export function createDaemonHeartbeatMonitor({
 
 const AFTER_RPC_RESPONSE = Symbol("afterRpcResponse");
 
+export function recoverUnlaunchedRuntimeUpdate(root, updateId, error, code) {
+  const filename = assertNoLinks(path.join(root, "update-activation.json"));
+  const journal = JSON.parse(fs.readFileSync(filename, "utf8"));
+  if (journal.type !== "copilot-flock-update-activation-v1" || journal.updateId !== updateId) {
+    throw new Error("Unlaunched activation recovery identity mismatch");
+  }
+  let restored = false;
+  let failure = error;
+  try {
+    if (journal.rollbackSource) {
+      const source = assertNoLinks(path.resolve(journal.rollbackSource));
+      if (path.dirname(source) !== fs.realpathSync(os.tmpdir()) ||
+          !path.basename(source).startsWith(`flock-update-rollback-${updateId}-`) ||
+          loadRuntimeManifest(source).manifestDigest !== journal.previousManifestDigest) {
+        throw new Error("Rollback source ownership/digest is unproven");
+      }
+      stageAndActivateRuntime({ sourceDir: source, targetDir: root, updateId, correlationId: journal.correlationId });
+      restored = true;
+      fs.rmSync(source, { recursive: true, force: true });
+    }
+    fs.unlinkSync(filename);
+  } catch (recoveryError) {
+    failure = `${error.message || error}; rollback failed: ${recoveryError.message}`;
+  }
+  recordRuntimeUpdatePhase(root, {
+    updateId, correlationId: journal.correlationId, phase: restored ? "rolled_back" : "failed",
+    error: failure, code, reason: "activation_not_launched",
+  });
+}
+
 export async function dispatchDaemonRpcRequest(cfg, request, sendResponse) {
   const result = await handleRpcAction(cfg, {
     ...request, deferUpdateActivation: true, inProcessSelfPing: false,
@@ -12827,10 +12877,7 @@ export async function dispatchDaemonRpcRequest(cfg, request, sendResponse) {
   });
   try { await sendResponse(result); }
   catch (error) {
-    if (result?.status === "activating") recordRuntimeUpdatePhase(getBridgeHome(), {
-      updateId: result.updateId, correlationId: result.correlationId, phase: "failed",
-      error, code: "UPDATE_REPLY_FLUSH_FAILED", reason: "activation_not_launched",
-    });
+    if (result?.status === "activating") recoverUnlaunchedRuntimeUpdate(getBridgeHome(), result.updateId, error, "UPDATE_REPLY_FLUSH_FAILED");
     throw error;
   }
   if (result?.[AFTER_RPC_RESPONSE]) await result[AFTER_RPC_RESPONSE]();
@@ -15798,6 +15845,7 @@ export async function executeMcpTool(cfg, name, args = {}, options = {}) {
     return await voteReleaseAcrossFlock(cfg, {
       branch: args.branch,
       machines: args.machines || "*",
+      flock: args.flock || null,
     });
   }
 
@@ -16677,7 +16725,7 @@ export async function runMcpServer(cfg, { passive = false } = {}) {
   activeCallerMcpSnapshot = captureCallerMcpSnapshot(cfg, { surface: "mcp-stdio" });
   // Start local daemon in background if not already running (unless passive)
   if (!passive && !cfg.unconfigured) {
-    ensureDaemonStarted(cfg).catch(() => {});
+    ensureDaemonStarted(cfg).catch((error) => console.error(`Daemon startup failed: ${redactFlockSnapshot(error.message)}`));
   }
 
   let framingMode = null; // "newline" | "content-length"
@@ -16746,6 +16794,7 @@ export async function runMcpServer(cfg, { passive = false } = {}) {
           for (const key of Object.keys(cfg)) delete cfg[key];
           Object.assign(cfg, refreshed);
           activeCallerMcpSnapshot = captureCallerMcpSnapshot(cfg, { surface: "mcp-stdio" });
+          if (!passive && !cfg.unconfigured) await ensureDaemonStarted(cfg);
         }
         sendRpcMessage({
           jsonrpc: "2.0",
@@ -17449,7 +17498,9 @@ export function buildCanonicalVoteBallotPayload(ballot) {
 export async function reviewReleaseCandidate(cfg, params = {}, internalOptions = {}) {
   const reviewStartedAt = new Date().toISOString();
   const branch = String(params?.branch || "main").trim();
-  if (!/^[A-Za-z0-9._/-]+$/.test(branch) || branch.includes("..")) {
+  if (!/^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(branch) || branch.includes("..") ||
+      branch.startsWith("refs/") || branch.endsWith("/") || branch.includes("//") ||
+      branch.split("/").some((part) => part.startsWith(".") || part.endsWith(".lock") || part.endsWith("."))) {
     throw new Error(`Invalid branch name for review_release: ${branch}`);
   }
 
@@ -17514,7 +17565,7 @@ export async function reviewReleaseCandidate(cfg, params = {}, internalOptions =
     const resolveRepo =
       typeof internalOptions.resolveRepoFn === "function"
         ? internalOptions.resolveRepoFn
-        : () => internalOptions.repoDir || resolveOrFindBridgeGitRepo();
+        : () => internalOptions.repoDir || resolveOrFindBridgeGitRepo({ noninteractive: true });
     const repoDir = resolveRepo();
     if (!repoDir || !fs.existsSync(repoDir)) {
       throw Object.assign(
@@ -17523,25 +17574,29 @@ export async function reviewReleaseCandidate(cfg, params = {}, internalOptions =
       );
     }
 
+    const gitEnv = { ...process.env, GIT_TERMINAL_PROMPT: "0", GCM_INTERACTIVE: "Never", GIT_ASKPASS: "", SSH_ASKPASS: "" };
+    for (const name of Object.keys(gitEnv)) {
+      if (name.startsWith("VSCODE_GIT_") || name === "ELECTRON_RUN_AS_NODE") delete gitEnv[name];
+    }
+    const gitFlags = ["-c", "credential.interactive=never", "-c", "core.askPass=", "-C", repoDir];
     if (internalOptions.fetchFromOrigin !== false) {
       await runBoundedSubprocess(
         "git",
         [
-          "-C",
-          repoDir,
+          ...gitFlags,
           "fetch",
           "--force",
           "--no-write-fetch-head",
           "origin",
           "+refs/heads/main:refs/remotes/origin/main",
         ],
-        { timeoutMs: fetchTimeoutMs, maxOutputBytes }
+        { timeoutMs: fetchTimeoutMs, maxOutputBytes, env: gitEnv }
       );
 
       const fetchBranchRes = await runBoundedSubprocess(
         "git",
-        ["-C", repoDir, "fetch", "--force", "origin", branch],
-        { timeoutMs: fetchTimeoutMs, maxOutputBytes }
+        [...gitFlags, "fetch", "--force", "origin", `refs/heads/${branch}`],
+        { timeoutMs: fetchTimeoutMs, maxOutputBytes, env: gitEnv }
       );
       if (!fetchBranchRes.ok) {
         throw Object.assign(
@@ -17558,11 +17613,11 @@ export async function reviewReleaseCandidate(cfg, params = {}, internalOptions =
       }
     }
 
-    const revRef = internalOptions.fetchFromOrigin === false ? branch : "FETCH_HEAD";
+    const revRef = internalOptions.fetchFromOrigin === false ? `refs/heads/${branch}` : "FETCH_HEAD";
     const revRes = await runBoundedSubprocess(
       "git",
-      ["-C", repoDir, "rev-parse", "--verify", `${revRef}^{commit}`],
-      { timeoutMs: 5000, maxOutputBytes }
+      [...gitFlags, "rev-parse", "--verify", `${revRef}^{commit}`],
+      { timeoutMs: 5000, maxOutputBytes, env: gitEnv }
     );
     if (!revRes.ok || !revRes.stdout.trim()) {
       throw Object.assign(
@@ -17577,8 +17632,8 @@ export async function reviewReleaseCandidate(cfg, params = {}, internalOptions =
 
     const diffRes = await runBoundedSubprocess(
       "git",
-      ["-C", repoDir, "diff", "--stat", `origin/main..${candidateCommit}`],
-      { timeoutMs: 5000, maxOutputBytes }
+      [...gitFlags, "diff", "--stat", `origin/main..${candidateCommit}`],
+      { timeoutMs: 5000, maxOutputBytes, env: gitEnv }
     );
     diffStat = diffRes.ok && diffRes.stdout.trim() ? diffRes.stdout.trim() : candidateSha;
 
@@ -18025,7 +18080,7 @@ export function verifyVoteBallotSignature(ballot, registeredPublicKey = null) {
 
 export async function voteReleaseAcrossFlock(
   cfg,
-  { branch = "main", machines = "*" } = {},
+  { branch = "main", machines = "*", flock = null, timeoutMs = 990000 } = {},
   internalDeps = {}
 ) {
   const discoverFn = internalDeps.discoverFn || discoverMachines;
@@ -18033,6 +18088,12 @@ export async function voteReleaseAcrossFlock(
     internalDeps.membersMapFn ||
     ((c) => getCachedBootstrapMembersMap(c, { forceRefresh: true }));
   const rpcBatchFn = internalDeps.rpcBatchFn || invokeRemoteRpcBatch;
+  const selected = authorizeCallerFlockSelection(cfg, flock || resolveDefaultOperationFlockSelector(cfg));
+  const policy = loadLocalFlocksConfig(cfg).flocks?.[selected.flockId];
+  if (policy?.trustTier !== "owner" ||
+      normalizeGitHubUser(policy.ownerGitHubUser)?.toLowerCase() !== normalizeGitHubUser(cfg.githubUser)?.toLowerCase()) {
+    throw Object.assign(new Error("Release voting requires an explicit authorized owner flock"), { code: "RELEASE_REVIEW_FORBIDDEN", statusCode: 403 });
+  }
 
   const [discovered, membersMap] = await Promise.all([
     discoverFn(cfg, { includeSelf: true, timeoutMs: 2500 }),
@@ -18048,11 +18109,11 @@ export async function voteReleaseAcrossFlock(
     target: t,
     toMachine: t.machineId,
     action: "review_release",
-    params: { branch },
+    params: { branch, flock: selected.flockId },
   }));
 
   const outcomes =
-    batchItems.length > 0 ? await rpcBatchFn(cfg, batchItems, 360000) : [];
+    batchItems.length > 0 ? await rpcBatchFn(cfg, batchItems, Math.max(990000, Number(timeoutMs) || 990000)) : [];
 
   const votes = outcomes.map((o) => {
     const mId = o.item.target.machineId;
@@ -18455,10 +18516,7 @@ export async function performLocalSelfUpdate(
             });
             child.unref();
           } catch (error) {
-            recordRuntimeUpdatePhase(resolvedTargetDir, {
-              updateId, correlationId, phase: "failed", error, code: "RUNTIME_ACTIVATION_SPAWN_FAILED",
-              reason: "post_reply_launcher_failed",
-            });
+            recoverUnlaunchedRuntimeUpdate(resolvedTargetDir, updateId, error, "RUNTIME_ACTIVATION_SPAWN_FAILED");
             logDaemon("Update activator launch failed after RPC response", { updateId, error: redactFlockSnapshot(error.message) });
           }
         },
@@ -21018,37 +21076,7 @@ export async function installBridge({
       });
     }
   } else {
-    // Ping our own machineId with collectAll=true to discover and kill any orphaned
-    // legacy v1.0.0-pre daemon PIDs that may not be recorded in daemon.pid.
-    const pidsToKill = new Set();
-    const existingDaemon = isLocalDaemonRunning();
-    if (existingDaemon.running && existingDaemon.pid) {
-      pidsToKill.add(existingDaemon.pid);
-    }
-    try {
-      const existingReplies = await invokeRemoteRpc(cfg, {
-        toMachine: cfg.machineId,
-        action: "ping",
-        collectAll: true,
-        timeoutMs: 1200,
-      });
-      for (const r of existingReplies) {
-        if (r.result?.pid && Number.isInteger(Number(r.result.pid))) {
-          pidsToKill.add(Number(r.result.pid));
-        }
-      }
-    } catch {}
-
-    for (const oldPid of pidsToKill) {
-      if (oldPid && oldPid !== process.pid) {
-        try {
-          process.kill(oldPid);
-        } catch {}
-      }
-    }
-    if (pidsToKill.size > 0) {
-      await new Promise((r) => setTimeout(r, 400));
-    }
+    await stopPinnedDaemon(getBridgeHome(), lifecyclePaths({ home: HOME_DIR, copilotHome: getCopilotDir() }));
 
     daemonInfo = await ensureDaemonStarted({
       ...cfg,
@@ -23052,7 +23080,9 @@ Usage:
   }
 
   if (command === "mcp") {
-    await runMcpServer(cfg, { passive: passiveCli });
+    await runMcpServer(cfg, {
+      passive: parseBooleanOption(flags.passive, false) || parseBooleanOption(process.env.COPILOT_FLOCK_PASSIVE, false),
+    });
     return;
   }
 

@@ -108,6 +108,35 @@ and the real activator to check reply ordering, PID replacement, and terminal
 verification/failure. Test TLS certificates use `openssl` (available with Git
 on the Windows qualification host); no live Azure service or fleet is used.
 
+### Final release-boundary hardening
+
+Release candidate execution is a protected owner-only RPC, including on shared
+collaborator/guest flocks. It requires verified same-user owner authorization;
+file-transfer or unrestricted-collaborator settings cannot grant it. Review
+accepts validated branch names only (never `refs/*`), fetches explicitly from
+`refs/heads/`, and disables interactive Git credential helpers. Release voting
+uses an authorized owner flock selector and a minimum 990-second RPC deadline
+so the 900-second qualification suite cannot outlive the caller's vote window.
+
+Cross-user presence pings omit host usernames/WebSocket ports; unscoped pings
+contain no sessions. Host-wide project, lock and diagnostic inventories are
+denied to cross-user or restricted-flock callers. The legacy master-credential
+bootstrap endpoint is now platform-maintainer-only: repository write access or
+general allowlisting does not authorize master transport keys. GitHub-token
+queue access requires authoritative active machine ownership (or maintainer
+authority), and non-maintainer member lists contain shared peers only.
+
+MCP still loads configuration passively, but configured non-passive MCP hosts
+and successful same-process enrollment start the daemon. Explicit passive mode
+never starts it. Desktop session creation with `allowAll=false` no longer
+requests auto-approval or autopilot. Installation stops only the creation-pinned
+owned daemon, never unverified PIDs from network replies. Failed update reply
+flush/launcher startup restores the available rollback closure and clears
+unlaunched activation intent; ambiguous/failed recovery remains explicit.
+Support audit retention removes only contiguous prefixes, preserving hash-chain
+integrity across backward clock changes. Caller runtime drift detection covers
+the support module as part of the installed companion closure.
+
 ## Qualification still required
 
 1. Run the complete repository suite on the exact candidate commit.

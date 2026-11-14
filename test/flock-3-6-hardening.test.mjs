@@ -31,6 +31,11 @@ import {
   openFlockMembershipRegistry,
   resolveLegacyFlockRoster,
   updateFleetMachines,
+  handleRpcAction,
+  signRpcRequest,
+  reviewReleaseCandidate,
+  voteReleaseAcrossFlock,
+  recoverUnlaunchedRuntimeUpdate,
 } from "../flock.mjs";
 import { createBootstrapServer, enrollV3Device } from "../bootstrap-server.mjs";
 
@@ -757,5 +762,164 @@ test("fleet updates poll exact update identity and replacement PID instead of ac
   assert.equal(failed.ok, false);
   assert.equal(failed.remoteUpdates[0].updatePhase, "rolled_back");
   assert.equal(failed.remoteUpdates[0].error, "self-test failed");
+});
+
+test("release execution and global inventories reject explicit collaborator/guest requests and cross-user ping hides host/session details", async (t) => {
+  const root = fixture(t);
+  useCopilotHome(t, root);
+  const key = identity("peer");
+  const cfg = { machineId: "HOST", githubUser: "owner", scope: "work", specs: null };
+  const member = { machineId: "PEER", githubUser: "alice", scope: "work", publicKey: key.publicKey };
+  const request = (action, params = {}) => {
+    const requestId = crypto.randomUUID();
+    const sentAt = new Date().toISOString();
+    return { requestId, sentAt, fromMachine: "PEER", toMachine: "HOST", action, params,
+      auth: signRpcRequest({ requestId, sentAt, fromMachine: "PEER", toMachine: "HOST", action, params, identity: key }),
+      registryMembers: [member],
+    };
+  };
+  for (const role of ["collaborator", "guest"]) {
+    const policy = {
+      flockId: "owner/team", ownerGitHubUser: "owner", trustTier: role,
+      sessionVisibility: "explicit_opt_in_only", sharedSessionIds: [], members: [member],
+      ...(role === "guest" ? { membershipExpiresAtMs: Date.now() + 60000 } : {}),
+    };
+    for (const action of ["review_release", "list_projects", "list_locks", "diagnose"]) {
+      await assert.rejects(handleRpcAction(cfg, {
+        ...request(action, { flock: policy.flockId, branch: "main" }), flockPolicy: policy,
+      }), (error) => error.statusCode === 403, `${role} ${action} must fail before reading or executing host data`);
+    }
+  }
+  const sameUserMember = { ...member, githubUser: "owner" };
+  await assert.rejects(handleRpcAction(cfg, {
+    ...request("review_release", { flock: "owner/team", branch: "main" }),
+    registryMembers: [sameUserMember],
+    flockPolicy: { flockId: "owner/team", ownerGitHubUser: "owner", trustTier: "collaborator",
+      unrestrictedAccess: true, allowFileTransfer: true, sessionVisibility: "all", members: [sameUserMember] },
+  }), (error) => error.statusCode === 403);
+  const ping = await handleRpcAction(cfg, request("ping", { includeSessions: true, passive: true }));
+  assert.deepEqual(ping.sessions, []);
+  assert.deepEqual(ping.recentSessions, []);
+  assert.equal(ping.activeSessionCount, 0);
+  assert.equal(ping.username, undefined);
+  assert.equal(ping.wsPort, undefined);
+  for (const branch of ["refs/pull/42/head", "refs/heads/main", "../bad", "-option", "main//bad"]) {
+    await assert.rejects(reviewReleaseCandidate(cfg, { branch }), /Invalid branch/);
+  }
+});
+
+test("release vote uses exact authorized owner flock and waits longer than candidate qualification", async (t) => {
+  const root = fixture(t);
+  useCopilotHome(t, root);
+  fs.mkdirSync(path.join(root, "flock"), { recursive: true });
+  fs.writeFileSync(path.join(root, "flock", "flocks.json"), JSON.stringify({
+    flocks: { "owner/work": { flockId: "owner/work", ownerGitHubUser: "owner", trustTier: "owner" } },
+  }));
+  let observed;
+  await voteReleaseAcrossFlock({ machineId: "OWNER", githubUser: "owner", scope: "work" }, {
+    flock: "owner/work", timeoutMs: 1,
+  }, {
+    discoverFn: async () => [{ machineId: "OWNER" }],
+    membersMapFn: () => new Map(),
+    rpcBatchFn: async (_cfg, items, timeout) => { observed = { items, timeout }; return []; },
+  });
+  assert.ok(observed.timeout >= 990000);
+  assert.equal(observed.items[0].params.flock, "owner/work");
+});
+
+test("support audit expiry prunes a contiguous prefix even when the clock steps backward", (t) => {
+  const root = fixture(t);
+  let now = 100000;
+  const mailbox = new SupportMailbox(root, { clock: () => now, retentionMs: 60000 });
+  const data = mailbox.read();
+  mailbox.audit(data, "first");
+  now = 200000;
+  mailbox.audit(data, "second");
+  now = 120000;
+  mailbox.audit(data, "backward");
+  now = 230000;
+  mailbox.cleanup(data);
+  mailbox.save(data);
+  assert.deepEqual(mailbox.read().audit.map((entry) => entry.event), ["second", "backward"]);
+});
+
+test("unlaunched update failures restore the previous closure and remove blocking activation intent", (t) => {
+  const root = fixture(t);
+  const source = path.join(root, "source");
+  const target = path.join(root, "target");
+  fs.mkdirSync(source);
+  for (const filename of REQUIRED_RUNTIME_MODULES) fs.copyFileSync(path.resolve(filename), path.join(source, filename));
+  const previous = computeRuntimeManifest(source, { version: "3.6.0" });
+  fs.writeFileSync(path.join(source, "runtime-manifest.json"), JSON.stringify(previous));
+  stageAndActivateRuntime({ sourceDir: source, targetDir: target });
+  for (const code of ["UPDATE_REPLY_FLUSH_FAILED", "RUNTIME_ACTIVATION_SPAWN_FAILED"]) {
+    const updateId = crypto.randomUUID();
+    const backup = fs.mkdtempSync(path.join(os.tmpdir(), `flock-update-rollback-${updateId}-`));
+    for (const filename of [...REQUIRED_RUNTIME_MODULES, "runtime-manifest.json"]) {
+      fs.copyFileSync(path.join(source, filename), path.join(backup, filename));
+    }
+    fs.appendFileSync(path.join(target, "flock.mjs"), "\n// failed candidate\n");
+    fs.writeFileSync(path.join(target, "update-activation.json"), JSON.stringify({
+      type: "copilot-flock-update-activation-v1", updateId, correlationId: updateId,
+      rollbackSource: backup, previousManifestDigest: previous.manifestDigest,
+    }));
+    recoverUnlaunchedRuntimeUpdate(target, updateId, new Error("transport/spawn failed"), code);
+    assert.equal(fs.existsSync(path.join(target, "update-activation.json")), false);
+    assert.equal(fs.existsSync(backup), false);
+    assert.equal(computeRuntimeManifest(target, { version: "3.6.0" }).manifestDigest, previous.manifestDigest);
+    assert.equal(readRuntimeState(target).update.phase, "rolled_back");
+    assert.equal(readRuntimeState(target).update.code, code);
+  }
+});
+
+test("GitHub-token broker callers cannot bootstrap masters or drain/ack foreign machines and only see shared peers", async (t) => {
+  const root = fixture(t);
+  const storePath = path.join(root, "v3.json");
+  const membersPath = path.join(root, "members.json");
+  const previous = process.env.PLATFORM_MAINTAINER_USER;
+  const connection = process.env.SIGNALR_CONNECTION_STRING;
+  const allowlist = process.env.ALLOWED_GITHUB_USERS;
+  process.env.PLATFORM_MAINTAINER_USER = "maintainer";
+  process.env.ALLOWED_GITHUB_USERS = "allowlisted";
+  process.env.SIGNALR_CONNECTION_STRING = "Endpoint=https://example.invalid;AccessKey=CANARY-MASTER;Version=1.0;";
+  t.after(() => {
+    for (const [name, value] of [["PLATFORM_MAINTAINER_USER", previous], ["SIGNALR_CONNECTION_STRING", connection], ["ALLOWED_GITHUB_USERS", allowlist]]) {
+      if (value === undefined) delete process.env[name]; else process.env[name] = value;
+    }
+  });
+  const own = { machineId: "ALICE-PC", githubUser: "alice", githubUserId: 2002, deviceId: "alice-device", trustTier: "collaborator" };
+  const shared = { machineId: "SHARED-PC", githubUser: "owner", githubUserId: 1001, deviceId: "owner-device", trustTier: "owner" };
+  const secret = { machineId: "SECRET-PC", githubUser: "other", githubUserId: 3003, deviceId: "other-device", trustTier: "owner" };
+  fs.writeFileSync(storePath, JSON.stringify({ flocks: {
+    "owner/team": { flockId: "owner/team", members: { own, shared } },
+    "other/work": { flockId: "other/work", members: { secret } },
+  } }));
+  fs.writeFileSync(membersPath, JSON.stringify(Object.fromEntries([own, shared, secret].map((member) => [member.machineId, member]))));
+  const server = createBootstrapServer({ v3StorePath: storePath, membersPath,
+    apiGet: async (apiPath, token) => apiPath === "/user"
+      ? { statusCode: 200, body: { login: token, id: token === "alice" ? 2002 : 4004 } }
+      : { statusCode: 200, body: { full_name: "erjadi/copilot-flock", owner: { login: "source-owner" }, permissions: { push: true } } },
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(async () => { server.closeAllConnections(); await new Promise((resolve) => server.close(resolve)); });
+  const request = async (route, token, body) => {
+    const response = await fetch(`http://127.0.0.1:${server.address().port}${route}`, {
+      method: body ? "POST" : "GET", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      ...(body ? { body: JSON.stringify(body) } : {}),
+    });
+    return { status: response.status, body: await response.json() };
+  };
+  for (const token of ["alice", "allowlisted"]) {
+    const bootstrap = await request("/api/bootstrap", token);
+    assert.equal(bootstrap.status, 403);
+    assert.doesNotMatch(JSON.stringify(bootstrap.body), /AccessKey|CANARY-MASTER/);
+    assert.equal((await request("/api/queue/drain", token, { machineId: "SECRET-PC" })).status, 403);
+    assert.equal((await request("/api/queue/ack", token, { machineId: "SECRET-PC", requestIds: ["id"] })).status, 403);
+  }
+  const peers = await request("/api/members", "alice");
+  assert.equal(peers.status, 200);
+  assert.deepEqual(peers.body.members.map((member) => member.machineId).sort(), ["ALICE-PC", "SHARED-PC"]);
+  assert.equal((await request("/api/register", "alice", { machineId: "SECRET-PC" })).status, 403);
+  assert.equal((await request("/api/bootstrap", "maintainer")).body.connectionString.includes("CANARY-MASTER"), true);
 });
 

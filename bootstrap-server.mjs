@@ -3030,6 +3030,47 @@ export function createBootstrapServer({
         bodyData.githubUser ||
         url.searchParams.get("githubUser") ||
         null;
+    const isMaintainer = String(githubUser || "").toLowerCase() ===
+      String(process.env.PLATFORM_MAINTAINER_USER || PLATFORM_MAINTAINER_USER).toLowerCase();
+    if (url.pathname === "/api/bootstrap" && !isMaintainer) {
+      sendJson(res, 403, { ok: false, code: "MAINTAINER_REQUIRED", error: "Master transport bootstrap is restricted to the platform maintainer. Use scoped device enrollment." });
+      return;
+    }
+    const ownedMachines = new Set();
+    const sharedPeerPrincipals = new Set();
+    if (!deviceAuth && !isMaintainer) {
+      const store = loadV3FlockStore(v3StorePath);
+      const now = Date.now();
+      const allActive = Object.values(store.flocks || {}).filter((flock) =>
+        !flock.expiresAtMs || Number(flock.expiresAtMs) > now).flatMap((flock) =>
+        Object.values(flock.members || {}).filter((member) => member && !member.removed &&
+          (!member.membershipExpiresAtMs || Number(member.membershipExpiresAtMs) > now) &&
+          !isPrincipalRevokedInFlock(flock, member)));
+      const matchesCaller = (member) => Number(verification.githubUserId) > 0 &&
+        Number(member.githubUserId) === Number(verification.githubUserId) &&
+        String(member.githubUser).toLowerCase() === String(githubUser).toLowerCase();
+      for (const member of allActive.filter(matchesCaller)) {
+        const machine = String(member.machineId || "").toLowerCase();
+        if (machine && !allActive.some((other) => String(other.machineId || "").toLowerCase() === machine && !matchesCaller(other))) {
+          ownedMachines.add(machine);
+        }
+      }
+      for (const flock of Object.values(store.flocks || {})) {
+        if (flock.expiresAtMs && Number(flock.expiresAtMs) <= now) continue;
+        const active = Object.values(flock.members || {}).filter((member) => member && !member.removed &&
+          (!member.membershipExpiresAtMs || Number(member.membershipExpiresAtMs) > now) &&
+          !isPrincipalRevokedInFlock(flock, member));
+        if (!active.some(matchesCaller)) continue;
+        for (const member of active) sharedPeerPrincipals.add(`${String(member.githubUser).toLowerCase()}:${String(member.machineId).toLowerCase()}`);
+      }
+    }
+    const visibleRegistryMembers = (registry) => deviceAuth
+      ? Object.values(registry).filter((member) => member?.machineId && deviceAuth.allowedPeerMachines.has(String(member.machineId).toLowerCase()))
+      : isMaintainer ? Object.values(registry)
+      : Object.values(registry).filter((member) => sharedPeerPrincipals.has(`${String(member.githubUser).toLowerCase()}:${String(member.machineId).toLowerCase()}`));
+    const ownsQueue = (target) => isMaintainer || (deviceAuth
+      ? String(target || "").toLowerCase() === String(deviceAuth.machineId || "").toLowerCase()
+      : ownedMachines.has(String(target || "").toLowerCase()));
 
     if (deviceAuth && url.pathname === "/api/register") {
       if (
@@ -3045,6 +3086,11 @@ export function createBootstrapServer({
     }
 
     let registry = loadMembersRegistry(membersPath);
+    if (!deviceAuth && !isMaintainer && url.pathname === "/api/register" &&
+        !ownedMachines.has(String(machineId || "").toLowerCase())) {
+      sendJson(res, 403, { ok: false, error: "Registration requires an authoritative owned machine" });
+      return;
+    }
     if (machineId && (url.pathname === "/api/bootstrap" || url.pathname === "/api/register")) {
       registry = saveMemberRegistration({
         machineId,
@@ -3059,11 +3105,7 @@ export function createBootstrapServer({
     }
 
     if (url.pathname === "/api/members") {
-      const visibleMembers = deviceAuth
-        ? Object.values(registry).filter(
-            (m) => m?.machineId && deviceAuth.allowedPeerMachines.has(String(m.machineId).toLowerCase())
-          )
-        : Object.values(registry);
+      const visibleMembers = visibleRegistryMembers(registry);
       sendJson(res, 200, {
         ok: true,
         repo: verification.repo,
@@ -3076,6 +3118,10 @@ export function createBootstrapServer({
     if (url.pathname === "/api/queue/status") {
       const store = loadOfflineQueueStore();
       const rawFilter = (url.searchParams.get("machineId") || "").trim().toLowerCase();
+      if (!deviceAuth && !isMaintainer && !ownsQueue(rawFilter)) {
+        sendJson(res, 403, { ok: false, error: "Queue status requires an authoritative owned target machine" });
+        return;
+      }
       if (deviceAuth) {
         const ownMachineLower = String(deviceAuth.machineId || "").trim().toLowerCase();
         if (!ownMachineLower || (rawFilter && rawFilter !== ownMachineLower)) {
@@ -3143,6 +3189,10 @@ export function createBootstrapServer({
 
     if (url.pathname === "/api/queue/drain") {
       const requestedDrainTarget = bodyData.machineId || machineId;
+      if (!ownsQueue(requestedDrainTarget)) {
+        sendJson(res, 403, { ok: false, error: "Queue drain requires ownership of the target machine" });
+        return;
+      }
       if (deviceAuth) {
         const ownMachineLower = String(deviceAuth.machineId || "").trim().toLowerCase();
         if (!ownMachineLower || String(requestedDrainTarget || "").trim().toLowerCase() !== ownMachineLower) {
@@ -3170,6 +3220,11 @@ export function createBootstrapServer({
     }
 
     if (url.pathname === "/api/queue/ack") {
+      const ackTarget = deviceAuth?.machineId || machineId;
+      if (!isMaintainer && !ownsQueue(ackTarget)) {
+        sendJson(res, 403, { ok: false, error: "Queue acknowledgement requires ownership of the target machine" });
+        return;
+      }
       if (deviceAuth && !deviceAuth.machineId) {
         sendJson(res, 403, {
           ok: false,
@@ -3180,7 +3235,7 @@ export function createBootstrapServer({
       try {
         const result = await ackOfflineStoreItems({
           requestIds: bodyData.requestIds,
-          onlyForMachine: deviceAuth ? deviceAuth.machineId : null,
+          onlyForMachine: isMaintainer ? null : ackTarget,
         });
         sendJson(res, 200, result);
       } catch (err) {
@@ -3194,13 +3249,7 @@ export function createBootstrapServer({
     }
 
     if (url.pathname === "/api/register") {
-      const visibleMembers = deviceAuth
-        ? Object.values(registry).filter(
-            (member) =>
-              member?.machineId &&
-              deviceAuth.allowedPeerMachines.has(String(member.machineId).toLowerCase())
-          )
-        : Object.values(registry);
+      const visibleMembers = visibleRegistryMembers(registry);
       sendJson(res, 200, {
         ok: true,
         repo: verification.repo,

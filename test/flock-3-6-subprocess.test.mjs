@@ -155,10 +155,21 @@ test("unconfigured and missing-vault MCP subprocesses initialize and submit supp
       const afterEnrollment = await call("list_flock_members", { flock: "owner/team" });
       assert.notEqual(afterEnrollment.result.isError, true, afterEnrollment.result.content[0].text);
       assert.ok(JSON.parse(afterEnrollment.result.content[0].text).members.length >= 1);
+      await until(() => fs.existsSync(path.join(home, "flock", "daemon.pid")), 20000);
+      assert.ok(Number(fs.readFileSync(path.join(home, "flock", "daemon.pid"), "utf8")) > 0,
+        "Successful enrollment in non-passive MCP starts the daemon");
       assert.equal(fs.existsSync(path.join(home, "helper-used")), false);
     } finally {
       child.kill();
-      await new Promise((resolve) => child.exitCode !== null ? resolve() : child.once("exit", resolve));
+      await new Promise((resolve) => child.exitCode !== null || child.signalCode !== null ? resolve() : child.once("exit", resolve));
+      const pidPath = path.join(home, "flock", "daemon.pid");
+      if (fs.existsSync(pidPath)) {
+        const pid = Number(fs.readFileSync(pidPath, "utf8"));
+        const live = inspectProcess(pid);
+        if (live?.command?.includes(home) || live?.argv?.some((arg) => arg.includes(home))) {
+          try { process.kill(pid); } catch {}
+        }
+      }
     }
   }
 });
@@ -278,7 +289,11 @@ test("resident daemon self_update flushes its RPC response before real activator
   openFlockMembershipRegistry(path.join(runtime, "flocks.json")).reconcileV3BrokerFlock(flock);
   openFlockMembershipRegistry(path.join(runtime, "flocks.json")).reconcileV3BrokerFlock({ ...flock, flockId: "owner" });
   const env = childEnv(home, tls.certPath);
-  const daemon = spawn(process.execPath, [path.join(runtime, "flock.mjs"), "daemon"], { env, stdio: "ignore", windowsHide: true });
+  const mcp = spawn(process.execPath, [path.join(runtime, "flock.mjs"), "mcp"], { env, stdio: ["pipe", "pipe", "pipe"], windowsHide: true });
+  const mcpRpc = stdioRpc(mcp);
+  assert.equal((await mcpRpc("initialize")).result.serverInfo.name, "copilot-flock");
+  await until(() => fs.existsSync(path.join(runtime, "daemon.pid")));
+  const daemon = { pid: Number(fs.readFileSync(path.join(runtime, "daemon.pid"), "utf8")) };
   t.after(async () => {
     const candidates = new Set([daemon.pid]);
     try { candidates.add(Number(fs.readFileSync(path.join(runtime, "daemon.pid"), "utf8"))); } catch {}
@@ -287,6 +302,8 @@ test("resident daemon self_update flushes its RPC response before real activator
       if (identity?.command?.includes(runtime) || identity?.argv?.some((arg) => arg.includes(runtime))) {
         try { process.kill(pid); } catch {}
       }
+      mcp.kill();
+      await new Promise((resolve) => mcp.exitCode !== null || mcp.signalCode !== null ? resolve() : mcp.once("exit", resolve));
     }
     for (const socket of sockets) socket.destroy();
     service.closeAllConnections();

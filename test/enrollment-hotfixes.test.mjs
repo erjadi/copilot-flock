@@ -374,7 +374,7 @@ test("v3 hotfix actual bootstrap child emits one JSON result and exits cleanly f
           assert.equal(args[0], "-e");
           assert.equal(options.timeout, 12000);
           child = spawnSync(executable, ["-e", stubBootstrapTransport(scenario) + args[1]], {
-            encoding: "utf8", timeout: 2000, windowsHide: true,
+            encoding: "utf8", timeout: 12000, windowsHide: true,
             env: { V3_URL: options.env.V3_URL, V3_METHOD: options.env.V3_METHOD,
               V3_BODY: options.env.V3_BODY, GH_BOOT_TOKEN: options.env.GH_BOOT_TOKEN },
           });

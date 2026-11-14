@@ -216,7 +216,9 @@ export class SupportMailbox {
         delete data.tickets[ticketId];
       }
     }
-    data.audit = data.audit.filter((entry) => Date.parse(entry.at) >= cutoff);
+    let prefix = 0;
+    while (prefix < data.audit.length && Date.parse(data.audit[prefix].at) < cutoff) prefix++;
+    data.audit = data.audit.slice(prefix);
     return data;
   }
 

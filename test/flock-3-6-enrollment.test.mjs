@@ -131,7 +131,7 @@ test("3.6 authoritative registry closes split-brain and pins peer keys by exact 
     const request = signedRequest({
       key: alice,
       machineId: "JAPAN-STU",
-      action: "list_locks",
+      action: "ping",
       params,
     });
     const result = await handleRpcAction(
@@ -145,7 +145,7 @@ test("3.6 authoritative registry closes split-brain and pins peer keys by exact 
     const forged = signedRequest({
       key: collision,
       machineId: "JAPAN-STU",
-      action: "list_locks",
+      action: "ping",
       params,
     });
     await assert.rejects(
@@ -397,7 +397,7 @@ test("3.6 first contact auto-syncs once on an unpinned explicit-flock peer and r
     const request = signedRequest({
       key: newcomer,
       machineId: "JAPAN-STU",
-      action: "list_locks",
+      action: "ping",
       params: { flock: "owner/japan-team" },
     });
     const result = await handleRpcAction(cfg, { ...request, flocksConfigPath: flocksPath });
@@ -960,7 +960,7 @@ test("3.6 unmocked HTTP broker converges owner and newcomer for immediate first 
     const request = signedRequest({
       key: newcomer,
       machineId: "JAPAN-STU",
-      action: "list_locks",
+      action: "ping",
       params: { flock: teamId },
       toMachine: "OWNER-PC",
     });
