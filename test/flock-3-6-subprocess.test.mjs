@@ -166,7 +166,10 @@ test("unconfigured and missing-vault MCP subprocesses initialize and submit supp
       if (fs.existsSync(pidPath)) {
         const pid = Number(fs.readFileSync(pidPath, "utf8"));
         const live = inspectProcess(pid);
-        if (live?.command?.includes(home) || live?.argv?.some((arg) => arg.includes(home))) {
+        const pinPath = path.join(home, "flock", "daemon-identity.json");
+        const pin = fs.existsSync(pinPath) ? JSON.parse(fs.readFileSync(pinPath, "utf8")) : null;
+        if (pin?.pid === pid && pin.start === live?.start && pin.executable === live?.executable &&
+            (pin.script === path.join(repo, "flock.mjs") || pin.script?.startsWith(home + path.sep))) {
           try { process.kill(pid); } catch {}
         }
       }
@@ -182,6 +185,52 @@ function frame(text) {
   else { header[1] = 126; header.writeUInt16BE(bytes.length, 2); }
   return Buffer.concat([header, bytes]);
 }
+
+test("real daemon connection failures persist only credential-free WebSocket diagnostics in log and state", async (t) => {
+  const root = temp(t, false);
+  const home = path.join(root, "home");
+  const runtime = path.join(home, "flock");
+  fs.mkdirSync(runtime, { recursive: true });
+  for (const filename of REQUIRED_RUNTIME_MODULES) fs.copyFileSync(path.join(repo, filename), path.join(runtime, filename));
+  fs.writeFileSync(path.join(runtime, "runtime-manifest.json"),
+    JSON.stringify(computeRuntimeManifest(runtime, { version: "3.6.0" })));
+  const tls = tlsFixture(root);
+  const canaries = ["WS_LOCAL_CANARY", "WS_SIGNATURE_CANARY", "WS_SIG_CANARY"];
+  const capturedTokens = [];
+  const service = https.createServer(tls, (_req, res) => { res.writeHead(404); res.end(); });
+  service.on("upgrade", (req, socket) => {
+    capturedTokens.push(new URL(req.url, "https://localhost").searchParams.get("access_token"));
+    socket.end(`HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\nwss://fixture.invalid/?token=${canaries[0]}&signature=${canaries[1]}&sig=${canaries[2]}`);
+  });
+  await new Promise((resolve) => service.listen(0, "127.0.0.1", resolve));
+  fs.writeFileSync(path.join(runtime, "config.json"), JSON.stringify({
+    machineId: "DIAGNOSTIC-PC", githubUser: "owner", scope: "work", bootstrapUrl: null,
+    connectionString: `Endpoint=https://127.0.0.1:${service.address().port};AccessKey=fixture-only-key;Version=1.0;`,
+    specs: { cpu: { model: "fixture" } },
+  }));
+  const child = spawn(process.execPath, [path.join(runtime, "flock.mjs"), "daemon"], {
+    env: childEnv(home, tls.certPath), stdio: "ignore", windowsHide: true,
+  });
+  t.after(async () => {
+    child.kill();
+    await new Promise((resolve) => child.exitCode !== null || child.signalCode !== null ? resolve() : child.once("exit", resolve));
+    service.closeAllConnections();
+    await new Promise((resolve) => service.close(resolve));
+    fs.rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  });
+  const state = await until(() => {
+    try {
+      const current = JSON.parse(fs.readFileSync(path.join(runtime, "state.json"), "utf8"));
+      return current.status === "error" && current;
+    } catch { return false; }
+  }, 45000);
+  assert.ok(capturedTokens[0]);
+  assert.match(state.lastError, /WebSocket upgrade failed/);
+  assert.doesNotMatch(state.lastError, /[?#]/);
+  const persisted = fs.readFileSync(path.join(runtime, "daemon.log"), "utf8") +
+    fs.readFileSync(path.join(runtime, "state.json"), "utf8");
+  for (const token of [...canaries, ...capturedTokens]) assert.equal(persisted.includes(token), false);
+});
 
 test("resident daemon self_update flushes its RPC response before real activator replaces its PID and records terminal verification", { timeout: 240000 }, async (t) => {
   const root = temp(t, false);

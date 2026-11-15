@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { atomicJson, inspectProcess } from "./flock-lifecycle.mjs";
+import { atomicJson, inspectProcess, redactDiagnosticText } from "./flock-lifecycle.mjs";
 
 const TERMINAL_STATES = new Set(["completed", "failed", "cancelled"]);
 const TRANSITIONS = Object.freeze({
@@ -40,12 +40,7 @@ function requesterKey({
 }
 
 function redactOperationContent(value, max = 8192) {
-  return boundedText(value, max)
-    .replace(/-----BEGIN [^-]+ PRIVATE KEY-----[\s\S]*?-----END [^-]+ PRIVATE KEY-----/gi, "[REDACTED PRIVATE KEY]")
-    .replace(/\b(AccessKey|SharedAccessKey|SharedAccessSignature|sig)=([^;\s&]+)/gi, "$1=[REDACTED]")
-    .replace(/\b(?:gh[opsu]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,})\b/g, "[REDACTED TOKEN]")
-    .replace(/\bBearer\s+[A-Za-z0-9._~+/-]+=*/gi, "Bearer [REDACTED]")
-    .replace(/\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/g, "[REDACTED JWT]");
+  return boundedText(redactDiagnosticText(value), max);
 }
 
 function terminateVerifiedProcessTree(identity, inspectProcessFn = inspectProcess, platform = process.platform) {
@@ -207,7 +202,7 @@ export class PersistentOperationStore {
     operation.updatedAtMs = now;
     if (detail.processIdentity !== undefined) operation.processIdentity = clone(detail.processIdentity);
     if (detail.result !== undefined) operation.result = clone(detail.result);
-    if (detail.error !== undefined) operation.error = boundedText(detail.error);
+    if (detail.error !== undefined) operation.error = redactOperationContent(detail.error, 4096);
     if (detail.deliveryStage !== undefined) operation.deliveryStage = detail.deliveryStage;
     if (detail.runtime !== undefined) operation.runtime = clone(detail.runtime);
     operation.history = [
@@ -537,6 +532,6 @@ export function compactOperation(operation) {
           },
         }
       : {}),
-    ...(operation.error ? { error: operation.error } : {}),
+    ...(operation.error ? { error: redactOperationContent(operation.error, 4096) } : {}),
   };
 }

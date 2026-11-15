@@ -530,6 +530,21 @@ function sendJson(res, statusCode, body) {
   res.end(payload);
 }
 
+export function projectV3EnrollmentResponse(result, protocolVersion) {
+  if (Number(protocolVersion) >= 36) return result;
+  const compatible = (entry) => entry?.trustTier !== "owner" ||
+    /^[^/]+(?:\/(?:personal|work))?$/.test(String(entry?.flockId || ""));
+  const output = { ...result };
+  for (const field of ["enrolledFlocks", "ownedFlocks", "joinedFlocks", "revokedFlockSummaries", "expiredFlockSummaries"]) {
+    if (Array.isArray(output[field])) output[field] = output[field].filter(compatible);
+  }
+  if (Array.isArray(output.controlHints)) {
+    const retained = new Set((output.enrolledFlocks || []).map((entry) => entry.flockId));
+    output.controlHints = output.controlHints.filter((entry) => retained.has(entry.flockId));
+  }
+  return output;
+}
+
 // ---------------------------------------------------------------------------
 // v3.0 Multi-Flock P2P Platform Broker Engine
 // ---------------------------------------------------------------------------
@@ -2684,7 +2699,7 @@ export function createBootstrapServer({
           }, membersPath);
         }
         sendJson(res, 200, {
-          ...out,
+          ...projectV3EnrollmentResponse(out, req.headers["x-flock-protocol-version"]),
           hub: DEFAULT_HUB,
         });
         return;
@@ -2731,7 +2746,7 @@ export function createBootstrapServer({
           },
           { storePath }
         );
-        sendJson(res, 200, out);
+        sendJson(res, 200, projectV3EnrollmentResponse(out, req.headers["x-flock-protocol-version"]));
         return;
       } catch (err) {
         sendJson(res, err.statusCode || 500, {
@@ -2822,7 +2837,7 @@ export function createBootstrapServer({
           },
           { storePath, sandbox: isPreview }
         );
-        sendJson(res, 200, out);
+        sendJson(res, 200, projectV3EnrollmentResponse(out, req.headers["x-flock-protocol-version"]));
         return;
       }
 
@@ -2848,7 +2863,7 @@ export function createBootstrapServer({
           },
           { storePath }
         );
-        sendJson(res, 200, out);
+        sendJson(res, 200, projectV3EnrollmentResponse(out, req.headers["x-flock-protocol-version"]));
         return;
       }
 

@@ -6,6 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import { EventEmitter } from "node:events";
 import { spawnSync } from "node:child_process";
+import { pathToFileURL } from "node:url";
 import {
   commandIsDaemon,
   computeRuntimeManifest,
@@ -17,6 +18,7 @@ import {
   lifecyclePaths,
   recordInstalledArtifact,
   uninstallFlock,
+  downgradeRuntime35,
 } from "../flock-lifecycle.mjs";
 import { compactOperation } from "../flock-operations.mjs";
 import { SupportMailbox, ensureSupportDeviceKey } from "../flock-support.mjs";
@@ -40,8 +42,12 @@ import {
   discoverReleaseCandidateTests,
   buildReleaseCandidateTestArgs,
   ackOfflineQueueMessages,
+  signV3EnrollmentRequest,
+  signV3MembershipSyncRequest,
+  reprovisionFleetMachines,
+  diagnoseFleetMachines,
 } from "../flock.mjs";
-import { createBootstrapServer, enrollV3Device } from "../bootstrap-server.mjs";
+import { createBootstrapServer, enrollV3Device, createV3FlockInvite } from "../bootstrap-server.mjs";
 
 function fixture(t) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "flock-36-hardening-"));
@@ -56,6 +62,52 @@ function identity(deviceId) {
   });
   return { ...pair, deviceId };
 }
+
+test("owner fleet mutations exclude collaborators before update, reprovision queue, diagnose and session creation", async (t) => {
+  const root = fixture(t);
+  useCopilotHome(t, root);
+  fs.mkdirSync(path.join(root, "flock"), { recursive: true });
+  const peers = [
+    { machineId: "OWNED", githubUser: "owner", scope: "work", role: "owner" },
+    { machineId: "COLLAB", githubUser: "alice", scope: "work", role: "collaborator" },
+  ];
+  fs.writeFileSync(path.join(root, "flock", "flocks.json"), JSON.stringify({ flocks: {
+    owner: { flockId: "owner", ownerGitHubUser: "owner", trustTier: "owner", members: peers },
+  } }));
+  const sent = [];
+  const cfg = { machineId: "LOCAL", githubUser: "owner", scope: "work", connectionString: "fixture",
+    rpcTransport: async (request) => {
+      if (request.action === "ping") return peers.map((peer) => ({ fromMachine: peer.machineId, result: peer }));
+      sent.push(request);
+      return { fromMachine: request.toMachine, result: { status: "accepted" } };
+    } };
+  const batches = [];
+  const invokeBatchFn = async (_cfg, items) => { batches.push(...items); return []; };
+  await updateFleetMachines(cfg, { includeSelf: false, discoverFn: async () => peers, invokeBatchFn, postUpdateWaitMs: 0 });
+  assert.deepEqual(batches.map((item) => item.toMachine), ["OWNED"]);
+  await assert.rejects(updateFleetMachines(cfg, { machines: "COLLAB", includeSelf: false,
+    discoverFn: async () => peers, invokeBatchFn }), (error) => error.statusCode === 403);
+  const queued = [];
+  await reprovisionFleetMachines(cfg, {
+    discoverFn: async () => peers, fetchMembersFn: async () => peers, postReprovisionWaitMs: 0,
+    invokeBatchFn: async (_cfg, items) => items.map((item) => ({ item, ok: false, error: "Timed out after 1ms waiting for response from machine" })),
+    enqueueOfflineFn: (input) => { queued.push(input.toMachine); return { ok: true }; },
+  });
+  assert.deepEqual(queued, ["OWNED"]);
+  fs.writeFileSync(path.join(root, "flock", "daemon.pid"), String(process.pid));
+  fs.writeFileSync(path.join(root, "flock", "state.json"), JSON.stringify({ status: "connected", pid: process.pid, updatedAt: new Date().toISOString() }));
+  batches.length = 0;
+  const diagnostics = await diagnoseFleetMachines(cfg, {
+    passive: true, pingFn: async () => peers.map((peer) => ({ fromMachine: peer.machineId, result: peer })),
+    fetchMembersFn: async () => peers, invokeBatchFn,
+  });
+  assert.deepEqual(batches.map((item) => item.toMachine), ["OWNED"]);
+  assert.equal(diagnostics.members.find((member) => member.machineId === "COLLAB").diagnosticAccess, "public_presence_only");
+  await executeMcpTool(cfg, "broadcast_remote_session_message", { new_session: true, message: "Synthetic fixture" });
+  assert.deepEqual(sent.filter((request) => request.action === "create_session").map((request) => request.toMachine), ["OWNED"]);
+  await assert.rejects(executeMcpTool(cfg, "broadcast_remote_session_message", { machines: "COLLAB", new_session: true, message: "denied" }),
+    (error) => error.statusCode === 403);
+});
 
 test("Windows daemon recognition accepts real quoting and whitespace but rejects extra arguments", () => {
   const script = String.raw`C:\Users\Eric J\.copilot\flock\flock.mjs`;
@@ -98,7 +150,7 @@ test("runtime update journal retains correlation, redacted failure, and terminal
   const state = readRuntimeState(root);
   assert.equal(state.update.phase, "rolled_back");
   assert.equal(state.update.correlationId, "corr-1");
-  assert.match(state.update.error, /REDACTED/);
+  assert.match(state.update.error, /redacted/i);
   assert.doesNotMatch(state.update.error, /eyJabc/);
   assert.deepEqual(state.update.history.map((entry) => entry.phase), ["staged", "rolled_back"]);
 });
@@ -315,8 +367,8 @@ test("operation DTO redacts JWTs as well as tokens", () => {
     createdAt: "2026-11-14T19:00:00Z",
     updatedAt: "2026-11-14T19:00:01Z",
   });
-  assert.match(compact.result.content, /REDACTED JWT/);
-  assert.match(compact.result.content, /REDACTED TOKEN/);
+  assert.match(compact.result.content, /redacted JWT/i);
+  assert.match(compact.result.content, /redacted.*token/i);
   assert.doesNotMatch(compact.result.content, /eyJabc|ghp_/);
 });
 
@@ -733,11 +785,11 @@ test("fleet updates poll exact update identity and replacement PID instead of ac
   const digest = "d".repeat(64);
   let probes = 0;
   let updateId;
-  const result = await updateFleetMachines({ machineId: "LOCAL" }, {
+  const result = await updateFleetMachines({ machineId: "LOCAL", githubUser: "owner", scope: "work" }, {
     includeSelf: false, postUpdateWaitMs: 0, verificationTimeoutMs: 3000,
     discoverFn: async () => {
       probes++;
-      if (probes === 1) return [{ machineId: "REMOTE", pid: 10 }];
+      if (probes === 1) return [{ machineId: "REMOTE", githubUser: "owner", scope: "work", role: "owner", pid: 10 }];
       return [{
         machineId: "REMOTE", pid: probes === 2 ? 10 : 11,
         update: { updateId, phase: probes === 2 ? "activated" : "verified" },
@@ -756,9 +808,9 @@ test("fleet updates poll exact update identity and replacement PID instead of ac
   assert.equal(probes, 3);
   assert.equal(result.ok, true);
   assert.equal(result.remoteUpdates[0].activationVerified, true);
-  const failed = await updateFleetMachines({ machineId: "LOCAL" }, {
+  const failed = await updateFleetMachines({ machineId: "LOCAL", githubUser: "owner", scope: "work" }, {
     includeSelf: false, postUpdateWaitMs: 0, verificationTimeoutMs: 0,
-    discoverFn: async () => [{ machineId: "REMOTE", update: { updateId: "update-poll", phase: "rolled_back", error: "self-test failed" } }],
+    discoverFn: async () => [{ machineId: "REMOTE", githubUser: "owner", scope: "work", role: "owner", update: { updateId: "update-poll", phase: "rolled_back", error: "self-test failed" } }],
     invokeBatchFn: async (_cfg, items) => items.map((item) => ({
       item, ok: true, response: { result: { status: "activating", updateId: "update-poll" } },
     })),
@@ -876,7 +928,7 @@ if (Module.registerHooks) Module.registerHooks({resolve(specifier, context, next
   const args = buildReleaseCandidateTestArgs(root, selected, guard);
   assert.equal(args.some((arg) => arg.includes("isolation=none")), false);
   const concurrency = Number(args.find((arg) => arg.startsWith("--test-concurrency=")).split("=")[1]);
-  assert.ok(concurrency >= 1 && concurrency <= Math.min(4, os.availableParallelism?.() || os.cpus().length));
+  assert.ok(concurrency >= 1 && concurrency <= Math.min(process.platform === "win32" ? 2 : 4, os.availableParallelism?.() || os.cpus().length));
   const singleArgs = buildReleaseCandidateTestArgs(root, [selected[0]], guard);
   if (process.allowedNodeEnvironmentFlags.has("--test-isolation") ||
       process.allowedNodeEnvironmentFlags.has("--experimental-test-isolation")) {
@@ -949,6 +1001,137 @@ test("GitHub-token broker callers cannot bootstrap masters or drain/ack foreign 
       if (value === undefined) delete process.env[name]; else process.env[name] = value;
     }
   });
+  await exerciseGitHubQueue(t, { root, storePath, membersPath });
+});
+
+  test("HTTP enrollment and sync preserve internal owner devices but project 3.5-compatible responses without changing signed bodies", async (t) => {
+    const root = fixture(t);
+    const storePath = path.join(root, "broker.json");
+    const first = identity("first");
+    first.fingerprint = crypto.createHash("sha256").update(first.publicKey.trim()).digest("hex").slice(0, 32);
+    await enrollV3Device({ githubUser: "owner", githubUserId: 1001, deviceId: first.fingerprint,
+      machineId: "OWNER-1", scope: "work", publicKey: first.publicKey, keyFingerprint: first.fingerprint }, { storePath, connectionString: "" });
+    await createV3FlockInvite({ callerGitHubUser: "owner", callerGitHubUserId: 1001,
+      targetAddress: "owner/team", invitedUser: "alice", invitedGitHubUserId: 2002 }, { storePath });
+    const second = identity("second");
+    second.fingerprint = crypto.createHash("sha256").update(second.publicKey.trim()).digest("hex").slice(0, 32);
+    const server = createBootstrapServer({ v3StorePath: storePath, membersPath: path.join(root, "members.json"),
+      apiGet: async (route) => route === "/user" ? { statusCode: 200, body: { login: "owner", id: 1001 } }
+        : { statusCode: 200, body: { full_name: "erjadi/copilot-flock", permissions: { push: true } } } });
+    await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+    t.after(async () => { server.closeAllConnections(); await new Promise((resolve) => server.close(resolve)); });
+    const post = async (route, body, protocol) => {
+      const response = await fetch(`http://127.0.0.1:${server.address().port}/api/v3${route}`, {
+        method: "POST", headers: { Authorization: "Bearer owner", "Content-Type": "application/json",
+          ...(protocol ? { "X-Flock-Protocol-Version": protocol } : {}) }, body: JSON.stringify(body),
+      });
+      const output = await response.json();
+      assert.equal(response.status, 200, output.error);
+      return output;
+    };
+    const verify35 = (result) => {
+      for (const entry of result.enrolledFlocks) if (entry.trustTier === "owner") {
+        assert.match(entry.flockId, /^[^/]+(?:\/(?:personal|work))?$/, "3.5 rejects owner authority on shared/guest entries");
+      }
+    };
+    const enrollment = signV3EnrollmentRequest({ deviceId: second.fingerprint, machineId: "OWNER-2", scope: "work",
+      publicKey: second.publicKey, keyFingerprint: second.fingerprint }, 1001, second);
+    const legacy = await post("/enroll", enrollment);
+    verify35(legacy);
+    const modern = await post("/enroll", enrollment, "36");
+    assert.ok(modern.enrolledFlocks.some((entry) => entry.flockId === "owner/team" && entry.trustTier === "owner"));
+    const sync = signV3MembershipSyncRequest({ deviceId: second.fingerprint, machineId: "OWNER-2" }, second);
+    verify35(await post("/flocks/sync", sync, "35"));
+    const modernSync = await post("/flocks/sync", sync, "36");
+    assert.ok(modernSync.enrolledFlocks.some((entry) => entry.flockId === "owner/team"));
+    const internal = JSON.parse(fs.readFileSync(storePath, "utf8"));
+    assert.ok(Object.values(internal.flocks["owner/team"].members).some((member) => member.machineId === "OWNER-2"));
+  });
+
+  test("state-aware offline 3.5 downgrade plans, archives evidence, preserves monotonic state and refuses unsafe credentials or active work", async (t) => {
+    const home = fixture(t);
+    const paths = lifecyclePaths({ home, copilotHome: path.join(home, ".copilot"), platform: "win32", appData: path.join(home, "AppData") });
+    const root = paths.roots[0];
+    const source = path.join(home, "verified-35");
+    fs.mkdirSync(root, { recursive: true });
+    fs.mkdirSync(source);
+    const legacyRuntime = `export const BRIDGE_VERSION = "3.5.0";
+  export async function runDaemon() {}
+  export async function runMcpServer() {}
+  export function verifyAndSync35(local, incoming) {
+    for (const [id, entry] of Object.entries(local.flocks)) {
+      if (entry.trustTier === "owner" && !/^[^/]+(?:\\/(?:personal|work))?$/.test(id)) throw Error("UNVERIFIED_OWNER_AUTHORITY");
+      if (id === "owner/team" && entry.members[0].trustTier !== entry.trustTier) throw Error("FORGED_AUTHORITY");
+    }
+    for (const entry of incoming) {
+      if (entry.rosterEpoch < local.flocks[entry.flockId].rosterEpoch) throw Error("ROSTER_ROLLBACK_REJECTED");
+    }
+    return true;
+  }`;
+    for (const name of ["flock.mjs", "bridge.mjs"]) {
+      fs.writeFileSync(path.join(source, name), legacyRuntime);
+      fs.writeFileSync(path.join(root, name), 'export const BRIDGE_VERSION="3.6.0"; export async function runDaemon() {}');
+      recordInstalledArtifact(root, path.join(root, name), paths);
+    }
+    const manifest = computeRuntimeManifest(source, { version: "3.5.0", requiredModules: [] });
+    fs.writeFileSync(path.join(source, "runtime-manifest.json"), JSON.stringify(manifest));
+    const mcp = Buffer.from(JSON.stringify({ type: "stdio", command: process.execPath, args: [path.join(root, "flock.mjs"), "mcp"], tools: ["*"] }));
+    const startup = Buffer.from(`verified fixture launcher for "${path.join(root, "flock.mjs")}" daemon`);
+    fs.writeFileSync(path.join(source, "mcp.json"), mcp);
+    fs.writeFileSync(path.join(source, "startup.vbs"), startup);
+    const recovery = Buffer.from(JSON.stringify({ runtimeManifestDigest: manifest.manifestDigest, artifacts: [
+      { kind: "mcp", source: "mcp.json", sha256: crypto.createHash("sha256").update(mcp).digest("hex") },
+      { kind: "startup", index: 0, source: "startup.vbs", sha256: crypto.createHash("sha256").update(startup).digest("hex") },
+    ] }));
+    fs.writeFileSync(path.join(source, "downgrade-artifacts.json"), recovery);
+    const options = { root, sourceDir: source, paths, expectedManifestDigest: manifest.manifestDigest,
+      recoveryDigest: crypto.createHash("sha256").update(recovery).digest("hex") };
+    const cfg = path.join(root, "config.json");
+    fs.writeFileSync(cfg, JSON.stringify({ tokenLocalAuth: true }));
+    assert.throws(() => downgradeRuntime35(options), /Vault-only/);
+    fs.writeFileSync(cfg, JSON.stringify({ connectionString: "legacy-authorized-fixture" }));
+    fs.writeFileSync(path.join(root, "cli-leases.json"), JSON.stringify({ leases: { active: { operationId: "running" } } }));
+    assert.throws(() => downgradeRuntime35(options), /leases/);
+    fs.writeFileSync(path.join(root, "cli-leases.json"), JSON.stringify({ leases: {} }));
+    fs.writeFileSync(path.join(root, "operations.json"), JSON.stringify({ operations: { test: { state: "running" } } }));
+    assert.throws(() => downgradeRuntime35(options), /Active operations/);
+    fs.writeFileSync(path.join(root, "operations.json"), JSON.stringify({ operations: { test: { state: "completed" } } }));
+    const preserved = {
+      "identity.json": '{"fingerprint":"preserved"}',
+      "flock-registry.json": '{"flocks":{"owner/team":{"rosterEpoch":9,"rosterRevision":8,"tombstones":{"peer":{"removed":true}}}}}',
+      "processed-offline-ids.json": '{"processedIds":["must-not-replay"],"pendingAckIds":["must-ack"]}',
+      "inbox.jsonl": '{"message":"preserve"}\n', "outbox.jsonl": '{"requestId":"preserve"}\n',
+    };
+    for (const [name, value] of Object.entries(preserved)) fs.writeFileSync(path.join(root, name), value);
+    fs.writeFileSync(path.join(root, "flocks.json"), JSON.stringify({ threadBindings: { shared: "owner/team" }, flocks: {
+      "owner/work": { trustTier: "owner", rosterEpoch: 9 },
+      "owner/team": { trustTier: "owner", rosterEpoch: 9, revokedPrincipals: { removed: true }, membershipExpiresAtMs: Date.now() + 60000,
+        members: [{ trustTier: "owner", machineId: "OWNER" }],
+        sharedSessionIds: ["shared"], sharedSnapshots: { shared: { summarySnapshot: "approved" } } },
+    } }));
+    fs.writeFileSync(path.join(root, "flock-support.mjs"), "// 3.6 evidence");
+    fs.mkdirSync(path.join(root, ".data", "support-quarantine"), { recursive: true });
+    fs.writeFileSync(path.join(root, ".data", "support-quarantine", "evidence.json"), '{"inert":true}');
+    const before = fs.readFileSync(path.join(root, "flocks.json"), "utf8");
+    assert.equal(downgradeRuntime35(options).status, "planned");
+    assert.equal(fs.readFileSync(path.join(root, "flocks.json"), "utf8"), before);
+    const result = downgradeRuntime35({ ...options, apply: true });
+    assert.equal(result.status, "restored");
+    const local = JSON.parse(fs.readFileSync(path.join(root, "flocks.json"), "utf8"));
+    assert.equal(local.flocks["owner/team"].trustTier, "collaborator");
+    assert.equal(local.flocks["owner/team"].sessionVisibility, "explicit_opt_in_only");
+    assert.equal(local.flocks["owner/team"].rosterEpoch, 9);
+    assert.equal(local.flocks["owner/team"].revokedPrincipals.removed, true);
+    assert.equal(local.threadBindings.shared, "owner/team");
+    const legacy = await import(pathToFileURL(path.join(root, "flock.mjs")).href);
+    assert.equal(legacy.verifyAndSync35(local, [{ flockId: "owner/team", rosterEpoch: 10 }]), true);
+    assert.throws(() => legacy.verifyAndSync35(local, [{ flockId: "owner/team", rosterEpoch: 8 }]), /ROLLBACK/);
+    for (const [name, value] of Object.entries(preserved)) assert.equal(fs.readFileSync(path.join(root, name), "utf8"), value);
+    assert.equal(fs.readFileSync(path.join(result.archive, "support-quarantine", "evidence.json"), "utf8"), '{"inert":true}');
+    assert.equal(fs.existsSync(path.join(root, "flock-support.mjs")), false);
+    if (process.platform !== "win32") assert.equal(fs.statSync(result.archive).mode & 0o777, 0o700);
+  });
+async function exerciseGitHubQueue(t, { root, storePath, membersPath }) {
   const own = { machineId: "ALICE-PC", githubUser: "alice", githubUserId: 2002, deviceId: "alice-device", trustTier: "collaborator" };
   const shared = { machineId: "SHARED-PC", githubUser: "owner", githubUserId: 1001, deviceId: "owner-device", trustTier: "owner" };
   const secret = { machineId: "SECRET-PC", githubUser: "other", githubUserId: 3003, deviceId: "other-device", trustTier: "owner" };
@@ -1003,5 +1186,5 @@ test("GitHub-token broker callers cannot bootstrap masters or drain/ack foreign 
   assert.equal(acknowledged.status, 200);
   assert.equal(acknowledged.body.ackedCount, 1);
   assert.equal((await request("/api/queue/drain", "owner", { machineId: "SHARED-PC", peekOnly: true })).body.messages.length, 0);
-});
+}
 

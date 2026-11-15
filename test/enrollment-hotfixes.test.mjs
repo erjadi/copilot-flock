@@ -289,6 +289,7 @@ function stubBootstrapTransport(scenario) {
       return { request(url, options, onResponse) {
         assert.equal(url.origin, "https://demo-broker.invalid");
         assert.equal(options.headers.Authorization, "Bearer " + process.env.GH_BOOT_TOKEN);
+        assert.equal(options.headers["X-Flock-Protocol-Version"], "36");
         assert.equal(options.timeout, 10000);
         if (scenario === "sync-error") { delivered = true; throw Error("synthetic transport failure"); }
         request = new EventEmitter();

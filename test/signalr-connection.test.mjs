@@ -12,6 +12,47 @@ const cfg = { protocol: "broker-free-v34", endpoint: "https://fixture.service.si
   host: "fixture.service.signalr.net", hub: "fixture_forbidden", clientToken: "fixture-private-token",
   credentialExpiresAt: Number.MAX_SAFE_INTEGER };
 
+const credentialCanaries = ["eyJhbGciOiJIUzI1NiJ9.c2lnbmFsci1zZWNyZXQ.c2lnbmF0dXJl",
+  "LOCAL_WS_OPAQUE_CANARY", "SIG_OPAQUE_CANARY", "SIGNATURE_OPAQUE_CANARY", "FRAGMENT_CANARY", "PASSWORD_CANARY"];
+const credentialUrl = `wss://user:${credentialCanaries[5]}@fixture.service.signalr.net/client/?access_token=${credentialCanaries[0]}&token=${credentialCanaries[1]}&sig=${credentialCanaries[2]}&signature=${credentialCanaries[3]}#${credentialCanaries[4]}`;
+
+test("both raw WebSocket entrypoints omit credential query, fragment and userinfo from all connection failures", async (t) => {
+  for (const mode of ["timeout", "socket-error", "upgrade"]) {
+    mockTlsSocket(t, (socket) => {
+      if (mode === "socket-error") {
+        socket.destroy(Object.assign(new Error(`connect failed at ${credentialUrl}`), { code: "ECONNRESET" }));
+      } else if (mode === "upgrade") {
+        socket.emit("data", Buffer.from(`HTTP/1.1 403 ${credentialUrl}\r\n\r\n${credentialUrl}`));
+      }
+    }, { timeout: mode === "timeout" });
+    for (const implementation of implementations) {
+      await assert.rejects(new implementation.RawWebSocketClient(credentialUrl, { timeoutMs: 5 }).connect(), (error) => {
+        assert.match(error.message, /wss:\/\/fixture\.service\.signalr\.net\/client\//);
+        assert.doesNotMatch(error.message, /[?#]/);
+        const detail = `${error.message}\n${error.stack}\n${JSON.stringify(error)}`;
+        for (const canary of credentialCanaries) assert.equal(detail.includes(canary), false);
+        if (mode === "upgrade") assert.equal(error.statusCode, 403);
+        if (mode === "timeout") assert.equal(error.code, "ETIMEDOUT");
+        if (mode === "socket-error") assert.equal(error.code, "ECONNRESET");
+        return true;
+      });
+    }
+  }
+});
+
+test("central diagnostic formatting scrubs credential URL query values on every error formatting path", () => {
+  const query = `wss://fixture.invalid/client/?access_token=${credentialCanaries[0]}&TOKEN=${credentialCanaries[1]}&sig=${credentialCanaries[2]}&signature=${credentialCanaries[3]}`;
+  for (const implementation of implementations) {
+    for (const value of [
+      query, new Error(query), { code: query }, { stack: query }, { detail: query },
+    ]) {
+      const output = implementation.formatErrorDetail(value);
+      for (const canary of credentialCanaries.slice(0, 4)) assert.equal(output.includes(canary), false);
+      assert.match(output, /redacted/i);
+    }
+  }
+});
+
 function mockTlsSocket(t, respond, { timeout = false } = {}) {
   const sockets = [];
   t.mock.method(tls, "connect", () => {

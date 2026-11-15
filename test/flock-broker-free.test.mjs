@@ -116,6 +116,22 @@ test("scoped Azure issuance has exact audiences, expiry, policy and target-only 
   await assert.rejects(new AzureTransport(endpoints, { secrets: { listenKey: "listen-fixture" } }).subscription(record.localPeerId, "DELETE"), /Manage/);
   assert.throws(() => azureEndpoints("https://evil.example", endpoints.serviceBusEndpoint), /endpoints/);
 });
+test("broker-free RPC error DTOs and admission logs redact opaque WebSocket query credentials", async (t) => {
+  const f = await fixture(t);
+  const canaries = ["WS_LOCAL_CANARY", "WS_ACCESS_CANARY", "WS_SIG_CANARY", "WS_SIGNATURE_CANARY"];
+  const leaked = `wss://fixture.invalid/client/?token=${canaries[0]}&access_token=${canaries[1]}&sig=${canaries[2]}&signature=${canaries[3]}`;
+  f.owner.dispatch = async () => { throw new Error(`WebSocket failed at ${leaked}`); };
+  const daemon = await f.owner.start();
+  t.after(() => daemon.close());
+  const replies = await f.peer.invoke({
+    flockId: "demo/team", toMachine: "OWNER", action: "ping", collectAll: true, timeoutMs: 1000,
+  });
+  assert.equal(replies.length, 1);
+  assert.match(replies[0].error, /redacted/);
+  f.owner.log(`Admission failed: ${leaked}`);
+  const output = JSON.stringify({ replies, logs: f.logs });
+  for (const canary of canaries) assert.equal(output.includes(canary), false);
+});
 test("subscription names bind the full peer identity and known namespace collisions reject before cloud effects", async (t) => {
   const f = await fixture(t);
   const code = await f.peer.joinRequest({ machineId: "ANOTHER-PEER", scope: "personal", flockId: "demo/team" });

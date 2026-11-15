@@ -35,7 +35,7 @@ function decodeJwtPayload(token) {
 async function postJson(url, body, headers = {}) {
   const response = await fetch(url, {
     method: "POST",
-    headers: { "content-type": "application/json", ...headers },
+    headers: { "content-type": "application/json", "X-Flock-Protocol-Version": "36", ...headers },
     body: JSON.stringify(body),
   });
   return { response, body: await response.json() };

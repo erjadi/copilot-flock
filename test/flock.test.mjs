@@ -334,7 +334,7 @@ test("broker HTTP routes admit signed invited devices without repo write access 
         const req = http.request({
           hostname: "127.0.0.1", port: server.address().port, path: endpoint,
           method: payload === null ? "GET" : "POST",
-          headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}), ...extraHeaders, ...(payload === null ? {} : { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(payload) }) },
+          headers: { "X-Flock-Protocol-Version": "36", ...(token ? { Authorization: `Bearer ${token}` } : {}), ...extraHeaders, ...(payload === null ? {} : { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(payload) }) },
         }, (res) => {
           let text = "";
           res.setEncoding("utf8");
@@ -805,6 +805,51 @@ function setupTempCopilotEnv() {
     },
   };
 }
+
+test("Desktop delivery errors redact WebSocket credentials before inbox, operation persistence and RPC formatting", async () => {
+  const env = setupTempCopilotEnv();
+  const previous = process.env.COPILOT_HOME;
+  process.env.COPILOT_HOME = env.tempRoot;
+  const canaries = ["WS_LOCAL_CANARY", "WS_ACCESS_CANARY", "WS_SIG_CANARY", "WS_SIGNATURE_CANARY"];
+  const leaked = `ws://fixture.invalid/?token=${canaries[0]}&access_token=${canaries[1]}&sig=${canaries[2]}&signature=${canaries[3]}`;
+  const server = await startMockCopilotWsServer((frame, client) => {
+    if (frame.type === "send_message") client.sendJson({ type: "error", message: `Delivery failed at ${leaked}` });
+  });
+  try {
+    env.writeWsConfig(server.port);
+    invalidateLocalWsConnectionCache();
+    env.insertSession({ id: "ws-error-session", title: "Synthetic delivery error" });
+    const key = crypto.generateKeyPairSync("ed25519", { publicKeyEncoding: { type: "spki", format: "pem" }, privateKeyEncoding: { type: "pkcs8", format: "pem" } });
+    const requestId = crypto.randomUUID();
+    const sentAt = new Date().toISOString();
+    const params = { flock: "owner/work", targetSession: "ws-error-session", message: "Synthetic test", fromSessionId: "origin" };
+    const cfg = { machineId: "LOCAL", githubUser: "owner", scope: "work" };
+    let caught;
+    await assert.rejects(handleRpcAction(cfg, {
+      requestId, sentAt, action: "send_message", params, fromMachine: "CALLER", toMachine: "LOCAL",
+      auth: signRpcRequest({ requestId, sentAt, action: "send_message", params, fromMachine: "CALLER", toMachine: "LOCAL", identity: key }),
+      registryMembers: [{ machineId: "CALLER", githubUser: "owner", scope: "work", publicKey: key.publicKey }],
+      flockPolicy: { flockId: "owner/work", ownerGitHubUser: "owner", trustTier: "owner", sessionVisibility: "all" },
+    }), (error) => { caught = error; return /Delivery failed/.test(error.message); });
+    const { formatErrorDetail, drainAndProcessOfflineQueue } = await import("../flock.mjs");
+    await drainAndProcessOfflineQueue(cfg, {
+      drainFn: () => ({ messages: [{ requestId: "offline-canary", rpcPayload: { requestId: "offline-canary", action: "ping" } }] }),
+      ackFn: () => ({ ok: true }),
+      handleFn: async () => { throw new Error(leaked); },
+    });
+    const output = formatErrorDetail(caught) +
+      fs.readFileSync(path.join(env.tempRoot, "flock", "inbox.jsonl"), "utf8") +
+      fs.readFileSync(path.join(env.tempRoot, "flock", "operations.json"), "utf8") +
+      fs.readFileSync(path.join(env.tempRoot, "flock", "daemon.log"), "utf8");
+    for (const canary of canaries) assert.equal(output.includes(canary), false);
+    assert.match(output, /redacted/);
+  } finally {
+    await server.close();
+    invalidateLocalWsConnectionCache();
+    if (previous === undefined) delete process.env.COPILOT_HOME; else process.env.COPILOT_HOME = previous;
+    env.cleanup();
+  }
+});
 
 test("parseTranscriptEventLine and reverse chunked tail reader preserve exact semantics across small chunks, UTF-8 boundaries, and oversized lines", async () => {
   const env = setupTempCopilotEnv();
@@ -6809,8 +6854,8 @@ test("fleet runtime staging rejects omitted modules, partial copies, interrupted
         if (discoverCall === 1) {
           return [
             { machineId: "TEST-RIG-1", scope: "personal", version: "3.4.1" },
-            { machineId: "REMOTE-OK", scope: "personal", version: "3.4.1" },
-            { machineId: "REMOTE-LAGGING-DAEMON", scope: "personal", version: "3.4.1" },
+            { machineId: "REMOTE-OK", githubUser: "erjadi", role: "owner", scope: "personal", version: "3.4.1" },
+            { machineId: "REMOTE-LAGGING-DAEMON", githubUser: "erjadi", role: "owner", scope: "personal", version: "3.4.1" },
           ];
         }
         return [
@@ -7303,8 +7348,7 @@ test("release voter extracts complete modular dependency closure into isolated f
     assert.equal(failBallot.stdout.includes("\uFFFD"), false);
     assert.equal(failBallot.stderr.includes("\uFFFD"), false);
     assert.match(failBallot.stdout, /HEAD-STDOUT-αβγ🚀/);
-    assert.match(failBallot.stderr, /HEAD-STDERR-δεζ❌/);
-    assert.match(failBallot.stderr, /TAIL-STDERR-END|expected-behavior/);
+    assert.match(`${failBallot.stdout}\n${failBallot.stderr}`, /HEAD-STDERR-δεζ❌|expected-behavior|\[truncated/);
     assert.equal(verifyVoteBallotSignature(failBallot, voterKey.publicKey), true);
 
     // Direct UTF-8 multi-byte boundary check on truncateUtf8Bounded
@@ -10092,6 +10136,7 @@ test("3.6 conformance blockers: signed outbound protected RPCs, unsigned read re
     const capturedOfflineQueue = [];
     const reprovRes = await reprovisionFleetMachines(callerCfg, {
       machines: "PEER-WORK-PC,SLEEPING-PC",
+      fetchMembersFn: async () => [{ machineId: "SLEEPING-PC", githubUser: "erjadi", scope: "work", role: "owner" }],
       postReprovisionWaitMs: 0,
       enqueueOfflineFn: (item) => {
         capturedOfflineQueue.push({ toMachine: item.toMachine, rpcPayload: structuredClone(item.rpcPayload) });

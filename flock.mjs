@@ -55,6 +55,11 @@ import {
   recordRuntimeUpdatePhase,
   parseWindowsCommandLine,
   commandIsDaemon,
+  redactDiagnosticText,
+  downgradeRuntime35,
+  canonicalCopilotHome,
+  canonicalRuntimePath,
+  installedArtifactDigest,
 } from "./flock-lifecycle.mjs";
 import {
   isSyntheticBuiltInFlock,
@@ -358,7 +363,7 @@ const DEFAULT_BOOTSTRAP_ORIGIN = DEFAULT_BOOTSTRAP_URL
 const RECORD_SEP = "\x1e";
 
 const HOME_DIR = os.homedir();
-const COPILOT_DIR = process.env.COPILOT_HOME || path.join(HOME_DIR, ".copilot");
+const COPILOT_DIR = canonicalCopilotHome(process.env.COPILOT_HOME || path.join(HOME_DIR, ".copilot"));
 const LEGACY_BRIDGE_HOME = path.join(COPILOT_DIR, "signalr-bridge");
 const BRIDGE_HOME = path.join(COPILOT_DIR, "flock");
 const CONFIG_PATH = path.join(BRIDGE_HOME, "config.json");
@@ -522,7 +527,7 @@ export function verifyRpcSignature({
 }
 
 function getCopilotDir() {
-  return process.env.COPILOT_HOME || COPILOT_DIR;
+  return canonicalCopilotHome(process.env.COPILOT_HOME || COPILOT_DIR);
 }
 
 export function isSandboxV3Mode() {
@@ -578,6 +583,7 @@ function getFlocksConfigPath() {
 }
 
 export function getFlockRegistryPath(customFlocksPath = null) {
+  if (customFlocksPath) customFlocksPath = canonicalRuntimePath(customFlocksPath);
   if (!customFlocksPath || path.basename(customFlocksPath) === "flocks.json") {
     return path.join(customFlocksPath ? path.dirname(customFlocksPath) : getBridgeHome(), "flock-registry.json");
   }
@@ -1141,19 +1147,19 @@ export function inspectLocalRuntimeHealth(
 
 export function formatErrorDetail(err) {
   if (!err) return "Unknown error (empty error object)";
-  if (typeof err === "string") return err.trim() || "Unknown error (empty string)";
+  if (typeof err === "string") return redactFlockSnapshot(err.trim()) || "Unknown error (empty string)";
   const msg = typeof err.message === "string" ? err.message.trim() : "";
   const code = err.code ? `[${err.code}]` : "";
-  if (msg) return code && !msg.includes(String(err.code)) ? `${code} ${msg}` : msg;
-  if (code) return `Error ${code}`;
+  if (msg) return redactFlockSnapshot(code && !msg.includes(String(err.code)) ? `${code} ${msg}` : msg);
+  if (code) return redactFlockSnapshot(`Error ${code}`);
   if (typeof err.stack === "string" && err.stack.trim()) {
-    return err.stack.split(/\r?\n/)[0].trim();
+    return redactFlockSnapshot(err.stack.split(/\r?\n/)[0].trim());
   }
   try {
     const s = JSON.stringify(err);
-    if (s && s !== "{}") return s;
+    if (s && s !== "{}") return redactFlockSnapshot(s);
   } catch {}
-  return String(err) || "Unknown error";
+  return redactFlockSnapshot(String(err)) || "Unknown error";
 }
 
 export function writeConfigFileSecure(cfgObj, targetPath = getConfigPath()) {
@@ -1170,7 +1176,7 @@ export function writeConfigFileSecure(cfgObj, targetPath = getConfigPath()) {
 function logDaemon(msg, extra = undefined) {
   ensureBridgeDir();
   const logPath = getDaemonLogPath();
-  const line = `[${new Date().toISOString()}] ${msg}${extra !== undefined ? " " + JSON.stringify(extra) : ""}\n`;
+  const line = redactFlockSnapshot(`[${new Date().toISOString()}] ${msg}${extra !== undefined ? " " + JSON.stringify(extra) : ""}\n`);
   try {
     if (fs.existsSync(logPath)) {
       const st = fs.statSync(logPath);
@@ -5325,7 +5331,7 @@ function projectPublicDiagnosticsResponse(result, options) {
     ...(result.daemon ? { daemon: projectPublicDaemonStatus(result.daemon, options) } : {}),
     members: page.items.map((member) => full ? member : Object.fromEntries(
       ["machineId", "scope", "online", "healthy", "version", "expectedVersion", "overallState",
-        "presenceLayers", "reason", "issues", "remediation", "duplicateInstances", "daemonInstanceCount"]
+        "presenceLayers", "reason", "issues", "remediation", "diagnosticAccess", "duplicateInstances", "daemonInstanceCount"]
         .filter((key) => member[key] !== undefined).map((key) => [key, member[key]])
     )),
     membersPage: page.page,
@@ -6927,7 +6933,7 @@ export function callBootstrapQueueApi({
     if (out) {
       const parsed = JSON.parse(out);
       if (parsed?.ok) return parsed.value;
-      const error = new Error(parsed?.error || "Offline queue request failed");
+      const error = new Error(redactFlockSnapshot(parsed?.error || "Offline queue request failed"));
       error.code = "QUEUE_REQUEST_FAILED";
       error.statusCode = parsed?.statusCode || null;
       error.stage = "offline_queue";
@@ -6938,7 +6944,7 @@ export function callBootstrapQueueApi({
     const error = new Error(`Offline queue request failed: ${redactFlockSnapshot(cause.message)}`);
     error.code = "QUEUE_REQUEST_FAILED";
     error.stage = "offline_queue";
-    error.cause = cause;
+    error.cause = new Error(formatErrorDetail(cause));
     throw error;
   }
   return null;
@@ -7213,19 +7219,33 @@ export class RawWebSocketClient {
       const isSecure = this.url.protocol === "wss:";
       const port = Number(this.url.port) || (isSecure ? 443 : 80);
       const host = this.url.hostname;
+      const safeEndpoint = `${this.url.protocol}//${this.url.host}${this.url.pathname || "/"}`;
+      const safeSocketError = (error, reason = "connection failed") => {
+        const code = /^[A-Z0-9_]+$/.test(String(error?.code || "")) ? error.code : null;
+        const statusCode = Number.isInteger(error?.statusCode) ? error.statusCode : null;
+        return Object.assign(new Error(`WebSocket ${code === "ETIMEDOUT" ? "connect timeout" : reason} to ${safeEndpoint}${
+          statusCode ? ` (HTTP ${statusCode})` : code ? ` (${code})` : ""
+        }`), { ...(code ? { code } : {}), ...(statusCode ? { statusCode } : {}) });
+      };
       const wsKey = crypto.randomBytes(16).toString("base64");
       let connectSettled = false;
 
-      const onConnectError = (err) => {
+      const onConnectError = (err, reason) => {
         if (connectSettled) return;
         connectSettled = true;
         cleanupConnect();
-        reject(err);
+        reject(safeSocketError(err, reason));
       };
 
-      const rawSocket = isSecure
-        ? tls.connect({ host, port, servername: host, family: 4, lookup: ipv4Lookup })
-        : net.connect({ host, port, family: 4, lookup: ipv4Lookup });
+      let rawSocket;
+      try {
+        rawSocket = isSecure
+          ? tls.connect({ host, port, servername: host, family: 4, lookup: ipv4Lookup })
+          : net.connect({ host, port, family: 4, lookup: ipv4Lookup });
+      } catch (error) {
+        reject(safeSocketError(error));
+        return;
+      }
 
       this.socket = rawSocket;
       rawSocket.setTimeout(this.timeoutMs);
@@ -7241,7 +7261,7 @@ export class RawWebSocketClient {
 
       rawSocket.on("timeout", () => {
         if (!handshakeDone) {
-          rawSocket.destroy(new Error(`WebSocket connect timeout to ${this.url.href}`));
+          rawSocket.destroy(Object.assign(new Error("WebSocket connect timeout"), { code: "ETIMEDOUT" }));
         }
       });
 
@@ -7276,8 +7296,7 @@ export class RawWebSocketClient {
           const firstLine = headerText.split("\r\n")[0] || "";
           const statusCode = Number(firstLine.match(/^HTTP\/1\.[01] (\d{3})(?:\s|$)/)?.[1]) || null;
           if (statusCode !== 101) {
-            const rest = headerBuf.slice(headerEnd + 4).toString("utf8");
-            onConnectError(Object.assign(new Error(`WebSocket upgrade failed (${firstLine}): ${rest}`), { statusCode }));
+            onConnectError({ statusCode }, "upgrade failed");
             rawSocket.destroy();
             return;
           }
@@ -7286,7 +7305,7 @@ export class RawWebSocketClient {
           rawSocket.setTimeout(0);
           cleanupConnect();
           rawSocket.on("error", (err) => {
-            if (this.onError) this.onError(err);
+            if (this.onError) this.onError(safeSocketError(err));
           });
 
           const leftover = headerBuf.slice(headerEnd + 4);
@@ -7304,7 +7323,7 @@ export class RawWebSocketClient {
 
       rawSocket.on("close", () => {
         this.closed = true;
-        if (!handshakeDone) onConnectError(new Error("WebSocket connection closed before upgrade completed"));
+        if (!handshakeDone) onConnectError(null, "connection closed before upgrade completed");
         if (this.onClose) this.onClose({ code: this.closeCode, reason: this.closeReason });
       });
     });
@@ -7492,7 +7511,7 @@ export async function connectSignalRClient(cfg, { userId, onInvocation, onClose 
 
       if (!handshakeResolved) {
         if (msg.error) {
-          settleHandshake(new Error(`SignalR handshake error: ${msg.error}`));
+          settleHandshake(new Error(`SignalR handshake error: ${redactFlockSnapshot(msg.error)}`));
           ws.close();
           return;
         }
@@ -7511,7 +7530,7 @@ export async function connectSignalRClient(cfg, { userId, onInvocation, onClose 
       } else if (msg.type === 7) {
         // Close frame from SignalR JSON protocol
         ws.closeCode = 1000;
-        ws.closeReason = msg.error || "signalr_type_7_close";
+        ws.closeReason = msg.error ? redactFlockSnapshot(msg.error) : "signalr_type_7_close";
         ws.close();
       }
     }
@@ -9513,7 +9532,7 @@ export async function injectLocalSessionMessage({
             const msg = JSON.parse(txt);
             if (msg && msg.type === "error") {
               wsError = new Error(
-                `Copilot Desktop WebSocket error: ${msg.message || JSON.stringify(msg)}`
+                `Copilot Desktop WebSocket error: ${redactFlockSnapshot(msg.message || JSON.stringify(msg))}`
               );
             }
           } catch {}
@@ -9940,7 +9959,7 @@ export async function createLocalSession({
           return;
         }
         if (msg.type === "error") {
-          const err = new Error(`Copilot Desktop WebSocket error: ${msg.message || JSON.stringify(msg)}`);
+          const err = new Error(`Copilot Desktop WebSocket error: ${redactFlockSnapshot(msg.message || JSON.stringify(msg))}`);
           if (rejectWorkspaceCreated) rejectWorkspaceCreated(err);
           if (rejectSessionCreated) rejectSessionCreated(err);
           return;
@@ -10122,9 +10141,11 @@ export async function createLocalSession({
     }
 
     if (title) {
+      let wsRename;
       try {
-        const wsRename = new RawWebSocketClient(wsUrl, { timeoutMs: 5000 });
-        await wsRename.connect();
+        ({ ws: wsRename } = await connectLocalDesktopWebSocket({
+          initialWsInfo: wsInfo, timeoutMs: 5000, discoverWsFn, retryPollMs: wsRetryPollMs,
+        }));
         wsRename.sendText(
           JSON.stringify({
             type: "rename_session",
@@ -10133,8 +10154,11 @@ export async function createLocalSession({
           })
         );
         await new Promise((r) => setTimeout(r, 250));
-        wsRename.close();
-      } catch {}
+      } catch (error) {
+        out.renameError = formatErrorDetail(error);
+      } finally {
+        wsRename?.close();
+      }
     }
   }
 
@@ -10396,7 +10420,8 @@ export async function invokeRemoteRpc(
 
   if (typeof cfg?.rpcTransport === "function") {
     const rawReplies = await cfg.rpcTransport(rpcPayload, { collectAll, timeoutMs });
-    const replyList = Array.isArray(rawReplies) ? rawReplies : rawReplies ? [rawReplies] : [];
+    const replyList = (Array.isArray(rawReplies) ? rawReplies : rawReplies ? [rawReplies] : [])
+      .map((reply) => reply.error ? { ...reply, error: redactFlockSnapshot(reply.error) } : reply);
     if (collectAll) return replyList;
     const winner = replyList[0];
     if (!winner) {
@@ -10405,7 +10430,7 @@ export async function invokeRemoteRpc(
       );
     }
     if (winner.error) {
-      throw new Error(`Remote machine "${winner.fromMachine}" returned error: ${winner.error}`);
+      throw new Error(redactFlockSnapshot(`Remote machine "${winner.fromMachine}" returned error: ${winner.error}`));
     }
     return winner;
   }
@@ -10421,9 +10446,10 @@ export async function invokeRemoteRpc(
     userId: replyUserId,
     onInvocation: (target, args) => {
       if (target === "bridgeRpcResponse" && args[0]?.requestId === requestId) {
-        responses.push(args[0]);
+        const response = args[0].error ? { ...args[0], error: redactFlockSnapshot(args[0].error) } : args[0];
+        responses.push(response);
         if (!collectAll) {
-          resolveFirst(args[0]);
+          resolveFirst(response);
         }
       }
     },
@@ -10461,7 +10487,7 @@ export async function invokeRemoteRpc(
     ]);
 
     if (winner.error) {
-      throw new Error(`Remote machine "${winner.fromMachine}" returned error: ${winner.error}`);
+      throw new Error(redactFlockSnapshot(`Remote machine "${winner.fromMachine}" returned error: ${winner.error}`));
     }
     return winner;
   } finally {
@@ -10474,7 +10500,7 @@ export async function invokeRemoteRpcBatch(cfg, items, timeoutMs = 18000, { pass
   if (cfg.protocol === "broker-free-v34" || typeof cfg?.rpcTransport === "function") {
     return Promise.all(items.map(async (item) => {
       try { return { item, ok: true, response: await invokeRemoteRpc(cfg, { ...item, timeoutMs, passive }) }; }
-      catch (error) { return { item, ok: false, error: error.message }; }
+      catch (error) { return { item, ok: false, error: formatErrorDetail(error) }; }
     }));
   }
   const preparedItems = items.map((item) => {
@@ -10560,11 +10586,11 @@ export async function invokeRemoteRpcBatch(cfg, items, timeoutMs = 18000, { pass
         .then(() => responsePromise)
         .then((winner) => {
           if (winner.error) {
-            throw new Error(`Remote machine "${winner.fromMachine}" returned error: ${winner.error}`);
+            throw new Error(redactFlockSnapshot(`Remote machine "${winner.fromMachine}" returned error: ${winner.error}`));
           }
           return { ok: true, response: winner, item };
         })
-        .catch((err) => ({ ok: false, error: err.message, item }));
+        .catch((err) => ({ ok: false, error: formatErrorDetail(err), item }));
     });
 
     return await Promise.all(promises);
@@ -12630,7 +12656,7 @@ export async function drainAndProcessOfflineQueue(
           });
           handleSucceeded = true;
         } catch (err) {
-          logDaemon(`Offline queue replay error for ${reqId}: ${err.message}`);
+          logDaemon(`Offline queue replay error for ${reqId}: ${formatErrorDetail(err)}`);
           if (reqId) {
             inFlightSet.delete(reqId);
             persistCurrentState();
@@ -13093,7 +13119,7 @@ export async function runDaemon(cfg) {
       });
       updateStateFile("reconnecting", {
         lastCloseCode: closeDetails?.code ?? null,
-        lastCloseReason: closeDetails?.reason || null,
+        lastCloseReason: closeDetails?.reason ? redactFlockSnapshot(closeDetails.reason) : null,
       });
       await new Promise((r) => setTimeout(r, waitMs));
       continue;
@@ -13117,6 +13143,9 @@ export function inspectLocalDaemonPassive(cfg = null) {
   if (fs.existsSync(statePath)) {
     try {
       stateObj = JSON.parse(fs.readFileSync(statePath, "utf8"));
+      for (const field of ["lastError", "lastCloseReason"]) {
+        if (typeof stateObj[field] === "string") stateObj[field] = redactFlockSnapshot(stateObj[field]);
+      }
     } catch {}
   }
   if (!fs.existsSync(pidPath)) {
@@ -13167,7 +13196,7 @@ export function inspectLocalDaemonPassive(cfg = null) {
         pin.executable !== live.executable ||
         pin.command !== live.command ||
         JSON.stringify(pin.argv) !== JSON.stringify(live.argv) ||
-        !lifecyclePaths().scripts.includes(pin.script)
+        !lifecyclePaths().scripts.includes(canonicalRuntimePath(pin.script))
       ) {
         if (
           lifecyclePaths().scripts.some(
@@ -13283,7 +13312,7 @@ export async function ensureDaemonStarted(cfg) {
     if (!live) status = { running: false };
     else if (!pin || pin.pid !== status.pid || pin.start !== live.start || pin.executable !== live.executable ||
         pin.command !== live.command || JSON.stringify(pin.argv) !== JSON.stringify(live.argv) ||
-        !lifecyclePaths().scripts.includes(pin.script)) {
+        !lifecyclePaths().scripts.includes(canonicalRuntimePath(pin.script))) {
       if (lifecyclePaths().scripts.some((script) => live.argv?.includes(script) || live.command?.includes(script))) {
         throw new Error("Unverified Flock daemon retained; no duplicate is started and no unrelated process is stopped");
       }
@@ -15202,7 +15231,7 @@ export async function executeMcpTool(cfg, name, args = {}, options = {}) {
         if (succeeded.length === 0 && replies.length > 0) {
           const firstErr = replies[0];
           throw new Error(
-            `Remote machine "${firstErr.fromMachine}" returned error: ${firstErr.error}`
+            redactFlockSnapshot(`Remote machine "${firstErr.fromMachine}" returned error: ${firstErr.error}`)
           );
         }
         const nonMemberCodeRe =
@@ -15541,7 +15570,7 @@ export async function executeMcpTool(cfg, name, args = {}, options = {}) {
       timeoutMs: 2500,
     });
 
-    const targets = filterBroadcastTargets(discovered, {
+    let targets = filterBroadcastTargets(discovered, {
       localMachineId: cfg.machineId,
       includeSelf,
       machines: args.machines || "*",
@@ -15553,6 +15582,9 @@ export async function executeMcpTool(cfg, name, args = {}, options = {}) {
       gpu: args.gpu || null,
       minRamGb: args.min_ram_gb ?? null,
       minFreeDiskGb: args.min_free_disk_gb ?? null,
+    });
+    if (args.new_session) targets = filterOwnedMutationTargets(cfg, targets, {
+      machines: args.machines || "*", flock: args.flock || null,
     });
 
     let senderSessionId = args.from_session || "latest";
@@ -16828,7 +16860,7 @@ export async function runMcpServer(cfg, { passive = false } = {}) {
             content: [
               {
                 type: "text",
-                text: `Error${err.code ? ` [${err.code}]` : ""}: ${err.message}`,
+                text: `Error: ${formatErrorDetail(err)}`,
               },
             ],
           },
@@ -17518,7 +17550,7 @@ export function buildReleaseCandidateTestArgs(fixtureDir, tests, guardScriptPath
     if (process.allowedNodeEnvironmentFlags?.has?.("--test-isolation")) args.push("--test-isolation=none");
     else if (process.allowedNodeEnvironmentFlags?.has?.("--experimental-test-isolation")) args.push("--experimental-test-isolation=none");
   } else {
-    args.push(`--test-concurrency=${Math.max(1, Math.min(4, os.availableParallelism?.() || os.cpus().length || 1))}`);
+    args.push(`--test-concurrency=${Math.max(1, Math.min(process.platform === "win32" ? 2 : 4, os.availableParallelism?.() || os.cpus().length || 1))}`);
   }
   args.push(...tests.map((rel) => path.join(fixtureDir, ...rel.split("/"))));
   return args;
@@ -18677,6 +18709,40 @@ export async function performLocalSelfUpdate(
   };
 }
 
+export function filterOwnedMutationTargets(cfg, targets, { machines = "*", flock = null, rejectExplicit = true } = {}) {
+  const owner = normalizeGitHubUser(cfg.githubUser)?.toLowerCase();
+  const selected = flock || (cfg.explicitFlock ? cfg.flockId : null) || cfg.boundFlockId || owner;
+  const policy = loadLocalFlocksConfig(cfg).flocks?.[selected];
+  if (!owner || !policy || policy.trustTier !== "owner" ||
+      normalizeGitHubUser(policy.ownerGitHubUser)?.toLowerCase() !== owner || isExplicitOptInFlockPolicy(policy) ||
+      isPrincipalRevokedInFlock(policy, { githubUser: owner }) ||
+      (policy.membershipExpiresAtMs && policy.membershipExpiresAtMs <= Date.now()) ||
+      (policy.expiresAtMs && policy.expiresAtMs <= Date.now())) {
+    throw Object.assign(new Error("Host mutation requires an active same-owner owner flock"), { code: "OWNER_MUTATION_REQUIRED", statusCode: 403 });
+  }
+  const registry = openFlockMembershipRegistry(cfg.flocksConfigPath || null);
+  const authoritative = registry.hasFlock(selected);
+  const now = Date.now();
+  const allowed = targets.filter((target) => {
+    const self = String(target.machineId).toLowerCase() === String(cfg.machineId).toLowerCase();
+    const proof = authoritative ? registry.findActiveMember(selected, { machineId: target.machineId })
+      : extractPolicyMembersList(policy).find((member) => String(member.machineId).toLowerCase() === String(target.machineId).toLowerCase()) ||
+        (self ? { githubUser: owner, scope: cfg.scope, role: "owner" } : target);
+    return proof && !["removed", "revoked", "expired", "revoked_or_expired"].includes(proof.membershipStatus) &&
+      normalizeGitHubUser(proof.githubUser)?.toLowerCase() === owner &&
+      (proof.role || proof.trustTier || "owner") === "owner" && !proof.removed && !proof.revoked &&
+      (!proof.membershipExpiresAtMs || Number(proof.membershipExpiresAtMs) > now) &&
+      (!proof.membershipExpiresAt || Date.parse(proof.membershipExpiresAt) > now) &&
+      !isPrincipalRevokedInFlock(policy, proof) &&
+      (!Array.isArray(policy.allowedScopes) || policy.allowedScopes.includes(proof.scope));
+  });
+  const explicit = String(machines).split(",").some((entry) => entry.trim() && entry.trim() !== "*" && !entry.includes("*"));
+  if (rejectExplicit && explicit && allowed.length !== targets.length) {
+    throw Object.assign(new Error("Explicit mutation target is not an active same-owner owner-role machine"), { code: "OWNER_MUTATION_REQUIRED", statusCode: 403 });
+  }
+  return allowed;
+}
+
 export async function updateFleetMachines(
   cfg,
   {
@@ -18695,12 +18761,12 @@ export async function updateFleetMachines(
   } = {}
 ) {
   const discovered = await discoverFn(cfg, { includeSelf: true, timeoutMs: 2500 });
-  const remoteTargets = filterBroadcastTargets(discovered, {
+  const remoteTargets = filterOwnedMutationTargets(cfg, filterBroadcastTargets(discovered, {
     localMachineId: cfg.machineId,
     includeSelf: false,
     machines,
     scope: scope && scope !== "all" ? normalizeScope(scope, "") : null,
-  });
+  }), { machines });
 
   const batchItems = remoteTargets.map((t) => ({
     target: t,
@@ -19279,11 +19345,12 @@ export async function reprovisionFleetMachines(
     machines = "*",
     enqueueOfflineFn = enqueueOfflineMessage,
     postReprovisionWaitMs = 5000,
+    discoverFn = discoverMachines, fetchMembersFn = fetchBootstrapMembers, invokeBatchFn = invokeRemoteRpcBatch,
   } = {}
 ) {
   const [discovered, bootstrapMembers] = await Promise.all([
-    discoverMachines(cfg, { includeSelf: true, timeoutMs: 2500 }),
-    fetchBootstrapMembers(),
+    discoverFn(cfg, { includeSelf: true, timeoutMs: 2500 }),
+    fetchMembersFn({ cfg, bootstrapUrl: cfg.bootstrapUrl || DEFAULT_BOOTSTRAP_URL }),
   ]);
 
   const allKnownMap = new Map();
@@ -19303,9 +19370,9 @@ export async function reprovisionFleetMachines(
     }
   }
 
-  const targets = Array.from(allKnownMap.values()).filter((m) =>
+  const targets = filterOwnedMutationTargets(cfg, Array.from(allKnownMap.values()).filter((m) =>
     matchesSelectorList(m.machineId, machines)
-  );
+  ), { machines });
 
   const batchItems = targets.map((t) => ({
     target: t,
@@ -19315,7 +19382,7 @@ export async function reprovisionFleetMachines(
   }));
 
   const outcomes =
-    batchItems.length > 0 ? await invokeRemoteRpcBatch(cfg, batchItems, 20000) : [];
+    batchItems.length > 0 ? await invokeBatchFn(cfg, batchItems, 20000) : [];
 
   const reprovisionResults = [];
   let anyOnlineSucceeded = false;
@@ -19992,7 +20059,8 @@ export function classifyLayeredPresence({
 
 export async function diagnoseFleetMachines(
   cfg,
-  { machines = "*", scope = null, fix = false, passive = !fix } = {}
+  { machines = "*", scope = null, fix = false, passive = !fix,
+    pingFn = invokeRemoteRpc, fetchMembersFn = fetchBootstrapMembers, invokeBatchFn = invokeRemoteRpcBatch } = {}
 ) {
   const effectiveFix = passive ? false : Boolean(fix);
   const effectivePassive = Boolean(passive) || !effectiveFix;
@@ -20044,7 +20112,7 @@ export async function diagnoseFleetMachines(
   let bootstrapMembers;
   try {
     [pingReplies, bootstrapMembers] = await Promise.all([
-      invokeRemoteRpc(cfg, {
+      pingFn(cfg, {
         toMachine: "*",
         action: "ping",
         params: effectivePassive ? { passive: true } : {},
@@ -20052,7 +20120,7 @@ export async function diagnoseFleetMachines(
         timeoutMs: process.env.BRIDGE_FAST_VOTE_TEST === "1" ? 150 : 2500,
         passive: effectivePassive,
       }),
-      fetchBootstrapMembers({ bootstrapUrl: cfg?.bootstrapUrl || DEFAULT_BOOTSTRAP_URL }),
+      fetchMembersFn({ bootstrapUrl: cfg?.bootstrapUrl || DEFAULT_BOOTSTRAP_URL, cfg }),
     ]);
   } catch (err) {
     if (effectivePassive) {
@@ -20143,7 +20211,18 @@ export async function diagnoseFleetMachines(
     return true;
   });
 
+  let ownerTargets;
+  try {
+    ownerTargets = filterOwnedMutationTargets(cfg, targetKeys.map((key) => allMachineIds.get(key)), {
+      machines, rejectExplicit: !effectivePassive,
+    });
+  } catch (error) {
+    if (!effectivePassive || error.statusCode !== 403) throw error;
+    ownerTargets = [];
+  }
+  const ownerIds = new Set(ownerTargets.map((target) => String(target.machineId).toLowerCase()));
   const onlineTargets = targetKeys
+    .filter((key) => ownerIds.has(key))
     .filter((k) => pingsByMachine.has(k))
     .map((k) => pingsByMachine.get(k)[0]);
 
@@ -20156,7 +20235,7 @@ export async function diagnoseFleetMachines(
 
   const batchOutcomes =
     batchItems.length > 0
-      ? await invokeRemoteRpcBatch(cfg, batchItems, 15000, { passive: effectivePassive })
+      ? await invokeBatchFn(cfg, batchItems, 15000, { passive: effectivePassive })
       : [];
   const diagByMachine = new Map();
   for (const o of batchOutcomes) {
@@ -20170,6 +20249,12 @@ export async function diagnoseFleetMachines(
     const online = livePings.length > 0;
     const daemonInstanceCount = livePings.length;
     const diagOutcome = diagByMachine.get(key);
+    if (!ownerIds.has(key)) return {
+      machineId: bm.machineId, scope: bm.scope, githubUser: bm.githubUser || null,
+      online, healthy: null, diagnosticAccess: "public_presence_only",
+      ...classifyLayeredPresence({ online, member: bm, ping: livePings[0] || {} }),
+      issues: [], remediation: "Host diagnostics require same-owner owner authority",
+    };
 
     if (!online) {
       const layeredPresence = classifyLayeredPresence({ online: false, member: bm });
@@ -20342,7 +20427,7 @@ export async function diagnoseFleetMachines(
     onlineCount: memberReports.filter((m) => m.online).length,
     offlineCount: memberReports.filter((m) => !m.online).length,
     healthyCount: memberReports.filter((m) => m.healthy).length,
-    unhealthyCount: memberReports.filter((m) => m.online && !m.healthy).length,
+    unhealthyCount: memberReports.filter((m) => m.online && m.healthy === false).length,
     ...(quarantinedMembers.length > 0 ? { quarantinedMembers } : {}),
     members: memberReports,
   };
@@ -20485,7 +20570,7 @@ export async function ensureThreadTrackerSession(cfg) {
       sessionId: null,
       title: THREAD_TRACKER_TITLE,
       created: false,
-      error: err.message,
+      error: formatErrorDetail(err),
     };
   }
 }
@@ -20556,6 +20641,7 @@ export function callBootstrapV3Endpoint(
     const body = process.env.V3_BODY || "";
     const headers = {
       "Accept": "application/json",
+      "X-Flock-Protocol-Version": "36",
       "User-Agent": "copilot-signalr-bridge/3.0"
     };
     if (process.env.GH_BOOT_TOKEN) {
@@ -20682,7 +20768,7 @@ export function callBootstrapV3Endpoint(
     }).trim();
     return out ? JSON.parse(out) : null;
   } catch (err) {
-    return { ok: false, error: err.message };
+    return { ok: false, error: formatErrorDetail(err) };
   }
 }
 
@@ -22380,11 +22466,7 @@ export async function queryFlockMembershipRegistry(
 }
 
 export function redactFlockSnapshot(text) {
-  return String(text).replace(/-----BEGIN [^-]*PRIVATE KEY-----[\s\S]*?-----END [^-]*PRIVATE KEY-----/g, "[redacted private key]")
-    .replace(/\b(?:Bearer|SharedAccessSignature)\s+[^\s"'<>]+/gi, "[redacted token]")
-    .replace(/\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g, "[redacted JWT]")
-    .replace(/\b(?:gh[pousr]_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]+)\b/g, "[redacted GitHub token]")
-    .replace(/((?:AccessKey|SharedAccessKey|api[_-]?key|password|client[_-]?secret|token)\s*["']?\s*[:=]\s*["']?)[^\s;"',}]+/gi, "$1[redacted]");
+  return redactDiagnosticText(text);
 }
 
 export async function dispatchBrokerFreeRpc(cfg, { member, payload, action, assertAuthorized, flockId }, {
@@ -22516,7 +22598,7 @@ export async function dispatchBrokerFreeRpc(cfg, { member, payload, action, asse
       return { ...result, operationId, correlationId, operation: compactOperation(store.get(operationId)) };
     } catch (error) {
       if (!["completed", "failed", "cancelled", "interrupted"].includes(store.get(operationId)?.state)) {
-        store.transition(operationId, "failed", { error: error.message });
+        store.transition(operationId, "failed", { error: formatErrorDetail(error) });
       }
       throw error;
     }
@@ -22583,7 +22665,7 @@ Owner removal ends that owner's renewal service; it does not delegate authority 
   try {
     for (const artifact of [...paths.persistence, ...paths.skills]) {
       assertNoLinks(artifact);
-      if (fs.existsSync(artifact) && manifest.artifacts[artifact] !== crypto.createHash("sha256").update(fs.readFileSync(artifact)).digest("hex")) {
+      if (fs.existsSync(artifact) && installedArtifactDigest(manifest, artifact) !== crypto.createHash("sha256").update(fs.readFileSync(artifact)).digest("hex")) {
         throw new Error(`Unowned/modified installation artifact retained: ${artifact}`);
       }
     }
@@ -22873,6 +22955,15 @@ async function main() {
     }
   } catch {}
   const { command, positional, flags } = parseCliArgs(process.argv.slice(2));
+  if (command === "downgrade-3-5") {
+    const result = downgradeRuntime35({
+      root: getBridgeHome(), sourceDir: flags.source,
+      expectedManifestDigest: flags["manifest-digest"], recoveryDigest: flags["recovery-digest"],
+      apply: flags.apply === true,
+    });
+    console.log(JSON.stringify(result, null, 2));
+    return;
+  }
   if (command === "activate-update") {
     if (path.resolve(__dirname) !== path.resolve(getBridgeHome())) throw new Error("Activator must run from the owned installed runtime");
     const cfg = loadConfig({ autoFetchAz: false, refreshSpecs: false, passive: true });
@@ -23893,7 +23984,7 @@ const isDirectEntrypoint = (() => {
 
 if (isDirectEntrypoint) {
   main().catch((err) => {
-    console.error(`Error: ${err.message}`);
+    console.error(`Error: ${formatErrorDetail(err)}`);
     process.exit(1);
   });
 }

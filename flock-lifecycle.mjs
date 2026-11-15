@@ -39,17 +39,81 @@ const runtimeFiles = [
   "update-activation.json",
   "update-verification.json",
 ];
+const copilotRootBindings = new Map();
+const runtimePathKey = (value) => process.platform === "win32" ? value.toLowerCase() : value;
+
+export function canonicalCopilotHome(selected = process.env.COPILOT_HOME || path.join(os.homedir(), ".copilot"), home = os.homedir()) {
+  const logical = path.resolve(selected);
+  const physical = fs.existsSync(logical) ? fs.realpathSync.native(logical) : logical;
+  const lowered = physical.toLowerCase();
+  if ([path.parse(physical).root, path.resolve(home), os.tmpdir()].some((value) => path.resolve(value).toLowerCase() === lowered) ||
+      path.resolve(home).toLowerCase().startsWith(lowered + path.sep) || physical.split(path.sep).some((part) => part.toLowerCase() === ".git") ||
+      fs.existsSync(path.join(physical, ".git"))) throw new Error("Unsafe configured Copilot root target; a dedicated directory is required");
+  if (logical.toLowerCase() === path.join(path.resolve(home), ".copilot").toLowerCase() && path.basename(physical).toLowerCase() !== ".copilot") {
+    throw new Error("Default Copilot root alias must target a directory named .copilot");
+  }
+  const previous = copilotRootBindings.get(runtimePathKey(logical));
+  if (previous && runtimePathKey(previous) !== runtimePathKey(physical)) throw new Error("Configured Copilot root changed during this process");
+  assertNoLinks(path.dirname(logical));
+  if (fs.existsSync(logical) && fs.lstatSync(logical).isSymbolicLink()) {
+    assertNoLinks(path.resolve(path.dirname(logical), fs.readlinkSync(logical)));
+  }
+  assertNoLinks(physical);
+  if (fs.existsSync(physical)) {
+    const stat = fs.statSync(physical);
+    if (!stat.isDirectory() || (process.platform !== "win32" && (stat.uid !== process.getuid() || (stat.mode & 0o022)))) {
+      throw new Error("Copilot root target directory ownership/permissions are unproven");
+    }
+  }
+  if (previous) return previous;
+  copilotRootBindings.set(runtimePathKey(logical), physical);
+  return physical;
+}
+
+export function canonicalRuntimePath(filename) {
+  const absolute = path.resolve(filename);
+  for (const [logical, physical] of copilotRootBindings) {
+    if (runtimePathKey(absolute) === logical || runtimePathKey(absolute).startsWith(logical + path.sep)) {
+      return assertNoLinks(path.join(physical, absolute.slice(logical.length).replace(/^[/\\]/, "")));
+    }
+
+  }
+  return assertNoLinks(absolute);
+}
+
+export function runtimePathAliases(filename) {
+  const physical = canonicalRuntimePath(filename);
+  return [...new Set([physical, ...[...copilotRootBindings].filter(([, root]) =>
+    runtimePathKey(physical) === runtimePathKey(root) || runtimePathKey(physical).startsWith(runtimePathKey(root) + path.sep))
+    .map(([logical, root]) => path.join(logical, physical.slice(root.length).replace(/^[/\\]/, "")))])];
+}
+
+function normalizeArtifactKeys(manifest) {
+  for (const [filename, digest] of Object.entries(manifest.artifacts || {})) {
+    const canonical = canonicalRuntimePath(filename);
+    if (canonical !== filename) {
+      if (manifest.artifacts[canonical] && manifest.artifacts[canonical] !== digest) throw new Error("Conflicting installation artifact aliases");
+      manifest.artifacts[canonical] = digest;
+      delete manifest.artifacts[filename];
+    }
+  }
+  return manifest;
+}
+
+export function installedArtifactDigest(manifest, filename) {
+  return normalizeArtifactKeys(manifest).artifacts?.[canonicalRuntimePath(filename)];
+}
 
 export function lifecyclePaths({ home = os.homedir(), copilotHome = process.env.COPILOT_HOME || path.join(home, ".copilot"),
   appData = process.env.APPDATA, platform = process.platform } = {}) {
   home = path.resolve(home);
-  copilotHome = path.resolve(copilotHome);
+  copilotHome = canonicalCopilotHome(copilotHome, home);
   if ([home, path.parse(home).root].includes(copilotHome)) throw new Error("Copilot home must be a dedicated directory");
   const app = platform === "win32" ? path.join(appData || path.join(home, "AppData", "Roaming"), "com.github.githubapp")
     : platform === "darwin" ? path.join(home, "Library", "Application Support", "com.github.githubapp")
     : path.join(home, ".config", "com.github.githubapp");
   const roots = ["flock", "signalr-bridge"].map((name) => path.join(copilotHome, name));
-  const scripts = roots.flatMap((root) => ["flock.mjs", "bridge.mjs"].map((name) => path.join(root, name)));
+  const scripts = roots.flatMap((root) => ["flock.mjs", "bridge.mjs"].flatMap((name) => runtimePathAliases(path.join(root, name))));
   const configs = [
     { path: path.join(copilotHome, "mcp-config.json"), key: "mcpServers" },
     { path: path.join(app, "mcp-config.json"), key: "mcpServers" },
@@ -129,6 +193,8 @@ export function atomicJson(filename, value, expected) {
 }
 
 export function recordInstalledArtifact(root, filename, paths = lifecyclePaths()) {
+  root = canonicalRuntimePath(root);
+  filename = canonicalRuntimePath(filename);
   if (!paths.roots.includes(root) ||
       ![...paths.skills, ...paths.persistence,
         ...runtimeFiles.filter((name) =>
@@ -144,6 +210,7 @@ export function recordInstalledArtifact(root, filename, paths = lifecyclePaths()
     : { type: "copilot-flock-installation-v1", artifacts: {} };
   if (manifest.type !== "copilot-flock-installation-v1") throw new Error("Invalid installation ownership manifest");
   manifest.artifacts[filename] = hash(fs.readFileSync(filename));
+  normalizeArtifactKeys(manifest);
   atomicJson(manifestPath, manifest);
 }
 
@@ -157,17 +224,23 @@ export function inspectProcess(pid, platform = process.platform) {
         start: fields[19], argv: fs.readFileSync(`${base}/cmdline`, "utf8").split("\0").filter(Boolean) };
     }
     if (platform === "win32") {
-      const text = execFileSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command",
-        `$p=Get-CimInstance Win32_Process -Filter 'ProcessId = ${pid}'; if($p){[pscustomobject]@{pid=$p.ProcessId;executable=$p.ExecutablePath;start=$p.CreationDate.ToUniversalTime().ToString('o');command=$p.CommandLine}|ConvertTo-Json -Compress}`],
-      { encoding: "utf8", windowsHide: true, timeout: 15000, stdio: ["ignore", "pipe", "pipe"] }).trim();
-      return text ? JSON.parse(text) : null;
+      try { process.kill(pid, 0); }
+      catch (error) { if (error.code === "ESRCH") return null; if (error.code !== "EPERM" && error.code !== "EACCES") throw error; }
+      for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+          const text = execFileSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command",
+            `$p=Get-CimInstance Win32_Process -Filter 'ProcessId = ${pid}'; if($p){[pscustomobject]@{pid=$p.ProcessId;executable=$p.ExecutablePath;start=$p.CreationDate.ToUniversalTime().ToString('o');command=$p.CommandLine}|ConvertTo-Json -Compress}`],
+          { encoding: "utf8", windowsHide: true, timeout: 15000, stdio: ["ignore", "pipe", "pipe"] }).trim();
+          return text ? JSON.parse(text) : null;
+        } catch (error) { if (error.code !== "ETIMEDOUT" || attempt !== 0) throw error; }
+      }
     }
     const text = execFileSync("ps", ["-p", String(pid), "-o", "lstart=", "-o", "command="],
       { encoding: "utf8", timeout: 5000, stdio: ["ignore", "pipe", "pipe"], windowsHide: true }).trim();
     return text ? { pid, start: text.slice(0, 24), executable: process.execPath,
       command: text.slice(25).trim() } : null;
   } catch (error) {
-    if (error.code === "ENOENT" || error.code === "ESRCH" || error.status === 1) return null;
+    if (error.code === "ESRCH" || (platform !== "win32" && (error.code === "ENOENT" || error.status === 1))) return null;
     throw error;
   }
 }
@@ -242,7 +315,7 @@ export function commandIsDaemon(identity, scripts, { platform = process.platform
   const executable = path.resolve(argv[0]);
   const expectedExecutable = path.resolve(identity?.executable || argv[0]);
   if (executable !== expectedExecutable) return false;
-  return scripts.includes(path.resolve(argv[1]));
+  return scripts.some((script) => canonicalRuntimePath(script) === canonicalRuntimePath(argv[1]));
 }
 
 export function inspectLinuxUnifiedCgroup(pid, {
@@ -387,6 +460,7 @@ export async function stopPinnedDaemon(root, paths, {
   delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
   checkLinuxCgroup = assertLinuxDaemonCgroupSafe,
 } = {}) {
+  root = canonicalRuntimePath(root);
   const pidPath = path.join(root, "daemon.pid");
   if (!fs.existsSync(pidPath)) return;
   const pid = Number(fs.readFileSync(pidPath, "utf8").trim());
@@ -401,7 +475,7 @@ export async function stopPinnedDaemon(root, paths, {
   const pin = JSON.parse(fs.readFileSync(pinPath, "utf8"));
   if (pin.pid !== pid || pin.start !== live.start || pin.executable !== live.executable ||
       pin.command !== live.command || JSON.stringify(pin.argv) !== JSON.stringify(live.argv) ||
-      !paths.scripts.includes(pin.script) || !commandIsDaemon(live, [pin.script])) {
+      !paths.scripts.includes(canonicalRuntimePath(pin.script)) || !commandIsDaemon(live, [canonicalRuntimePath(pin.script)])) {
     if (commandIsDaemon(live, paths.scripts)) throw new Error("Running daemon does not match its stored creation identity");
     return;
   }
@@ -421,7 +495,7 @@ export async function stopPinnedDaemon(root, paths, {
 function isOwnedMcp(entry, scripts) {
   return entry && typeof entry.command === "string" && Array.isArray(entry.args) &&
     entry.args.length === 2 && typeof entry.args[0] === "string" &&
-    scripts.includes(path.resolve(entry.args[0])) && entry.args[1] === "mcp" &&
+    scripts.includes(canonicalRuntimePath(entry.args[0])) && entry.args[1] === "mcp" &&
     /^(node(?:\.exe)?|.*[\\/]node(?:\.exe)?)$/i.test(entry.command);
 }
 
@@ -727,7 +801,7 @@ export async function activateLinuxSystemdDaemon({
     const matchesPin = Boolean(
       pin && pin.pid === pid && pin.start === live.start && pin.executable === live.executable &&
       pin.command === live.command && JSON.stringify(pin.argv) === JSON.stringify(live.argv) &&
-      paths.scripts.includes(pin.script) && commandIsDaemon(live, [pin.script])
+      paths.scripts.includes(canonicalRuntimePath(pin.script)) && commandIsDaemon(live, [canonicalRuntimePath(pin.script)])
     );
     if (matchesPin) {
       if (!runningDaemons.some((entry) => entry.pid === pid)) {
@@ -1162,7 +1236,7 @@ ConvertTo-Json -InputObject @($found) -Compress`], {
       throw error;
     }
     if (identity && (identity.argv?.some((arg) => scripts.includes(arg)) ||
-        scripts.some((script) => identity.command?.includes(script)))) {
+        scripts.some((script) => identity.command?.toLowerCase().includes(script.toLowerCase())))) {
       results.push({ pid, reason: "Runtime-referencing process requires creation-identity proof before termination" });
     }
   }
@@ -1272,7 +1346,7 @@ export async function uninstallFlock({
     if (config.protocol !== "broker-free-v34" && !Object.keys(flocks).length && (config.bootstrapUrl || config.connectionString) && !localOnly) {
       report.pending.push({ path: root, reason: "Legacy membership inventory is unavailable; cannot prove all flocks left" });
     }
-    installations.push({ root, ownedRuntimeFiles, manifest: read("installation.json", { artifacts: {} }) });
+    installations.push({ root, ownedRuntimeFiles, manifest: normalizeArtifactKeys(read("installation.json", { artifacts: {} })) });
   }
   if (report.pending.length && !localOnly) {
     report.retained.push(...installations.map(({ root }) => ({ path: root, reason: "Retained credentials and leave journal for retry" })));
@@ -1838,7 +1912,7 @@ const EMBEDDED_RUNTIME_MANIFEST_FALLBACK = (() => {
     operationsSha = hashRuntimeModule(fs.readFileSync(path.join(__lifecycleDir, "flock-operations.mjs")));
     supportSha = hashRuntimeModule(fs.readFileSync(path.join(__lifecycleDir, "flock-support.mjs")));
   } catch {}
-  const entrypointSha = "9e3684b62e3352563239eb4bfb1197d6aad2364ec5d3367e94ea877104eb77fc";
+  const entrypointSha = "2e0541e3045e66537079e5648543967d13c99776a21f3b5e8a9dff22ce56b401";
   const fallback = {
     type: "copilot-flock-runtime-manifest-v1",
     schema: 1,
@@ -1864,7 +1938,7 @@ const EMBEDDED_RUNTIME_MANIFEST_FALLBACK = (() => {
       },
       "flock-broker-free.mjs": {
         role: "companion",
-        sha256: "32d48ea6a437ea5944d8cfbe77e47550398d0c3411385a462c0d165378261972",
+        sha256: "348d329d89947d1a29730f9bd82b0c3420dd97d671d021117d4d3728aab32770",
         imports: [
           "./flock-azure.mjs",
           "./flock-lifecycle.mjs",
@@ -2241,14 +2315,18 @@ function updateRuntimeState(targetDir, patch) {
   return next;
 }
 
+export function redactDiagnosticText(text) {
+  return String(text ?? "")
+    .replace(/([?&](?:access_token|token|sig|signature)=)[^&#\s"'<>]*/gi, "$1[redacted]")
+    .replace(/-----BEGIN [^-]*PRIVATE KEY-----[\s\S]*?-----END [^-]*PRIVATE KEY-----/g, "[redacted private key]")
+    .replace(/\b(?:Bearer|SharedAccessSignature)\s+[^\s"'<>]+/gi, "[redacted token]")
+    .replace(/\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g, "[redacted JWT]")
+    .replace(/\b(?:gh[pousr]_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]+)\b/g, "[redacted GitHub token]")
+    .replace(/((?:AccessKey|SharedAccessKey|SharedAccessSignature|api[_-]?key|password|client[_-]?secret|access_token|token|signature|sig)\s*["']?\s*[:=]\s*["']?)[^\s;"',}]+/gi, "$1[redacted]");
+}
+
 function redactRuntimeError(error) {
-  return String(error?.message || error || "")
-    .replace(/-----BEGIN (?:[A-Z]+ )?PRIVATE KEY-----[\s\S]*?-----END (?:[A-Z]+ )?PRIVATE KEY-----/gi, "[REDACTED PRIVATE KEY]")
-    .replace(/\bBearer\s+[A-Za-z0-9._~+/-]+=*/gi, "Bearer [REDACTED]")
-    .replace(/\b(?:gh[opsu]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,})\b/g, "[REDACTED TOKEN]")
-    .replace(/\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/g, "[REDACTED JWT]")
-    .replace(/\b(AccessKey|SharedAccessKey|SharedAccessSignature|sig)=([^;\s&]+)/gi, "$1=[REDACTED]")
-    .slice(0, 4096);
+  return redactDiagnosticText(error?.message || error || "").slice(0, 4096);
 }
 
 export function recordRuntimeUpdatePhase(targetDir, {
@@ -2287,6 +2365,173 @@ export function recordRuntimeUpdatePhase(targetDir, {
   };
   updateRuntimeState(targetDir, { update: entry });
   return entry;
+}
+
+export function downgradeRuntime35({
+  root, sourceDir, expectedManifestDigest, recoveryDigest, apply = false, paths = lifecyclePaths(),
+} = {}) {
+  if (!root || !sourceDir || !/^[a-f0-9]{64}$/.test(expectedManifestDigest || "") || !/^[a-f0-9]{64}$/.test(recoveryDigest || "")) {
+    throw runtimeError("DOWNGRADE_UNSAFE", "Supply the stopped installation, verified 3.5 source and both independently pinned SHA-256 digests");
+  }
+  root = assertNoLinks(path.resolve(root));
+  sourceDir = assertNoLinks(path.resolve(sourceDir));
+  const abort = (message) => { throw runtimeError("DOWNGRADE_UNSAFE", message); };
+  if (!paths.roots.includes(root) || fs.existsSync(path.join(root, ".git")) || sourceDir === root) abort("Use an owned, stopped installation and a separate verified 3.5 source");
+  const read = (name, fallback = {}) => {
+    const filename = assertNoLinks(path.join(root, name));
+    return fs.existsSync(filename) ? JSON.parse(fs.readFileSync(filename, "utf8")) : fallback;
+  };
+  const config = read("config.json");
+  if (config.protocol === "broker-free-v34") abort("Broker-free downgrade is not supported by this legacy state recovery helper");
+  if (config.tokenLocalAuth && !config.connectionString) abort("Vault-only token-local credentials cannot run on 3.5; retain 3.6 recovery");
+  const daemonPid = path.join(root, "daemon.pid");
+  if (fs.existsSync(daemonPid) && inspectProcess(Number(fs.readFileSync(daemonPid, "utf8")))) abort("Stop the creation-pinned daemon before downgrade");
+  const leases = read("cli-leases.json", { leases: {} }).leases;
+  const operations = read("operations.json", { operations: {} }).operations;
+  if (!leases || typeof leases !== "object" || Array.isArray(leases) || Object.keys(leases).length) abort("Headless CLI leases require reconciliation before downgrade");
+  if (!operations || typeof operations !== "object" || Array.isArray(operations) || Object.values(operations).some((operation) =>
+    !["completed", "failed", "cancelled"].includes(operation?.state))) abort("Active operations prevent downgrade");
+  if ((read("processed-offline-ids.json").inFlightIds || []).length ||
+      fs.existsSync(path.join(root, "update-activation.json")) ||
+      fs.existsSync(path.join(root, RUNTIME_CUTOVER_JOURNAL_FILENAME))) abort("Pending execution or activation requires recovery before downgrade");
+  const manifest = loadRuntimeManifest(sourceDir, { requiredModules: [] });
+  if (!/^3\.5\./.test(manifest.version) || manifest.manifestDigest !== expectedManifestDigest) abort("Pin the independently verified 3.5 runtime manifest digest");
+  const computed = computeRuntimeManifest(sourceDir, { version: manifest.version, entrypoints: manifest.entrypoints, requiredModules: Object.keys(manifest.files) });
+  if (computed.manifestDigest !== expectedManifestDigest) abort("3.5 artifact closure does not match the pinned manifest");
+  defaultRunImportCheck(sourceDir, manifest);
+  const recoveryPath = assertNoLinks(path.join(sourceDir, "downgrade-artifacts.json"));
+  const recoveryBytes = fs.readFileSync(recoveryPath);
+  if (hash(recoveryBytes) !== recoveryDigest) abort("Pin the independently verified startup/MCP recovery descriptor digest");
+  const recovery = JSON.parse(recoveryBytes);
+  if (recovery.runtimeManifestDigest !== expectedManifestDigest || !Array.isArray(recovery.artifacts)) abort("Recovery descriptor must bind the supplied 3.5 runtime");
+  const writes = Object.keys(manifest.files).map((name) => ({
+    target: path.join(root, name), content: fs.readFileSync(assertNoLinks(path.join(sourceDir, name))),
+  }));
+  writes.push({ target: path.join(root, RUNTIME_MANIFEST_FILENAME), content: fs.readFileSync(path.join(sourceDir, RUNTIME_MANIFEST_FILENAME)) });
+  const installation = normalizeArtifactKeys(read("installation.json"));
+  if (installation.type !== "copilot-flock-installation-v1") abort("Installation ownership manifest is required");
+  for (const filename of ["flock.mjs", "bridge.mjs"]) {
+    const target = assertNoLinks(path.join(root, filename));
+    if (installation.artifacts?.[target] !== hash(fs.readFileSync(target))) abort("Current runtime ownership hash is unproven");
+  }
+  const kinds = new Set();
+  for (const artifact of recovery.artifacts) {
+    if (!/^[A-Za-z0-9._-]+$/.test(artifact.source || "") || !["startup", "mcp"].includes(artifact.kind)) abort("Invalid recovery artifact selector");
+    const content = fs.readFileSync(assertNoLinks(path.join(sourceDir, artifact.source)));
+    if (hash(content) !== artifact.sha256) abort("Recovery artifact digest mismatch");
+    if (artifact.kind === "startup") {
+      const target = paths.persistence[artifact.index || 0];
+      if (!target || kinds.has(`startup:${target}`)) abort("Invalid or duplicate startup target");
+      writes.push({ target, content });
+      kinds.add(`startup:${target}`);
+    } else {
+      if (kinds.has("mcp")) abort("Duplicate MCP recovery entry");
+      const entry = JSON.parse(content);
+      if (entry.command !== process.execPath || !Array.isArray(entry.args) || entry.args.length !== 2 ||
+          canonicalRuntimePath(entry.args[0]) !== path.join(root, "flock.mjs") || entry.args[1] !== "mcp") abort("MCP recovery must point to the supplied installed runtime");
+      entry.args[0] = path.join(root, "flock.mjs");
+      const target = paths.configs[0]?.path;
+      if (!target) abort("No supported MCP configuration target");
+      assertNoLinks(target);
+      const current = fs.existsSync(target) ? JSON.parse(fs.readFileSync(target, "utf8")) : {};
+      current.mcpServers ||= {};
+      delete current.mcpServers["copilot-signalr-bridge"];
+      current.mcpServers["copilot-flock"] = entry;
+      writes.push({ target, content: Buffer.from(JSON.stringify(current, null, 2)) });
+      kinds.add("mcp");
+    }
+  }
+  if (!kinds.has("mcp") || ![...kinds].some((kind) => kind.startsWith("startup:"))) abort("Verified startup and MCP recovery artifacts are both required");
+  const flocksPath = assertNoLinks(path.join(root, "flocks.json"));
+  const originalFlocks = fs.existsSync(flocksPath) ? fs.readFileSync(flocksPath, "utf8") : null;
+  const flocks = originalFlocks ? JSON.parse(originalFlocks) : { flocks: {} };
+  const normalizedFlocks = [];
+  for (const [id, policy] of Object.entries(flocks.flocks || {})) {
+    if (!/^[^/]+(?:\/(?:personal|work))?$/.test(id) && policy.trustTier === "owner") {
+      policy.trustTier = "collaborator";
+      policy.sessionVisibility = "explicit_opt_in_only";
+      if (Array.isArray(policy.members)) {
+        policy.members = policy.members.map((member) => member?.trustTier === "owner"
+          ? { ...member, trustTier: "collaborator" } : member);
+      }
+      normalizedFlocks.push(id);
+    }
+  }
+  writes.push({ target: path.join(root, "flocks.json"), content: Buffer.from(JSON.stringify(flocks, null, 2)) });
+  const archiveNames = ["runtime-state.json", "operations.json", "cli-leases.json", "update-verification.json",
+    ...["flock-operations.mjs", "flock-support.mjs"].filter((name) => !manifest.files[name])];
+  const support = path.join(root, ".data", "support-quarantine");
+  const allTargets = [...new Set([...writes.map((write) => write.target), path.join(root, "installation.json"),
+    ...archiveNames.map((name) => path.join(root, name))])];
+  for (const target of allTargets) assertNoLinks(target);
+  const checkTree = (dir) => {
+    assertNoLinks(dir);
+    if (fs.existsSync(dir)) for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const child = assertNoLinks(path.join(dir, entry.name));
+      if (entry.isDirectory()) checkTree(child);
+    }
+  };
+  checkTree(support);
+  const plan = { status: "planned", version: manifest.version, manifestDigest: expectedManifestDigest,
+    normalizedFlocks, archivedArtifacts: archiveNames, requiresStoppedInstallation: true,
+    preserved: ["identity", "registry epochs/revisions/tombstones", "offline dedup", "inbox/outbox", "live queues"] };
+  if (!apply) return plan;
+  if (fs.existsSync(daemonPid) && inspectProcess(Number(fs.readFileSync(daemonPid, "utf8")))) abort("Daemon started during downgrade planning; no files changed");
+  const archive = assertNoLinks(path.join(root, ".downgrade-archives", `${Date.now()}-${crypto.randomUUID()}`));
+  fs.mkdirSync(archive, { recursive: true, mode: 0o700 });
+  const originals = allTargets.map((target, index) => {
+    const content = fs.existsSync(target) ? fs.readFileSync(target) : null;
+    if (content) fs.writeFileSync(path.join(archive, `${index}.backup`), content, { mode: 0o600 });
+    return { target, content };
+  });
+  if (fs.existsSync(support)) fs.cpSync(support, path.join(archive, "support-quarantine"), { recursive: true });
+  atomicJson(path.join(archive, "recovery.json"), { ...plan, targets: allTargets, status: "archived" });
+  const touched = new Set();
+  try {
+    for (const write of writes) {
+      assertNoLinks(write.target);
+      if (write.target === flocksPath &&
+          (fs.existsSync(flocksPath) ? fs.readFileSync(flocksPath, "utf8") : null) !== originalFlocks) {
+        abort("Membership state changed during downgrade; retain current state and retry planning");
+      }
+      fs.mkdirSync(path.dirname(write.target), { recursive: true });
+      const temporary = `${write.target}.${crypto.randomUUID()}.tmp`;
+      fs.writeFileSync(temporary, write.content, { mode: 0o600 });
+      fs.renameSync(temporary, write.target);
+      touched.add(write.target);
+      if (write.target !== paths.configs[0].path) installation.artifacts[write.target] = hash(write.content);
+    }
+    for (const name of archiveNames) {
+      const target = assertNoLinks(path.join(root, name));
+      if (fs.existsSync(target)) { fs.unlinkSync(target); touched.add(target); }
+      delete installation.artifacts[target];
+    }
+    if (fs.existsSync(support)) fs.rmSync(assertNoLinks(support), { recursive: true });
+    if (computeRuntimeManifest(root, { version: manifest.version, entrypoints: manifest.entrypoints, requiredModules: Object.keys(manifest.files) }).manifestDigest !== expectedManifestDigest) {
+      abort("Restored runtime does not match the pinned 3.5 manifest");
+    }
+    touched.add(path.join(root, "installation.json"));
+    atomicJson(path.join(root, "installation.json"), installation);
+    atomicJson(path.join(archive, "recovery.json"), { ...plan, targets: allTargets, status: "restored" });
+    return { ...plan, status: "restored", archive, activated: false, verification: "3.5 imports and pinned artifact closure; runtime not started" };
+  } catch (error) {
+    const recoveryErrors = [];
+    for (const original of originals) {
+      if (!touched.has(original.target)) continue;
+      try {
+        assertNoLinks(original.target);
+        if (original.content) fs.writeFileSync(original.target, original.content);
+        else if (fs.existsSync(original.target)) fs.unlinkSync(original.target);
+      } catch (failure) { recoveryErrors.push(redactDiagnosticText(failure.message)); }
+    }
+    if (fs.existsSync(path.join(archive, "support-quarantine")) && !fs.existsSync(support)) {
+      try {
+        fs.cpSync(path.join(archive, "support-quarantine"), assertNoLinks(support), { recursive: true });
+      } catch (failure) { recoveryErrors.push(redactDiagnosticText(failure.message)); }
+    }
+    atomicJson(path.join(archive, "recovery.json"), { ...plan, status: "failed", error: redactDiagnosticText(error.message), recoveryErrors });
+    throw runtimeError("DOWNGRADE_RESTORE_FAILED", "Downgrade failed; archived evidence retained for explicit recovery");
+  }
 }
 
 const activeCutoverTargets = new Set();
@@ -3316,6 +3561,7 @@ export function activateStagedRuntime({
       throw runtimeError("RUNTIME_INSTALLATION_MANIFEST_INVALID", "Invalid installation ownership manifest");
     }
     installationManifest.artifacts ||= {};
+    normalizeArtifactKeys(installationManifest);
     for (const name of Object.keys(resolvedManifest.files)) {
       const activeFile = path.join(resolvedTarget, name);
       installationManifest.artifacts[activeFile] = hash(fs.readFileSync(activeFile));

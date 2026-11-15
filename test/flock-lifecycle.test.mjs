@@ -459,6 +459,101 @@ test("runtime changes after preflight are preserved with their ownership manifes
   } finally { f.close(); }
 });
 
+test("Windows process inspection fast-paths only ESRCH and retries CIM ETIMEDOUT exactly once", async (t) => {
+  const cp = (await import("node:child_process")).default;
+  const { syncBuiltinESMExports } = await import("node:module");
+  let probeCode = null;
+  let failures = [];
+  let calls = 0;
+  const kill = t.mock.method(process, "kill", (_pid, signal) => {
+    assert.equal(signal, 0);
+    if (probeCode) throw Object.assign(new Error(probeCode), { code: probeCode });
+    return true;
+  });
+  const exec = t.mock.method(cp, "execFileSync", (command, _args, options) => {
+    assert.equal(command, "powershell.exe");
+    assert.equal(options.timeout, 15000);
+    calls++;
+    if (failures.length) throw Object.assign(new Error(failures[0]), { code: failures.shift() });
+    return JSON.stringify({ pid: 12345, executable: "node.exe", start: "creation-proof", command: "node fixture.mjs daemon" });
+  });
+  syncBuiltinESMExports();
+  try {
+    probeCode = "ESRCH";
+    assert.equal(inspectProcess(12345, "win32"), null);
+    assert.equal(calls, 0);
+    probeCode = "EPERM";
+    failures = ["ETIMEDOUT"];
+    assert.equal(inspectProcess(12345, "win32").start, "creation-proof");
+    assert.equal(calls, 2);
+    failures = ["ETIMEDOUT", "ETIMEDOUT"];
+    assert.throws(() => inspectProcess(12345, "win32"), (error) => error.code === "ETIMEDOUT");
+    assert.equal(calls, 4);
+    failures = ["EACCES"];
+    assert.throws(() => inspectProcess(12345, "win32"), (error) => error.code === "EACCES");
+    assert.equal(calls, 5);
+  } finally { exec.mock.restore(); kill.mock.restore(); syncBuiltinESMExports(); }
+});
+
+test("configured root junctions canonicalize while descendant links, chained roots and retargets remain forbidden", async (t) => {
+  const { canonicalCopilotHome, canonicalRuntimePath } = await import("../flock-lifecycle.mjs");
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "flock-root-alias-"));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const logical = path.join(home, ".copilot");
+  const physical = path.join(home, "storage", ".copilot");
+  const other = path.join(home, "other", ".copilot");
+  fs.mkdirSync(physical, { recursive: true, mode: 0o700 });
+  fs.mkdirSync(other, { recursive: true, mode: 0o700 });
+  fs.symlinkSync(physical, logical, process.platform === "win32" ? "junction" : "dir");
+  assert.throws(() => assertNoLinks(logical), /link|junction/);
+  assert.equal(canonicalCopilotHome(logical, home), fs.realpathSync.native(physical));
+  const paths = lifecyclePaths({ home, copilotHome: logical, platform: "win32", appData: path.join(home, "AppData") });
+  const root = paths.roots[0];
+  fs.mkdirSync(root);
+  const script = path.join(root, "flock.mjs");
+  fs.writeFileSync(script, 'export const BRIDGE_VERSION = "test"; export async function runDaemon() {}');
+  recordInstalledArtifact(path.join(logical, "flock"), path.join(logical, "flock", "flock.mjs"), paths);
+  const manifest = JSON.parse(fs.readFileSync(path.join(root, "installation.json"), "utf8"));
+  assert.ok(manifest.artifacts[script]);
+  assert.equal(canonicalRuntimePath(path.join(logical, "flock", "flock.mjs")), script);
+  fs.symlinkSync(other, path.join(root, "escape"), process.platform === "win32" ? "junction" : "dir");
+  assert.throws(() => canonicalRuntimePath(path.join(logical, "flock", "escape", "config.json")), /link|junction/);
+  fs.unlinkSync(path.join(root, "escape"));
+  const legacyManifest = { ...manifest, artifacts: { [path.join(logical, "flock", "flock.mjs")]: manifest.artifacts[script] } };
+  fs.writeFileSync(path.join(root, "installation.json"), JSON.stringify(legacyManifest));
+  fs.writeFileSync(path.join(physical, "mcp-config.json"), JSON.stringify({ mcpServers: {
+    "copilot-flock": { type: "stdio", command: process.execPath, args: [path.join(logical, "flock", "flock.mjs"), "mcp"] },
+    unrelated: { command: "preserve" },
+  } }));
+  const removed = await uninstallFlock({ paths, stopDaemon: async () => {}, removeTasks: async () => [],
+    checkPersistence: async () => {}, findProcesses: async () => [] });
+  assert.equal(removed.fullyRemoved, true, JSON.stringify(removed));
+  const mcp = JSON.parse(fs.readFileSync(path.join(physical, "mcp-config.json"), "utf8"));
+  assert.equal(mcp.mcpServers["copilot-flock"], undefined);
+  assert.equal(mcp.mcpServers.unrelated.command, "preserve");
+  fs.unlinkSync(logical);
+  fs.symlinkSync(other, logical, process.platform === "win32" ? "junction" : "dir");
+  assert.throws(() => canonicalCopilotHome(logical, home), /changed/);
+  const chain = path.join(home, "chain");
+  fs.symlinkSync(other, chain, process.platform === "win32" ? "junction" : "dir");
+  const chainedRoot = path.join(home, "chained");
+  fs.symlinkSync(chain, chainedRoot, process.platform === "win32" ? "junction" : "dir");
+  assert.throws(() => canonicalCopilotHome(chainedRoot, home), /link|junction/);
+  assert.throws(() => canonicalCopilotHome(home, home), /Unsafe/);
+  const wrongHome = path.join(home, "wrong-home");
+  fs.mkdirSync(wrongHome);
+  fs.symlinkSync(path.dirname(physical), path.join(wrongHome, ".copilot"), process.platform === "win32" ? "junction" : "dir");
+  assert.throws(() => canonicalCopilotHome(path.join(wrongHome, ".copilot"), wrongHome), /named .copilot/);
+  fs.mkdirSync(path.join(other, ".git"));
+  assert.throws(() => canonicalCopilotHome(other, home), /Unsafe/);
+  fs.rmdirSync(path.join(other, ".git"));
+  if (process.platform !== "win32") {
+    fs.chmodSync(other, 0o777);
+    assert.throws(() => canonicalCopilotHome(other, home), /ownership\/permissions/);
+    fs.chmodSync(other, 0o700);
+  }
+});
+
 test("Linux process inspection never treats access denial as proof that a process exited", () => {
   const pid = 2147483647;
   const read = fs.readFileSync;

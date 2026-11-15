@@ -462,7 +462,7 @@ test("protected operation MCP/RPC resumes timed-out work, rejects spoofed peers,
   assert.equal(completed.operation.state, "completed");
   assert.match(completed.operation.result.content, /^completed with /);
   assert.doesNotMatch(completed.operation.result.content, /ghp_/);
-  assert.match(completed.operation.result.content, /REDACTED TOKEN/);
+  assert.match(completed.operation.result.content, /redacted.*token/i);
 
   const spoofParams = {
     flock: "owner/work",

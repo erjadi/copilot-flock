@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
-import { atomicJson, assertNoLinks, inspectProcess } from "./flock-lifecycle.mjs";
+import { atomicJson, assertNoLinks, inspectProcess, redactDiagnosticText } from "./flock-lifecycle.mjs";
 import { AzureTransport, azureEndpoints, parseAzureConnection, validateTransport, HUB } from "./flock-azure.mjs";
 import { createDeviceIdentity, createOwnerState, createJoinCode, approveJoin, acceptWelcome,
   ownerFingerprint, canonical, encryptEnvelope, decryptEnvelope, DurableReceiver,
@@ -33,7 +33,7 @@ export class BrokerFreeRuntime {
     this.connect = connect;
     this.dispatch = dispatch;
     this.onTimeSkip = onTimeSkip;
-    this.log = log;
+    this.log = (message) => log(redactDiagnosticText(message));
     this.registry = new FlockMembershipRegistry(this.root, { clock: this.clock });
     this.serial = Promise.resolve();
   }
@@ -962,7 +962,7 @@ export class BrokerFreeRuntime {
             result = await this.dispatch({ member, payload, action: header.action, assertAuthorized, flockId: fresh.flockId });
           }
           if (header.action !== "leave") assertAuthorized();
-        } catch (failure) { error = failure.message; }
+        } catch (failure) { error = redactDiagnosticText(failure.message); }
         // Leave may have rotated away the departing peer: its receipt is separately owner-signed.
         if (header.action === "leave" && result) {
           await this.transport(this.record(fresh.flockId)).publish(this.record(fresh.flockId).transport,
@@ -1020,6 +1020,7 @@ export class BrokerFreeRuntime {
           }
           if (message.type !== "envelope" || message.envelope.header.action !== "rpc_response") return;
           const { payload, member } = decryptEnvelope(message.envelope, this.record(record.flockId), this.clock());
+          if (typeof payload.error === "string") payload.error = redactDiagnosticText(payload.error);
           if (payload.requestId !== requestId || payload.fromMachine !== member.machineId ||
               (expectedPeer && member.peerId !== expectedPeer) ||
               (toMachine !== "*" && toMachine.toLowerCase() !== member.machineId.toLowerCase())) return;
@@ -1063,7 +1064,7 @@ export class BrokerFreeRuntime {
         timer = setTimeout(() => collectAll ? resolve(responses) : fail(new Error("Broker-free RPC timed out; queued dispatch may be pending or quarantined")), Math.min(120000, Math.max(100, timeoutMs)));
       });
       const result = await Promise.race([collectAll ? timeout : responsePromise, timeout]);
-      if (!collectAll && result.error) throw new Error(result.error);
+      if (!collectAll && result.error) throw new Error(redactDiagnosticText(result.error));
       return result;
     } finally { clearTimeout(timer); client.close(); }
   }

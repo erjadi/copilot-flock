@@ -147,7 +147,8 @@ the support module as part of the installed companion closure.
 The zero-dependency candidate runner discovers only `test/*.test.mjs`, excluding
 `*.live.test.mjs`. It does not select dependency-bearing `viewer/test/` files;
 root viewer roster/TODO tests remain included. Multiple candidate files use
-Node's normal per-file process isolation with concurrency capped at four and
+Node's normal per-file process isolation with concurrency capped at two on
+Windows or four elsewhere and
 the host's available parallelism. Only a single-file compatibility fixture can
 use `--test-isolation=none`. Qualification tests copy the real root test module
 closure into a fixture without `node_modules` and smoke-test its imports.
@@ -159,7 +160,63 @@ GitHub-token enqueue requires a shared authorized peer and cannot target
 arbitrary or private machines. Isolated HTTP roundtrip tests cover enqueue,
 peek-drain, target-scoped acknowledgment and forbidden targets.
 
+## Credential-safe diagnostics and 3.5 recovery
+
+WebSocket connection failures retain only origin/path and typed status/code,
+never URL query, fragment, userinfo, or untrusted upgrade response bodies.
+The shared diagnostic redactor covers `access_token`, `token`, `sig` and
+`signature` query values, including opaque local WebSocket tokens. Error
+formatting, daemon logs/state, operation errors, offline replay and RPC replies
+use that redactor. Existing historical logs are not silently erased.
+
+3.6 bootstrap requests advertise `X-Flock-Protocol-Version: 36` outside signed
+payloads. Enrollment/sync responses to absent/older protocol headers omit
+non-built-in owner-tier shared/guest entries that 3.5 rejects; the broker retains
+their owner devices/keys internally. 3.6 responses retain complete records.
+
+For an explicitly requested legacy downgrade, ask Copilot to plan recovery with
+a separately supplied, verified 3.5 runtime directory and pinned manifest digest.
+The `downgrade-3-5` CLI defaults to a plan; application requires explicit
+`--apply`, `--source`, `--manifest-digest`, and `--recovery-digest`.
+`downgrade-artifacts.json` in that source binds `runtimeManifestDigest` and an
+`artifacts` array. Each entry supplies `kind` (`startup` or `mcp`), a basename
+`source`, its SHA-256, and (for startup) a platform persistence-path `index`.
+The MCP source contains only the reviewed server entry, pointing at the
+installed runtime; unrelated current MCP entries are preserved. Independently
+verify both supplied digests before applying, including startup executable intent.
+
+Only a stopped, owned legacy installation is eligible. Vault-only token-local
+credentials, active operations/leases, and pending execution/activation are
+explicit aborts. Shared/guest owner labels, including their cached owner-member
+role labels, are normalized to collaborator with explicit opt-in; membership epochs, revocations, expiry, snapshots and
+bindings survive. Identity, registry epoch/revision/tombstone floors, offline
+dedup and inbox/outbox bytes are never rewound. Replaced artifacts, 3.6-only
+state and support data are retained in a timestamped owner-only downgrade
+archive, which can contain sensitive local recovery material.
+
+Recovery verifies the supplied 3.5 import/artifact closure and restores the
+supplied startup/MCP closure, but does not activate or deploy it. Broker-free
+downgrade is intentionally unsupported. Compatibility tests exercise 3.5-style
+authority/epoch checks; actual legacy fleet activation and the provenance of a
+user-supplied recovery bundle remain independent qualification responsibilities.
+
 ## Qualification still required
+
+The configured Copilot root is canonicalized once as an explicit trust boundary,
+including the default root-level `.copilot` junction. Its live physical binding
+is rechecked and cannot retarget during a process. Physical ancestors and all
+descendants still use strict no-link checks; unsafe root/home/temp/repository
+targets, chained links and writable/non-owned POSIX roots are rejected. Logical
+and physical runtime aliases remain recognizable for legacy ownership/MCP
+cleanup, while new paths and artifact keys use the canonical physical root.
+
+Windows process inspection returns early only for an ESRCH liveness probe,
+retries a CIM ETIMEDOUT once within the existing per-attempt bound, and never
+treats permission/tool failures as proof of exit. Windows candidate concurrency
+is capped at two. A shared same-owner owner-role target guard protects fleet
+updates, reprovision (including offline enqueue), active diagnostics and
+new-session broadcasts. Passive collaborator diagnostics use public presence
+only; ordinary informational broadcasts retain their existing policy.
 
 1. Run the complete repository suite on the exact candidate commit.
 2. Verify disposable Azure positive/negative JWT, SAS, audience, and scope
