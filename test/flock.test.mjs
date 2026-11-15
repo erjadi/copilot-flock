@@ -7168,6 +7168,12 @@ test("release voter extracts complete modular dependency closure into isolated f
     const passCommit = gitRun(originWorkDir, ["rev-parse", "HEAD"]);
 
     let passBallot;
+    const actualMkdir = fs.mkdirSync;
+    const isolatedModes = [];
+    const mkdirSpy = t.mock.method(fs, "mkdirSync", (filename, options) => {
+      if (String(filename).includes("flock-vote-") && path.basename(String(filename)) === ".copilot") isolatedModes.push(options?.mode);
+      return actualMkdir(filename, options);
+    });
     const childProcess = (await import("node:child_process")).default;
     const { syncBuiltinESMExports } = await import("node:module");
     const actualSpawn = childProcess.spawn;
@@ -7191,6 +7197,7 @@ test("release voter extracts complete modular dependency closure into isolated f
         assert.equal(process.env[name], value, "Review must not mutate the host environment");
       }
     } finally {
+      mkdirSpy.mock.restore();
       spawnSpy.mock.restore();
       syncBuiltinESMExports();
       if (previousTrace === undefined) delete process.env.GIT_TRACE; else process.env.GIT_TRACE = previousTrace;
@@ -7200,6 +7207,7 @@ test("release voter extracts complete modular dependency closure into isolated f
       }
     }
     assert.equal(passBallot.vote, "ACCEPT");
+    assert.ok(isolatedModes.includes(0o700), "Voter homes must request 0700 even under a 0002 umask");
     assert.ok(reviewGitCalls.length >= 2);
     for (const call of reviewGitCalls) {
       assert.equal(call.env.GIT_TERMINAL_PROMPT, "0");

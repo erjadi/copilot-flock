@@ -527,7 +527,7 @@ export function verifyRpcSignature({
 }
 
 function getCopilotDir() {
-  return canonicalCopilotHome(process.env.COPILOT_HOME || COPILOT_DIR);
+  return canonicalCopilotHome(process.env.COPILOT_HOME || path.join(HOME_DIR, ".copilot"));
 }
 
 export function isSandboxV3Mode() {
@@ -17703,7 +17703,7 @@ export async function reviewReleaseCandidate(cfg, params = {}, internalOptions =
     const fixtureDir = path.join(tmpRootReal, "fixture");
     const isolatedHome = path.join(tmpRootReal, "home");
     const isolatedCopilotHome = path.join(isolatedHome, ".copilot");
-    fs.mkdirSync(isolatedCopilotHome, { recursive: true });
+    fs.mkdirSync(isolatedCopilotHome, { recursive: true, mode: 0o700 });
 
     const extractor =
       typeof internalOptions.extractFixtureFn === "function"
@@ -18736,7 +18736,7 @@ export function filterOwnedMutationTargets(cfg, targets, { machines = "*", flock
       !isPrincipalRevokedInFlock(policy, proof) &&
       (!Array.isArray(policy.allowedScopes) || policy.allowedScopes.includes(proof.scope));
   });
-  const explicit = String(machines).split(",").some((entry) => entry.trim() && entry.trim() !== "*" && !entry.includes("*"));
+  const explicit = String(machines).split(",").some((entry) => entry.trim() && entry.trim().toLowerCase() !== "all" && entry.trim() !== "*" && !entry.includes("*"));
   if (rejectExplicit && explicit && allowed.length !== targets.length) {
     throw Object.assign(new Error("Explicit mutation target is not an active same-owner owner-role machine"), { code: "OWNER_MUTATION_REQUIRED", statusCode: 403 });
   }

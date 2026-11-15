@@ -206,9 +206,14 @@ The configured Copilot root is canonicalized once as an explicit trust boundary,
 including the default root-level `.copilot` junction. Its live physical binding
 is rechecked and cannot retarget during a process. Physical ancestors and all
 descendants still use strict no-link checks; unsafe root/home/temp/repository
-targets, chained links and writable/non-owned POSIX roots are rejected. Logical
+targets, chained links and world/shared-group-writable or non-owned POSIX roots are rejected. Logical
 and physical runtime aliases remain recognizable for legacy ownership/MCP
 cleanup, while new paths and artifact keys use the canonical physical root.
+POSIX UPG roots such as owned `0775` directories are accepted only when
+`gid == uid`; world-write and foreign-owned root symlinks are refused.
+Voter-isolated homes explicitly request `0700`, independent of a `0002` umask.
+Default-home reads re-resolve the logical `.copilot` alias each time, and
+the mutation selector `all` has the same wildcard semantics as `*`.
 
 Windows process inspection returns early only for an ESRCH liveness probe,
 retries a CIM ETIMEDOUT once within the existing per-attempt bound, and never

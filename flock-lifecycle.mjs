@@ -42,6 +42,16 @@ const runtimeFiles = [
 const copilotRootBindings = new Map();
 const runtimePathKey = (value) => process.platform === "win32" ? value.toLowerCase() : value;
 
+export function assertCopilotRootOwnership(stat, linkStat = null, {
+  platform = process.platform, uid = process.getuid?.(),
+} = {}) {
+  if (!stat.isDirectory() || (platform !== "win32" &&
+      (stat.uid !== uid || (stat.mode & 0o002) ||
+        ((stat.mode & 0o020) && stat.gid !== stat.uid) || (linkStat && linkStat.uid !== uid)))) {
+    throw new Error("Copilot root target directory/link ownership/permissions are unproven");
+  }
+}
+
 export function canonicalCopilotHome(selected = process.env.COPILOT_HOME || path.join(os.homedir(), ".copilot"), home = os.homedir()) {
   const logical = path.resolve(selected);
   const physical = fs.existsSync(logical) ? fs.realpathSync.native(logical) : logical;
@@ -55,15 +65,16 @@ export function canonicalCopilotHome(selected = process.env.COPILOT_HOME || path
   const previous = copilotRootBindings.get(runtimePathKey(logical));
   if (previous && runtimePathKey(previous) !== runtimePathKey(physical)) throw new Error("Configured Copilot root changed during this process");
   assertNoLinks(path.dirname(logical));
-  if (fs.existsSync(logical) && fs.lstatSync(logical).isSymbolicLink()) {
+  const linkStat = fs.existsSync(logical) ? fs.lstatSync(logical) : null;
+  if (linkStat?.isSymbolicLink()) {
+    if (process.platform !== "win32" && linkStat.uid !== process.getuid()) {
+      throw new Error("Copilot root symlink ownership is unproven");
+    }
     assertNoLinks(path.resolve(path.dirname(logical), fs.readlinkSync(logical)));
   }
   assertNoLinks(physical);
   if (fs.existsSync(physical)) {
-    const stat = fs.statSync(physical);
-    if (!stat.isDirectory() || (process.platform !== "win32" && (stat.uid !== process.getuid() || (stat.mode & 0o022)))) {
-      throw new Error("Copilot root target directory ownership/permissions are unproven");
-    }
+    assertCopilotRootOwnership(fs.statSync(physical), linkStat?.isSymbolicLink() ? linkStat : null);
   }
   if (previous) return previous;
   copilotRootBindings.set(runtimePathKey(logical), physical);
@@ -1912,7 +1923,7 @@ const EMBEDDED_RUNTIME_MANIFEST_FALLBACK = (() => {
     operationsSha = hashRuntimeModule(fs.readFileSync(path.join(__lifecycleDir, "flock-operations.mjs")));
     supportSha = hashRuntimeModule(fs.readFileSync(path.join(__lifecycleDir, "flock-support.mjs")));
   } catch {}
-  const entrypointSha = "2e0541e3045e66537079e5648543967d13c99776a21f3b5e8a9dff22ce56b401";
+  const entrypointSha = "cfa9a4def277d163a27520bf959b740c2e46c998ca8e7a72b1132681738c359a";
   const fallback = {
     type: "copilot-flock-runtime-manifest-v1",
     schema: 1,

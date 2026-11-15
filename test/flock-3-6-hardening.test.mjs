@@ -85,6 +85,9 @@ test("owner fleet mutations exclude collaborators before update, reprovision que
   const invokeBatchFn = async (_cfg, items) => { batches.push(...items); return []; };
   await updateFleetMachines(cfg, { includeSelf: false, discoverFn: async () => peers, invokeBatchFn, postUpdateWaitMs: 0 });
   assert.deepEqual(batches.map((item) => item.toMachine), ["OWNED"]);
+  batches.length = 0;
+  await updateFleetMachines(cfg, { machines: "all", includeSelf: false, discoverFn: async () => peers, invokeBatchFn, postUpdateWaitMs: 0 });
+  assert.deepEqual(batches.map((item) => item.toMachine), ["OWNED"]);
   await assert.rejects(updateFleetMachines(cfg, { machines: "COLLAB", includeSelf: false,
     discoverFn: async () => peers, invokeBatchFn }), (error) => error.statusCode === 403);
   const queued = [];

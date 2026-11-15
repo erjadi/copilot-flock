@@ -495,6 +495,39 @@ test("Windows process inspection fast-paths only ESRCH and retries CIM ETIMEDOUT
   } finally { exec.mock.restore(); kill.mock.restore(); syncBuiltinESMExports(); }
 });
 
+test("POSIX root permission policy accepts UPG 0775 but rejects world-write, shared-group writes and foreign symlinks", async () => {
+  const { assertCopilotRootOwnership } = await import("../flock-lifecycle.mjs");
+  const stat = (mode, gid = 1000, uid = 1000) => ({ mode, gid, uid, isDirectory: () => true });
+  const options = { platform: "linux", uid: 1000 };
+  assert.doesNotThrow(() => assertCopilotRootOwnership(stat(0o775), { uid: 1000 }, options));
+  assert.doesNotThrow(() => assertCopilotRootOwnership(stat(0o700, 2000), null, options));
+  assert.throws(() => assertCopilotRootOwnership(stat(0o777), null, options), /permissions/);
+  assert.throws(() => assertCopilotRootOwnership(stat(0o775, 2000), null, options), /permissions/);
+  assert.throws(() => assertCopilotRootOwnership(stat(0o775), { uid: 2000 }, options), /ownership/);
+  assert.throws(() => assertCopilotRootOwnership(stat(0o700, 1000, 2000), null, options), /ownership/);
+});
+
+test("getBridgeHome rechecks default logical home after root alias retarget with COPILOT_HOME unset", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "flock-default-retarget-"));
+  try {
+    const script = `
+      import fs from "node:fs"; import path from "node:path"; import os from "node:os"; import assert from "node:assert/strict";
+      const home=${JSON.stringify(home)}; os.homedir=()=>home; delete process.env.COPILOT_HOME;
+      const first=path.join(home,"first",".copilot"), second=path.join(home,"second",".copilot"), logical=path.join(home,".copilot");
+      fs.mkdirSync(first,{recursive:true,mode:0o700}); fs.mkdirSync(second,{recursive:true,mode:0o700});
+      fs.symlinkSync(first,logical,process.platform==="win32"?"junction":"dir");
+      const m=await import(${JSON.stringify(new URL("../flock.mjs", import.meta.url).href)});
+      assert.equal(m.getBridgeHome(),path.join(fs.realpathSync.native(first),"flock"));
+      fs.unlinkSync(logical); fs.symlinkSync(second,logical,process.platform==="win32"?"junction":"dir");
+      assert.throws(()=>m.getBridgeHome(),/changed/);
+    `;
+    const result = spawnSync(process.execPath, ["--input-type=module", "-e", script], {
+      encoding: "utf8", windowsHide: true, timeout: 15000,
+    });
+    assert.equal(result.status, 0, result.stderr);
+  } finally { fs.rmSync(home, { recursive: true, force: true }); }
+});
+
 test("configured root junctions canonicalize while descendant links, chained roots and retargets remain forbidden", async (t) => {
   const { canonicalCopilotHome, canonicalRuntimePath } = await import("../flock-lifecycle.mjs");
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "flock-root-alias-"));
