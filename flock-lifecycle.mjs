@@ -5,6 +5,7 @@ import crypto from "node:crypto";
 import { execFileSync, spawn } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { signLeave } from "./flock-membership.mjs";
+import * as registryCompatibility from "./flock-membership.mjs";
 
 const __lifecycleDir = path.dirname(fileURLToPath(import.meta.url));
 const hash = (data) => crypto.createHash("sha256").update(data).digest("hex");
@@ -40,6 +41,7 @@ const runtimeFiles = [
   "update-verification.json",
 ];
 const copilotRootBindings = new Map();
+let initializingCopilotRoot = false;
 const runtimePathKey = (value) => process.platform === "win32" ? value.toLowerCase() : value;
 
 export function assertCopilotRootOwnership(stat, linkStat = null, {
@@ -146,7 +148,20 @@ export function lifecyclePaths({ home = os.homedir(), copilotHome = process.env.
 }
 
 export function assertNoLinks(target) {
-  const absolute = path.resolve(target);
+  if (copilotRootBindings.size === 0 && !initializingCopilotRoot) {
+    initializingCopilotRoot = true;
+    try { canonicalCopilotHome(); } catch {}
+    finally { initializingCopilotRoot = false; }
+  }
+  let absolute = path.resolve(target);
+  for (const [logical, physical] of copilotRootBindings) {
+    if (runtimePathKey(physical) !== logical &&
+        (runtimePathKey(absolute) === logical || runtimePathKey(absolute).startsWith(logical + path.sep))) {
+      const verified = canonicalCopilotHome(logical);
+      absolute = path.join(verified, absolute.slice(logical.length).replace(/^[/\\]/, ""));
+      break;
+    }
+  }
   let current = path.parse(absolute).root;
   for (const component of absolute.slice(current.length).split(path.sep).filter(Boolean)) {
     current = path.join(current, component);
@@ -1923,7 +1938,7 @@ const EMBEDDED_RUNTIME_MANIFEST_FALLBACK = (() => {
     operationsSha = hashRuntimeModule(fs.readFileSync(path.join(__lifecycleDir, "flock-operations.mjs")));
     supportSha = hashRuntimeModule(fs.readFileSync(path.join(__lifecycleDir, "flock-support.mjs")));
   } catch {}
-  const entrypointSha = "25d58e3ceb47654690474c4fd0c43c7f27edc337308ead6bd0963d3ccc055aca";
+  const entrypointSha = "d9404b86bfa42477d1313008a73331dc9d304a42a05e2963b125152d0109e715";
   const fallback = {
     type: "copilot-flock-runtime-manifest-v1",
     schema: 1,
@@ -1969,7 +1984,7 @@ const EMBEDDED_RUNTIME_MANIFEST_FALLBACK = (() => {
       },
       "flock-membership.mjs": {
         role: "companion",
-        sha256: "05ae04e148b610fb7b2d1d86914f5373ede6262b45188427c5949c11cb64773a",
+        sha256: "c4c61a28c3bf47b1ddfdf1c875f49c654decfb1392ac492de554ea55a8f380a7",
         imports: [
           "./flock-lifecycle.mjs",
           "./flock-protocol.mjs",
@@ -2420,6 +2435,16 @@ export function downgradeRuntime35({
   const writes = Object.keys(manifest.files).map((name) => ({
     target: path.join(root, name), content: fs.readFileSync(assertNoLinks(path.join(sourceDir, name))),
   }));
+  const registry = read("flock-registry.json");
+  const registryPath = path.join(root, "flock-registry.json");
+  const registryBefore = fs.existsSync(registryPath) ? fs.readFileSync(registryPath) : null;
+  if (Object.keys(registry.retainedFlocks || {}).length) {
+    if (typeof registryCompatibility.prepareRegistryForLegacyDowngrade !== "function") {
+      abort("Complete current registry compatibility module is required for retained-state downgrade");
+    }
+    writes.push({ target: path.join(root, "flock-registry.json"),
+      content: Buffer.from(JSON.stringify(registryCompatibility.prepareRegistryForLegacyDowngrade(registry), null, 2)) });
+  }
   writes.push({ target: path.join(root, RUNTIME_MANIFEST_FILENAME), content: fs.readFileSync(path.join(sourceDir, RUNTIME_MANIFEST_FILENAME)) });
   const installation = normalizeArtifactKeys(read("installation.json"));
   if (installation.type !== "copilot-flock-installation-v1") abort("Installation ownership manifest is required");
@@ -2506,6 +2531,10 @@ export function downgradeRuntime35({
       if (write.target === flocksPath &&
           (fs.existsSync(flocksPath) ? fs.readFileSync(flocksPath, "utf8") : null) !== originalFlocks) {
         abort("Membership state changed during downgrade; retain current state and retry planning");
+      }
+      if (write.target === registryPath &&
+          (registryBefore === null || !fs.readFileSync(registryPath).equals(registryBefore))) {
+        abort("Registry state changed during downgrade; retain current epoch/tombstone state and retry");
       }
       fs.mkdirSync(path.dirname(write.target), { recursive: true });
       const temporary = `${write.target}.${crypto.randomUUID()}.tmp`;

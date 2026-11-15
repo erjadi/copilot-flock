@@ -1106,6 +1106,8 @@ test("GitHub-token broker callers cannot bootstrap masters or drain/ack foreign 
       return output;
     };
     const verify35 = (result) => {
+      assert.equal(result.completeMembershipSnapshot, false);
+      assert.equal(result.authoritativeSnapshot, false);
       for (const entry of result.enrolledFlocks) if (entry.trustTier === "owner") {
         assert.match(entry.flockId, /^[^/]+(?:\/(?:personal|work))?$/, "3.5 rejects owner authority on shared/guest entries");
       }
@@ -1119,6 +1121,7 @@ test("GitHub-token broker callers cannot bootstrap masters or drain/ack foreign 
     const sync = signV3MembershipSyncRequest({ deviceId: second.fingerprint, machineId: "OWNER-2" }, second);
     verify35(await post("/flocks/sync", sync, "35"));
     const modernSync = await post("/flocks/sync", sync, "36");
+    assert.equal(modernSync.completeMembershipSnapshot, true);
     assert.ok(modernSync.enrolledFlocks.some((entry) => entry.flockId === "owner/team"));
     const internal = JSON.parse(fs.readFileSync(storePath, "utf8"));
     assert.ok(Object.values(internal.flocks["owner/team"].members).some((member) => member.machineId === "OWNER-2"));
@@ -1206,6 +1209,31 @@ test("GitHub-token broker callers cannot bootstrap masters or drain/ack foreign 
     assert.equal(fs.readFileSync(path.join(result.archive, "support-quarantine", "evidence.json"), "utf8"), '{"inert":true}');
     assert.equal(fs.existsSync(path.join(root, "flock-support.mjs")), false);
     if (process.platform !== "win32") assert.equal(fs.statSync(result.archive).mode & 0o777, 0o700);
+    const registryPath = path.join(root, "flock-registry.json");
+    fs.writeFileSync(registryPath, JSON.stringify({ schema: 1, type: "copilot-flock-registry-v1", flocks: {} }));
+    const registry = openFlockMembershipRegistry(path.join(root, "flocks.json"));
+    const member = { peerId: "1001:retained-device", githubUser: "owner", githubUserId: 1001,
+      deviceId: "retained-device", keyFingerprint: "retained-device", machineId: "RETAINED",
+      scope: "work", trustTier: "collaborator" };
+    registry.reconcileV3BrokerFlock({ flockId: "owner/work-team", rosterEpoch: 19, members: [member] });
+    registry.recordRemovalTombstone("owner/work-team", { ...member, peerId: "1001:kicked",
+      deviceId: "kicked", keyFingerprint: "kicked", machineId: "KICKED", removedAtEpoch: 19 });
+    registry.retainFlocks(["owner/work-team"]);
+    const beforeDowngrade = fs.readFileSync(registryPath);
+    const retained = registry.read().retainedFlocks["owner/work-team"];
+    const restoredAgain = downgradeRuntime35({ ...options, apply: true });
+    assert.equal(restoredAgain.status, "restored");
+    const legacyRegistry = JSON.parse(fs.readFileSync(registryPath, "utf8"));
+    assert.equal(legacyRegistry.retainedFlocks, undefined);
+    assert.deepEqual(legacyRegistry.flocks["owner/work-team"].members, {});
+    assert.deepEqual(legacyRegistry.flocks["owner/work-team"].presence, {});
+    assert.equal(legacyRegistry.flocks["owner/work-team"].rosterEpoch, 19);
+    assert.ok(legacyRegistry.flocks["owner/work-team"].rosterRevision > retained.rosterRevision);
+    assert.deepEqual(legacyRegistry.flocks["owner/work-team"].tombstones, retained.tombstones);
+    assert.equal(registry.findActiveMember("owner/work-team", { machineId: "RETAINED" }), null);
+    const archivedBytes = fs.readdirSync(restoredAgain.archive).filter((name) => name.endsWith(".backup"))
+      .map((name) => fs.readFileSync(path.join(restoredAgain.archive, name)));
+    assert.ok(archivedBytes.some((bytes) => bytes.equals(beforeDowngrade)), "Original retained records stay in the downgrade evidence archive");
   });
 async function exerciseGitHubQueue(t, { root, storePath, membersPath }) {
   const own = { machineId: "ALICE-PC", githubUser: "alice", githubUserId: 2002, deviceId: "alice-device", trustTier: "collaborator" };

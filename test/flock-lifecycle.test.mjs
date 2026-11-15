@@ -540,6 +540,17 @@ test("configured root junctions canonicalize while descendant links, chained roo
   fs.symlinkSync(physical, logical, process.platform === "win32" ? "junction" : "dir");
   assert.throws(() => assertNoLinks(logical), /link|junction/);
   assert.equal(canonicalCopilotHome(logical, home), fs.realpathSync.native(physical));
+  const standalone = path.join(physical, "standalone");
+  fs.mkdirSync(standalone);
+  fs.symlinkSync(other, path.join(standalone, "escape"), process.platform === "win32" ? "junction" : "dir");
+  const standaloneImport = spawnSync(process.execPath, ["--input-type=module", "-e", `
+import assert from "node:assert/strict";
+await import(${JSON.stringify(new URL("../bootstrap-server.mjs", import.meta.url).href)});
+const {assertNoLinks}=await import(${JSON.stringify(new URL("../flock-lifecycle.mjs", import.meta.url).href)});
+assert.throws(()=>assertNoLinks(${JSON.stringify(path.join(logical, "standalone", "escape", "config.json"))}),/link|junction/);
+`], { cwd: path.join(logical, "standalone"), windowsHide: true, encoding: "utf8", timeout: 10000,
+    env: { ...process.env, COPILOT_HOME: logical } });
+  assert.equal(standaloneImport.status, 0, standaloneImport.stderr);
   const paths = lifecyclePaths({ home, copilotHome: logical, platform: "win32", appData: path.join(home, "AppData") });
   const root = paths.roots[0];
   fs.mkdirSync(root);

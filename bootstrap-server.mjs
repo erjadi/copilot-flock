@@ -164,10 +164,21 @@ function requestServiceBus({ token, method, apiPath, stage, body, ttlSeconds, me
             TimeToLive: Math.max(60, Number(ttlSeconds) || 86400), Label: String(machineId || "").toLowerCase() }),
           toMachine: JSON.stringify(String(machineId || "").toLowerCase()) } : {}) },
       }, (res) => {
-        res.resume();
+        let description = "";
+        let descriptionOversized = false;
+        const inspectDescription = stage === "subscription_get" || stage === "subscription_verify";
+        if (inspectDescription) res.on("data", (chunk) => {
+          if (Buffer.byteLength(description) + chunk.length > 65536) descriptionOversized = true;
+          else description += chunk.toString("utf8");
+        });
         res.on("error", () => resolve(serviceBusFailure("servicebus_transient_error", stage, "response_failed")));
         res.on("end", () => {
           const statusCode = res.statusCode || 500;
+          if (inspectDescription && statusCode === 200 && (descriptionOversized ||
+              !/<(?:[\w.-]+:)?SubscriptionDescription\b/i.test(description) ||
+              /<(?:[\w.-]+:)?Status\b[^>]*>\s*(?:Disabled|ReceiveDisabled)\s*</i.test(description))) {
+            return resolve(serviceBusFailure("servicebus_client_error", stage, "invalid_subscription_description", statusCode));
+          }
           if ((statusCode >= 200 && statusCode < 300) || (method === "DELETE" && statusCode === 404)) {
             return resolve({ ok: true, category: "servicebus_ok", stage, reason: null, statusCode });
           }
@@ -175,6 +186,7 @@ function requestServiceBus({ token, method, apiPath, stage, body, ttlSeconds, me
             : statusCode === 429 || statusCode >= 500 ? "servicebus_transient_error" : "servicebus_client_error",
           stage, "servicebus_request_rejected", statusCode));
         });
+        res.resume();
       });
       req.on("error", () => resolve(serviceBusFailure("servicebus_transient_error", stage, "request_failed")));
       req.on("timeout", () => { resolve(serviceBusFailure("servicebus_transient_error", stage, "request_timeout")); req.destroy(); });
@@ -185,23 +197,42 @@ function requestServiceBus({ token, method, apiPath, stage, body, ttlSeconds, me
   });
 }
 
+const subscriptionEnsureFlights = new Map();
 async function ensureServiceBusSubscription(sbToken, machineId) {
   if (!sbToken || !SERVICEBUS_NAMESPACE || !SERVICEBUS_TOPIC || !machineId) {
     return serviceBusFailure("msi_unconfigured", "subscription_put", "servicebus_namespace_unconfigured");
   }
   const subName = `sub-${sanitizeSbEntityName(machineId)}`;
+  const flightKey = `${SERVICEBUS_NAMESPACE}/${SERVICEBUS_TOPIC}/${subName}`;
+  if (subscriptionEnsureFlights.has(flightKey)) return subscriptionEnsureFlights.get(flightKey);
+  const flight = (async () => {
   const bodyXml = `<entry xmlns="http://www.w3.org/2005/Atom"><content type="application/xml"><SubscriptionDescription xmlns="http://schemas.microsoft.com/netservices/2010/10/servicebus/connect" xmlns:i="http://www.w3.org/2001/XMLSchema-instance"><LockDuration>PT1M</LockDuration><RequiresSession>false</RequiresSession><DefaultMessageTimeToLive>P1D</DefaultMessageTimeToLive><DeadLetteringOnMessageExpiration>false</DeadLetteringOnMessageExpiration><MaxDeliveryCount>10</MaxDeliveryCount></SubscriptionDescription></content></entry>`;
-
-  return requestServiceBus({ token: sbToken, method: "PUT", stage: "subscription_put",
-    apiPath: `/${encodeURIComponent(SERVICEBUS_TOPIC)}/subscriptions/${encodeURIComponent(subName)}?api-version=2017-04`,
+  const apiPath = `/${encodeURIComponent(SERVICEBUS_TOPIC)}/subscriptions/${encodeURIComponent(subName)}?api-version=2017-04`;
+  const inspect = async (stage = "subscription_get") => {
+    const result = await requestServiceBus({ token: sbToken, method: "GET", stage, apiPath });
+    return result.ok && result.statusCode !== 200
+      ? serviceBusFailure("servicebus_client_error", stage, "unexpected_subscription_status", result.statusCode)
+      : result;
+  };
+  const existing = await inspect();
+  if (existing.ok || existing.statusCode !== 404) return existing;
+  const created = await requestServiceBus({ token: sbToken, method: "PUT", stage: "subscription_put", apiPath,
     body: bodyXml });
+  if (created.statusCode !== 409) return created;
+  const verified = await inspect("subscription_verify");
+  return verified.ok || ["servicebus_authz_denied", "servicebus_transient_error"].includes(verified.category)
+    ? verified : serviceBusFailure("servicebus_client_error", "subscription_put", "subscription_conflict_unverified", 409);
+  })().finally(() => subscriptionEnsureFlights.delete(flightKey));
+  subscriptionEnsureFlights.set(flightKey, flight);
+  return flight;
 }
 
 export async function publishToServiceBusRest(item, ttlSeconds = 86400, { tokenProvider } = {}) {
   const authorization = await acquireServiceBusTokenDetailed({ tokenProvider });
   if (!authorization.ok) return { published: false, ...authorization };
   const subscription = await ensureServiceBusSubscription(authorization.token, item.toMachine);
-  if (!subscription.ok) return { published: false, ...subscription, reason: "subscription_ensure_failed" };
+  if (!subscription.ok) return { published: false, ...subscription,
+    reason: subscription.reason === "subscription_conflict_unverified" ? subscription.reason : "subscription_ensure_failed" };
   const body = Buffer.from(JSON.stringify(item), "utf8");
   const result = await requestServiceBus({ token: authorization.token, method: "POST", stage: "topic_post",
     apiPath: `/${encodeURIComponent(SERVICEBUS_TOPIC)}/messages?api-version=2017-04`,
@@ -288,12 +319,12 @@ export async function enqueueOfflineStoreItem({
   entry.serviceBusCategory = ["msi_unconfigured", "msi_token_rejected", "msi_transient_error",
     "servicebus_authz_denied", "servicebus_client_error", "servicebus_transient_error", "servicebus_ok"].includes(sbRes?.category)
     ? sbRes.category : "servicebus_transient_error";
-  entry.serviceBusStage = ["msi_token", "subscription_put", "topic_post"].includes(sbRes?.stage) ? sbRes.stage : null;
+  entry.serviceBusStage = ["msi_token", "subscription_get", "subscription_verify", "subscription_put", "topic_post"].includes(sbRes?.stage) ? sbRes.stage : null;
   entry.serviceBusReason = ["invalid_servicebus_resource", "invalid_test_token_response", "test_token_provider_unavailable",
     "identity_endpoint_unconfigured", "invalid_identity_endpoint", "identity_endpoint_unavailable", "token_request_rejected",
     "invalid_token_response", "token_response_failed", "token_request_failed", "token_request_timeout", "oversized_token_response",
     "request_timeout", "request_failed", "response_failed", "servicebus_request_rejected", "servicebus_namespace_unconfigured",
-    "subscription_ensure_failed", "invalid_servicebus_request"].includes(sbRes?.reason) ? sbRes.reason
+    "subscription_ensure_failed", "subscription_conflict_unverified", "invalid_servicebus_request"].includes(sbRes?.reason) ? sbRes.reason
       : /^AADSTS\d{5,9}$/.test(sbRes?.reason || "") ? sbRes.reason : null;
   entry.serviceBusStatusCode = Number.isInteger(sbRes?.statusCode) && sbRes.statusCode >= 100 && sbRes.statusCode <= 599 ? sbRes.statusCode : null;
   entry.serviceBusNamespace = SERVICEBUS_NAMESPACE;
@@ -335,9 +366,11 @@ export async function drainOfflineStoreItems({
   targetMachine,
   peekOnly = true,
   queuePath = OFFLINE_QUEUE_PATH,
+  normalizeStoredTarget = (value) => value,
+  allMachines = false,
 }) {
   const cleanMachine = String(targetMachine || "").trim();
-  if (!cleanMachine) {
+  if (!cleanMachine && !allMachines) {
     const inputErr = new Error("Missing machineId for drain");
     inputErr.code = "INVALID_QUEUE_INPUT";
     inputErr.statusCode = 400;
@@ -349,15 +382,19 @@ export async function drainOfflineStoreItems({
     const store = loadOfflineQueueStore(queuePath);
     const matched = [];
     const remaining = [];
+    let healed = false;
     for (const item of store.items) {
-      if (String(item.toMachine || "").toLowerCase() === targetLower) {
-        matched.push(item);
-        if (peekOnly) remaining.push(item);
+      const bareTarget = normalizeStoredTarget(item.toMachine);
+      if (bareTarget && (allMachines || String(bareTarget).toLowerCase() === targetLower)) {
+        const normalized = bareTarget !== item.toMachine ? { ...item, toMachine: bareTarget } : item;
+        healed ||= normalized !== item;
+        matched.push(normalized);
+        if (peekOnly) remaining.push(normalized);
       } else {
         remaining.push(item);
       }
     }
-    if (!peekOnly && matched.length > 0) {
+    if (healed || (!peekOnly && matched.length > 0)) {
       saveOfflineQueueStore({ items: remaining }, queuePath);
     }
     return {
@@ -374,6 +411,7 @@ export async function ackOfflineStoreItems({
   requestIds = [],
   onlyForMachine = null,
   queuePath = OFFLINE_QUEUE_PATH,
+  normalizeStoredTarget = (value) => value,
 }) {
   const ackSet = new Set(
     (Array.isArray(requestIds) ? requestIds : []).map((id) => String(id || "").trim()).filter(Boolean)
@@ -382,22 +420,75 @@ export async function ackOfflineStoreItems({
   return await withQueueStoreLock(async () => {
     const store = loadOfflineQueueStore(queuePath);
     const before = store.items.length;
-    const remaining = store.items.filter(
-      (item) =>
-        !ackSet.has(item.requestId) ||
-        (scopedMachine !== null && String(item.toMachine || "").toLowerCase() !== scopedMachine)
-    );
-    if (remaining.length !== before) {
+    let scopedRemaining = 0;
+    let healed = false;
+    const remaining = store.items.flatMap((item) => {
+      const target = normalizeStoredTarget(item.toMachine);
+      const inScope = target && (scopedMachine === null || String(target).toLowerCase() === scopedMachine);
+      if (inScope && ackSet.has(item.requestId)) return [];
+      if (inScope) scopedRemaining++;
+      if (inScope && target !== item.toMachine) {
+        healed = true;
+        return [{ ...item, toMachine: target }];
+      }
+      return [item];
+    });
+    if (healed || remaining.length !== before) {
       saveOfflineQueueStore({ items: remaining }, queuePath);
     }
     return {
       ok: true,
       ackedCount: before - remaining.length,
-      remainingCount: scopedMachine
-        ? remaining.filter((item) => String(item.toMachine || "").toLowerCase() === scopedMachine).length
-        : remaining.length,
+      remainingCount: scopedMachine ? scopedRemaining : remaining.length,
     };
   });
+}
+
+function queueTargetNormalizer(store, { deviceAuth, verification, isGitHubMaintainer }) {
+  const now = Date.now();
+  const rosters = Object.values(store.flocks || {}).filter((flock) =>
+    !flock.revoked && (!flock.expiresAtMs || Number(flock.expiresAtMs) > now)).map((flock) => ({
+    flock,
+    members: Object.values(flock.members || {}).filter((member) => member && !member.removed &&
+      (!member.membershipExpiresAtMs || Number(member.membershipExpiresAtMs) > now) &&
+      (!Array.isArray(flock.allowedScopes) || flock.allowedScopes.length === 0 || flock.allowedScopes.includes(member.scope)) &&
+      !isPrincipalRevokedInFlock(flock, member)),
+  }));
+  const matchesCaller = (member) => deviceAuth
+    ? member.deviceId === deviceAuth.deviceId && Number(member.githubUserId) === Number(deviceAuth.githubUserId)
+    : Number(member.githubUserId) === Number(verification.githubUserId) &&
+      String(member.githubUser).toLowerCase() === String(verification.githubUser).toLowerCase();
+  return (raw, { enqueue = false } = {}) => {
+    const deny = () => { throw Object.assign(new Error("Queue target is invalid or outside the caller's authorized enrolled owner/flock scope"),
+      { code: "QUEUE_TARGET_UNAUTHORIZED", statusCode: 403 }); };
+    const malformed = () => { throw Object.assign(new Error("Malformed queue target; use a bare machineId or owner/flock/machineId"),
+      { code: "INVALID_QUEUE_TARGET", statusCode: 400 }); };
+    if (typeof raw !== "string" || raw !== raw.trim() || !raw || raw.length > 300) return malformed();
+    const parts = raw.split("/");
+    if (![1, 3].includes(parts.length) || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(parts.at(-1)) ||
+        (parts.length === 3 && (!parts.slice(0, 2).every((part) => /^[a-z0-9][a-z0-9-]{0,62}$/i.test(part)) ||
+          parts[1].toLowerCase() === "private"))) return malformed();
+    const machine = parts.at(-1).toLowerCase();
+    const flockId = parts.length === 3 ? parts.slice(0, 2).join("/").toLowerCase() : null;
+    const matches = [];
+    for (const { flock, members } of rosters) {
+      if (flockId && flock.flockId.toLowerCase() !== flockId) continue;
+      const caller = members.find(matchesCaller);
+      for (const member of members) {
+        if (String(member.machineId || "").toLowerCase() !== machine) continue;
+        const permitted = isGitHubMaintainer || (enqueue
+          ? caller && ["owner", "collaborator"].includes(caller.trustTier)
+          : matchesCaller(member));
+        if (permitted) matches.push(member);
+      }
+    }
+    if (!matches.length) return deny();
+    const principal = `${matches[0].githubUserId}:${String(matches[0].githubUser).toLowerCase()}`;
+    if (rosters.some(({ members }) => members.some((member) =>
+      String(member.machineId || "").toLowerCase() === machine &&
+      `${member.githubUserId}:${String(member.githubUser).toLowerCase()}` !== principal))) return deny();
+    return matches[0].machineId;
+  };
 }
 
 function loadMembersRegistry(customPath = MEMBERS_PATH) {
@@ -562,7 +653,7 @@ export function projectV3EnrollmentResponse(result, protocolVersion) {
   if (Number(protocolVersion) >= 36) return result;
   const compatible = (entry) => entry?.trustTier !== "owner" ||
     /^[^/]+(?:\/(?:personal|work))?$/.test(String(entry?.flockId || ""));
-  const output = { ...result };
+  const output = { ...result, completeMembershipSnapshot: false, authoritativeSnapshot: false };
   for (const field of ["enrolledFlocks", "ownedFlocks", "joinedFlocks", "revokedFlockSummaries", "expiredFlockSummaries"]) {
     if (Array.isArray(output[field])) output[field] = output[field].filter(compatible);
   }
@@ -1257,6 +1348,16 @@ export async function enrollV3Device(
         }
       }
       const prevMember = f.members[peerId];
+      let restoredAuthority = false;
+      f.revokedPrincipals ||= {};
+      const restoredKeys = [peerId, cleanDevice];
+      if (["owner_root", "owner_scope"].includes(f.flockType) && f.ownerGitHubUser === cleanUser &&
+          (!f.ownerGitHubUserId || Number(f.ownerGitHubUserId) === numUserId)) {
+        restoredKeys.push(cleanUser, String(numUserId));
+      }
+      for (const key of restoredKeys) {
+        if (f.revokedPrincipals[key]) { delete f.revokedPrincipals[key]; restoredAuthority = true; }
+      }
       f.members[peerId] = {
         peerId,
         githubUser: cleanUser,
@@ -1280,7 +1381,7 @@ export async function enrollV3Device(
         delete f.removedMachines[`${cleanUser}:${cleanMachine.toLowerCase()}`];
       }
       if (
-        !prevMember ||
+        restoredAuthority || !prevMember ||
         prevMember.publicKey !== publicKey ||
         prevMember.trustTier !== item.trustTier
       ) {
@@ -1341,6 +1442,8 @@ export async function enrollV3Device(
       deviceId: cleanDevice,
       machineId: cleanMachine,
       scope: normScope,
+      completeMembershipSnapshot: false,
+      authoritativeSnapshot: false,
       enrolledFlocks,
       controlHints: enrolledFlocks.map((flock) => ({
         type: "roster_epoch_changed",
@@ -1474,6 +1577,8 @@ export async function refreshV3FlockToken(
     return {
       ok: true,
       flockId: f.flockId,
+      completeMembershipSnapshot: false,
+      authoritativeSnapshot: false,
       flockUuid: f.flockUuid,
       hubName: f.hubName,
       rosterEpoch: f.rosterEpoch,
@@ -1771,7 +1876,9 @@ export async function kickV3FlockMember(
           };
         }
         if (!isSelfLeave) {
-          if (cleanTargetUser && !cleanTargetMachine && !targetDeviceId) {
+          const isBuiltInOwner = ["owner_root", "owner_scope"].includes(f.flockType) &&
+            String(m.githubUser).toLowerCase() === String(f.ownerGitHubUser).toLowerCase();
+          if (cleanTargetUser && !cleanTargetMachine && !targetDeviceId && !isBuiltInOwner) {
             f.revokedPrincipals[m.githubUser] = new Date().toISOString();
             if (m.githubUserId) f.revokedPrincipals[String(m.githubUserId)] = new Date().toISOString();
           }
@@ -2084,6 +2191,22 @@ export async function syncV3DeviceMemberships(
     let mutated = false;
 
     for (const f of Object.values(store.flocks || {})) {
+      const priorMember = Object.values(f.members || {}).find((m) => m &&
+        m.deviceId === cleanDevice && Number(m.githubUserId) === numUserId &&
+        String(m.githubUser || "").toLowerCase() === cleanUser);
+      const isAuthenticatedBuiltInOwner = Boolean(priorMember && !f.targetMachineId &&
+        ["owner_root", "owner_scope"].includes(f.flockType) && f.ownerGitHubUser === cleanUser &&
+        (!f.ownerGitHubUserId || Number(f.ownerGitHubUserId) === numUserId) &&
+        (!Array.isArray(f.allowedScopes) || f.allowedScopes.length === 0 || f.allowedScopes.includes(priorMember.scope)));
+      if (isAuthenticatedBuiltInOwner) {
+        for (const key of [cleanUser, String(numUserId)]) {
+          if (f.revokedPrincipals?.[key]) {
+            delete f.revokedPrincipals[key];
+            f.rosterEpoch = (Number(f.rosterEpoch) || 1) + 1;
+            mutated = true;
+          }
+        }
+      }
       if (
         isPrincipalRevokedInFlock(f, {
           githubUser: cleanUser,
@@ -2114,15 +2237,12 @@ export async function syncV3DeviceMemberships(
         mutated = addOwnerMachinesToSharedFlock(store, f, cleanUser, now) || mutated;
       }
 
-      const memberEntry = Object.entries(f.members || {}).find(
-        ([, m]) =>
-          m &&
-          m.deviceId === cleanDevice &&
-          Number(m.githubUserId) === numUserId &&
-          String(m.githubUser || "").toLowerCase() === cleanUser
-      );
-      if (!memberEntry) continue;
-      const [memberKey, member] = memberEntry;
+      const refreshedEntry = Object.entries(f.members || {}).find(([, m]) => m &&
+        m.deviceId === cleanDevice && Number(m.githubUserId) === numUserId &&
+        String(m.githubUser || "").toLowerCase() === cleanUser);
+      if (!refreshedEntry) continue;
+      const [memberKey, member] = refreshedEntry;
+      if (Array.isArray(f.allowedScopes) && f.allowedScopes.length && !f.allowedScopes.includes(member.scope)) continue;
 
       if (
         (member.membershipExpiresAtMs && Number(member.membershipExpiresAtMs) <= now) ||
@@ -2148,12 +2268,6 @@ export async function syncV3DeviceMemberships(
         });
         continue;
       }
-
-      const isAuthenticatedBuiltInOwner =
-        !f.targetMachineId &&
-        (f.flockType === "owner_root" || f.flockType === "owner_scope") &&
-        f.ownerGitHubUser === cleanUser &&
-        (!f.ownerGitHubUserId || Number(f.ownerGitHubUserId) === numUserId);
 
       if (
         isAuthenticatedBuiltInOwner &&
@@ -2229,6 +2343,7 @@ export async function syncV3DeviceMemberships(
       revokedFlockSummaries,
       expiredFlockSummaries,
       authoritativeSnapshot: true,
+      completeMembershipSnapshot: true,
     };
   });
 }
@@ -2321,6 +2436,8 @@ export async function listV3UserFlocks(
     peerId: numUserId && cleanDevice ? `${numUserId}:${cleanDevice}` : null,
     ownedFlocks,
     joinedFlocks,
+    completeMembershipSnapshot: false,
+    authoritativeSnapshot: false,
   };
 }
 
@@ -2894,7 +3011,7 @@ export function createBootstrapServer({
             ...bodyData,
             githubUser: effectiveUser,
             githubUserId: effectiveUserId,
-            requireSignature: !privilegedVerification.ok,
+            requireSignature: true,
           },
           { storePath }
         );
@@ -3051,7 +3168,7 @@ export function createBootstrapServer({
       }
     }
 
-    const machineId =
+    let machineId =
       bodyData.machineId ||
       url.searchParams.get("machineId") ||
       req.headers["x-machine-id"] ||
@@ -3128,23 +3245,51 @@ export function createBootstrapServer({
       ? Object.values(registry).filter((member) => member?.machineId && deviceAuth.allowedPeerMachines.has(String(member.machineId).toLowerCase()))
       : isMaintainer ? Object.values(registry)
       : Object.values(registry).filter((member) => sharedPeerPrincipals.has(`${String(member.githubUser).toLowerCase()}:${String(member.machineId).toLowerCase()}`));
-    const ownsQueue = (target) => deviceAuth
-      ? Boolean(deviceAuth.machineId) && String(target || "").trim().toLowerCase() === String(deviceAuth.machineId).trim().toLowerCase()
-      : isGitHubMaintainer || ownedMachines.has(String(target || "").trim().toLowerCase());
-    if (deviceAuth && url.pathname.startsWith("/api/queue/")) {
-      const ownMachine = String(deviceAuth.machineId || "").trim().toLowerCase();
-      const selectors = [
-        ...(Object.hasOwn(bodyData, "machineId") ? [bodyData.machineId] : []),
-        ...url.searchParams.getAll("machineId"),
-        ...(req.headers["x-machine-id"] !== undefined ? [req.headers["x-machine-id"]] : []),
-      ];
-      if (typeof deviceAuth.machineId !== "string" || !ownMachine ||
-          selectors.some((value) => typeof value !== "string" || value.trim().toLowerCase() !== ownMachine)) {
-        sendJson(res, 403, { ok: false, error: "Token-local queue selectors must identify the device's own enrolled machineId." });
+    let normalizeQueueTarget = null;
+    let normalizeStoredTarget = (value) => value;
+    if (url.pathname.startsWith("/api/queue/")) {
+      normalizeQueueTarget = queueTargetNormalizer(loadV3FlockStore(v3StorePath), {
+        deviceAuth, verification, isGitHubMaintainer,
+      });
+      normalizeStoredTarget = (value) => {
+        if (typeof value !== "string" || !value.includes("/")) return value;
+        try { return normalizeQueueTarget(value); }
+        catch (error) {
+          if (!["QUEUE_TARGET_UNAUTHORIZED", "INVALID_QUEUE_TARGET"].includes(error.code)) throw error;
+          return null;
+        }
+      };
+      try {
+        const selectors = [
+          ...(Object.hasOwn(bodyData, "machineId") ? [bodyData.machineId] : []),
+          ...url.searchParams.getAll("machineId"),
+          ...(req.headers["x-machine-id"] !== undefined ? [req.headers["x-machine-id"]] : []),
+        ];
+        const normalizedSelectors = selectors.map((value) => normalizeQueueTarget(value));
+        if (deviceAuth) {
+          const ownMachine = normalizeQueueTarget(deviceAuth.machineId);
+          if (normalizedSelectors.some((value) => value.toLowerCase() !== ownMachine.toLowerCase())) {
+            throw Object.assign(new Error("Token-local queue selectors must identify the device's own enrolled machineId"),
+              { statusCode: 403, code: "QUEUE_TARGET_UNAUTHORIZED" });
+          }
+          machineId = ownMachine;
+          if (Object.hasOwn(bodyData, "machineId")) bodyData.machineId = ownMachine;
+        } else if (machineId) {
+          machineId = normalizeQueueTarget(machineId);
+          if (normalizedSelectors.some((value) => value.toLowerCase() !== machineId.toLowerCase())) {
+            throw Object.assign(new Error("Queue machine selectors disagree"), { statusCode: 403, code: "QUEUE_TARGET_UNAUTHORIZED" });
+          }
+          if (Object.hasOwn(bodyData, "machineId")) bodyData.machineId = machineId;
+        }
+        if (url.pathname === "/api/queue/enqueue") bodyData.toMachine = normalizeQueueTarget(bodyData.toMachine, { enqueue: true });
+      } catch (error) {
+        sendJson(res, error.statusCode || 403, { ok: false, code: error.code || "QUEUE_TARGET_UNAUTHORIZED", error: error.message });
         return;
       }
     }
-
+    const ownsQueue = (target) => deviceAuth
+      ? Boolean(deviceAuth.machineId) && String(target || "").trim().toLowerCase() === String(deviceAuth.machineId).trim().toLowerCase()
+      : isGitHubMaintainer || ownedMachines.has(String(target || "").trim().toLowerCase());
     if (deviceAuth && url.pathname === "/api/register") {
       if (
         !deviceAuth.machineId ||
@@ -3189,8 +3334,7 @@ export function createBootstrapServer({
     }
 
     if (url.pathname === "/api/queue/status") {
-      const store = loadOfflineQueueStore(queuePath);
-      const rawFilter = (url.searchParams.get("machineId") || "").trim().toLowerCase();
+      const rawFilter = String(machineId || "").toLowerCase();
       if (!deviceAuth && !isGitHubMaintainer && !ownsQueue(rawFilter)) {
         sendJson(res, 403, { ok: false, error: "Queue status requires an authoritative owned target machine" });
         return;
@@ -3208,9 +3352,16 @@ export function createBootstrapServer({
       const targetFilter = deviceAuth
         ? String(deviceAuth.machineId || "").trim().toLowerCase()
         : rawFilter;
-      const items = targetFilter
-        ? store.items.filter((x) => String(x.toMachine || "").toLowerCase() === targetFilter)
-        : store.items;
+      let status;
+      try {
+        status = await drainOfflineStoreItems({ queuePath, targetMachine: targetFilter, peekOnly: true,
+          allMachines: isGitHubMaintainer && !targetFilter, normalizeStoredTarget });
+      } catch (error) {
+        sendJson(res, error.statusCode || 500, { ok: false, code: error.code || "QUEUE_ERROR",
+          error: "Offline queue status/healing could not be persisted; inspect broker storage before retrying." });
+        return;
+      }
+      const items = status.messages;
       sendJson(res, 200, {
         ok: true,
         serviceBusNamespace: SERVICEBUS_NAMESPACE,
@@ -3291,6 +3442,7 @@ export function createBootstrapServer({
           queuePath,
           targetMachine: requestedDrainTarget,
           peekOnly: Boolean(bodyData.peekOnly),
+          normalizeStoredTarget,
         });
         sendJson(res, 200, result);
       } catch (err) {
@@ -3320,7 +3472,8 @@ export function createBootstrapServer({
         const result = await ackOfflineStoreItems({
           queuePath,
           requestIds: bodyData.requestIds,
-          onlyForMachine: deviceAuth ? deviceAuth.machineId : isGitHubMaintainer ? null : ackTarget,
+          onlyForMachine: deviceAuth ? deviceAuth.machineId : isGitHubMaintainer && !machineId ? null : ackTarget,
+          normalizeStoredTarget,
         });
         sendJson(res, 200, result);
       } catch (err) {

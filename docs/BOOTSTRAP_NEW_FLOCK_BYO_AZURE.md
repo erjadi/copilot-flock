@@ -173,6 +173,15 @@ are limited to that device's queue even with omitted or own selectors.
 Enqueue `toMachine` targeting retains its active shared-flock authorization.
 Only a non-device, GitHub-authenticated platform maintainer retains global ACK
 authority.
+Hosted subscription ensure first verifies an active subscription using a
+bounded GET response. A missing subscription is created; a concurrent-create
+409 must be followed by verified existence before publication. Canonical
+`owner/flock/machineId` queue targets are authorized in that exact flock and
+normalized to the enrolled bare ID. Authorized status/drain/ack operations can
+heal existing canonical rows without rewriting their payload, ID or expiry.
+Malformed selectors fail with 400; foreign or ambiguous enrolled targets fail
+with 403. A GitHub maintainer's explicit ACK selector is scoped; only omission
+of a selector retains global ACK.
 
 After an authorized disposable setup, run the explicitly approved
 [live audience/SAS isolation gate](./BROKER_FREE_V34.md#required-live-azure-gate)

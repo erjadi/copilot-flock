@@ -64,6 +64,7 @@ import {
 import {
   isSyntheticBuiltInFlock,
   hasVerifiedOwnerAuthority,
+  isPrincipalRevokedInFlock as isAuthoritativePrincipalRevoked,
   verifyAuthoritativeFlockRecord,
   FlockMembershipRegistry,
   createSignedRosterSnapshot,
@@ -3808,7 +3809,7 @@ export function reconcileAuthoritativeFlockMemberships(
   cfg,
   authResult,
   customPath = getFlocksConfigPath(),
-  { requireMemberProof = true, now = Date.now(), onBeforeCommit = null } = {}
+  { requireMemberProof = true, completeMembershipSnapshot, now = Date.now(), onBeforeCommit = null } = {}
 ) {
   const principal = normalizeGitHubUser(authResult?.githubUser)?.toLowerCase();
   const principalId = Number(authResult?.githubUserId);
@@ -3845,6 +3846,16 @@ export function reconcileAuthoritativeFlockMemberships(
   }
 
   const auth = { githubUser: principal, githubUserId: principalId, peerId, deviceId, now };
+  const isCompleteSnapshot = Boolean(completeMembershipSnapshot ?? (authResult?.completeMembershipSnapshot === true));
+  if (isCompleteSnapshot) {
+    const identity = legacyRosterIdentity(cfg, customPath);
+    if (!requireMemberProof || !deviceId || !identity?.fingerprint ||
+        String(identity.fingerprint).toLowerCase() !== deviceId || peerId !== expectedPeerId) {
+      const error = new Error("Complete membership snapshots require verified member proof bound to this local device");
+      error.code = "UNVERIFIED_AUTHORITY";
+      throw error;
+    }
+  }
   for (const rawFlock of incomingList) {
     if (rawFlock?.trustTier === "owner") {
       verifyAuthoritativeFlockRecord(rawFlock, auth, { requireMemberProof });
@@ -3860,7 +3871,7 @@ export function reconcileAuthoritativeFlockMemberships(
       rank: isOwner ? 0 : flock.trustTier === "guest" ? 1 : 2,
       serialized: JSON.stringify(rawFlock),
     };
-  });
+  }).filter(({ flock }) => legacyRosterAllowsScope(flock, normalizeScope(cfg?.scope || authResult.scope, "work")));
 
   // Select only fresh verified broker records, never cached unverified privileges or invite labels.
   records.sort(
@@ -3922,11 +3933,13 @@ export function reconcileAuthoritativeFlockMemberships(
       customPath
     );
     const persistedFlocks = diskParsed.flocks || {};
+    const registryState = openFlockMembershipRegistry(customPath).read();
 
     const enrolledOut = [];
     const healedFlockIds = [];
     const preservedOwnerFlockIds = [];
     const quarantinedFlockIds = [];
+    const prunedFlockIds = new Set();
 
     for (const flock of selected.values()) {
       const persistedPrevious = persistedFlocks[flock.flockId];
@@ -3935,6 +3948,8 @@ export function reconcileAuthoritativeFlockMemberships(
       );
       const prevEpoch = hasRealPersisted ? Number(persistedPrevious.rosterEpoch) || 0 : 0;
       const incomingEpoch = Number(flock.rosterEpoch) || 1;
+      const retainedFloor = registryState.retainedFlocks?.[flock.flockId];
+      const activeFloor = registryState.flocks[flock.flockId];
       const previousHasVerifiedOwner =
         hasRealPersisted && hasVerifiedOwnerAuthority(persistedPrevious, auth);
 
@@ -3955,6 +3970,12 @@ export function reconcileAuthoritativeFlockMemberships(
         );
         err.code = "STALE_ROSTER_EPOCH";
         throw err;
+      }
+      if (incomingEpoch < Math.max(retainedFloor?.rosterEpoch || 1, retainedFloor?.minAcceptedEpoch || 1,
+          activeFloor?.rosterEpoch || 1, activeFloor?.minAcceptedEpoch || 1)) {
+        const error = new Error(`Authoritative membership for "${flock.flockId}" is below the retained registry floor`);
+        error.code = "ROSTER_ROLLBACK_REJECTED";
+        throw error;
       }
 
       if (previousHasVerifiedOwner && flock.trustTier !== "owner") {
@@ -4007,7 +4028,9 @@ export function reconcileAuthoritativeFlockMemberships(
               ? persistedPrevious.shareSpecs
               : "full"
             : "summary",
+        membershipStatus: "active",
       };
+      delete nextEntry.revoked;
       if (flock.trustTier === "owner") {
         nextEntry.membershipExpiresAt = null;
         nextEntry.membershipExpiresAtMs = null;
@@ -4044,7 +4067,10 @@ export function reconcileAuthoritativeFlockMemberships(
           continue;
         }
         const existing = persistedFlocks[normId];
-        if (!existing || isSyntheticBuiltInFlock(existing) || hasVerifiedOwnerAuthority(existing, auth)) {
+        const verifiedIncomingOwner = enrolledOut.some((entry) => entry.flockId === normId &&
+          hasVerifiedOwnerAuthority(entry, auth));
+        if (!existing || isSyntheticBuiltInFlock(existing) || hasVerifiedOwnerAuthority(existing, auth) ||
+            verifiedIncomingOwner) {
           continue;
         }
         const nextQuarantined = {
@@ -4077,12 +4103,35 @@ export function reconcileAuthoritativeFlockMemberships(
       }
     }
 
+    for (const [id, entry] of Object.entries(localFlocks.flocks)) {
+      const localStub = (!entry.flockUuid || isSyntheticBuiltInFlock(entry)) &&
+        (!Array.isArray(entry.members) || entry.members.length === 0) &&
+        Array.isArray(entry.sharedSessionIds) && entry.sharedSessionIds.length > 0;
+      const quarantined = quarantinedFlockIds.includes(id);
+      if (entry.revoked || (entry.membershipExpiresAtMs != null && entry.membershipExpiresAtMs <= now) ||
+          (isCompleteSnapshot && (!selected.has(id) || !legacyRosterAllowsScope(entry, normalizeScope(cfg?.scope || authResult.scope, "work"))))) {
+        prunedFlockIds.add(id);
+        if (quarantined && Array.isArray(entry.sharedSessionIds) && entry.sharedSessionIds.length) {
+          entry.revoked = true;
+          entry.members = [];
+          entry.membershipStatus = "revoked_or_expired";
+        } else if (!localStub) delete localFlocks.flocks[id];
+        else entry.membershipStatus = "local_stub";
+      } else if (isCompleteSnapshot && !selected.has(id) && localStub) {
+        entry.membershipStatus = "local_stub";
+      }
+    }
+
     if (typeof onBeforeCommit === "function") {
       onBeforeCommit(casAttempt);
     }
 
     try {
       atomicWriteFlocksConfig(customPath, localFlocks, rawBefore);
+      if (prunedFlockIds.size) {
+        openFlockMembershipRegistry(customPath).retainFlocks([...prunedFlockIds]);
+        cleanupFlockCredentialVault(customPath, { now, removeFlockIds: [...prunedFlockIds] });
+      }
       return {
         ...authResult,
         enrolledFlocks: enrolledOut,
@@ -4090,6 +4139,7 @@ export function reconcileAuthoritativeFlockMemberships(
         healedFlockIds,
         preservedOwnerFlockIds,
         quarantinedFlockIds,
+        prunedFlockIds: [...prunedFlockIds],
       };
     } catch (writeErr) {
       if (writeErr?.code === "CONCURRENT_FLOCK_CONFIG_CHANGE" && casAttempt < 4) {
@@ -4103,7 +4153,7 @@ export function reconcileAuthoritativeFlockMemberships(
   throw err;
 }
 
-export function applyV3EnrollmentResult(cfg, result, customPath = getFlocksConfigPath()) {
+export function applyV3EnrollmentResult(cfg, result, customPath = getFlocksConfigPath(), options = {}) {
   if (
     isTokenLocalAuthEnabled(cfg) &&
     typeof result?.connectionString === "string" &&
@@ -4141,18 +4191,21 @@ export function applyV3EnrollmentResult(cfg, result, customPath = getFlocksConfi
     Object.assign(cfg, applyCredentialVaultToConfig(cfg, customPath));
   }
   const authoritativeResult = stripEnrollmentCredentials(result);
+  const completeMembershipSnapshot = options.completeMembershipSnapshot ?? authoritativeResult.completeMembershipSnapshot === true;
   const reconciled = reconcileAuthoritativeFlockMemberships(cfg, authoritativeResult, customPath, {
-    requireMemberProof: false,
+    requireMemberProof: options.requireMemberProof === true,
+    completeMembershipSnapshot,
   });
-  const registryRecords = [
-    ...(reconciled.enrolledFlocks || []),
+  const inactiveFlocks = [
     ...(Array.isArray(result?.revokedFlockSummaries) ? result.revokedFlockSummaries : []),
     ...(Array.isArray(result?.expiredFlockSummaries) ? result.expiredFlockSummaries : []),
   ];
-  if (registryRecords.length > 0) {
+  if (inactiveFlocks.length || reconciled.enrolledFlocks.length || completeMembershipSnapshot) {
     try {
       openFlockMembershipRegistry(customPath).reconcileV3Broker({
-        enrolledFlocks: registryRecords,
+        enrolledFlocks: reconciled.enrolledFlocks,
+        inactiveFlocks,
+        authoritativeFlockIds: completeMembershipSnapshot ? reconciled.reconciledFlockIds : null,
       });
     } catch (error) {
       const partial = new Error(
@@ -4240,7 +4293,7 @@ export async function requireBootstrapCapabilities(
 async function performFlockMembershipSync(
   cfg,
   {
-    customPath = getFlocksConfigPath(),
+    customPath = cfg?.flocksConfigPath || getFlocksConfigPath(),
     callEndpoint = callBootstrapV3Endpoint,
     identityKeypair = null,
     sandbox = isSandboxV3Mode(),
@@ -4290,20 +4343,25 @@ async function performFlockMembershipSync(
       Object.assign(cfg, applyCredentialVaultToConfig(cfg, customPath));
     }
     const authoritativeResult = stripEnrollmentCredentials(res);
-    const reconciled = reconcileAuthoritativeFlockMemberships(cfg, authoritativeResult, customPath, {
+    const reconciled = reconcileAuthoritativeFlockMemberships({ ...cfg, identity: idKey }, authoritativeResult, customPath, {
       requireMemberProof: true,
+      completeMembershipSnapshot: res.completeMembershipSnapshot === true,
       now,
     });
-    const registryRecords = [
-      ...(reconciled.enrolledFlocks || []),
+    const inactiveFlocks = [
       ...(Array.isArray(res?.revokedFlockSummaries) ? res.revokedFlockSummaries : []),
       ...(Array.isArray(res?.expiredFlockSummaries) ? res.expiredFlockSummaries : []),
     ];
-    if (registryRecords.length > 0) {
-      openFlockMembershipRegistry(customPath).reconcileV3Broker({
-        enrolledFlocks: registryRecords,
+    {
+      const registry = openFlockMembershipRegistry(customPath);
+      registry.reconcileV3Broker({
+        enrolledFlocks: reconciled.enrolledFlocks,
+        inactiveFlocks,
+        authoritativeFlockIds: res.completeMembershipSnapshot === true ? reconciled.reconciledFlockIds : null,
         now,
       });
+      cleanupFlockCredentialVault(customPath, { now,
+        removeFlockIds: Object.keys(registry.read().retainedFlocks) });
     }
     return { ...reconciled, correlationId, stage: "complete" };
   } catch (cause) {
@@ -4421,7 +4479,7 @@ export async function refreshTokenLocalTransportCredentials(
     machineId: response.machineId || credential.machineId || cfg?.machineId,
     enrolledFlocks: [response],
   };
-  applyV3EnrollmentResult(cfg, authoritative, customPath);
+  applyV3EnrollmentResult(cfg, authoritative, customPath, { completeMembershipSnapshot: false });
   Object.assign(cfg, applyCredentialVaultToConfig(cfg, customPath));
   return cfg;
 }
@@ -15913,7 +15971,9 @@ export async function executeMcpTool(cfg, name, args = {}, options = {}) {
   if (name === "list_flocks") {
     let reconciliation = null;
     if (args.reconcile === true) {
-      reconciliation = await syncFlockMemberships(cfg);
+      reconciliation = await syncFlockMemberships(cfg, {
+        customPath: options.flocksConfigPath || cfg?.flocksConfigPath || getFlocksConfigPath(),
+      });
     }
     const targetFlock = args.flock || cfg.boundFlockId || null;
     if (targetFlock) {
@@ -15953,6 +16013,7 @@ export async function executeMcpTool(cfg, name, args = {}, options = {}) {
     }
     const legacyRoster = await resolveLegacyFlockRoster(cfg, {
       ...options,
+      ...(reconciliation ? { persistFlocksCache: false, authoritativeFlockIds: reconciliation.reconciledFlockIds } : {}),
       targetFlock,
       deferPresenceMerge: true,
     });
@@ -15960,18 +16021,12 @@ export async function executeMcpTool(cfg, name, args = {}, options = {}) {
       ? applyLivePresenceToLegacyRoster(legacyRoster, onlineMachines, liveSignalRSource)
       : applyLivePresenceToLegacyRoster(legacyRoster, null, null);
     let cachedFlocks = [];
-    const hasRemoteRoster =
-      resolved.remoteOwnedFlocks?.length > 0 || resolved.remoteJoinedFlocks?.length > 0;
+    const hasRemoteRoster = resolved.enrolledRosterFlocks?.length > 0;
     try {
       const registry = openFlockMembershipRegistry(options.flocksConfigPath || cfg?.flocksConfigPath || null);
       if (hasRemoteRoster) {
         registry.reconcileV3Broker({
-          myFlocksResponse: {
-            ok: true,
-            githubUser: resolved.effectiveOwner || cfg.githubUser,
-            ownedFlocks: resolved.remoteOwnedFlocks || [],
-            joinedFlocks: resolved.remoteJoinedFlocks || [],
-          },
+          enrolledFlocks: resolved.enrolledRosterFlocks,
           bootstrapMembers: resolved.knownMembers || [],
         });
       }
@@ -21310,6 +21365,37 @@ function isNonExpiredIsoOrMs(expiresAt, expiresAtMs, nowMs) {
   return true;
 }
 
+function legacyRosterIdentity(cfg, flocksPath) {
+  if (cfg?.identity) return cfg.identity;
+  const filename = path.join(path.dirname(flocksPath), "identity.json");
+  if (!fs.existsSync(filename)) return null;
+  return JSON.parse(fs.readFileSync(assertNoLinks(filename), "utf8"));
+}
+
+function legacyRosterAllowsScope(flock, scope) {
+  return !Array.isArray(flock?.allowedScopes) || flock.allowedScopes.length === 0 || flock.allowedScopes.includes(scope);
+}
+
+function findLegacyRosterDeviceMember(cfg, flock, { principal, deviceId = null, now }) {
+  const scope = normalizeScope(cfg?.scope, "work");
+  if (!cfg?.machineId || !legacyRosterAllowsScope(flock, scope) ||
+      !isNonExpiredIsoOrMs(flock.membershipExpiresAt, flock.membershipExpiresAtMs, now) ||
+      (flock.expiresAtMs != null && Number(flock.expiresAtMs) <= now)) return null;
+  const identity = cfg.identity || null;
+  const expectedDevice = identity?.fingerprint || deviceId;
+  return (Array.isArray(flock.members) ? flock.members : []).find((member) => {
+    if (!member || member.removed || member.revoked ||
+        String(member.githubUser || "").toLowerCase() !== principal ||
+        String(member.machineId || "").toLowerCase() !== String(cfg.machineId).toLowerCase() ||
+        (member.scope && member.scope !== scope) ||
+        !isNonExpiredIsoOrMs(member.membershipExpiresAt, member.membershipExpiresAtMs, now)) return false;
+    if (expectedDevice && String(member.deviceId || member.keyFingerprint || "").toLowerCase() !==
+        String(expectedDevice).toLowerCase()) return false;
+    if (identity?.publicKey && member.publicKey?.trim() !== identity.publicKey.trim()) return false;
+    return !isAuthoritativePrincipalRevoked(flock, member);
+  }) || null;
+}
+
 export async function resolveLegacyFlockRoster(cfg, options = {}) {
   if (cfg?.protocol === "broker-free-v34") {
     throw new Error("Legacy broker roster query is forbidden in broker-free-v34 mode");
@@ -21320,10 +21406,11 @@ export async function resolveLegacyFlockRoster(cfg, options = {}) {
   const flocksConfigPath = options.flocksConfigPath || cfg?.flocksConfigPath || getFlocksConfigPath();
   const fileExistedBefore = Boolean(flocksConfigPath && fs.existsSync(flocksConfigPath));
 
+  const rawBefore = fileExistedBefore ? fs.readFileSync(flocksConfigPath) : null;
   let rawStored = { flocks: {} };
   if (fileExistedBefore) {
     try {
-      rawStored = JSON.parse(fs.readFileSync(flocksConfigPath, "utf8")) || { flocks: {} };
+      rawStored = JSON.parse(rawBefore.toString("utf8")) || { flocks: {} };
     } catch {}
   }
   const storedFlockIds = new Set(Object.keys(rawStored.flocks || {}));
@@ -21331,6 +21418,8 @@ export async function resolveLegacyFlockRoster(cfg, options = {}) {
   const configuredUser = normalizeGitHubUser(cfg?.githubUser)?.toLowerCase() || null;
   const localScope = normalizeScope(cfg?.scope, "work");
   const hasBootstrap = Boolean(cfg?.bootstrapUrl || DEFAULT_BOOTSTRAP_URL);
+  const localIdentity = legacyRosterIdentity(cfg, flocksConfigPath);
+  const deviceCfg = localIdentity ? { ...cfg, identity: localIdentity } : cfg;
 
   const [v3Raw, membersRaw] = await Promise.all([
     (async () => {
@@ -21339,7 +21428,8 @@ export async function resolveLegacyFlockRoster(cfg, options = {}) {
       if (!isTokenLocalAuthEnabled(cfg) && !resolveLocalGitHubToken(cfg)) {
         return { __skipped: true, error: "Missing local GitHub token" };
       }
-      return callBootstrapV3Endpoint(cfg, "/my-flocks", { method: "GET" });
+      return callBootstrapV3Endpoint(cfg, localIdentity?.fingerprint
+        ? `/my-flocks?deviceId=${encodeURIComponent(localIdentity.fingerprint)}` : "/my-flocks", { method: "GET" });
     })(),
     (async () => {
       if (options.fetchLegacyMembers) return await options.fetchLegacyMembers(cfg);
@@ -21451,6 +21541,8 @@ export async function resolveLegacyFlockRoster(cfg, options = {}) {
   const reconciledFlocksMap = new Map();
   const revokedOwnerMachines = new Set();
   const persistedFlocksOut = { ...(localFlocksCfg.flocks || {}) };
+  const enrolledRosterFlocks = [];
+  const prunedFlockIds = new Set();
   const quarantinedMembers = [];
   const quarantinedRosterKeys = new Set();
   const recordQuarantinedRosterMember = (flockId, member, source) => {
@@ -21528,17 +21620,24 @@ export async function resolveLegacyFlockRoster(cfg, options = {}) {
       const remoteEpoch = Number(rf.rosterEpoch) || 1;
       const localEpoch = hadStoredMembers ? (Number(localPrev.rosterEpoch) || 0) : 0;
 
-      const isBuiltInOwner =
-        String(rf.ownerGitHubUser || "").toLowerCase() === effectiveOwner &&
-        !rf.targetMachineId &&
-        (rf.flockType === "owner_root" || rf.flockType === "owner_scope");
-      const localMemberSelf = (rf.members || []).find(
-        (m) =>
-          String(m?.githubUser || "").toLowerCase() === effectiveOwner &&
-          (!cfg?.machineId || String(m?.machineId || "").toLowerCase() === String(cfg.machineId).toLowerCase())
-      );
-      const effectiveTrust = isBuiltInOwner
-        ? "owner"
+      const higherLocalEpoch = storedFlockIds.has(flockId) && remoteEpoch < (Number(localPrev?.rosterEpoch) || 0);
+      const membershipRecord = higherLocalEpoch ? localPrev : rf;
+      const localMemberSelf = findLegacyRosterDeviceMember(deviceCfg, membershipRecord, {
+        principal: effectiveOwner, deviceId: v3Res.deviceId, now: nowMs,
+      });
+      if (!legacyRosterAllowsScope(rf, localScope) || !localMemberSelf ||
+          (options.authoritativeFlockIds && !options.authoritativeFlockIds.includes(flockId))) {
+        delete persistedFlocksOut[flockId];
+        prunedFlockIds.add(flockId);
+        continue;
+      }
+      const ownerAuth = { githubUser: effectiveOwner,
+        githubUserId: v3Res.githubUserId || localMemberSelf.githubUserId,
+        deviceId: localMemberSelf.deviceId, peerId: localMemberSelf.peerId, now: nowMs };
+      const verifiedOwner = hasVerifiedOwnerAuthority({ ...membershipRecord, trustTier: "owner" }, ownerAuth) ||
+        hasVerifiedOwnerAuthority(localPrev, ownerAuth);
+      const isBuiltInOwner = verifiedOwner && ["owner_root", "owner_scope"].includes(membershipRecord.flockType);
+      const effectiveTrust = verifiedOwner ? "owner"
         : localMemberSelf?.trustTier === "guest" || localPrev?.trustTier === "guest" || rf.flockType === "guest_pass"
         ? "guest"
         : "collaborator";
@@ -21561,6 +21660,11 @@ export async function resolveLegacyFlockRoster(cfg, options = {}) {
         flockSource = "broker_v3_my_flocks";
         flockFetchedAt = v3Source.fetchedAt;
       }
+      if (verifiedOwner && localMemberSelf.trustTier !== "owner" && hasVerifiedOwnerAuthority(localPrev, ownerAuth)) {
+        const provenSelf = localPrev.members.find((member) => member.peerId === ownerAuth.peerId &&
+          member.deviceId === ownerAuth.deviceId && member.trustTier === "owner");
+        chosenMembers = chosenMembers.map((member) => member.peerId === ownerAuth.peerId ? { ...provenSelf } : member);
+      }
 
       const mergedEntry = {
         ...(localPrev || {}),
@@ -21569,6 +21673,7 @@ export async function resolveLegacyFlockRoster(cfg, options = {}) {
         hubName: rf.hubName || localPrev?.hubName || null,
         flockType: rf.flockType || localPrev?.flockType || "shared",
         ownerGitHubUser: rf.ownerGitHubUser || localPrev?.ownerGitHubUser || effectiveOwner,
+        ownerGitHubUserId: rf.ownerGitHubUserId || localPrev?.ownerGitHubUserId || null,
         allowedScopes: sanitizeAllowedScopes(rf.allowedScopes || localPrev?.allowedScopes, localScope),
         targetMachineId: rf.targetMachineId ?? localPrev?.targetMachineId ?? null,
         trustTier: effectiveTrust,
@@ -21580,55 +21685,34 @@ export async function resolveLegacyFlockRoster(cfg, options = {}) {
         rosterFetchedAt: flockFetchedAt,
         rosterSource: flockSource,
         membershipStatus: "active",
+        ...(verifiedOwner ? { membershipExpiresAt: null, membershipExpiresAtMs: null } : {}),
         members: chosenMembers,
       };
+      if (verifiedOwner) delete mergedEntry.revoked;
       reconciledFlocksMap.set(flockId, mergedEntry);
       persistedFlocksOut[flockId] = mergedEntry;
-    }
-
-    for (const builtInId of [builtInRootId, builtInScopeId]) {
-      if (!reconciledFlocksMap.has(builtInId)) {
-        const base = localFlocksCfg.flocks[builtInId] || {
-          flockId: builtInId,
-          ownerGitHubUser: effectiveOwner,
-          flockType: builtInId === builtInRootId ? "owner_root" : "owner_scope",
-          trustTier: "owner",
-          allowedScopes: builtInId === builtInRootId ? ["personal", "work"] : [localScope],
-          sessionVisibility: "all",
-          shareSpecs: "full",
-          sharedSnapshots: {},
-          sharedSessionIds: [],
-          rosterEpoch: 1,
-        };
-        const entry = {
-          ...base,
-          members: [],
-          rosterFetchedAt: v3Source.fetchedAt,
-          rosterSource: "broker_v3_my_flocks",
-          membershipStatus: "active",
-        };
-        reconciledFlocksMap.set(builtInId, entry);
-        persistedFlocksOut[builtInId] = entry;
-      }
+      enrolledRosterFlocks.push({ ...membershipRecord, trustTier: effectiveTrust,
+        rosterEpoch: chosenEpoch, members: chosenMembers });
     }
 
     for (const [storedId, storedFlock] of Object.entries(rawStored.flocks || {})) {
       if (reconciledFlocksMap.has(storedId)) continue;
+      if (prunedFlockIds.has(storedId) || !legacyRosterAllowsScope(storedFlock, localScope)) {
+        delete persistedFlocksOut[storedId];
+        prunedFlockIds.add(storedId);
+        continue;
+      }
       const hadRemoteState =
         Array.isArray(storedFlock?.members) ||
         Boolean(storedFlock?.hubToken) ||
         (storedFlock?.ownerGitHubUser &&
           String(storedFlock.ownerGitHubUser).toLowerCase() !== effectiveOwner);
       if (hadRemoteState) {
-        if (Array.isArray(storedFlock?.sharedSessionIds) && storedFlock.sharedSessionIds.length > 0) {
-          persistedFlocksOut[storedId] = {
-            ...storedFlock,
-            members: [],
-            membershipStatus: "revoked_or_expired",
-          };
-        } else {
-          delete persistedFlocksOut[storedId];
-        }
+        if (Array.isArray(storedFlock.sharedSessionIds) && storedFlock.sharedSessionIds.length) {
+          persistedFlocksOut[storedId] = { ...stripEnrollmentCredentials({ enrolledFlocks: [storedFlock] }).enrolledFlocks[0],
+            members: [], revoked: true, membershipStatus: "revoked_or_expired" };
+        } else delete persistedFlocksOut[storedId];
+        prunedFlockIds.add(storedId);
       } else {
         // Pure local share_thread policy stub created by this owner before broker creation
         const stubEntry = {
@@ -21648,16 +21732,16 @@ export async function resolveLegacyFlockRoster(cfg, options = {}) {
         ? Boolean(options.persistFlocksCache)
         : fileExistedBefore && localFlocksCfg.ownerGitHubUser === effectiveOwner;
     if (shouldPersist && flocksConfigPath) {
-      try {
-        saveLocalFlocksConfig(
-          {
-            ...localFlocksCfg,
-            ownerGitHubUser: effectiveOwner,
-            flocks: persistedFlocksOut,
-          },
-          flocksConfigPath
-        );
-      } catch {}
+      atomicWriteFlocksConfig(flocksConfigPath, {
+        ...localFlocksCfg,
+        ownerGitHubUser: effectiveOwner,
+        flocks: persistedFlocksOut,
+      }, rawBefore);
+      const registry = openFlockMembershipRegistry(flocksConfigPath);
+      for (const id of registry.listFlockIds()) if (!enrolledRosterFlocks.some((entry) => entry.flockId === id)) prunedFlockIds.add(id);
+      registry.retainFlocks([...prunedFlockIds]);
+      if (enrolledRosterFlocks.length) registry.reconcileV3Broker({ enrolledFlocks: enrolledRosterFlocks });
+      cleanupFlockCredentialVault(flocksConfigPath, { now: nowMs, removeFlockIds: [...prunedFlockIds] });
     }
   } else {
     for (const [flockId, lf] of Object.entries(localFlocksCfg.flocks || {})) {
@@ -21700,8 +21784,10 @@ export async function resolveLegacyFlockRoster(cfg, options = {}) {
       }
       const targetBuiltIns = [builtInRootId, `${effectiveOwner}/${bmScope}`];
       for (const bFlockId of targetBuiltIns) {
+        if (bFlockId !== builtInRootId && bFlockId !== builtInScopeId) continue;
         let fEntry = reconciledFlocksMap.get(bFlockId);
         if (!fEntry) {
+          if (v3Source.ok) continue;
           fEntry = {
             flockId: bFlockId,
             flockUuid: `builtin-${bFlockId.replace("/", "-")}`,
@@ -21823,6 +21909,8 @@ export async function resolveLegacyFlockRoster(cfg, options = {}) {
     localFlocks: localFlocksView,
     remoteOwnedFlocks: remoteOwnedView,
     remoteJoinedFlocks: remoteJoinedView,
+    enrolledRosterFlocks,
+    prunedFlockIds: [...prunedFlockIds],
     quarantinedMembers,
     revokedOwnerMachines,
     v3Source,
@@ -22444,7 +22532,9 @@ export async function queryFlockMembershipRegistry(
       cfg,
       ["rosterSync", "tokenLocalDeviceAuth", "deviceSignedOperations"]
     );
-    const remoteRes = await callBootstrapV3Endpoint(cfg, "/my-flocks", { method: "GET" });
+    const localIdentity = legacyRosterIdentity(cfg, customFlocksPath || cfg.flocksConfigPath || getFlocksConfigPath());
+    const remoteRes = await callBootstrapV3Endpoint(cfg, localIdentity?.fingerprint
+      ? `/my-flocks?deviceId=${encodeURIComponent(localIdentity.fingerprint)}` : "/my-flocks", { method: "GET" });
     if (!remoteRes?.ok) {
       const error = new Error(remoteRes?.error || "Failed to fetch authoritative flock roster");
       error.code = remoteRes?.code || "ROSTER_FETCH_FAILED";
@@ -22461,8 +22551,14 @@ export async function queryFlockMembershipRegistry(
       error.stage = "roster_sync";
       throw error;
     }
+    const resolved = await resolveLegacyFlockRoster(cfg, {
+      flocksConfigPath: customFlocksPath || cfg.flocksConfigPath,
+      fetchV3MyFlocks: async () => remoteRes,
+      fetchLegacyMembers: async () => bootstrapStatus,
+      deferPresenceMerge: true,
+    });
     registry.reconcileV3Broker({
-      myFlocksResponse: remoteRes,
+      enrolledFlocks: resolved.enrolledRosterFlocks,
       bootstrapMembers: bootstrapStatus.members,
     });
   }

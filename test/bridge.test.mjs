@@ -2695,7 +2695,8 @@ test(
     privateKeyEncoding: { type: "pkcs8", format: "pem" },
   });
   try {
-    const ownerCfg = { githubUser: "erjadi", machineId: "MAIN-PC", scope: "personal" };
+    const ownerCfg = { githubUser: "erjadi", machineId: "MAIN-PC", scope: "personal",
+      identity: { ...ownerKeys, fingerprint: "fp-bridge-owner" } };
     const enrolled = await enrollV3Device(
       {
         githubUser: "erjadi",

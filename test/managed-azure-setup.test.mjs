@@ -89,7 +89,8 @@ delete process.env.SERVICEBUS_ENTRA_RESOURCE;
 delete process.env.IDENTITY_ENDPOINT; delete process.env.MSI_ENDPOINT;
 delete process.env.IDENTITY_HEADER; delete process.env.MSI_SECRET;
 const calls=[]; let msiStatus=400; let msiError="AADSTS500011 SECRET_ERROR_RESPONSE";
-let putStatus=201; let postStatus=202; let deleteStatus=204;
+let getStatus=404; let getXml="<SubscriptionDescription><Status>Active</Status></SubscriptionDescription>";
+let raceGetStatus=null; let putStatus=201; let postStatus=202; let deleteStatus=204;
 const mock=(url, options, callback) => {
  if(typeof options==="function") {callback=options;options=url;url=null;}
  const identity=url instanceof URL && url.hostname==="127.0.0.1";
@@ -107,10 +108,12 @@ const mock=(url, options, callback) => {
   calls.push(identity?{resource:url.searchParams.get("resource")}:{method:options.method,host:hostname});
   const response=new EventEmitter();
   response.statusCode=identity?msiStatus:hostname==="demo-sb.servicebus.windows.net"
-    ? options.method==="PUT"?putStatus:options.method==="POST"?postStatus:deleteStatus : 202;
+    ? options.method==="GET"?getStatus:options.method==="PUT"?putStatus:options.method==="POST"?postStatus:deleteStatus : 202;
+  if(!identity&&options.method==="PUT"&&putStatus===409&&raceGetStatus!==null)getStatus=raceGetStatus;
   response.resume=()=>{};
   callback(response);
   if(identity) response.emit("data",msiStatus===200?JSON.stringify({access_token:"SECRET_MSI_TOKEN",expires_on:String(Math.floor(Date.now()/1000)+3600)}):msiError);
+  else if(options.method==="GET"&&hostname==="demo-sb.servicebus.windows.net")response.emit("data",getXml);
   response.emit("end");
  });
  return req;
@@ -149,7 +152,7 @@ for(const [status,category] of [[401,"servicebus_authz_denied"],[403,"servicebus
  putStatus=status;const before=calls.length;
  result=await broker.publishToServiceBusRest(entry,60,{tokenProvider});
  assert.equal(result.published,false);assert.equal(result.category,category);assert.equal(result.stage,"subscription_put");
- assert.equal(result.reason,"subscription_ensure_failed");assert.equal(calls.length,before+1);
+ assert.equal(result.reason,"subscription_ensure_failed");assert.equal(calls.length,before+2);
  assert.doesNotMatch(JSON.stringify(result),/SECRET/);
 }
 putStatus=201;postStatus=403;
@@ -157,6 +160,37 @@ result=await broker.publishToServiceBusRest(entry,60,{tokenProvider});
 assert.equal(result.published,false);assert.equal(result.stage,"topic_post");assert.equal(result.category,"servicebus_authz_denied");
 postStatus=202;
 assert.equal((await broker.publishToServiceBusRest(entry,60,{tokenProvider})).published,true);
+getStatus=200;putStatus=409;
+let start=calls.length;
+assert.equal((await broker.publishToServiceBusRest(entry,60,{tokenProvider})).published,true);
+assert.deepEqual(calls.slice(start).map(call=>call.method),["GET","POST"]);
+getStatus=404;raceGetStatus=200;start=calls.length;
+assert.equal((await broker.publishToServiceBusRest(entry,60,{tokenProvider})).published,true);
+assert.deepEqual(calls.slice(start).map(call=>call.method),["GET","PUT","GET","POST"]);
+for(const status of [404,403,503]){
+ getStatus=404;raceGetStatus=status;start=calls.length;
+ result=await broker.publishToServiceBusRest(entry,60,{tokenProvider});
+ assert.equal(result.published,false);assert.equal(result.stage,status===404?"subscription_put":"subscription_verify");
+ if(status===404)assert.equal(result.reason,"subscription_conflict_unverified");
+ assert.deepEqual(calls.slice(start).map(call=>call.method),["GET","PUT","GET"]);
+}
+getStatus=200;raceGetStatus=null;putStatus=409;
+for(const xml of ["invalid","<SubscriptionDescription><Status>Disabled</Status></SubscriptionDescription>",
+ "<SubscriptionDescription><Status>ReceiveDisabled</Status></SubscriptionDescription>","X".repeat(65537)]){
+ getXml=xml;result=await broker.publishToServiceBusRest(entry,60,{tokenProvider});
+ assert.equal(result.published,false);assert.equal(result.category,"servicebus_client_error");
+}
+getXml="<SubscriptionDescription><Status>Active</Status></SubscriptionDescription>";
+getStatus=404;raceGetStatus=200;putStatus=409;getXml="<SubscriptionDescription><Status>Disabled</Status></SubscriptionDescription>";
+result=await broker.publishToServiceBusRest(entry,60,{tokenProvider});
+assert.equal(result.published,false);assert.equal(result.stage,"subscription_put");assert.equal(result.reason,"subscription_conflict_unverified");
+getStatus=200;raceGetStatus=null;getXml="<SubscriptionDescription><Status>Active</Status></SubscriptionDescription>";
+start=calls.length;
+const concurrent=await Promise.all([broker.publishToServiceBusRest(entry,60,{tokenProvider}),
+ broker.publishToServiceBusRest({...entry,requestId:"second"},60,{tokenProvider})]);
+assert.ok(concurrent.every(result=>result.published));
+assert.equal(calls.slice(start).filter(call=>call.method==="GET").length,1);
+assert.equal(calls.slice(start).filter(call=>call.method==="POST").length,2);
 for(const status of [200,204,404,403]){
  deleteStatus=status;
  result=await broker.deleteLegacyPeerSubscription({machineId:"FIXTURE-PEER"},{tokenProvider});
@@ -222,6 +256,54 @@ try {
  const global=await ackRequest(["foreign-ack-proof"],{device:false});
  assert.equal(global.status,200);assert.equal(global.data.ackedCount,1,"GitHub-token maintainer retains global ACK");
  assert.equal(broker.loadOfflineQueueStore(queuePath).items.length,0);
+ const queueRequest=async(endpoint,body=null,headers={})=>{
+  const raw=body===null?"":JSON.stringify(body);const method=body===null?"GET":"POST";
+  const signed=buildTokenLocalDeviceAuthHeaders({method,pathnameWithSearch:endpoint,body:raw},{...pair,fingerprint});
+  const response=await fetch("http://127.0.0.1:"+server.address().port+endpoint,{method,...(body===null?{}:{body:raw}),
+   headers:{"Content-Type":"application/json","X-Flock-Device-Id":signed.deviceId,"X-Flock-Timestamp":signed.timestamp,"X-Flock-Signature":signed.signature,...headers}});
+  return {status:response.status,data:await response.json()};
+ };
+ const canonical="demo-owner/work/ACK-OWNER";
+ for(const [toMachine,requestId]of [[canonical,"canonical-new"],["ACK-OWNER","bare-new"]]){
+  const queued=await queueRequest("/api/queue/enqueue",{machineId:canonical,toMachine,rpcPayload:{requestId,fromMachine:"ACK-OWNER"}});
+  assert.equal(queued.status,200);assert.equal(queued.data.serviceBusPublished,true);assert.equal(queued.data.toMachine,"ACK-OWNER");
+ }
+ for(const target of ["other/work/ACK-OWNER","demo-owner/personal/ACK-OWNER","demo-owner/work/../ACK-OWNER",
+  "demo-owner/work","demo-owner/private/ACK-OWNER"]){
+  const before=fs.readFileSync(queuePath);
+  const deniedStatus=target.includes("..")||target.includes("/private/")||target.split("/").length===2?400:403;
+  assert.equal((await queueRequest("/api/queue/enqueue",{toMachine:target,rpcPayload:{requestId:"forbidden"}})).status,deniedStatus);
+  assert.equal((await queueRequest("/api/queue/status?machineId="+encodeURIComponent(target))).status,deniedStatus);
+  assert.equal((await queueRequest("/api/queue/drain",{machineId:target,peekOnly:true})).status,deniedStatus);
+  assert.equal((await queueRequest("/api/queue/ack",{machineId:target,requestIds:["canonical-new"]})).status,deniedStatus);
+  assert.deepEqual(fs.readFileSync(queuePath),before);
+ }
+ await broker.enqueueOfflineStoreItem({toMachine:canonical,rpcPayload:{requestId:"canonical-old"},queuePath,publishFn:null});
+ await broker.enqueueOfflineStoreItem({toMachine:"other/work/ACK-OWNER",rpcPayload:{requestId:"foreign-owner-old"},queuePath,publishFn:null});
+ await broker.enqueueOfflineStoreItem({toMachine:"demo-owner/personal/ACK-OWNER",rpcPayload:{requestId:"foreign-scope-old"},queuePath,publishFn:null});
+ const originalItems=broker.loadOfflineQueueStore(queuePath).items;
+ const canonicalOld=originalItems.find(item=>item.requestId==="canonical-old");
+ const foreignOld=originalItems.filter(item=>item.requestId.startsWith("foreign-"));
+ const status=await queueRequest("/api/queue/status?machineId="+encodeURIComponent(canonical));
+ assert.equal(status.status,200);assert.equal(status.data.queuedCount,3);
+ assert.deepEqual(broker.loadOfflineQueueStore(queuePath).items.find(item=>item.requestId==="canonical-old"),{...canonicalOld,toMachine:"ACK-OWNER"});
+ let drained=await queueRequest("/api/queue/drain",{machineId:canonical,peekOnly:true});
+ assert.equal(drained.status,200);assert.equal(drained.data.drainedCount,3);
+ assert.ok(drained.data.messages.every(item=>item.toMachine==="ACK-OWNER"));
+ const denied=await queueRequest("/api/queue/ack",{machineId:canonical,requestIds:foreignOld.map(item=>item.requestId)});
+ assert.equal(denied.status,200);assert.equal(denied.data.ackedCount,0);assert.equal(denied.data.remainingCount,3);
+ assert.deepEqual(broker.loadOfflineQueueStore(queuePath).items.filter(item=>item.requestId.startsWith("foreign-")),foreignOld);
+ await broker.enqueueOfflineStoreItem({toMachine:canonical,rpcPayload:{requestId:"drain-heal-old"},queuePath,publishFn:null});
+ drained=await queueRequest("/api/queue/drain",{machineId:canonical,peekOnly:true},{"X-Machine-Id":canonical});
+ assert.equal(drained.data.drainedCount,4);
+ assert.equal(broker.loadOfflineQueueStore(queuePath).items.find(item=>item.requestId==="drain-heal-old").toMachine,"ACK-OWNER");
+ await broker.enqueueOfflineStoreItem({toMachine:canonical,rpcPayload:{requestId:"ack-heal-old"},queuePath,publishFn:null});
+ const canonicalAck=await queueRequest("/api/queue/ack",{machineId:canonical,requestIds:["canonical-new","bare-new","canonical-old","drain-heal-old"]});
+ assert.equal(canonicalAck.data.ackedCount,4);assert.equal(canonicalAck.data.remainingCount,1);
+ assert.equal(broker.loadOfflineQueueStore(queuePath).items.find(item=>item.requestId==="ack-heal-old").toMachine,"ACK-OWNER");
+ assert.equal((await queueRequest("/api/queue/ack",{requestIds:["ack-heal-old"]})).data.ackedCount,1);
+ assert.equal((await queueRequest("/api/queue/status?machineId="+encodeURIComponent(canonical))).data.queuedCount,0);
+ assert.deepEqual(broker.loadOfflineQueueStore(queuePath).items,foreignOld);
 }finally{server.closeAllConnections();await new Promise(resolve=>server.close(resolve));fs.rmSync(root,{recursive:true,force:true});}
 `;
   const result = spawnSync(process.execPath, ["--input-type=module", "-e", script], {

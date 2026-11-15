@@ -3763,7 +3763,7 @@ test("legacy flock_status and list_flocks surface offline shared-flock collabora
       targetAddress: "erjadi/experimental",
       invitedUser: "renepajta",
       invitedGitHubUserId: 2002,
-      allowedScopes: ["work"],
+      allowedScopes: ["personal", "work"],
     },
     { storePath }
   );
@@ -5611,7 +5611,7 @@ test("reconcileAuthoritativeFlockMemberships heals downgraded owner roles, enfor
       });
     }
 
-    const ownerCfg = { githubUser: "erjadi", machineId: "MAIN-WORKSTATION", scope: "personal" };
+    const ownerCfg = { githubUser: "erjadi", machineId: "MAIN-WORKSTATION", scope: "personal", identity: ownerIdentity };
 
     // 1. Initial owner enrollment on broker + client; share two threads on `erjadi/personal`
     const initialOwnerEnroll = await enrollV3Device(
@@ -5967,7 +5967,7 @@ test("reconcileAuthoritativeFlockMemberships heals downgraded owner roles, enfor
 
     // 4. Collaborator <-> Guest role reconciliation, epoch monotonicity, sharing preservation,
     // forged claims, and revoked/expired authority rejection
-    const aliceCfg = { githubUser: "alice", machineId: "ALICE-LAPTOP", scope: "work" };
+    const aliceCfg = { githubUser: "alice", machineId: "ALICE-LAPTOP", scope: "work", identity: aliceIdentity };
     const aliceGuestInvite = await createV3FlockInvite(
       {
         callerGitHubUser: "erjadi",
@@ -10310,12 +10310,16 @@ test("3.6 conformance blockers: signed outbound protected RPCs, unsigned read re
               hubName: "v3_flock_root",
               flockType: "owner_root",
               ownerGitHubUser: "erjadi",
+              ownerGitHubUserId: 1001,
+              allowedScopes: ["personal", "work"],
               rosterEpoch: 3,
               hubToken: "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ2My1sZWFrIn0.sig",
               serverNonce: "V3_NONCE_CANARY",
               voucherSecret: "V3_VOUCHER_CANARY",
               members: [
-                { machineId: "CALLER-PC", githubUser: "erjadi", scope: "personal", privateKey: "PRIVATE_KEY_CANARY" },
+                { machineId: "CALLER-PC", githubUser: "erjadi", githubUserId: 1001, scope: "personal",
+                  peerId: "1001:caller-fp", deviceId: "caller-fp", keyFingerprint: "caller-fp",
+                  publicKey: callerIdentity.publicKey, trustTier: "owner", privateKey: "PRIVATE_KEY_CANARY" },
                 { machineId: "STALE-LEGACY-PC", githubUser: "erjadi", scope: "private" },
               ],
             },

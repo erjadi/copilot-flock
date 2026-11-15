@@ -107,8 +107,48 @@ stdio clients submit support to a local TLS bootstrap service, reject ordinary
 remote tools, and continue after real enrollment without restarting stdio.
 A child resident daemon uses real WebSocket/HTTPS RPC, a disposable Git origin,
 and the real activator to check reply ordering, PID replacement, and terminal
-verification/failure. Test TLS certificates use `openssl` (available with Git
-on the Windows qualification host); no live Azure service or fleet is used.
+verification/failure. Test TLS certificates use OpenSSL when available, with a
+test-only Node crypto fallback; no live Azure service or fleet is used.
+
+### Post-canary roster and durable-queue remediation
+
+The NEXUS-V2 Gate 8a rejection and clean 3.5 rollback remain historical evidence,
+not an accepted rollout. The replacement candidate separates account-owned
+`/my-flocks` overviews from this device's verified, scope-compatible enrollment.
+Reconciliation preserves owner trust, proof-bearing self rows, approved sharing
+and bindings; signed sync remains authoritative over the subsequent overview.
+Fresh verified built-in owner authority clears stale local revocation flags,
+without accepting epoch rollback or clearing actual per-device revocation.
+Only an explicit `completeMembershipSnapshot: true` response with verified
+member proof bound to the local device permits absence-pruning. Signed sync
+emits the marker; enrollment, token refresh, account overviews and pre-36
+projections remain partial/additive. An older broker omitting the marker cannot
+trigger absence-pruning. Revoked policies with approved shares remain inactive
+tombstones so sharing intent survives without granting membership.
+
+Unenrolled, incompatible, revoked and expired active registry entries move
+atomically to optional `retainedFlocks` in the same schema-1 registry file.
+Retained records preserve epoch/revision floors, hashes, owner pins and removal
+tombstones but grant no active membership or presence. Stale writers cannot
+reactivate them; verified re-enrollment must satisfy the retained floors.
+The explicit 3.5 downgrade helper archives original registry bytes and converts
+nonempty retained state to inactive, member-free floor records that 3.5 saves
+can preserve. Empty-retained downgrade leaves registry bytes untouched.
+
+Hosted Service Bus subscription ensure is idempotent and coalesced: validate a
+bounded active subscription description, create on 404, and verify existence
+after a racing 409 before posting any message. Unverified conflicts and disabled
+subscriptions remain explicit failures. Queue APIs resolve canonical
+`owner/flock/machineId` and bare selectors against exact active memberships,
+store bare enrolled IDs, and heal only authorized, unambiguous historical rows.
+Request IDs, payloads, expiry and deduplication are not rewritten. Device ACK
+scope and queue depth remain own-machine-only, including maintainer devices.
+
+These client/runtime and broker changes require a new exact candidate digest,
+review/voter/compatibility checks, disposable multi-message Azure qualification
+and a repeated NEXUS canary before any broader client rollout. Earlier receipts
+do not transfer automatically. This source change itself authorizes no live
+queue edits, cloud deployment, vote, publication or fleet update.
 
 ### Final release-boundary hardening
 

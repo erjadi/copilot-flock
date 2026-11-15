@@ -1109,25 +1109,24 @@ function mergeFlockStatesMonotonic(diskFlock, memFlock) {
   if (!diskFlock) return structuredClone(memFlock);
   if (!memFlock) return structuredClone(diskFlock);
   if (diskFlock.protocol !== memFlock.protocol) {
-    return structuredClone(memFlock);
+    throw registryError("ROSTER_PROTOCOL_MISMATCH", "Cannot merge registry state across protocols");
   }
   const cmp = compareRosterVersion(
     { epoch: memFlock.rosterEpoch, revision: memFlock.rosterRevision },
     { epoch: diskFlock.rosterEpoch, revision: diskFlock.rosterRevision }
   );
   if (cmp < 0) {
-    const kept = structuredClone(diskFlock);
-    kept.presence = mergePresenceMaps(diskFlock.presence, memFlock.presence, kept.members || {}, kept.tombstones || {});
-    return kept;
+    return mergeFlockStatesMonotonic(memFlock, diskFlock);
   }
   const next = structuredClone(memFlock);
+  next.minAcceptedEpoch = Math.max(diskFlock.minAcceptedEpoch || 1, memFlock.minAcceptedEpoch || 1, next.rosterEpoch);
   next.tombstones ||= {};
   next.members ||= {};
   let mutatedRoster = false;
   for (const [idKey, diskTomb] of Object.entries(diskFlock.tombstones || {})) {
     const memMember = next.members[idKey];
     if (memMember) {
-      if (compareRosterVersion(
+      if ((next.protocol === "v3-broker" && memMember.addedAtEpoch <= diskTomb.removedAtEpoch) || compareRosterVersion(
         { epoch: memMember.addedAtEpoch, revision: memMember.updatedAtRevision },
         { epoch: diskTomb.removedAtEpoch, revision: diskTomb.removedAtRevision }
       ) <= 0) {
@@ -1155,6 +1154,56 @@ function mergeFlockStatesMonotonic(diskFlock, memFlock) {
   }
   next.presence = mergePresenceMaps(diskFlock.presence, memFlock.presence, next.members, next.tombstones);
   return next;
+}
+
+function mergeRegistryState(disk, memory, { archivedIds = new Set(), activatedIds = new Set() }, now) {
+  const flocks = {};
+  const retainedFlocks = {};
+  const ids = new Set([...Object.keys(disk?.flocks || {}), ...Object.keys(memory.flocks || {}),
+    ...Object.keys(disk?.retainedFlocks || {}), ...Object.keys(memory.retainedFlocks || {})]);
+  for (const id of ids) {
+    const active = mergeFlockStatesMonotonic(disk?.flocks?.[id], memory.flocks?.[id]);
+    const retained = mergeFlockStatesMonotonic(disk?.retainedFlocks?.[id], memory.retainedFlocks?.[id]);
+    const merged = mergeFlockStatesMonotonic(retained, active);
+    if (archivedIds.has(id) || (!activatedIds.has(id) &&
+        (disk?.retainedFlocks?.[id] || (!disk?.flocks?.[id] && memory.retainedFlocks?.[id])))) {
+      retainedFlocks[id] = { ...merged, presence: {},
+        retainedAtMs: retained?.retainedAtMs ?? now,
+        retainedReason: retained?.retainedReason || "unenrolled_or_scope_incompatible" };
+    } else {
+      delete merged.retainedAtMs;
+      delete merged.retainedReason;
+      flocks[id] = merged;
+    }
+  }
+  return { schema: REGISTRY_SCHEMA_VERSION, type: REGISTRY_TYPE, updatedAtMs: now, flocks,
+    ...(Object.keys(retainedFlocks).length ? { retainedFlocks } : {}) };
+}
+
+export function prepareRegistryForLegacyDowngrade(registry) {
+  const result = structuredClone(registry);
+  for (const [id, retained] of Object.entries(result.retainedFlocks || {})) {
+    const active = result.flocks[id];
+    const merged = mergeFlockStatesMonotonic(retained, active);
+    if (!active || compareRosterVersion(
+      { epoch: active.rosterEpoch, revision: active.rosterRevision },
+      { epoch: retained.rosterEpoch, revision: retained.rosterRevision }
+    ) < 0) {
+      if (Object.keys(merged.members || {}).length) merged.rosterRevision++;
+      merged.members = {};
+      merged.presence = {};
+    }
+    merged.minAcceptedEpoch = Math.max(active?.minAcceptedEpoch || 1, retained.minAcceptedEpoch || 1, merged.rosterEpoch);
+    delete merged.retainedAtMs;
+    delete merged.retainedReason;
+    merged.rosterHash = computeRosterHash({
+      flockId: id, protocol: merged.protocol, rosterEpoch: merged.rosterEpoch,
+      rosterRevision: merged.rosterRevision, members: merged.members, tombstones: merged.tombstones,
+    });
+    result.flocks[id] = merged;
+  }
+  delete result.retainedFlocks;
+  return result;
 }
 
 const activeRegistrySaveLocks = new Set();
@@ -1275,22 +1324,30 @@ export class FlockMembershipRegistry {
         type: REGISTRY_TYPE,
         updatedAtMs: 0,
         flocks: {},
+        retainedFlocks: {},
       };
       this.state = structuredClone(empty);
       return empty;
     }
     const parsed = JSON.parse(fs.readFileSync(this.filename, "utf8"));
     if (!parsed || parsed.type !== REGISTRY_TYPE || parsed.schema !== REGISTRY_SCHEMA_VERSION ||
-        !parsed.flocks || typeof parsed.flocks !== "object" || Array.isArray(parsed.flocks)) {
+        !parsed.flocks || typeof parsed.flocks !== "object" || Array.isArray(parsed.flocks) ||
+        (parsed.retainedFlocks !== undefined && (!parsed.retainedFlocks ||
+          typeof parsed.retainedFlocks !== "object" || Array.isArray(parsed.retainedFlocks)))) {
       throw registryError("ROSTER_CORRUPT_STORE", `Invalid flock membership registry store: ${this.filename}`);
     }
+    parsed.retainedFlocks ||= {};
     this.state = structuredClone(parsed);
     return parsed;
   }
 
-  save(data = this.state) {
+  save(data = this.state, transitions = {}) {
     if (!data || typeof data !== "object") {
       data = { schema: REGISTRY_SCHEMA_VERSION, type: REGISTRY_TYPE, updatedAtMs: 0, flocks: {} };
+    }
+    if (data.retainedFlocks !== undefined && (!data.retainedFlocks ||
+        typeof data.retainedFlocks !== "object" || Array.isArray(data.retainedFlocks))) {
+      throw registryError("ROSTER_CORRUPT_STORE", "Invalid retained flock registry");
     }
     fs.mkdirSync(this.root, { recursive: true });
     return withRegistryFileLock(this.filename, ({ key }) => {
@@ -1307,46 +1364,19 @@ export class FlockMembershipRegistry {
             }
           } catch {}
         }
-        const mergedFlocks = {};
-        const allIds = new Set([
-          ...Object.keys(diskParsed?.flocks || {}),
-          ...Object.keys(data.flocks || {}),
-        ]);
-        for (const fid of allIds) {
-          mergedFlocks[fid] = mergeFlockStatesMonotonic(diskParsed?.flocks?.[fid], data.flocks?.[fid]);
+        if (diskParsed?.retainedFlocks !== undefined && (!diskParsed.retainedFlocks ||
+            typeof diskParsed.retainedFlocks !== "object" || Array.isArray(diskParsed.retainedFlocks))) {
+          throw registryError("ROSTER_CORRUPT_STORE", "Invalid retained flock registry");
         }
-        let toWrite = {
-          schema: REGISTRY_SCHEMA_VERSION,
-          type: REGISTRY_TYPE,
-          updatedAtMs: Math.trunc(this.clock()),
-          flocks: mergedFlocks,
-        };
+        let toWrite = mergeRegistryState(diskParsed, data, transitions, Math.trunc(this.clock()));
         const seqBefore = registryCommitSeq;
         try {
           atomicJson(this.filename, toWrite, diskRaw);
           if (registryCommitSeq > seqBefore) {
             const concurrentCommitted = latestCommittedRegistryByPath.get(key)?.state;
             if (concurrentCommitted && concurrentCommitted.flocks) {
-              const postMergedFlocks = {};
-              const postIds = new Set([
-                ...Object.keys(concurrentCommitted.flocks || {}),
-                ...Object.keys(toWrite.flocks || {}),
-              ]);
-              for (const fid of postIds) {
-                postMergedFlocks[fid] = mergeFlockStatesMonotonic(
-                  concurrentCommitted.flocks?.[fid],
-                  toWrite.flocks?.[fid]
-                );
-              }
-              toWrite = {
-                schema: REGISTRY_SCHEMA_VERSION,
-                type: REGISTRY_TYPE,
-                updatedAtMs: Math.max(
-                  toWrite.updatedAtMs,
-                  Number(concurrentCommitted.updatedAtMs) || 0
-                ),
-                flocks: postMergedFlocks,
-              };
+              toWrite = mergeRegistryState(concurrentCommitted, toWrite, transitions,
+                Math.max(toWrite.updatedAtMs, Number(concurrentCommitted.updatedAtMs) || 0));
               atomicJson(this.filename, toWrite);
             }
           }
@@ -1359,12 +1389,30 @@ export class FlockMembershipRegistry {
           data.type = toWrite.type;
           data.updatedAtMs = toWrite.updatedAtMs;
           data.flocks = structuredClone(toWrite.flocks);
+          if (toWrite.retainedFlocks) data.retainedFlocks = structuredClone(toWrite.retainedFlocks);
+          else delete data.retainedFlocks;
           this.state = structuredClone(toWrite);
           return toWrite;
         } catch (err) {
           if (!/Concurrent config change/.test(err.message) || attempt >= 5) throw err;
         }
       }
+    }, { timeoutMs: this.lockTimeoutMs });
+  }
+
+  retainFlocks(flockIds) {
+    fs.mkdirSync(this.root, { recursive: true });
+    return withRegistryFileLock(this.filename, () => {
+      const data = this.read();
+      const archivedIds = new Set(flockIds.map(normalizeRegistryFlockId));
+      for (const id of archivedIds) {
+        if (!data.flocks[id]) continue;
+        data.retainedFlocks ||= {};
+        data.retainedFlocks[id] = mergeFlockStatesMonotonic(data.retainedFlocks[id], data.flocks[id]);
+        delete data.flocks[id];
+      }
+      this.save(data, { archivedIds });
+      return [...archivedIds];
     }, { timeoutMs: this.lockTimeoutMs });
   }
 
@@ -1406,6 +1454,13 @@ export class FlockMembershipRegistry {
     minAcceptedEpoch = 1,
     now = this.clock(),
   } = {}) {
+    fs.mkdirSync(this.root, { recursive: true });
+    return withRegistryFileLock(this.filename, () => this.applySignedSnapshotLocked(snapshot, {
+      ownerPublicKey, expectedFlockId, expectedOwnerFingerprint, minAcceptedEpoch, now,
+    }), { timeoutMs: this.lockTimeoutMs });
+  }
+
+  applySignedSnapshotLocked(snapshot, { ownerPublicKey, expectedFlockId, expectedOwnerFingerprint, minAcceptedEpoch, now }) {
     const verified = verifySignedRosterSnapshot(snapshot, ownerPublicKey, {
       expectedFlockId,
       expectedOwnerFingerprint,
@@ -1413,7 +1468,7 @@ export class FlockMembershipRegistry {
     });
     const { body, membersMap, tombstonesMap, ownerFingerprint: ownerFp } = verified;
     const data = this.read();
-    const stored = data.flocks[body.flockId];
+    const stored = mergeFlockStatesMonotonic(data.flocks[body.flockId], data.retainedFlocks?.[body.flockId]);
 
     if (stored) {
       if (stored.protocol !== "broker-free-v34") {
@@ -1421,6 +1476,9 @@ export class FlockMembershipRegistry {
       }
       if (stored.ownerFingerprint && stored.ownerFingerprint !== ownerFp) {
         throw registryError("ROSTER_OWNER_MISMATCH", `Owner fingerprint pin mismatch for flock "${body.flockId}"`);
+      }
+      if (body.epoch < (stored.minAcceptedEpoch || 1)) {
+        throw registryError("ROSTER_ROLLBACK_REJECTED", "Snapshot is below the retained epoch floor");
       }
       const cmp = compareRosterVersion(
         { epoch: body.epoch, revision: body.revision },
@@ -1439,7 +1497,9 @@ export class FlockMembershipRegistry {
         stored.syncedAtMs = Math.trunc(now);
         stored.needsSnapshotSync = false;
         stored.lastSignedSnapshot = snapshot;
-        this.save(data);
+        data.flocks[body.flockId] = stored;
+        if (data.retainedFlocks) delete data.retainedFlocks[body.flockId];
+        this.save(data, { activatedIds: new Set([body.flockId]) });
         return { applied: false, idempotent: true, flockId: body.flockId, rosterEpoch: stored.rosterEpoch, rosterRevision: stored.rosterRevision, rosterHash: stored.rosterHash };
       }
       for (const [idKey, prevTomb] of Object.entries(stored.tombstones || {})) {
@@ -1488,7 +1548,8 @@ export class FlockMembershipRegistry {
       presence: retainedPresence,
       lastSignedSnapshot: snapshot,
     };
-    this.save(data);
+    if (data.retainedFlocks) delete data.retainedFlocks[body.flockId];
+    this.save(data, { activatedIds: new Set([body.flockId]) });
     return {
       applied: true,
       idempotent: false,
@@ -1630,19 +1691,26 @@ export class FlockMembershipRegistry {
     removedMachines = [],
     now = this.clock(),
   } = {}) {
+    fs.mkdirSync(this.root, { recursive: true });
+    return withRegistryFileLock(this.filename, () => this.reconcileV3BrokerFlockLocked(flockSummary, {
+      bootstrapMembers, removedPeers, removedMachines, now,
+    }), { timeoutMs: this.lockTimeoutMs });
+  }
+
+  reconcileV3BrokerFlockLocked(flockSummary, { bootstrapMembers, removedPeers, removedMachines, now }) {
     if (!flockSummary || !flockSummary.flockId) {
       throw registryError("ROSTER_FLOCK_INVALID", "v3 broker flock summary requires flockId");
     }
     const flockId = normalizeRegistryFlockId(flockSummary.flockId);
     const incomingEpoch = Math.max(1, Math.trunc(Number(flockSummary.rosterEpoch) || 1));
     const data = this.read();
-    const stored = data.flocks[flockId];
+    const stored = mergeFlockStatesMonotonic(data.flocks[flockId], data.retainedFlocks?.[flockId]);
 
     if (stored) {
       if (stored.protocol !== "v3-broker") {
         throw registryError("ROSTER_PROTOCOL_MISMATCH", `Flock "${flockId}" is registered under protocol "${stored.protocol}"`);
       }
-      if (incomingEpoch < stored.rosterEpoch) {
+      if (incomingEpoch < Math.max(stored.rosterEpoch, stored.minAcceptedEpoch || 1)) {
         throw registryError(
           "ROSTER_ROLLBACK_REJECTED",
           `Stale v3 broker rosterEpoch ${incomingEpoch} for "${flockId}" rejected; stored epoch is ${stored.rosterEpoch}`
@@ -1871,7 +1939,8 @@ export class FlockMembershipRegistry {
       presence: nextPresence,
       quarantinedMembers,
     };
-    this.save(data);
+    if (data.retainedFlocks) delete data.retainedFlocks[flockId];
+    this.save(data, { activatedIds: new Set([flockId]) });
     return {
       applied: !unchanged,
       idempotent: unchanged,
@@ -1888,8 +1957,18 @@ export class FlockMembershipRegistry {
     enrolledFlocks = [],
     bootstrapMembers = [],
     now = this.clock(),
+    inactiveFlocks = [],
+    authoritativeFlockIds = null,
   } = {}) {
+    fs.mkdirSync(this.root, { recursive: true });
+    return withRegistryFileLock(this.filename, () => this.reconcileV3BrokerLocked({
+      myFlocksResponse, enrolledFlocks, bootstrapMembers, now, inactiveFlocks, authoritativeFlockIds,
+    }), { timeoutMs: this.lockTimeoutMs });
+  }
+
+  reconcileV3BrokerLocked({ myFlocksResponse, enrolledFlocks, bootstrapMembers, now, inactiveFlocks, authoritativeFlockIds }) {
     const summaries = [
+      ...inactiveFlocks,
       ...(Array.isArray(enrolledFlocks) ? enrolledFlocks : []),
       ...(Array.isArray(myFlocksResponse?.ownedFlocks) ? myFlocksResponse.ownedFlocks : []),
       ...(Array.isArray(myFlocksResponse?.joinedFlocks) ? myFlocksResponse.joinedFlocks : []),
@@ -1909,6 +1988,12 @@ export class FlockMembershipRegistry {
     for (const summary of byFlock.values()) {
       results.push(this.reconcileV3BrokerFlock(summary, { bootstrapMembers, now }));
     }
+    const activeIds = new Set(enrolledFlocks.map((entry) => entry.flockId));
+    const retainedIds = new Set(inactiveFlocks.filter((entry) => !activeIds.has(entry.flockId)).map((entry) => entry.flockId));
+    if (authoritativeFlockIds) for (const id of this.listFlockIds()) {
+      if (!authoritativeFlockIds.includes(id)) retainedIds.add(id);
+    }
+    if (retainedIds.size) this.retainFlocks([...retainedIds]);
     return results;
   }
 

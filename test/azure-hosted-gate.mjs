@@ -120,9 +120,20 @@ export async function runHostedEntraGate(t, config, {
     assert.equal(queued.serviceBusCategory, "servicebus_ok");
     positive("broker-msi-subscription-put-and-topic-publish", { resource: status.serviceBusResource,
       stages: ["subscription_put", "topic_post"], statusCode: queued.serviceBusStatusCode });
-    const drained = requireOk(await request("/api/queue/drain", { machineId: guest.machineId, peekOnly: true },
+    const canonicalGuest = `${flockId}/${guest.machineId}`;
+    const secondId = crypto.randomUUID();
+    pendingIds.push(secondId);
+    const repeated = requireOk(await request("/api/queue/enqueue", {
+      toMachine: canonicalGuest, machineId: owner.machineId, ttlSeconds: 60,
+      rpcPayload: { requestId: secondId, fromMachine: owner.machineId, action: "ping", params: { fixture: true } },
+    }, { peer: owner }), "canonical second-message enqueue");
+    assert.equal(repeated.serviceBusPublished, true, "Existing subscription must not prevent repeat publication");
+    assert.equal(repeated.toMachine, guest.machineId);
+    positive("broker-msi-existing-subscription-repeat-publish-and-canonical-target");
+    const drained = requireOk(await request("/api/queue/drain", { machineId: canonicalGuest, peekOnly: true },
       { peer: guest }), "own queue drain");
     assert.ok(drained.messages.some((item) => item.requestId === queued.requestId && item.serviceBusPublished === true));
+    assert.ok(drained.messages.some((item) => item.requestId === secondId && item.toMachine === guest.machineId && item.serviceBusPublished === true));
     await negatives("cross-peer-drain", "/api/queue/drain", { machineId: owner.machineId, peekOnly: true }, { peer: guest });
     await negatives("cross-peer-ack", "/api/queue/ack", { machineId: guest.machineId, requestIds: pendingIds }, { peer: owner });
     for (const [operation, selector] of [
@@ -155,7 +166,7 @@ export async function runHostedEntraGate(t, config, {
     assert.equal(ownAck.ackedCount, 1);
     assert.equal(ownAck.remainingCount, 0, "A successful own ACK must not disclose the still-pending foreign queue");
     positive("device-maintainer-own-ack", { ackedCount: ownAck.ackedCount, remainingCount: ownAck.remainingCount });
-    const ack = requireOk(await request("/api/queue/ack", { machineId: guest.machineId, requestIds: pendingIds },
+    const ack = requireOk(await request("/api/queue/ack", { machineId: canonicalGuest, requestIds: pendingIds },
       { peer: guest }), "own queue acknowledgement");
     assert.equal(ack.ackedCount, pendingIds.length);
     const afterAck = requireOk(await request("/api/queue/drain", { machineId: guest.machineId, peekOnly: true },
