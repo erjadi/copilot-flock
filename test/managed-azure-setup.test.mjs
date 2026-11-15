@@ -88,20 +88,29 @@ process.env.PLATFORM_MAINTAINER_USER="demo-owner";
 delete process.env.SERVICEBUS_ENTRA_RESOURCE;
 delete process.env.IDENTITY_ENDPOINT; delete process.env.MSI_ENDPOINT;
 delete process.env.IDENTITY_HEADER; delete process.env.MSI_SECRET;
-const calls=[]; let msiStatus=400; let putStatus=201; let postStatus=202; let deleteStatus=204;
+const calls=[]; let msiStatus=400; let msiError="AADSTS500011 SECRET_ERROR_RESPONSE";
+let putStatus=201; let postStatus=202; let deleteStatus=204;
 const mock=(url, options, callback) => {
  if(typeof options==="function") {callback=options;options=url;url=null;}
  const identity=url instanceof URL && url.hostname==="127.0.0.1";
  const req=new EventEmitter(); req.destroy=()=>{};req.write=()=>{};
  req.end=()=>queueMicrotask(()=>{
   const hostname=options.hostname || url?.hostname;
+  if(hostname==="demo-signalr.service.signalr.net"){
+   assert.equal(options.method,"POST");
+   assert.match(url.pathname,/^\\/api\\/hubs\\/[^/]+\\/users\\/[^/]+\\/:closeConnections$/);
+   assert.equal(url.searchParams.get("api-version"),"2022-06-01");
+   assert.equal(options.headers["Content-Length"],"0");
+   const claims=JSON.parse(Buffer.from(options.headers.Authorization.slice(7).split(".")[1],"base64url").toString("utf8"));
+   assert.equal(claims.aud,url.origin+url.pathname);
+  }
   calls.push(identity?{resource:url.searchParams.get("resource")}:{method:options.method,host:hostname});
   const response=new EventEmitter();
   response.statusCode=identity?msiStatus:hostname==="demo-sb.servicebus.windows.net"
     ? options.method==="PUT"?putStatus:options.method==="POST"?postStatus:deleteStatus : 202;
   response.resume=()=>{};
   callback(response);
-  if(identity) response.emit("data",msiStatus===200?JSON.stringify({access_token:"SECRET_MSI_TOKEN",expires_on:String(Math.floor(Date.now()/1000)+3600)}):"AADSTS500011 SECRET_ERROR_RESPONSE");
+  if(identity) response.emit("data",msiStatus===200?JSON.stringify({access_token:"SECRET_MSI_TOKEN",expires_on:String(Math.floor(Date.now()/1000)+3600)}):msiError);
   response.emit("end");
  });
  return req;
@@ -115,6 +124,11 @@ let result=await broker.acquireServiceBusTokenDetailed();
 assert.equal(result.category,"msi_token_rejected");assert.equal(result.reason,"AADSTS500011");
 assert.doesNotMatch(JSON.stringify(result),/SECRET/);
 assert.equal(calls.at(-1).resource,"https://servicebus.azure.net");
+msiStatus=500;
+result=await broker.acquireServiceBusTokenDetailed();
+assert.equal(result.category,"msi_token_rejected");assert.equal(result.reason,"AADSTS500011");
+assert.doesNotMatch(JSON.stringify(result),/SECRET/);
+msiError="temporary identity endpoint outage SECRET_ERROR_RESPONSE";
 for(const status of [429,503]){
  msiStatus=status;assert.equal((await broker.acquireServiceBusTokenDetailed()).category,"msi_transient_error");
 }

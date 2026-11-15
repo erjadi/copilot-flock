@@ -118,6 +118,8 @@ export async function acquireServiceBusTokenDetailed({ tokenProvider } = {}) {
           res.on("end", () => {
             if (settled) return;
             const status = res.statusCode || 500;
+            const rejection = (status < 200 || status >= 300) ? data.match(/\bAADSTS\d{5,9}\b/)?.[0] : null;
+            if (rejection) return finish(serviceBusFailure("msi_token_rejected", "msi_token", rejection, status));
             if (status === 429 || status >= 500) {
               return finish(serviceBusFailure("msi_transient_error", "msi_token", "identity_endpoint_unavailable", status));
             }
@@ -795,7 +797,7 @@ export async function evictSignalRHubUserImmediate({
 
   try {
     const u = new URL(
-      `${endpoint}/api/v1/hubs/${encodeURIComponent(hub)}/users/${encodeURIComponent(userId)}`
+      `${endpoint}/api/hubs/${encodeURIComponent(hub)}/users/${encodeURIComponent(userId)}/:closeConnections?api-version=2022-06-01`
     );
     const aud = `${u.origin}${u.pathname}`;
     const exp = Math.floor(Date.now() / 1000) + 300;
@@ -812,8 +814,8 @@ export async function evictSignalRHubUserImmediate({
       const req = https.request(
         u,
         {
-          method: "DELETE",
-          headers: { Authorization: `Bearer ${jwt}` },
+          method: "POST",
+          headers: { Authorization: `Bearer ${jwt}`, "Content-Length": "0" },
           timeout: 4000,
         },
         (res) => {
