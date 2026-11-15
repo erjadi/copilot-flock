@@ -46,6 +46,7 @@ import {
   signV3MembershipSyncRequest,
   reprovisionFleetMachines,
   diagnoseFleetMachines,
+  resolveCopilotCliBin,
 } from "../flock.mjs";
 import { createBootstrapServer, enrollV3Device, createV3FlockInvite } from "../bootstrap-server.mjs";
 
@@ -55,6 +56,18 @@ function fixture(t) {
   return root;
 }
 
+function ownedUpdateId(t) {
+  const updateId = crypto.randomUUID();
+  t.after(() => {
+    for (const name of fs.readdirSync(os.tmpdir()).filter((name) => name.startsWith(`flock-update-rollback-${updateId}-`))) {
+      const target = path.join(os.tmpdir(), name);
+      assert.equal(fs.lstatSync(target).isSymbolicLink(), false);
+      fs.rmSync(target, { recursive: true, force: true });
+    }
+  });
+  return updateId;
+}
+
 function identity(deviceId) {
   const pair = crypto.generateKeyPairSync("ed25519", {
     publicKeyEncoding: { type: "spki", format: "pem" },
@@ -62,6 +75,42 @@ function identity(deviceId) {
   });
   return { ...pair, deviceId };
 }
+
+test("explicit empty CLI path disables cached PATH and absolute POSIX fallbacks but explicit binaries still resolve", (t) => {
+  const previous = process.env.COPILOT_CLI_PATH;
+  const previousPath = process.env.PATH;
+  const platform = Object.getOwnPropertyDescriptor(process, "platform");
+  const root = fixture(t);
+  const explicit = path.join(root, "fixture-copilot");
+  const originalExists = fs.existsSync;
+  const originalStat = fs.statSync;
+  const accesses = [];
+  t.mock.method(fs, "existsSync", (filename) => filename === explicit || originalExists(filename));
+  t.mock.method(fs, "accessSync", (filename) => {
+    accesses.push(filename);
+    if (filename !== "/usr/bin/copilot") throw Object.assign(new Error("not found"), { code: "ENOENT" });
+  });
+  t.mock.method(fs, "statSync", (filename, ...args) => filename === "/usr/bin/copilot"
+    ? { isFile: () => true } : originalStat(filename, ...args));
+  try {
+    Object.defineProperty(process, "platform", { ...platform, value: "linux" });
+    process.env.PATH = root;
+    delete process.env.COPILOT_CLI_PATH;
+    assert.equal(resolveCopilotCliBin(), "/usr/bin/copilot");
+    accesses.length = 0;
+    process.env.COPILOT_CLI_PATH = "";
+    assert.equal(resolveCopilotCliBin(), null);
+    assert.deepEqual(accesses, [], "Disable must take effect before cached fallback or filesystem probing");
+    process.env.COPILOT_CLI_PATH = explicit;
+    assert.equal(resolveCopilotCliBin(), explicit);
+    process.env.COPILOT_CLI_PATH = "";
+    assert.equal(resolveCopilotCliBin(), null);
+  } finally {
+    Object.defineProperty(process, "platform", platform);
+    if (previous === undefined) delete process.env.COPILOT_CLI_PATH; else process.env.COPILOT_CLI_PATH = previous;
+    if (previousPath === undefined) delete process.env.PATH; else process.env.PATH = previousPath;
+  }
+});
 
 test("owner fleet mutations exclude collaborators before update, reprovision queue, diagnose and session creation", async (t) => {
   const root = fixture(t);
@@ -133,6 +182,26 @@ test("Windows daemon recognition accepts real quoting and whitespace but rejects
   }
 });
 
+test("legacy compatibility checkout sync failure is persisted and returned without mutating that checkout", async (t) => {
+  const root = fixture(t);
+  const source = path.join(root, "source");
+  const target = path.join(root, "runtime");
+  const legacy = path.join(root, "legacy-checkout");
+  fs.mkdirSync(source);
+  fs.mkdirSync(path.join(legacy, ".git"), { recursive: true });
+  fs.writeFileSync(path.join(legacy, "preserve.txt"), "unrelated checkout evidence");
+  for (const filename of REQUIRED_RUNTIME_MODULES) fs.copyFileSync(path.resolve(filename), path.join(source, filename));
+  fs.writeFileSync(path.join(source, "runtime-manifest.json"), JSON.stringify(computeRuntimeManifest(source, { version: "3.6.0" })));
+  const result = await performLocalSelfUpdate({ machineId: "OWNER", scope: "work", githubUser: "owner" }, {
+    sourceDir: source, targetDir: target, legacyDir: legacy, spawnInstall: false, updateId: ownedUpdateId(t),
+  });
+  assert.match(result.compatibilityWarning, /retained.*RUNTIME_UNSAFE_TARGET/);
+  assert.match(readRuntimeState(target).update.warning, /does not verify legacy callers/);
+  assert.equal(fs.readFileSync(path.join(legacy, "preserve.txt"), "utf8"), "unrelated checkout evidence");
+  assert.equal(fs.existsSync(path.join(legacy, ".git")), true);
+  assert.deepEqual(fs.readdirSync(legacy).sort(), [".git", "preserve.txt"]);
+});
+
 test("runtime update journal retains correlation, redacted failure, and terminal phase history", (t) => {
   const root = fixture(t);
   recordRuntimeUpdatePhase(root, {
@@ -193,6 +262,7 @@ test("noninteractive update preflight strips interactive helpers and returns a t
 
 test("launcher failure rolls installed artifacts back to the previous verified runtime", async (t) => {
   const root = fixture(t);
+  const updateId = ownedUpdateId(t);
   const sourceV1 = path.join(root, "source-v1");
   const sourceV2 = path.join(root, "source-v2");
   const target = path.join(root, "runtime");
@@ -229,7 +299,7 @@ test("launcher failure rolls installed artifacts back to the previous verified r
         spawnProcess() {
           throw new Error("launcher denied");
         },
-        updateId: "candidate",
+        updateId,
         correlationId: "corr-candidate",
       }
     ),
@@ -729,6 +799,7 @@ test("traceless removal deletes owned support artifacts but preserves unrelated 
 test("spawnInstall activation waits for resident digest and self-test verification, and rolls back failed activation", async (t) => {
   const root = fixture(t);
   for (const fails of [false, true]) {
+    const updateId = ownedUpdateId(t);
     const source = path.join(root, `source-${fails}`);
     const target = path.join(root, `target-${fails}`);
     fs.mkdirSync(source, { recursive: true });
@@ -743,14 +814,14 @@ test("spawnInstall activation waits for resident digest and self-test verificati
     fs.writeFileSync(path.join(source, "runtime-manifest.json"), JSON.stringify(next));
     let selfTests = 0;
     const execute = performLocalSelfUpdate({ machineId: "PC", scope: "work" }, {
-      sourceDir: source, targetDir: target, updateId: `activate-${fails}`, legacyDir: null,
+      sourceDir: source, targetDir: target, updateId, legacyDir: null,
       spawnProcess(_command, args) {
         assert.equal(args[1], "activate-update");
         const child = new EventEmitter();
         child.unref = () => {};
         setImmediate(async () => {
           try {
-            await activateRuntimeUpdate({ machineId: "PC" }, { root: target, updateId: `activate-${fails}` }, {
+            await activateRuntimeUpdate({ machineId: "PC" }, { root: target, updateId }, {
               restartRuntime: async () => {
                 const current = computeRuntimeManifest(target, { version: "3.6.0" });
                 return { ...resident, manifestDigest: current.manifestDigest };
@@ -970,7 +1041,7 @@ test("unlaunched update failures restore the previous closure and remove blockin
   fs.writeFileSync(path.join(source, "runtime-manifest.json"), JSON.stringify(previous));
   stageAndActivateRuntime({ sourceDir: source, targetDir: target });
   for (const code of ["UPDATE_REPLY_FLUSH_FAILED", "RUNTIME_ACTIVATION_SPAWN_FAILED"]) {
-    const updateId = crypto.randomUUID();
+    const updateId = ownedUpdateId(t);
     const backup = fs.mkdtempSync(path.join(os.tmpdir(), `flock-update-rollback-${updateId}-`));
     for (const filename of [...REQUIRED_RUNTIME_MODULES, "runtime-manifest.json"]) {
       fs.copyFileSync(path.join(source, filename), path.join(backup, filename));

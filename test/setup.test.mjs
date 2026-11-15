@@ -8,6 +8,13 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 
 const root = fileURLToPath(new URL("../", import.meta.url));
 const powerShell = process.platform === "win32" ? "powershell.exe" : "pwsh";
+function powerShellSkipReason(platform, probe = spawnSync) {
+  if (platform === "win32") return false;
+  return probe("pwsh", ["-NoProfile", "-NonInteractive", "-Command", "exit 0"],
+    { encoding: "utf8", timeout: 5000 }).error?.code === "ENOENT"
+    ? "pwsh is not installed on this POSIX host" : false;
+}
+const powerShellSkip = powerShellSkipReason(process.platform);
 const subscription = "11111111-2222-3333-4444-555555555555";
 const metadata = Object.fromEntries(Object.entries({
   subscriptionId: subscription, signalrName: "demo-signalr",
@@ -20,6 +27,15 @@ const env = { ...process.env, SIGNALR_CONNECTION_STRING: "", SERVICEBUS_CONNECTI
   COPILOT_FLOCK_INVITE_FILE: "", COPILOT_FLOCK_BOOTSTRAP_URL: "",
   COPILOT_FLOCK_SCOPE: "", COPILOT_BRIDGE_SCOPE: "", GITHUB_USER: "demo-owner",
   COPILOT_FLOCK_ALLOWED_BOOTSTRAP_ORIGIN: "", COPILOT_BRIDGE_ALLOWED_BOOTSTRAP_ORIGIN: "" };
+
+test("PowerShell setup omission is allowed only for a missing POSIX pwsh, never Windows or probe failures", () => {
+  assert.equal(powerShellSkipReason("win32", () => { throw new Error("Windows must not be optional"); }), false);
+  assert.match(powerShellSkipReason("linux", () => ({ error: { code: "ENOENT" } })), /not installed/);
+  assert.match(powerShellSkipReason("darwin", () => ({ error: { code: "ENOENT" } })), /not installed/);
+  for (const result of [{ status: 0 }, { status: 1 }, { error: { code: "EACCES" } }, { error: { code: "ETIMEDOUT" } }]) {
+    assert.equal(powerShellSkipReason("linux", () => result), false);
+  }
+});
 
 function fixture() {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "flock-setup-entry-"));
@@ -132,7 +148,7 @@ function checkManaged(result, skip = false, githubUser = "demo-owner") {
   assert.doesNotMatch(result.stdout + result.stderr + JSON.stringify(result.events), /synthetic-key-do-not-print/);
 }
 
-test("PowerShell actual entrypoint installs CLI, authenticates, selects subscription and deploys default/omitted broker", () => {
+test("PowerShell actual entrypoint installs CLI, authenticates, selects subscription and deploys default/omitted broker", { skip: powerShellSkip }, () => {
   for (const skip of [false, true]) {
     const result = runPowerShell({ skip });
     checkManaged(result, skip);
@@ -144,7 +160,7 @@ test("PowerShell actual entrypoint installs CLI, authenticates, selects subscrip
   assert.ok(github.events.some((event) => event.kind === "gh" && event.args.includes(".login")));
 });
 
-test("PowerShell actual entrypoint fails before local install and preserves direct setup", () => {
+test("PowerShell actual entrypoint fails before local install and preserves direct setup", { skip: powerShellSkip }, () => {
   for (const fail of ["cli", "login", "group", "deployment", "malformed", "metadata", "keys"]) {
     const result = runPowerShell({ fail });
     assert.notEqual(result.status, 0, `${fail}: ${result.stdout}\n${result.stderr}`);

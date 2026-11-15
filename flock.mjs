@@ -7218,7 +7218,7 @@ export class RawWebSocketClient {
     return new Promise((resolve, reject) => {
       const isSecure = this.url.protocol === "wss:";
       const port = Number(this.url.port) || (isSecure ? 443 : 80);
-      const host = this.url.hostname;
+      const host = this.url.hostname.replace(/^\[|\]$/g, "");
       const safeEndpoint = `${this.url.protocol}//${this.url.host}${this.url.pathname || "/"}`;
       const safeSocketError = (error, reason = "connection failed") => {
         const code = /^[A-Z0-9_]+$/.test(String(error?.code || "")) ? error.code : null;
@@ -7240,7 +7240,7 @@ export class RawWebSocketClient {
       let rawSocket;
       try {
         rawSocket = isSecure
-          ? tls.connect({ host, port, servername: host, family: 4, lookup: ipv4Lookup })
+          ? tls.connect({ host, port, ...(net.isIP(host) ? {} : { servername: host }), family: 4, lookup: ipv4Lookup })
           : net.connect({ host, port, family: 4, lookup: ipv4Lookup });
       } catch (error) {
         reject(safeSocketError(error));
@@ -9039,8 +9039,9 @@ let copilotCliProbeCache = {
   checkedAtMs: 0,
 };
 
-function resolveCopilotCliBin() {
-  const cacheKey = `${process.env.COPILOT_CLI_PATH || ""}\n${process.env.PATH || ""}`;
+export function resolveCopilotCliBin() {
+  if (process.env.COPILOT_CLI_PATH === "") return null;
+  const cacheKey = `${process.env.COPILOT_CLI_PATH ?? "<auto>"}\n${process.env.PATH || ""}`;
   const nowMs = Date.now();
   if (
     copilotCliProbeCache.key === cacheKey &&
@@ -17838,6 +17839,7 @@ export async function reviewReleaseCandidate(cfg, params = {}, internalOptions =
     isolatedEnv.HOME = isolatedHome;
     isolatedEnv.USERPROFILE = isolatedHome;
     isolatedEnv.COPILOT_HOME = isolatedCopilotHome;
+    isolatedEnv.COPILOT_CLI_PATH = "";
     isolatedEnv.XDG_CONFIG_HOME = path.join(isolatedHome, ".config");
     isolatedEnv.XDG_STATE_HOME = path.join(isolatedHome, ".local", "state");
     isolatedEnv.XDG_CACHE_HOME = path.join(isolatedHome, ".cache");
@@ -18536,6 +18538,13 @@ export async function performLocalSelfUpdate(
     correlationId,
   });
 
+  let compatibilityWarning = null;
+  if (!resolvedLegacyDir && !targetDir && fs.existsSync(getLegacyBridgeHome())) {
+    compatibilityWarning = "Legacy compatibility runtime was not synchronized; inspect its process/config references. Primary verification does not verify legacy callers.";
+    recordRuntimeUpdatePhase(resolvedTargetDir, {
+      updateId, correlationId, phase: readRuntimeState(resolvedTargetDir).update.phase, warning: compatibilityWarning,
+    });
+  }
   if (resolvedLegacyDir && fs.existsSync(resolvedLegacyDir) && path.resolve(resolvedLegacyDir) !== path.resolve(resolvedTargetDir)) {
     try {
       stageAndActivateRuntime({
@@ -18543,7 +18552,13 @@ export async function performLocalSelfUpdate(
         targetDir: resolvedLegacyDir,
         verifyImports: false,
       });
-    } catch {}
+    } catch (error) {
+      compatibilityWarning = redactFlockSnapshot(`Legacy compatibility runtime retained (${error.code || "SYNC_FAILED"}); inspect its process/config references. Primary verification does not verify legacy callers.`);
+      recordRuntimeUpdatePhase(resolvedTargetDir, {
+        updateId, correlationId, phase: readRuntimeState(resolvedTargetDir).update.phase,
+        warning: compatibilityWarning,
+      });
+    }
   }
 
   const targetScript = path.join(resolvedTargetDir, "flock.mjs");
@@ -18558,6 +18573,7 @@ export async function performLocalSelfUpdate(
       const result = {
         status: "activating", updateId, correlationId, machineId: cfg.machineId,
         targetDigest: activated.installed.digest, previousPid: process.pid,
+        compatibilityWarning,
         staged: activated.staged, installed: activated.installed,
         resident: activated.resident, verified: { ...activated.verified, fullyActive: false, status: "pending_activation" },
       };
@@ -18696,6 +18712,7 @@ export async function performLocalSelfUpdate(
     status: spawnInstall || activated.verified?.fullyActive ? "verified" : "activated",
     updateId,
     correlationId,
+    compatibilityWarning,
     machineId: cfg.machineId,
     previousVersion: BRIDGE_VERSION,
     previousDigest: RUNTIME_MODULE_MANIFEST?.manifestDigest || null,

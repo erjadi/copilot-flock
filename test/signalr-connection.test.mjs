@@ -16,6 +16,26 @@ const credentialCanaries = ["eyJhbGciOiJIUzI1NiJ9.c2lnbmFsci1zZWNyZXQ.c2lnbmF0dX
   "LOCAL_WS_OPAQUE_CANARY", "SIG_OPAQUE_CANARY", "SIGNATURE_OPAQUE_CANARY", "FRAGMENT_CANARY", "PASSWORD_CANARY"];
 const credentialUrl = `wss://user:${credentialCanaries[5]}@fixture.service.signalr.net/client/?access_token=${credentialCanaries[0]}&token=${credentialCanaries[1]}&sig=${credentialCanaries[2]}&signature=${credentialCanaries[3]}#${credentialCanaries[4]}`;
 
+test("TLS WebSocket SNI is omitted for IP literals and retained for DNS hosts", async (t) => {
+  const options = [];
+  t.mock.method(tls, "connect", (input) => {
+    options.push(input);
+    const socket = new EventEmitter();
+    socket.setTimeout = () => {};
+    socket.destroy = () => { socket.emit("close"); };
+    setImmediate(() => socket.emit("error", Object.assign(new Error("synthetic connection failure"), { code: "ECONNREFUSED" })));
+    return socket;
+  });
+  for (const implementation of implementations) {
+    for (const host of ["127.0.0.1", "::1", "fixture.service.signalr.net"]) {
+      await assert.rejects(new implementation.RawWebSocketClient(`wss://${net.isIP(host) === 6 ? `[${host}]` : host}/client/`).connect(), /ECONNREFUSED/);
+      assert.equal(options.at(-1).host, host);
+      assert.equal(options.at(-1).servername, net.isIP(host) ? undefined : host);
+      assert.equal(Object.hasOwn(options.at(-1), "servername"), !net.isIP(host));
+    }
+  }
+});
+
 test("both raw WebSocket entrypoints omit credential query, fragment and userinfo from all connection failures", async (t) => {
   for (const mode of ["timeout", "socket-error", "upgrade"]) {
     mockTlsSocket(t, (socket) => {

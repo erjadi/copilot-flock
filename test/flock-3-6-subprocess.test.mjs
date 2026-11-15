@@ -11,9 +11,27 @@ import { createBootstrapServer, enrollV3Device, createV3FlockInvite } from "../b
 import { SupportMailbox } from "../flock-support.mjs";
 import { REQUIRED_RUNTIME_MODULES, computeRuntimeManifest, inspectProcess } from "../flock-lifecycle.mjs";
 import { openFlockMembershipRegistry } from "../flock.mjs";
+import { resolveOpenSsl } from "./openssl.mjs";
 
 const repo = path.resolve(".");
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+test("Windows TLS fixture OpenSSL resolves PATH, Git-derived and standard locations without ambient OpenSSL", () => {
+  const win = path.win32;
+  const probe = (files, env) => resolveOpenSsl({ platform: "win32", env,
+    isFile: (filename) => files.some((file) => win.normalize(file).toLowerCase() === win.normalize(filename).toLowerCase()) });
+  assert.equal(probe(["X:\\tools\\openssl.exe", "Y:\\Git\\usr\\bin\\openssl.exe"],
+    { PATH: "X:\\tools;Y:\\Git\\cmd" }), "X:\\tools\\openssl.exe");
+  assert.equal(probe(["Y:\\Git\\cmd\\git.exe", "Y:\\Git\\usr\\bin\\openssl.exe"],
+    { PATH: "Y:\\Git\\cmd" }), "Y:\\Git\\usr\\bin\\openssl.exe");
+  assert.equal(probe(["C:\\Program Files\\Git\\usr\\bin\\openssl.exe"], { PATH: "" }),
+    "C:\\Program Files\\Git\\usr\\bin\\openssl.exe");
+  assert.equal(probe(["C:\\Program Files\\Git\\mingw64\\bin\\openssl.exe"], { PATH: "" }),
+    "C:\\Program Files\\Git\\mingw64\\bin\\openssl.exe");
+  assert.equal(probe(["C:\\Program Files (x86)\\Git\\usr\\bin\\openssl.exe"], { PATH: "" }),
+    "C:\\Program Files (x86)\\Git\\usr\\bin\\openssl.exe");
+  assert.throws(() => probe([], { PATH: "" }), /OpenSSL is required/);
+});
 
 function temp(t, cleanup = true) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "flock-subprocess-"));
@@ -31,7 +49,7 @@ function key(deviceId) {
 function tlsFixture(root) {
   const filename = path.join(root, "tls-key.pem");
   const cert = path.join(root, "tls-cert.pem");
-  execFileSync("openssl", [
+  execFileSync(resolveOpenSsl(), [
     "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", filename,
     "-out", cert, "-days", "1", "-subj", "/CN=localhost",
     "-addext", "subjectAltName=DNS:localhost,IP:127.0.0.1",
@@ -44,7 +62,7 @@ function childEnv(home, certPath) {
   for (const name of Object.keys(env)) {
     if (/^(COPILOT_|BRIDGE_|SIGNALR_|SERVICEBUS_|NODE_TEST_|GITHUB_TOKEN|GH_TOKEN|NODE_OPTIONS)/.test(name)) delete env[name];
   }
-  return { ...env, COPILOT_HOME: home, HOME: path.dirname(home), USERPROFILE: path.dirname(home),
+  return { ...env, COPILOT_HOME: home, COPILOT_CLI_PATH: "", HOME: path.dirname(home), USERPROFILE: path.dirname(home),
     APPDATA: path.join(home, "AppData"), NODE_EXTRA_CA_CERTS: certPath };
 }
 

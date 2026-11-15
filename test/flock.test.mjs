@@ -6384,13 +6384,28 @@ test("runtime manifest without an external manifest matches the pinned closure, 
   }
 });
 
-test("fleet runtime staging rejects omitted modules, partial copies, interrupted staging/cutover, and hash mismatches while preserving active generation and protected state", async () => {
+test("fleet runtime staging rejects omitted modules, partial copies, interrupted staging/cutover, and hash mismatches while preserving active generation and protected state", async (t) => {
   const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
   const scratchRoot = fs.mkdtempSync(path.join(os.tmpdir(), "flock-manifest-gate-"));
   const prevCopilotHome = process.env.COPILOT_HOME;
   const copilotHome = path.join(scratchRoot, ".copilot");
   const targetDir = path.join(copilotHome, "flock");
   process.env.COPILOT_HOME = copilotHome;
+  const ownedUpdates = [];
+  const testSelfUpdate = (cfg, options) => {
+    const updateId = crypto.randomUUID();
+    ownedUpdates.push(updateId);
+    return performLocalSelfUpdate(cfg, { ...options, updateId });
+  };
+  t.after(() => {
+    for (const updateId of ownedUpdates) {
+      for (const name of fs.readdirSync(os.tmpdir()).filter((name) => name.startsWith(`flock-update-rollback-${updateId}-`))) {
+        const target = path.join(os.tmpdir(), name);
+        assert.equal(fs.lstatSync(target).isSymbolicLink(), false);
+        fs.rmSync(target, { recursive: true, force: true });
+      }
+    }
+  });
 
   try {
     // 1. Seed a verified working v1 ("3.4.1") installation + protected identity, protocol, and credential state
@@ -6695,7 +6710,7 @@ test("fleet runtime staging rejects omitted modules, partial copies, interrupted
     assertBaselinePreserved("installBridge rejects hash mismatch before mutating config/identity");
 
     await assert.rejects(
-      () => performLocalSelfUpdate(testCfg, { sourceDir: hashMismatchDir, gitSync: false, spawnInstall: false }),
+      () => testSelfUpdate(testCfg, { sourceDir: hashMismatchDir, gitSync: false, spawnInstall: false }),
       (err) => err.code === "RUNTIME_HASH_MISMATCH"
     );
     assertBaselinePreserved("performLocalSelfUpdate rejects hash mismatch before mutating active runtime");
@@ -6712,11 +6727,12 @@ test("fleet runtime staging rejects omitted modules, partial copies, interrupted
       (err) => err.code === "BROKER_FREE_MUTATION_FORBIDDEN"
     );
     await assert.rejects(
-      () => performLocalSelfUpdate({ ...testCfg, protocol: "broker-free-v34" }, { sourceDir: validV2Dir, gitSync: false, spawnInstall: false }),
+      () => testSelfUpdate({ ...testCfg, protocol: "broker-free-v34" }, { sourceDir: validV2Dir, gitSync: false, spawnInstall: false }),
       (err) => err.code === "BROKER_FREE_MUTATION_FORBIDDEN"
     );
 
     const failedFleetLocal = await updateFleetMachines(testCfg, {
+      localUpdateFn: testSelfUpdate,
       machines: "TEST-RIG-1",
       includeSelf: true,
       sourceDir: hashMismatchDir,
@@ -6757,7 +6773,7 @@ test("fleet runtime staging rejects omitted modules, partial copies, interrupted
     stagedOnly.cleanup();
 
     // Perform self_update atomic cutover to v2 while v1 daemon is still resident in memory
-    const selfUpdateRes = await performLocalSelfUpdate(testCfg, {
+    const selfUpdateRes = await testSelfUpdate(testCfg, {
       sourceDir: validV2Dir,
       gitSync: false,
       spawnInstall: false,
@@ -7119,6 +7135,7 @@ test("release voter extracts complete modular dependency closure into isolated f
         'import { summarizeCandidate } from "../flock.mjs";',
         'import { BOOTSTRAP_READY } from "../bootstrap-server.mjs";',
         'globalThis.candidateTestFile = "flock";',
+        'if (process.env.COPILOT_CLI_PATH !== "") throw Error("Candidate runtime CLI discovery must be disabled");',
         `const hostTempRoot = ${JSON.stringify(env.tempRoot)};`,
         'test("modular candidate runs in isolated fixture without reading ~/.copilot/flock", () => {',
         '  assert.equal(summarizeCandidate(), "fresh-candidate-lifecycle");',
@@ -8483,7 +8500,9 @@ test("TODO #14: ECONNREFUSED on stale ws.port (portA) invalidates cache, re-read
     invalidateLocalWsConnectionCache();
 
     const previousPath = process.env.PATH;
+    const previousCli = process.env.COPILOT_CLI_PATH;
     process.env.PATH = env.tempRoot;
+    process.env.COPILOT_CLI_PATH = "";
     try {
       await assert.rejects(
         () =>
@@ -8495,6 +8514,7 @@ test("TODO #14: ECONNREFUSED on stale ws.port (portA) invalidates cache, re-read
       );
     } finally {
       process.env.PATH = previousPath;
+      if (previousCli === undefined) delete process.env.COPILOT_CLI_PATH; else process.env.COPILOT_CLI_PATH = previousCli;
     }
 
     const inboxEntriesAfterDead = fs
@@ -10446,7 +10466,7 @@ test("3.6 conformance blockers: signed outbound protected RPCs, unsigned read re
     env.writeWsConfig(deadPort);
     invalidateLocalWsConnectionCache();
     process.env.PATH = env.tempRoot;
-    delete process.env.COPILOT_CLI_PATH;
+    process.env.COPILOT_CLI_PATH = "";
 
     const degradedPing = await handleRpcAction(peerHostCfg, { action: "ping", inProcessSelfPing: true });
     assert.equal(degradedPing.copilotDesktopReachable, false);

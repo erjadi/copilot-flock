@@ -214,6 +214,21 @@ POSIX UPG roots such as owned `0775` directories are accepted only when
 Voter-isolated homes explicitly request `0700`, independent of a `0002` umask.
 Default-home reads re-resolve the logical `.copilot` alias each time, and
 the mutation selector `all` has the same wildcard semantics as `*`.
+An explicit empty `COPILOT_CLI_PATH` disables all automatic CLI discovery,
+including cached results and absolute POSIX fallbacks. Candidate review sets
+that disable value; CLI-resolution fixtures can still supply explicit binaries.
+Failed-update tests clean only rollback directories tied to their own generated
+update IDs, without removing product recovery evidence.
+On POSIX qualification hosts without `pwsh`, only the two PowerShell setup
+entrypoint tests are skipped. Windows PowerShell remains mandatory, as does
+POSIX bash coverage; permission/timeouts or a broken installed shell are failures.
+TLS WebSocket connections omit SNI for IP literals (required by Node 26) while
+retaining DNS SNI. Windows TLS qualification resolves OpenSSL from PATH, the
+discovered Git installation, then standard Git locations, with an explicit
+failure if unavailable. An unsafe legacy checkout is never deleted to make
+compatibility synchronization succeed: its failure is returned and retained as
+an update-journal warning, and primary verification does not imply legacy
+caller convergence.
 
 Windows process inspection returns early only for an ESRCH liveness probe,
 retries a CIM ETIMEDOUT once within the existing per-attempt bound, and never

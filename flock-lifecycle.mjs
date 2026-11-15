@@ -1923,7 +1923,7 @@ const EMBEDDED_RUNTIME_MANIFEST_FALLBACK = (() => {
     operationsSha = hashRuntimeModule(fs.readFileSync(path.join(__lifecycleDir, "flock-operations.mjs")));
     supportSha = hashRuntimeModule(fs.readFileSync(path.join(__lifecycleDir, "flock-support.mjs")));
   } catch {}
-  const entrypointSha = "cfa9a4def277d163a27520bf959b740c2e46c998ca8e7a72b1132681738c359a";
+  const entrypointSha = "766146ae8069e679714637f0d634e67bbaeddaffd38843de009a4550d7b7627c";
   const fallback = {
     type: "copilot-flock-runtime-manifest-v1",
     schema: 1,
@@ -2349,6 +2349,7 @@ export function recordRuntimeUpdatePhase(targetDir, {
   manifestDigest = null,
   version = null,
   reason = null,
+  warning = null,
 } = {}) {
   if (!updateId || !phase) throw new Error("Runtime update phase requires updateId and phase");
   const current = readRuntimeState(targetDir);
@@ -2361,6 +2362,7 @@ export function recordRuntimeUpdatePhase(targetDir, {
     version: version ?? previous?.version ?? null,
     manifestDigest: manifestDigest ?? previous?.manifestDigest ?? null,
     reason: reason ?? previous?.reason ?? null,
+    warning: warning ? redactRuntimeError(warning) : previous?.warning || null,
     error: error ? redactRuntimeError(error) : null,
     code: code || null,
     updatedAt: now,
