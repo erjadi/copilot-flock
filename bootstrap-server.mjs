@@ -2416,6 +2416,7 @@ export function createBootstrapServer({
   v3StorePath = V3_FLOCKS_PATH,
   v3PreviewStorePath = V3_PREVIEW_FLOCKS_PATH,
   membersPath = MEMBERS_PATH,
+  queuePath = OFFLINE_QUEUE_PATH,
   supportRoot = path.join(path.dirname(v3StorePath), "support-quarantine", "mailbox"),
   supportOptions = {},
 } = {}) {
@@ -2505,7 +2506,7 @@ export function createBootstrapServer({
 
   if (url.pathname === "/" || url.pathname === "/healthz" || url.pathname === "/health") {
     const registry = loadMembersRegistry(membersPath);
-    const qStore = loadOfflineQueueStore();
+    const qStore = loadOfflineQueueStore(queuePath);
     const v3Store = loadV3FlockStore(v3StorePath);
     sendJson(res, 200, {
       ok: true,
@@ -3038,6 +3039,7 @@ export function createBootstrapServer({
     }
     const ownedMachines = new Set();
     const sharedPeerPrincipals = new Set();
+    const sharedQueueMachines = new Set();
     if (!deviceAuth && !isMaintainer) {
       const store = loadV3FlockStore(v3StorePath);
       const now = Date.now();
@@ -3062,6 +3064,13 @@ export function createBootstrapServer({
           !isPrincipalRevokedInFlock(flock, member));
         if (!active.some(matchesCaller)) continue;
         for (const member of active) sharedPeerPrincipals.add(`${String(member.githubUser).toLowerCase()}:${String(member.machineId).toLowerCase()}`);
+        if (active.some((member) => matchesCaller(member) && ["owner", "collaborator"].includes(member.trustTier))) {
+          for (const member of active) {
+            const machine = String(member.machineId || "").toLowerCase();
+            if (machine && !allActive.some((other) => String(other.machineId || "").toLowerCase() === machine &&
+                Number(other.githubUserId) !== Number(member.githubUserId))) sharedQueueMachines.add(machine);
+          }
+        }
       }
     }
     const visibleRegistryMembers = (registry) => deviceAuth
@@ -3116,7 +3125,7 @@ export function createBootstrapServer({
     }
 
     if (url.pathname === "/api/queue/status") {
-      const store = loadOfflineQueueStore();
+      const store = loadOfflineQueueStore(queuePath);
       const rawFilter = (url.searchParams.get("machineId") || "").trim().toLowerCase();
       if (!deviceAuth && !isMaintainer && !ownsQueue(rawFilter)) {
         sendJson(res, 403, { ok: false, error: "Queue status requires an authoritative owned target machine" });
@@ -3158,6 +3167,10 @@ export function createBootstrapServer({
     }
 
     if (url.pathname === "/api/queue/enqueue") {
+      if (!deviceAuth && !isMaintainer && !sharedQueueMachines.has(String(bodyData.toMachine || "").trim().toLowerCase())) {
+        sendJson(res, 403, { ok: false, error: "Offline enqueue requires an authorized peer in an active shared flock" });
+        return;
+      }
       if (deviceAuth) {
         const targetLower = String(bodyData.toMachine || "").trim().toLowerCase();
         if (!deviceAuth.hasCollaboratorOrOwner || !targetLower || !deviceAuth.allowedPeerMachines.has(targetLower)) {
@@ -3170,6 +3183,7 @@ export function createBootstrapServer({
       }
       try {
         const result = await enqueueOfflineStoreItem({
+          queuePath,
           toMachine: bodyData.toMachine,
           rpcPayload: bodyData.rpcPayload,
           githubUser,
@@ -3205,6 +3219,7 @@ export function createBootstrapServer({
       }
       try {
         const result = await drainOfflineStoreItems({
+          queuePath,
           targetMachine: requestedDrainTarget,
           peekOnly: Boolean(bodyData.peekOnly),
         });
@@ -3234,6 +3249,7 @@ export function createBootstrapServer({
       }
       try {
         const result = await ackOfflineStoreItems({
+          queuePath,
           requestIds: bodyData.requestIds,
           onlyForMachine: isMaintainer ? null : ackTarget,
         });

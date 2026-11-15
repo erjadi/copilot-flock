@@ -5,6 +5,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { EventEmitter } from "node:events";
+import { spawnSync } from "node:child_process";
 import {
   commandIsDaemon,
   computeRuntimeManifest,
@@ -36,6 +37,9 @@ import {
   reviewReleaseCandidate,
   voteReleaseAcrossFlock,
   recoverUnlaunchedRuntimeUpdate,
+  discoverReleaseCandidateTests,
+  buildReleaseCandidateTestArgs,
+  ackOfflineQueueMessages,
 } from "../flock.mjs";
 import { createBootstrapServer, enrollV3Device } from "../bootstrap-server.mjs";
 
@@ -808,23 +812,81 @@ test("release execution and global inventories reject explicit collaborator/gues
   }
 });
 
-test("release vote uses exact authorized owner flock and waits longer than candidate qualification", async (t) => {
+test("release vote defaults to owner root across personal/work and excludes collaborators, guests and inactive peers", async (t) => {
   const root = fixture(t);
   useCopilotHome(t, root);
   fs.mkdirSync(path.join(root, "flock"), { recursive: true });
   fs.writeFileSync(path.join(root, "flock", "flocks.json"), JSON.stringify({
-    flocks: { "owner/work": { flockId: "owner/work", ownerGitHubUser: "owner", trustTier: "owner" } },
+    flocks: {
+      owner: { flockId: "owner", ownerGitHubUser: "owner", trustTier: "owner", allowedScopes: ["personal", "work"] },
+      "owner/work": { flockId: "owner/work", ownerGitHubUser: "owner", trustTier: "owner", allowedScopes: ["work"] },
+    },
   }));
-  let observed;
-  await voteReleaseAcrossFlock({ machineId: "OWNER", githubUser: "owner", scope: "work" }, {
-    flock: "owner/work", timeoutMs: 1,
-  }, {
-    discoverFn: async () => [{ machineId: "OWNER" }],
-    membersMapFn: () => new Map(),
-    rpcBatchFn: async (_cfg, items, timeout) => { observed = { items, timeout }; return []; },
+  const peers = [
+    { machineId: "PERSONAL", githubUser: "owner", scope: "personal", role: "owner" },
+    { machineId: "WORK", githubUser: "owner", scope: "work", role: "owner" },
+    { machineId: "COLLAB", githubUser: "alice", scope: "work", role: "collaborator" },
+    { machineId: "GUEST", githubUser: "guest", scope: "personal", role: "guest" },
+    { machineId: "EXPIRED", githubUser: "owner", scope: "work", role: "owner", membershipExpiresAtMs: Date.now() - 1 },
+  ];
+  const observations = [];
+  const deps = {
+    discoverFn: async () => peers,
+    membersMapFn: () => new Map(peers.map((peer) => [peer.machineId.toLowerCase(), peer])),
+    rpcBatchFn: async (_cfg, items, timeout) => { observations.push({ items, timeout }); return []; },
+  };
+  const cfg = { machineId: "WORK", githubUser: "owner", scope: "work", flockId: "owner/work" };
+  await voteReleaseAcrossFlock(cfg, { timeoutMs: 1 }, deps);
+  assert.ok(observations[0].timeout >= 1620000);
+  assert.deepEqual(observations[0].items.map((item) => item.toMachine).sort(), ["PERSONAL", "WORK"]);
+  assert.ok(observations[0].items.every((item) => item.params.flock === "owner"));
+  await voteReleaseAcrossFlock(cfg, { flock: "owner/work", timeoutMs: 1800000 }, deps);
+  assert.equal(observations[1].timeout, 1800000);
+  assert.deepEqual(observations[1].items.map((item) => item.toMachine), ["WORK"]);
+  assert.equal(observations[1].items[0].params.flock, "owner/work");
+});
+
+test("real repository candidate discovery and isolated import smoke select only dependency-free root tests", (t) => {
+  const root = fixture(t);
+  const selected = discoverReleaseCandidateTests(path.resolve("."));
+  const packageTests = JSON.parse(fs.readFileSync("package.json", "utf8")).scripts.test.match(/test\/[^\s]+\.test\.mjs/g).sort();
+  assert.deepEqual(selected, packageTests);
+  assert.ok(selected.includes("test/viewer-roster.test.mjs"));
+  assert.ok(selected.includes("test/viewer-todos.test.mjs"));
+  assert.equal(selected.some((filename) => filename.startsWith("viewer/") || filename.endsWith(".live.test.mjs")), false);
+  for (const relativeDir of ["", "test", "viewer"]) {
+    for (const filename of fs.readdirSync(path.resolve(relativeDir))) {
+      if (!filename.endsWith(".mjs") && filename !== "package.json" && filename !== "runtime-manifest.json") continue;
+      const source = path.resolve(relativeDir, filename);
+      if (!fs.statSync(source).isFile()) continue;
+      const destination = path.join(root, relativeDir, filename);
+      fs.mkdirSync(path.dirname(destination), { recursive: true });
+      fs.copyFileSync(source, destination);
+    }
+  }
+  const guard = path.join(root, "no-external-dependencies.mjs");
+  fs.writeFileSync(guard, `import Module from "node:module";
+if (Module.registerHooks) Module.registerHooks({resolve(specifier, context, next) {
+  const result = next(specifier, context);
+  if (result.url.includes("/node_modules/")) throw Error("External dependency selected: " + specifier);
+  return result;
+}});`);
+  assert.equal(fs.existsSync(path.join(root, "node_modules")), false);
+  assert.equal(fs.existsSync(path.join(root, "viewer", "node_modules")), false);
+  const args = buildReleaseCandidateTestArgs(root, selected, guard);
+  assert.equal(args.some((arg) => arg.includes("isolation=none")), false);
+  const concurrency = Number(args.find((arg) => arg.startsWith("--test-concurrency=")).split("=")[1]);
+  assert.ok(concurrency >= 1 && concurrency <= Math.min(4, os.availableParallelism?.() || os.cpus().length));
+  const singleArgs = buildReleaseCandidateTestArgs(root, [selected[0]], guard);
+  if (process.allowedNodeEnvironmentFlags.has("--test-isolation") ||
+      process.allowedNodeEnvironmentFlags.has("--experimental-test-isolation")) {
+    assert.ok(singleArgs.some((arg) => arg.includes("isolation=none")));
+  }
+  const result = spawnSync(process.execPath, ["--test-name-pattern=^$", ...args], {
+    cwd: root, encoding: "utf8", timeout: 120000, windowsHide: true,
+    env: { ...process.env, COPILOT_HOME: path.join(root, "isolated-home") },
   });
-  assert.ok(observed.timeout >= 990000);
-  assert.equal(observed.items[0].params.flock, "owner/work");
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
 });
 
 test("support audit expiry prunes a contiguous prefix even when the clock steps backward", (t) => {
@@ -896,8 +958,9 @@ test("GitHub-token broker callers cannot bootstrap masters or drain/ack foreign 
   } }));
   fs.writeFileSync(membersPath, JSON.stringify(Object.fromEntries([own, shared, secret].map((member) => [member.machineId, member]))));
   const server = createBootstrapServer({ v3StorePath: storePath, membersPath,
+    queuePath: path.join(root, "queue.json"),
     apiGet: async (apiPath, token) => apiPath === "/user"
-      ? { statusCode: 200, body: { login: token, id: token === "alice" ? 2002 : 4004 } }
+      ? { statusCode: 200, body: { login: token, id: token === "alice" ? 2002 : token === "owner" ? 1001 : 4004 } }
       : { statusCode: 200, body: { full_name: "erjadi/copilot-flock", owner: { login: "source-owner" }, permissions: { push: true } } },
   });
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
@@ -915,11 +978,30 @@ test("GitHub-token broker callers cannot bootstrap masters or drain/ack foreign 
     assert.doesNotMatch(JSON.stringify(bootstrap.body), /AccessKey|CANARY-MASTER/);
     assert.equal((await request("/api/queue/drain", token, { machineId: "SECRET-PC" })).status, 403);
     assert.equal((await request("/api/queue/ack", token, { machineId: "SECRET-PC", requestIds: ["id"] })).status, 403);
+    assert.equal((await request("/api/queue/enqueue", token, { toMachine: "SECRET-PC", rpcPayload: { requestId: "forbidden" } })).status, 403);
+    assert.equal((await request("/api/queue/enqueue", token, { toMachine: "ARBITRARY", rpcPayload: { requestId: "forbidden" } })).status, 403);
   }
   const peers = await request("/api/members", "alice");
   assert.equal(peers.status, 200);
   assert.deepEqual(peers.body.members.map((member) => member.machineId).sort(), ["ALICE-PC", "SHARED-PC"]);
   assert.equal((await request("/api/register", "alice", { machineId: "SECRET-PC" })).status, 403);
   assert.equal((await request("/api/bootstrap", "maintainer")).body.connectionString.includes("CANARY-MASTER"), true);
+  const queued = await request("/api/queue/enqueue", "alice", {
+    machineId: "ALICE-PC", toMachine: "SHARED-PC", rpcPayload: { requestId: "shared-roundtrip", action: "ping" },
+  });
+  assert.equal(queued.status, 200);
+  const drained = await request("/api/queue/drain", "owner", { machineId: "SHARED-PC", peekOnly: true });
+  assert.equal(drained.status, 200);
+  assert.equal(drained.body.messages[0].requestId, "shared-roundtrip");
+  assert.equal((await request("/api/queue/ack", "alice", { machineId: "SHARED-PC", requestIds: ["shared-roundtrip"] })).status, 403);
+  const queueCall = new Function("callBootstrapQueueApi", "os", `return (${ackOfflineQueueMessages.toString()})`)(
+    (input) => input, os
+  );
+  const ack = queueCall({ cfg: { machineId: "SHARED-PC" }, bootstrapUrl: "https://fixture.invalid/api/bootstrap", requestIds: ["shared-roundtrip"] });
+  assert.equal(ack.bodyObj.machineId, "SHARED-PC");
+  const acknowledged = await request("/api/queue/ack", "owner", ack.bodyObj);
+  assert.equal(acknowledged.status, 200);
+  assert.equal(acknowledged.body.ackedCount, 1);
+  assert.equal((await request("/api/queue/drain", "owner", { machineId: "SHARED-PC", peekOnly: true })).body.messages.length, 0);
 });
 

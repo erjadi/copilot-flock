@@ -34,8 +34,10 @@ performing cloud mutation, remote-machine update, deployment, or a release vote.
 - Public status/roster projections default to bounded pages and expose explicit
   full detail. Viewer shims reject obsolete `private` scope input instead of
   translating it.
-- Release review now requires all repository and viewer tests, entrypoint byte
-  parity, dependency closure, and runtime manifest verification.
+- Zero-dependency release review requires the root repository test suite,
+  entrypoint byte parity, dependency closure, and runtime manifest verification.
+  Viewer build/UI tests remain a separate qualification gate with viewer
+  dependencies installed.
 
 ## Milestone 4 conformance corrections
 
@@ -115,8 +117,11 @@ collaborator/guest flocks. It requires verified same-user owner authorization;
 file-transfer or unrestricted-collaborator settings cannot grant it. Review
 accepts validated branch names only (never `refs/*`), fetches explicitly from
 `refs/heads/`, and disables interactive Git credential helpers. Release voting
-uses an authorized owner flock selector and a minimum 990-second RPC deadline
-so the 900-second qualification suite cannot outlive the caller's vote window.
+uses an authorized owner flock selector and a minimum 1,620-second RPC deadline,
+with headroom beyond the configurable 1,500-second candidate test budget.
+An omitted selector means the owner root across personal/work; targets must
+be active same-owner machines, never collaborators or guests. Explicit scoped
+selectors honor that flock's allowed scopes.
 
 Cross-user presence pings omit host usernames/WebSocket ports; unscoped pings
 contain no sessions. Host-wide project, lock and diagnostic inventories are
@@ -136,6 +141,23 @@ unlaunched activation intent; ambiguous/failed recovery remains explicit.
 Support audit retention removes only contiguous prefixes, preserving hash-chain
 integrity across backward clock changes. Caller runtime drift detection covers
 the support module as part of the installed companion closure.
+
+### Final qualification and interop corrections
+
+The zero-dependency candidate runner discovers only `test/*.test.mjs`, excluding
+`*.live.test.mjs`. It does not select dependency-bearing `viewer/test/` files;
+root viewer roster/TODO tests remain included. Multiple candidate files use
+Node's normal per-file process isolation with concurrency capped at four and
+the host's available parallelism. Only a single-file compatibility fixture can
+use `--test-isolation=none`. Qualification tests copy the real root test module
+closure into a fixture without `node_modules` and smoke-test its imports.
+
+Trusted local administrative creation paths explicitly request allow-all and
+autopilot for coordinator/tracker sessions. The default remains false for
+remote/non-owner creation. Queue acknowledgments include the local machine ID;
+GitHub-token enqueue requires a shared authorized peer and cannot target
+arbitrary or private machines. Isolated HTTP roundtrip tests cover enqueue,
+peek-drain, target-scoped acknowledgment and forbidden targets.
 
 ## Qualification still required
 

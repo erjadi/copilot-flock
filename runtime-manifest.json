@@ -9,7 +9,7 @@
   "files": {
     "bridge.mjs": {
       "role": "entrypoint",
-      "sha256": "62a59c4263a85694806059cd082f8d4e0ce07b2a55dc5cdb85f92faa29eab112",
+      "sha256": "9e3684b62e3352563239eb4bfb1197d6aad2364ec5d3367e94ea877104eb77fc",
       "imports": [
         "./flock-broker-free.mjs",
         "./flock-lifecycle.mjs",
@@ -38,7 +38,7 @@
     },
     "flock-lifecycle.mjs": {
       "role": "companion",
-      "sha256": "f993a11c172f6872c316b36c1d6dbb8f81ae02f7bd5439cb5a918f0d4c57067f",
+      "sha256": "a06763aa7daeedd31b90a076daf5a89134846c154034870390285252482c6de6",
       "imports": [
         "./flock-membership.mjs"
       ]
@@ -74,7 +74,7 @@
     },
     "flock.mjs": {
       "role": "entrypoint",
-      "sha256": "62a59c4263a85694806059cd082f8d4e0ce07b2a55dc5cdb85f92faa29eab112",
+      "sha256": "9e3684b62e3352563239eb4bfb1197d6aad2364ec5d3367e94ea877104eb77fc",
       "imports": [
         "./flock-broker-free.mjs",
         "./flock-lifecycle.mjs",
@@ -85,5 +85,5 @@
       ]
     }
   },
-  "manifestDigest": "b0ff759ea1ef5c09d1a579877142a979127262ae215468a040ca5f9943b7cf98"
+  "manifestDigest": "2417c8807338a36ce5a6756de6ca7831d76501e8c490e128117c5e773de1fe64"
 }

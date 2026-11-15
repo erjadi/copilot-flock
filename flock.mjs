@@ -6979,12 +6979,13 @@ export function ackOfflineQueueMessages({
   bootstrapUrl = DEFAULT_BOOTSTRAP_URL,
   requestIds = [],
   cfg = null,
+  machineId = cfg?.machineId || os.hostname(),
 } = {}) {
   return callBootstrapQueueApi({
     bootstrapUrl,
     endpointPath: "/api/queue/ack",
     method: "POST",
-    bodyObj: { requestIds },
+    bodyObj: { requestIds, machineId },
     cfg,
   });
 }
@@ -13974,13 +13975,21 @@ const MCP_TOOLS = [
   {
     name: "vote_bridge_release",
     description:
-      "Pre-merge flock governance check: ask every online member of the flock to fetch a candidate git branch, extract its complete repository/runtime dependency closure into an isolated fixture, run syntax and unit tests on their OS/arch, and return an Ed25519-signed ACCEPT/REJECT ballot with bounded diagnostics before merging to main.",
+      "Pre-merge owner-fleet governance check: ask active same-owner machines to review a candidate branch in an isolated zero-dependency runtime fixture and return signed ballots. Defaults to the owner root across personal/work; collaborators and guests are excluded.",
     inputSchema: {
       type: "object",
       properties: {
         branch: {
           type: "string",
           description: "Candidate git branch on origin to review and vote on (e.g. 'v2.1.0-rc').",
+        },
+        flock: {
+          type: "string",
+          description: "Optional authorized owner flock selector. Omit for the owner root across personal/work.",
+        },
+        timeout_ms: {
+          type: "number",
+          description: "Vote RPC deadline, with a 1,620,000 ms minimum covering qualification and preflight.",
         },
         machines: {
           type: "string",
@@ -15846,6 +15855,7 @@ export async function executeMcpTool(cfg, name, args = {}, options = {}) {
       branch: args.branch,
       machines: args.machines || "*",
       flock: args.flock || null,
+      timeoutMs: args.timeout_ms,
     });
   }
 
@@ -17495,6 +17505,25 @@ export function buildCanonicalVoteBallotPayload(ballot) {
   });
 }
 
+export function discoverReleaseCandidateTests(fixtureDir) {
+  const root = path.join(fixtureDir, "test");
+  return fs.existsSync(root) ? fs.readdirSync(root)
+    .filter((name) => name.endsWith(".test.mjs") && !name.endsWith(".live.test.mjs"))
+    .map((name) => `test/${name}`).sort() : [];
+}
+
+export function buildReleaseCandidateTestArgs(fixtureDir, tests, guardScriptPath) {
+  const args = ["--import", pathToFileURL(guardScriptPath).href, "--test", "--test-reporter=tap"];
+  if (tests.length === 1) {
+    if (process.allowedNodeEnvironmentFlags?.has?.("--test-isolation")) args.push("--test-isolation=none");
+    else if (process.allowedNodeEnvironmentFlags?.has?.("--experimental-test-isolation")) args.push("--experimental-test-isolation=none");
+  } else {
+    args.push(`--test-concurrency=${Math.max(1, Math.min(4, os.availableParallelism?.() || os.cpus().length || 1))}`);
+  }
+  args.push(...tests.map((rel) => path.join(fixtureDir, ...rel.split("/"))));
+  return args;
+}
+
 export async function reviewReleaseCandidate(cfg, params = {}, internalOptions = {}) {
   const reviewStartedAt = new Date().toISOString();
   const branch = String(params?.branch || "main").trim();
@@ -17511,7 +17540,7 @@ export async function reviewReleaseCandidate(cfg, params = {}, internalOptions =
   const checkTimeoutMs =
     Number(internalOptions.checkTimeoutMs) > 0 ? Number(internalOptions.checkTimeoutMs) : 15000;
   const testTimeoutMs =
-    Number(internalOptions.testTimeoutMs) > 0 ? Number(internalOptions.testTimeoutMs) : 900000;
+    Number(internalOptions.testTimeoutMs) > 0 ? Number(internalOptions.testTimeoutMs) : 1500000;
   const fetchTimeoutMs =
     Number(internalOptions.fetchTimeoutMs) > 0 ? Number(internalOptions.fetchTimeoutMs) : 20000;
 
@@ -17666,22 +17695,7 @@ export async function reviewReleaseCandidate(cfg, params = {}, internalOptions =
     const hasFlockMjs = fs.existsSync(path.join(fixtureDir, "flock.mjs"));
     const hasBridgeMjs = fs.existsSync(path.join(fixtureDir, "bridge.mjs"));
     const hasBootstrapMjs = fs.existsSync(path.join(fixtureDir, "bootstrap-server.mjs"));
-    const candidateTestRels = [
-      ...(
-        fs.existsSync(path.join(fixtureDir, "test"))
-          ? fs.readdirSync(path.join(fixtureDir, "test"))
-              .filter((name) => name.endsWith(".test.mjs"))
-              .map((name) => `test/${name}`)
-          : []
-      ),
-      ...(
-        fs.existsSync(path.join(fixtureDir, "viewer", "test"))
-          ? fs.readdirSync(path.join(fixtureDir, "viewer", "test"))
-              .filter((name) => name.endsWith(".test.mjs"))
-              .map((name) => `viewer/test/${name}`)
-          : []
-      ),
-    ].sort();
+    const candidateTestRels = discoverReleaseCandidateTests(fixtureDir);
 
     if (!hasFlockMjs && !hasBridgeMjs) {
       throw Object.assign(
@@ -17868,13 +17882,7 @@ export async function reviewReleaseCandidate(cfg, params = {}, internalOptions =
       checks.bootstrapSyntaxOk = true;
       checks.verifiedEntrypoints = entrypointsToVerify;
 
-      const testArgs = ["--import", pathToFileURL(guardScriptPath).href, "--test", "--test-reporter=tap"];
-      if (process.allowedNodeEnvironmentFlags?.has?.("--test-isolation")) {
-        testArgs.push("--test-isolation=none");
-      } else if (process.allowedNodeEnvironmentFlags?.has?.("--experimental-test-isolation")) {
-        testArgs.push("--experimental-test-isolation=none");
-      }
-      testArgs.push(...candidateTestRels.map((rel) => path.join(fixtureDir, ...rel.split("/"))));
+      const testArgs = buildReleaseCandidateTestArgs(fixtureDir, candidateTestRels, guardScriptPath);
 
       const testRes = await runBoundedSubprocess(preflightExecutable, testArgs, {
         cwd: fixtureDir,
@@ -18080,7 +18088,7 @@ export function verifyVoteBallotSignature(ballot, registeredPublicKey = null) {
 
 export async function voteReleaseAcrossFlock(
   cfg,
-  { branch = "main", machines = "*", flock = null, timeoutMs = 990000 } = {},
+  { branch = "main", machines = "*", flock = null, timeoutMs = 1620000 } = {},
   internalDeps = {}
 ) {
   const discoverFn = internalDeps.discoverFn || discoverMachines;
@@ -18088,7 +18096,8 @@ export async function voteReleaseAcrossFlock(
     internalDeps.membersMapFn ||
     ((c) => getCachedBootstrapMembersMap(c, { forceRefresh: true }));
   const rpcBatchFn = internalDeps.rpcBatchFn || invokeRemoteRpcBatch;
-  const selected = authorizeCallerFlockSelection(cfg, flock || resolveDefaultOperationFlockSelector(cfg));
+  const owner = normalizeGitHubUser(cfg.githubUser)?.toLowerCase();
+  const selected = authorizeCallerFlockSelection(cfg, flock || owner);
   const policy = loadLocalFlocksConfig(cfg).flocks?.[selected.flockId];
   if (policy?.trustTier !== "owner" ||
       normalizeGitHubUser(policy.ownerGitHubUser)?.toLowerCase() !== normalizeGitHubUser(cfg.githubUser)?.toLowerCase()) {
@@ -18099,10 +18108,26 @@ export async function voteReleaseAcrossFlock(
     discoverFn(cfg, { includeSelf: true, timeoutMs: 2500 }),
     Promise.resolve().then(() => membersMapFn(cfg)),
   ]);
+  const registry = openFlockMembershipRegistry(cfg.flocksConfigPath || null);
+  const authoritative = registry.hasFlock(selected.flockId);
+  const now = Date.now();
   const targets = filterBroadcastTargets(discovered, {
     localMachineId: cfg.machineId,
     includeSelf: true,
     machines,
+  }).filter((target) => {
+    const self = String(target.machineId).toLowerCase() === String(cfg.machineId).toLowerCase();
+    const registered = membersMap?.get(String(target.machineId).toLowerCase());
+    const proof = authoritative ? registry.findActiveMember(selected.flockId, { machineId: target.machineId })
+      : extractPolicyMembersList(policy).find((member) => String(member.machineId).toLowerCase() === String(target.machineId).toLowerCase()) ||
+        (self ? { githubUser: owner, machineId: cfg.machineId, scope: cfg.scope, role: "owner", ...registered } : registered);
+    if (!proof || target.online === false || proof.removed || proof.revoked || proof.membershipStatus === "removed" ||
+        normalizeGitHubUser(proof.githubUser)?.toLowerCase() !== owner ||
+        (proof.role || proof.trustTier || "owner") !== "owner" ||
+        (proof.membershipExpiresAtMs && Number(proof.membershipExpiresAtMs) <= now) ||
+        (proof.membershipExpiresAt && Date.parse(proof.membershipExpiresAt) <= now) ||
+        isPrincipalRevokedInFlock(policy, proof)) return false;
+    return !Array.isArray(policy.allowedScopes) || policy.allowedScopes.includes(proof.scope);
   });
 
   const batchItems = targets.map((t) => ({
@@ -18113,7 +18138,7 @@ export async function voteReleaseAcrossFlock(
   }));
 
   const outcomes =
-    batchItems.length > 0 ? await rpcBatchFn(cfg, batchItems, Math.max(990000, Number(timeoutMs) || 990000)) : [];
+    batchItems.length > 0 ? await rpcBatchFn(cfg, batchItems, Math.max(1620000, Number(timeoutMs) || 1620000)) : [];
 
   const votes = outcomes.map((o) => {
     const mId = o.item.target.machineId;
@@ -19143,6 +19168,7 @@ export async function reprovisionLocalBridge(
     const coordCreated = await createLocalSession({
       cfg,
       title: COORDINATOR_TITLE,
+      allowAll: true,
       systemPrompt: COORDINATOR_CHARTER_PROMPT,
       message: null,
       mode: "immediate",
@@ -19152,6 +19178,7 @@ export async function reprovisionLocalBridge(
     const trackerCreated = await createLocalSession({
       cfg,
       title: THREAD_TRACKER_TITLE,
+      allowAll: true,
       systemPrompt: THREAD_TRACKER_CHARTER_PROMPT,
       message: null,
       mode: "immediate",
@@ -19577,6 +19604,7 @@ export async function diagnoseLocalBridgeState(
         const created = await createLocalSession({
           cfg,
           title: COORDINATOR_TITLE,
+          allowAll: true,
           message: null,
           mode: "immediate",
         });
@@ -20435,6 +20463,7 @@ export async function ensureThreadTrackerSession(cfg) {
     const created = await createLocalSession({
       cfg,
       title: THREAD_TRACKER_TITLE,
+      allowAll: true,
       systemPrompt: THREAD_TRACKER_CHARTER_PROMPT,
       message: null,
       fromMachine: cfg.machineId,
@@ -22899,7 +22928,7 @@ Copilot SignalR Thread Bridge v${BRIDGE_VERSION} (your-signalr.service.signalr.n
 
 Usage:
   node bridge.mjs install [--machine-id <name>] [--scope personal|work] [--github-user <handle>] [--connection-string <str>]
-  node bridge.mjs vote-release --branch <candidate-branch> [--machines <m1,m2,*>]
+  node bridge.mjs vote-release --branch <candidate-branch> [--flock <owner[/scope]>] [--machines <m1,m2,*>] [--timeout-ms <ms>]
   node bridge.mjs update [--all] [--machines <m1,m2,DESKTOP-*>] [--scope personal|work]
   node bridge.mjs diagnose [--fix] [--passive] [--machines <m1,m2,DESKTOP-*>] [--scope personal|work]
   node bridge.mjs reprovision --machines <m1,m2>
@@ -23437,6 +23466,8 @@ Usage:
     const res = await voteReleaseAcrossFlock(cfg, {
       branch,
       machines: flags.machines || flags.machine || "*",
+      flock: flags.flock || null,
+      timeoutMs: Number(flags["timeout-ms"]) || undefined,
     });
     console.log(JSON.stringify(res, null, 2));
     return;

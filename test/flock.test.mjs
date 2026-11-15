@@ -654,6 +654,54 @@ test("Desktop session creation with allowAll=false never requests allow-all, aut
   }
 });
 
+test("trusted local tracker installation and diagnostic coordinator creation request allow-all and autopilot Desktop frames", async () => {
+  const env = setupTempCopilotEnv();
+  const previous = process.env.COPILOT_HOME;
+  const previousAppData = process.env.APPDATA;
+  process.env.COPILOT_HOME = env.tempRoot;
+  process.env.APPDATA = path.join(env.tempRoot, "appdata");
+  const frames = [];
+  const created = [];
+  const server = await startMockCopilotWsServer((frame, client) => {
+    frames.push(frame);
+    if (frame.type === "create_session") {
+      const sessionId = crypto.randomUUID();
+      created.push(sessionId);
+      env.insertSession({ id: sessionId, title: "Pending local administrative session" });
+      client.sendJson({ type: "session_created", request_id: frame.request_id, session_id: sessionId, session_type: "general_chat" });
+    }
+    if (frame.type === "rename_session") env.insertSession({ id: frame.session_id, title: frame.title });
+    if (frame.type === "get_session_permission_mode") client.sendJson({
+      type: "command_result", request_id: frame.request_id, data: "allow-all",
+    });
+  });
+  try {
+    env.writeWsConfig(server.port);
+    invalidateLocalWsConnectionCache();
+    const { ensureThreadTrackerSession } = await import("../flock.mjs");
+    const cfg = { machineId: "LOCAL", githubUser: "owner", scope: "work", specs: null };
+    const tracker = await ensureThreadTrackerSession(cfg);
+    assert.equal(tracker.created, true, tracker.error);
+    await diagnoseLocalBridgeState(cfg, {
+      fix: true, inDaemonRpc: true,
+      configureBootPersistenceFn: () => ({ type: "test-only" }),
+      registerBootstrapFn: () => ({ ok: true }),
+    });
+    assert.equal(created.length, 2, "Tracker and coordinator should each be created once");
+    assert.ok(frames.filter((frame) => frame.type === "create_session").every((frame) => frame.permission_mode === "allow-all"));
+    for (const sessionId of created) {
+      assert.ok(frames.some((frame) => frame.type === "set_session_auto_approve" && frame.session_id === sessionId && frame.auto_approve === true));
+      assert.ok(frames.some((frame) => frame.type === "set_session_mode" && frame.session_id === sessionId && frame.mode === "autopilot"));
+    }
+  } finally {
+    await server.close();
+    invalidateLocalWsConnectionCache();
+    if (previous === undefined) delete process.env.COPILOT_HOME; else process.env.COPILOT_HOME = previous;
+    if (previousAppData === undefined) delete process.env.APPDATA; else process.env.APPDATA = previousAppData;
+    env.cleanup();
+  }
+});
+
 function setupTempCopilotEnv() {
   const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-test-"));
   fs.mkdirSync(path.join(tempRoot, "run"), { recursive: true });
@@ -7025,6 +7073,7 @@ test("release voter extracts complete modular dependency closure into isolated f
         'import path from "node:path";',
         'import { summarizeCandidate } from "../flock.mjs";',
         'import { BOOTSTRAP_READY } from "../bootstrap-server.mjs";',
+        'globalThis.candidateTestFile = "flock";',
         `const hostTempRoot = ${JSON.stringify(env.tempRoot)};`,
         'test("modular candidate runs in isolated fixture without reading ~/.copilot/flock", () => {',
         '  assert.equal(summarizeCandidate(), "fresh-candidate-lifecycle");',
@@ -7035,6 +7084,16 @@ test("release voter extracts complete modular dependency closure into isolated f
         '  console.log("modular-candidate-stdout-ok");',
         '});',
       ].join("\n"),
+      "test/isolation.test.mjs": [
+        'import test from "node:test";',
+        'import assert from "node:assert/strict";',
+        'test("candidate files use independent process state", () => {',
+        '  assert.equal(globalThis.candidateTestFile, undefined);',
+        '  globalThis.candidateTestFile = "isolation";',
+        '});',
+      ].join("\n"),
+      "test/azure.live.test.mjs": 'throw Error("Live Azure tests must not be selected in a zero-dependency review");\n',
+      "viewer/test/dependency.test.mjs": 'import "uninstalled-viewer-dependency";\n',
     };
 
     writeTreeFiles(originWorkDir, baseModularCandidate);
@@ -7275,7 +7334,7 @@ test("release voter extracts complete modular dependency closure into isolated f
     const timeoutBallot = await reviewReleaseCandidate(
       voterCfg,
       { branch: "rc-timeout-test" },
-      { repoDir: originWorkDir, fetchFromOrigin: false, testTimeoutMs: 1500 }
+      { repoDir: originWorkDir, fetchFromOrigin: false, testTimeoutMs: 10000 }
     );
     assert.equal(timeoutBallot.vote, "REJECT");
     assert.equal(timeoutBallot.failureCategory, "candidate_test_failure");
