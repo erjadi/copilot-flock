@@ -196,6 +196,8 @@ test("legacy compatibility checkout sync failure is persisted and returned witho
     sourceDir: source, targetDir: target, legacyDir: legacy, spawnInstall: false, updateId: ownedUpdateId(t),
   });
   assert.match(result.compatibilityWarning, /retained.*RUNTIME_UNSAFE_TARGET/);
+  assert.equal(result.legacySync.status, "skipped");
+  assert.equal(result.legacySync.code, "RUNTIME_UNSAFE_TARGET");
   assert.match(readRuntimeState(target).update.warning, /does not verify legacy callers/);
   assert.equal(fs.readFileSync(path.join(legacy, "preserve.txt"), "utf8"), "unrelated checkout evidence");
   assert.equal(fs.existsSync(path.join(legacy, ".git")), true);

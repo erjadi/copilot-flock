@@ -18378,6 +18378,21 @@ export async function activateRuntimeUpdate(cfg, {
   }
 }
 
+export function synchronizeLegacyRuntime(sourceDir, legacyDir, { enabled = true } = {}) {
+  if (!legacyDir || !fs.existsSync(legacyDir) || path.resolve(sourceDir) === path.resolve(legacyDir)) {
+    return { status: "not_present", code: null, reason: null };
+  }
+  let code = "LEGACY_NOT_SYNCHRONIZED";
+  if (enabled) {
+    try {
+      stageAndActivateRuntime({ sourceDir, targetDir: legacyDir, verifyImports: false });
+      return { status: "synced", code: null, reason: null };
+    } catch (error) { code = error.code || "LEGACY_SYNC_FAILED"; }
+  }
+  return { status: "skipped", code: redactFlockSnapshot(code),
+    reason: redactFlockSnapshot(`Legacy compatibility runtime retained (${code}); inspect its process/config references. Primary verification does not verify legacy callers.`) };
+}
+
 export async function performLocalSelfUpdate(
   cfg,
   {
@@ -18538,27 +18553,13 @@ export async function performLocalSelfUpdate(
     correlationId,
   });
 
-  let compatibilityWarning = null;
-  if (!resolvedLegacyDir && !targetDir && fs.existsSync(getLegacyBridgeHome())) {
-    compatibilityWarning = "Legacy compatibility runtime was not synchronized; inspect its process/config references. Primary verification does not verify legacy callers.";
+  const legacySync = synchronizeLegacyRuntime(resolvedTargetDir,
+    resolvedLegacyDir || (!targetDir ? getLegacyBridgeHome() : null), { enabled: Boolean(resolvedLegacyDir) });
+  const compatibilityWarning = legacySync.reason;
+  if (compatibilityWarning) {
     recordRuntimeUpdatePhase(resolvedTargetDir, {
       updateId, correlationId, phase: readRuntimeState(resolvedTargetDir).update.phase, warning: compatibilityWarning,
     });
-  }
-  if (resolvedLegacyDir && fs.existsSync(resolvedLegacyDir) && path.resolve(resolvedLegacyDir) !== path.resolve(resolvedTargetDir)) {
-    try {
-      stageAndActivateRuntime({
-        sourceDir: resolvedTargetDir,
-        targetDir: resolvedLegacyDir,
-        verifyImports: false,
-      });
-    } catch (error) {
-      compatibilityWarning = redactFlockSnapshot(`Legacy compatibility runtime retained (${error.code || "SYNC_FAILED"}); inspect its process/config references. Primary verification does not verify legacy callers.`);
-      recordRuntimeUpdatePhase(resolvedTargetDir, {
-        updateId, correlationId, phase: readRuntimeState(resolvedTargetDir).update.phase,
-        warning: compatibilityWarning,
-      });
-    }
   }
 
   const targetScript = path.join(resolvedTargetDir, "flock.mjs");
@@ -18574,6 +18575,7 @@ export async function performLocalSelfUpdate(
         status: "activating", updateId, correlationId, machineId: cfg.machineId,
         targetDigest: activated.installed.digest, previousPid: process.pid,
         compatibilityWarning,
+        legacySync,
         staged: activated.staged, installed: activated.installed,
         resident: activated.resident, verified: { ...activated.verified, fullyActive: false, status: "pending_activation" },
       };
@@ -18713,6 +18715,7 @@ export async function performLocalSelfUpdate(
     updateId,
     correlationId,
     compatibilityWarning,
+    legacySync,
     machineId: cfg.machineId,
     previousVersion: BRIDGE_VERSION,
     previousDigest: RUNTIME_MODULE_MANIFEST?.manifestDigest || null,
@@ -21023,16 +21026,7 @@ export async function installBridge({
     manifest: stagedRelease.manifest,
     onDuringCutover: onDuringCutoverArg,
   });
-  // Also update legacy ~/.copilot/signalr-bridge if that directory exists so running sessions stay in sync
-  if (fs.existsSync(getLegacyBridgeHome()) && path.resolve(getLegacyBridgeHome()) !== path.resolve(getBridgeHome())) {
-    try {
-      stageAndActivateRuntime({
-        sourceDir: getBridgeHome(),
-        targetDir: getLegacyBridgeHome(),
-        verifyImports: false,
-      });
-    } catch {}
-  }
+  const legacySync = synchronizeLegacyRuntime(getBridgeHome(), getLegacyBridgeHome());
 
   const mcpConfigPath = path.join(getCopilotDir(), "mcp-config.json");
   let bootPersistence = null;
@@ -21255,6 +21249,7 @@ export async function installBridge({
   return {
     version: BRIDGE_VERSION,
     manifestDigest: stagedRelease.manifest.manifestDigest,
+    legacySync,
     runtimeStates: finalRuntimeStates,
     staged: finalRuntimeStates.staged,
     installed: finalRuntimeStates.installed,

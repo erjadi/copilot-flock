@@ -224,11 +224,14 @@ entrypoint tests are skipped. Windows PowerShell remains mandatory, as does
 POSIX bash coverage; permission/timeouts or a broken installed shell are failures.
 TLS WebSocket connections omit SNI for IP literals (required by Node 26) while
 retaining DNS SNI. Windows TLS qualification resolves OpenSSL from PATH, the
-discovered Git installation, then standard Git locations, with an explicit
+discovered Git installation (including `usr`, `clangarm64` and `mingw64` binaries),
+then standard Program Files/LocalAppData Git locations, with an explicit
 failure if unavailable. An unsafe legacy checkout is never deleted to make
 compatibility synchronization succeed: its failure is returned and retained as
 an update-journal warning, and primary verification does not imply legacy
 caller convergence.
+Both local self-update and installation return a nonfatal `legacySync`
+status/code/reason rather than swallowing compatibility-sync failures.
 
 Windows process inspection returns early only for an ESRCH liveness probe,
 retries a CIM ETIMEDOUT once within the existing per-attempt bound, and never

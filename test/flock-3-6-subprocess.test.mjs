@@ -28,6 +28,10 @@ test("Windows TLS fixture OpenSSL resolves PATH, Git-derived and standard locati
     "C:\\Program Files\\Git\\usr\\bin\\openssl.exe");
   assert.equal(probe(["C:\\Program Files\\Git\\mingw64\\bin\\openssl.exe"], { PATH: "" }),
     "C:\\Program Files\\Git\\mingw64\\bin\\openssl.exe");
+  assert.equal(probe(["C:\\Program Files\\Git\\clangarm64\\bin\\openssl.exe"], { PATH: "" }),
+    "C:\\Program Files\\Git\\clangarm64\\bin\\openssl.exe");
+  assert.equal(probe(["X:\\Local\\Programs\\Git\\clangarm64\\bin\\openssl.exe"], { PATH: "", LOCALAPPDATA: "X:\\Local" }),
+    "X:\\Local\\Programs\\Git\\clangarm64\\bin\\openssl.exe");
   assert.equal(probe(["C:\\Program Files (x86)\\Git\\usr\\bin\\openssl.exe"], { PATH: "" }),
     "C:\\Program Files (x86)\\Git\\usr\\bin\\openssl.exe");
   assert.throws(() => probe([], { PATH: "" }), /OpenSSL is required/);

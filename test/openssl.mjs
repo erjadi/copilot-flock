@@ -21,7 +21,7 @@ export function resolveOpenSsl({
       ...(env.LOCALAPPDATA ? [paths.join(env.LOCALAPPDATA, "Programs", "Git")] : []),
     ];
     for (const root of roots) {
-      for (const suffix of [["usr", "bin"], ["mingw64", "bin"], ["bin"]]) {
+      for (const suffix of [["usr", "bin"], ["clangarm64", "bin"], ["mingw64", "bin"], ["bin"]]) {
         const candidate = paths.join(root, ...suffix, executable);
         if (isFile(candidate)) return candidate;
       }
