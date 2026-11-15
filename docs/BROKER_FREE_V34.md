@@ -339,6 +339,10 @@ auth-mode blockers, never successful negative controls. Original authorization
 failures and cleanup failures are both retained. Afterwards, synchronously
 remove only the approved fresh disposable resource group and verify absence;
 incomplete teardown keeps the gate pending.
+Hosted qualification also checks that device-maintainer ACKs with omitted or
+own selectors return `ackedCount: 0` for foreign IDs, preserve those items and
+report only own-queue `remainingCount`. These are HTTP 200 semantic nonmutation
+checks, separate from the provider's HTTP 401/403 negative controls.
 
 The distinct wrong-hub fixture is `fixture_forbidden`, shared by the REST and
 WebSocket probes. [Azure's documented hub-name syntax](https://learn.microsoft.com/en-us/azure/azure-signalr/swagger/signalr-data-plane-rest-v1)

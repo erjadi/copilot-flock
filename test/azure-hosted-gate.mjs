@@ -125,6 +125,20 @@ export async function runHostedEntraGate(t, config, {
     assert.ok(drained.messages.some((item) => item.requestId === queued.requestId && item.serviceBusPublished === true));
     await negatives("cross-peer-drain", "/api/queue/drain", { machineId: owner.machineId, peekOnly: true }, { peer: guest });
     await negatives("cross-peer-ack", "/api/queue/ack", { machineId: guest.machineId, requestIds: pendingIds }, { peer: owner });
+    for (const [operation, selector] of [
+      ["device-maintainer-foreign-ack-without-selector", {}],
+      ["device-maintainer-foreign-ack-own-selector", { machineId: owner.machineId }],
+    ]) {
+      const foreignAck = requireOk(await request("/api/queue/ack", { ...selector, requestIds: pendingIds },
+        { peer: owner }), "device ACK foreign item");
+      assert.equal(foreignAck.ackedCount, 0, "A device-authenticated maintainer cannot acknowledge another device's items");
+      assert.equal(foreignAck.remainingCount, 0, "Scoped ACK cannot disclose foreign queue depth");
+      const preserved = requireOk(await request("/api/queue/drain", { machineId: guest.machineId, peekOnly: true },
+        { peer: guest }), "foreign queue preservation");
+      assert.deepEqual(preserved.messages, drained.messages, "Foreign queue items must remain unchanged after the denied ACK");
+      t.diagnostic(JSON.stringify({ kind: "live-gate-authorization-probe", operation, outcome: "denied_no_mutation",
+        status: 200, ackedCount: foreignAck.ackedCount, remainingCount: foreignAck.remainingCount, foreignItemsPreserved: true }));
+    }
     await negatives("guest-enqueue", "/api/queue/enqueue", { toMachine: owner.machineId,
       rpcPayload: { requestId: crypto.randomUUID() } }, { peer: guest });
     await negatives("invalid-device-signature", "/api/queue/drain", { machineId: guest.machineId },

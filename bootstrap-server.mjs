@@ -393,7 +393,9 @@ export async function ackOfflineStoreItems({
     return {
       ok: true,
       ackedCount: before - remaining.length,
-      remainingCount: remaining.length,
+      remainingCount: scopedMachine
+        ? remaining.filter((item) => String(item.toMachine || "").toLowerCase() === scopedMachine).length
+        : remaining.length,
     };
   });
 }
@@ -3081,6 +3083,7 @@ export function createBootstrapServer({
         null;
     const isMaintainer = String(githubUser || "").toLowerCase() ===
       String(process.env.PLATFORM_MAINTAINER_USER || PLATFORM_MAINTAINER_USER).toLowerCase();
+    const isGitHubMaintainer = !deviceAuth && isMaintainer;
     if (url.pathname === "/api/bootstrap" && !isMaintainer) {
       sendJson(res, 403, { ok: false, code: "MAINTAINER_REQUIRED", error: "Master transport bootstrap is restricted to the platform maintainer. Use scoped device enrollment." });
       return;
@@ -3125,9 +3128,22 @@ export function createBootstrapServer({
       ? Object.values(registry).filter((member) => member?.machineId && deviceAuth.allowedPeerMachines.has(String(member.machineId).toLowerCase()))
       : isMaintainer ? Object.values(registry)
       : Object.values(registry).filter((member) => sharedPeerPrincipals.has(`${String(member.githubUser).toLowerCase()}:${String(member.machineId).toLowerCase()}`));
-    const ownsQueue = (target) => isMaintainer || (deviceAuth
-      ? String(target || "").toLowerCase() === String(deviceAuth.machineId || "").toLowerCase()
-      : ownedMachines.has(String(target || "").toLowerCase()));
+    const ownsQueue = (target) => deviceAuth
+      ? Boolean(deviceAuth.machineId) && String(target || "").trim().toLowerCase() === String(deviceAuth.machineId).trim().toLowerCase()
+      : isGitHubMaintainer || ownedMachines.has(String(target || "").trim().toLowerCase());
+    if (deviceAuth && url.pathname.startsWith("/api/queue/")) {
+      const ownMachine = String(deviceAuth.machineId || "").trim().toLowerCase();
+      const selectors = [
+        ...(Object.hasOwn(bodyData, "machineId") ? [bodyData.machineId] : []),
+        ...url.searchParams.getAll("machineId"),
+        ...(req.headers["x-machine-id"] !== undefined ? [req.headers["x-machine-id"]] : []),
+      ];
+      if (typeof deviceAuth.machineId !== "string" || !ownMachine ||
+          selectors.some((value) => typeof value !== "string" || value.trim().toLowerCase() !== ownMachine)) {
+        sendJson(res, 403, { ok: false, error: "Token-local queue selectors must identify the device's own enrolled machineId." });
+        return;
+      }
+    }
 
     if (deviceAuth && url.pathname === "/api/register") {
       if (
@@ -3175,7 +3191,7 @@ export function createBootstrapServer({
     if (url.pathname === "/api/queue/status") {
       const store = loadOfflineQueueStore(queuePath);
       const rawFilter = (url.searchParams.get("machineId") || "").trim().toLowerCase();
-      if (!deviceAuth && !isMaintainer && !ownsQueue(rawFilter)) {
+      if (!deviceAuth && !isGitHubMaintainer && !ownsQueue(rawFilter)) {
         sendJson(res, 403, { ok: false, error: "Queue status requires an authoritative owned target machine" });
         return;
       }
@@ -3219,7 +3235,7 @@ export function createBootstrapServer({
     }
 
     if (url.pathname === "/api/queue/enqueue") {
-      if (!deviceAuth && !isMaintainer && !sharedQueueMachines.has(String(bodyData.toMachine || "").trim().toLowerCase())) {
+      if (!deviceAuth && !isGitHubMaintainer && !sharedQueueMachines.has(String(bodyData.toMachine || "").trim().toLowerCase())) {
         sendJson(res, 403, { ok: false, error: "Offline enqueue requires an authorized peer in an active shared flock" });
         return;
       }
@@ -3289,12 +3305,7 @@ export function createBootstrapServer({
 
     if (url.pathname === "/api/queue/ack") {
       const ackTarget = deviceAuth?.machineId || machineId;
-      if (deviceAuth && bodyData.machineId &&
-          String(bodyData.machineId).trim().toLowerCase() !== String(ackTarget || "").trim().toLowerCase()) {
-        sendJson(res, 403, { ok: false, error: "Token-local device can only acknowledge its own machineId." });
-        return;
-      }
-      if (!isMaintainer && !ownsQueue(ackTarget)) {
+      if (!ownsQueue(ackTarget)) {
         sendJson(res, 403, { ok: false, error: "Queue acknowledgement requires ownership of the target machine" });
         return;
       }
@@ -3309,7 +3320,7 @@ export function createBootstrapServer({
         const result = await ackOfflineStoreItems({
           queuePath,
           requestIds: bodyData.requestIds,
-          onlyForMachine: isMaintainer ? null : ackTarget,
+          onlyForMachine: deviceAuth ? deviceAuth.machineId : isGitHubMaintainer ? null : ackTarget,
         });
         sendJson(res, 200, result);
       } catch (err) {

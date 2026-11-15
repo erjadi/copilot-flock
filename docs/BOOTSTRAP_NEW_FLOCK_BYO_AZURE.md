@@ -166,6 +166,13 @@ token. Subscription PUT must succeed before topic POST; queue results report
 `serviceBusReason`, `serviceBusStatusCode`. An accepted broker JSON queue entry
 is not proof of Service Bus publication. The hosted queue's drain/ack operations
 remain broker-durable-JSON mediated, not direct Entra client transport.
+Every device-signed queue request's caller machine selectors must identify its
+enrolled machine, including platform-maintainer devices. Foreign
+body/query/header selectors are rejected. ACK mutation and `remainingCount`
+are limited to that device's queue even with omitted or own selectors.
+Enqueue `toMachine` targeting retains its active shared-flock authorization.
+Only a non-device, GitHub-authenticated platform maintainer retains global ACK
+authority.
 
 After an authorized disposable setup, run the explicitly approved
 [live audience/SAS isolation gate](./BROKER_FREE_V34.md#required-live-azure-gate)

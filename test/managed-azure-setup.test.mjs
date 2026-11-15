@@ -79,7 +79,7 @@ test("hosted MSI audience, terminal token failures, PUT-gates-POST, leave classi
   const script = `
 import assert from "node:assert/strict";
 import fs from "node:fs"; import os from "node:os"; import path from "node:path";
-import http from "node:http"; import https from "node:https";
+import http from "node:http"; import https from "node:https"; import crypto from "node:crypto";
 import { EventEmitter } from "node:events";
 import { syncBuiltinESMExports } from "node:module";
 process.env.SERVICEBUS_NAMESPACE="demo-sb.servicebus.windows.net";
@@ -182,7 +182,45 @@ try {
  assert.ok(diagnostics.some(value=>value.includes("broker-msi-subscription-put-and-topic-publish")));
  assert.ok(diagnostics.some(value=>value.includes("broker-durable-json-own-queue-drain-and-ack")));
  assert.ok(diagnostics.some(value=>value.includes("broker-msi-subscription-delete-on-leave")));
+ assert.ok(diagnostics.some(value=>value.includes("device-maintainer-foreign-ack-without-selector")&&value.includes("denied_no_mutation")));
+ assert.ok(diagnostics.some(value=>value.includes("device-maintainer-foreign-ack-own-selector")&&value.includes("denied_no_mutation")));
  assert.doesNotMatch(diagnostics.join(""),/SECRET|topic-send-and-own-subscription-listen/);
+ const pair=crypto.generateKeyPairSync("ed25519",{publicKeyEncoding:{type:"spki",format:"pem"},privateKeyEncoding:{type:"pkcs8",format:"pem"}});
+ const fingerprint=crypto.createHash("sha256").update(pair.publicKey.trim()).digest("hex").slice(0,32);
+ await broker.enrollV3Device({githubUser:"demo-owner",githubUserId:1001,deviceId:fingerprint,machineId:"ACK-OWNER",
+  scope:"work",publicKey:pair.publicKey,keyFingerprint:fingerprint},{storePath:path.join(root,"v3.json"),connectionString:${JSON.stringify(signalr)}});
+ const queuePath=path.join(root,"queue.json");
+ for(const [toMachine,requestId]of [["ACK-OWNER","own-ack-proof"],["OTHER-PEER","foreign-ack-proof"]]){
+  await broker.enqueueOfflineStoreItem({toMachine,rpcPayload:{requestId},queuePath,publishFn:null});
+ }
+ const {buildTokenLocalDeviceAuthHeaders}=await import(${JSON.stringify(new URL("../flock.mjs", import.meta.url).href)});
+ const ackRequest=async(requestIds,{device=true,bodyMachine,queryMachine,headerMachine}={})=>{
+  const body=JSON.stringify({requestIds,...(bodyMachine!==undefined?{machineId:bodyMachine}:{})});
+  const queries=Array.isArray(queryMachine)?queryMachine:queryMachine!==undefined?[queryMachine]:[];
+  const endpoint="/api/queue/ack"+(queries.length?"?"+queries.map(value=>"machineId="+encodeURIComponent(value)).join("&"):"");
+  const signed=device?buildTokenLocalDeviceAuthHeaders({method:"POST",pathnameWithSearch:endpoint,body},{...pair,fingerprint}):null;
+  const response=await fetch("http://127.0.0.1:"+server.address().port+endpoint,{method:"POST",body,
+   headers:{"Content-Type":"application/json",...(headerMachine!==undefined?{"X-Machine-Id":headerMachine}:{}),
+    ...(signed?{"X-Flock-Device-Id":signed.deviceId,"X-Flock-Timestamp":signed.timestamp,"X-Flock-Signature":signed.signature}:{Authorization:"Bearer fixture-maintainer"})}});
+  return {status:response.status,data:await response.json()};
+ };
+ const before=fs.readFileSync(queuePath);
+ for(const selector of [{bodyMachine:"OTHER-PEER"},{queryMachine:"OTHER-PEER"},{headerMachine:"OTHER-PEER"},
+  {bodyMachine:"ACK-OWNER",queryMachine:"OTHER-PEER"},{queryMachine:["ACK-OWNER","OTHER-PEER"]}]){
+  assert.equal((await ackRequest(["foreign-ack-proof"],selector)).status,403);
+  assert.deepEqual(fs.readFileSync(queuePath),before,"Foreign selectors cannot mutate any queue entry");
+ }
+ for(const selector of [{},{bodyMachine:"ACK-OWNER"},{queryMachine:"ACK-OWNER"},{headerMachine:"ACK-OWNER"}]){
+  const denied=await ackRequest(["foreign-ack-proof"],selector);
+  assert.equal(denied.status,200);assert.equal(denied.data.ackedCount,0);assert.equal(denied.data.remainingCount,1);
+  assert.deepEqual(fs.readFileSync(queuePath),before,"A scoped device ACK cannot rewrite or remove foreign queue entries");
+ }
+ const own=await ackRequest(["own-ack-proof"]);
+ assert.equal(own.status,200);assert.equal(own.data.ackedCount,1);assert.equal(own.data.remainingCount,0);
+ assert.ok(broker.loadOfflineQueueStore(queuePath).items.some(item=>item.requestId==="foreign-ack-proof"));
+ const global=await ackRequest(["foreign-ack-proof"],{device:false});
+ assert.equal(global.status,200);assert.equal(global.data.ackedCount,1,"GitHub-token maintainer retains global ACK");
+ assert.equal(broker.loadOfflineQueueStore(queuePath).items.length,0);
 }finally{server.closeAllConnections();await new Promise(resolve=>server.close(resolve));fs.rmSync(root,{recursive:true,force:true});}
 `;
   const result = spawnSync(process.execPath, ["--input-type=module", "-e", script], {
