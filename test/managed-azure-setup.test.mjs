@@ -184,6 +184,7 @@ try {
  assert.ok(diagnostics.some(value=>value.includes("broker-msi-subscription-delete-on-leave")));
  assert.ok(diagnostics.some(value=>value.includes("device-maintainer-foreign-ack-without-selector")&&value.includes("denied_no_mutation")));
  assert.ok(diagnostics.some(value=>value.includes("device-maintainer-foreign-ack-own-selector")&&value.includes("denied_no_mutation")));
+ assert.ok(diagnostics.some(value=>value.includes("device-maintainer-own-ack")&&value.includes('"ackedCount":1')));
  assert.doesNotMatch(diagnostics.join(""),/SECRET|topic-send-and-own-subscription-listen/);
  const pair=crypto.generateKeyPairSync("ed25519",{publicKeyEncoding:{type:"spki",format:"pem"},privateKeyEncoding:{type:"pkcs8",format:"pem"}});
  const fingerprint=crypto.createHash("sha256").update(pair.publicKey.trim()).digest("hex").slice(0,32);

@@ -144,6 +144,17 @@ export async function runHostedEntraGate(t, config, {
     await negatives("invalid-device-signature", "/api/queue/drain", { machineId: guest.machineId },
       { peer: guest, invalidSignature: true });
     await negatives("unauthenticated-drain", "/api/queue/drain", { machineId: guest.machineId });
+    const ownRequestId = crypto.randomUUID();
+    const ownQueued = requireOk(await request("/api/queue/enqueue", {
+      toMachine: owner.machineId, machineId: owner.machineId, ttlSeconds: 60,
+      rpcPayload: { requestId: ownRequestId, fromMachine: owner.machineId, action: "ping", params: { fixture: true } },
+    }, { peer: owner }), "maintainer own enqueue");
+    assert.equal(ownQueued.serviceBusPublished, true);
+    const ownAck = requireOk(await request("/api/queue/ack", { machineId: owner.machineId, requestIds: [ownRequestId] },
+      { peer: owner }), "maintainer own ACK");
+    assert.equal(ownAck.ackedCount, 1);
+    assert.equal(ownAck.remainingCount, 0, "A successful own ACK must not disclose the still-pending foreign queue");
+    positive("device-maintainer-own-ack", { ackedCount: ownAck.ackedCount, remainingCount: ownAck.remainingCount });
     const ack = requireOk(await request("/api/queue/ack", { machineId: guest.machineId, requestIds: pendingIds },
       { peer: guest }), "own queue acknowledgement");
     assert.equal(ack.ackedCount, pendingIds.length);
