@@ -33,6 +33,11 @@
       "type": "string",
       "defaultValue": "copilot-bridge-offline"
     },
+    "serviceBusDisableLocalAuth": {
+      "type": "bool",
+      "defaultValue": true,
+      "metadata": { "description": "Hosted brokers use Entra/RBAC. Broker-free SAS requires explicit local-auth enablement permitted by subscription policy." }
+    },
     "deployTokenBroker": {
       "type": "bool",
       "defaultValue": false,
@@ -84,7 +89,7 @@
         "name": "[parameters('serviceBusSku')]",
         "tier": "[parameters('serviceBusSku')]"
       },
-      "properties": {}
+      "properties": { "disableLocalAuth": "[parameters('serviceBusDisableLocalAuth')]" }
     },
     {
       "type": "Microsoft.ServiceBus/namespaces/topics",
@@ -94,6 +99,7 @@
       "properties": {}
     },
     {
+      "condition": "[not(parameters('serviceBusDisableLocalAuth'))]",
       "type": "Microsoft.ServiceBus/namespaces/AuthorizationRules",
       "apiVersion": "2022-10-01-preview",
       "name": "[format('{0}/FlockSendRule', variables('serviceBusNamespaceName'))]",
@@ -101,6 +107,7 @@
       "properties": { "rights": ["Send"] }
     },
     {
+      "condition": "[not(parameters('serviceBusDisableLocalAuth'))]",
       "type": "Microsoft.ServiceBus/namespaces/AuthorizationRules",
       "apiVersion": "2022-10-01-preview",
       "name": "[format('{0}/FlockListenRule', variables('serviceBusNamespaceName'))]",
@@ -145,7 +152,6 @@
           "minTlsVersion": "1.2",
           "appSettings": [
             { "name": "SIGNALR_CONNECTION_STRING", "value": "[listKeys(resourceId('Microsoft.SignalRService/signalR', variables('signalrName')), '2023-02-01').primaryConnectionString]" },
-            { "name": "SERVICEBUS_CONNECTION_STRING", "value": "[listKeys(resourceId('Microsoft.ServiceBus/namespaces/AuthorizationRules', variables('serviceBusNamespaceName'), 'RootManageSharedAccessKey'), '2022-10-01-preview').primaryConnectionString]" },
             { "name": "SERVICEBUS_NAMESPACE", "value": "[format('{0}.servicebus.windows.net', variables('serviceBusNamespaceName'))]" },
             { "name": "SERVICEBUS_TOPIC", "value": "[parameters('serviceBusTopicName')]" },
             { "name": "COPILOT_FLOCK_HUB", "value": "copilotbridge" },

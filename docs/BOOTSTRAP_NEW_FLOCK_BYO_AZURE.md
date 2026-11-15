@@ -73,6 +73,25 @@ at the owner, then accept the owner's sealed Welcome with an independently
 verified owner fingerprint. Invitees need no Azure CLI or master connection
 strings. Scope, expiry and explicitly permitted sessions are owner-approved.
 
+### Service Bus authentication and subscription policy
+
+The ARM template defaults `serviceBusDisableLocalAuth` to `true`. Copilot's
+broker-free setup explicitly selects `false` because that transport requires
+separate Manage/Send/Listen SAS policies. Before retrieving keys or starting
+local installation, setup reads the selected namespace's effective
+`disableLocalAuth` value and resource identity. Disabled authentication raises
+`AUTH_MODE_UNSUPPORTED`; missing, denied or unprovable metadata raises
+`POLICY_BLOCKED`. Key retrieval alone does not establish that SAS is usable.
+
+If subscription policy requires local authentication to remain disabled, ask
+Copilot for the **explicit hosted-broker Entra/RBAC setup** instead. It selects
+`serviceBusDisableLocalAuth=true`, creates no SAS authorization rules, and uses
+the broker's system-assigned identity and Service Bus Data Owner assignment.
+It neither reads Service Bus keys nor installs a Service Bus connection string.
+Do not bypass policy, automatically change an existing namespace, or silently
+migrate a broker-free installation to hosting. Hosting requires separate
+approval for B1 charges and role-assignment permissions.
+
 ### Setup selectors used by Copilot
 
 | Windows | Bash | Default |
@@ -89,7 +108,7 @@ strings. Scope, expiry and explicitly permitted sessions are owner-approved.
 
 Advanced operators can deploy the same ARM template with reviewed parameter
 overrides: `location`, `namePrefix`, `uniqueSuffix`, `signalrSku`,
-`serviceBusSku` (Standard only), `serviceBusTopicName`, `deployTokenBroker`,
+`serviceBusSku` (Standard only), `serviceBusTopicName`, `serviceBusDisableLocalAuth`, `deployTokenBroker`,
 `appServiceSku`, `allowedGithubRepo` and `platformMaintainerUser`. The managed
 wrappers use the standard offline topic and public Azure endpoints.
 
@@ -98,6 +117,8 @@ wrappers use the standard offline topic and public Azure endpoints.
 Only `-LegacyBroker` / `--legacy-broker` opts into the old hosted broker:
 Linux Node 22 Web App, B1 plan, persistent storage, system-assigned identity and
 namespace-scoped Service Bus role assignment. B1 incurs additional charges.
+Service Bus local authentication stays disabled; its keys are not placed in Web
+App settings. SignalR signing credentials remain restricted Web App settings.
 This path ZIP-deploys `bootstrap-server.mjs` and `package.json`, polls `/health`
 and requires confirmed broker registration/v3 enrollment. The normalized origin
 is pinned; a conflicting explicit pin fails. Its one-step v3 invites do not
@@ -132,6 +153,19 @@ offline delivery or end-to-end enrollment acceptance. The source and mock
 tests do not establish live Azure deployment, pricing, all-platform support
 or guaranteed latency. Network/proxy policies can still block outbound
 SignalR or Service Bus connections.
+
+Hosted Service Bus MSI requests use `https://servicebus.azure.net` by default.
+`SERVICEBUS_ENTRA_RESOURCE` permits only the explicitly supported sovereign
+Service Bus resource identifiers (`https://servicebus.usgovcloudapi.net` and
+`https://servicebus.chinacloudapi.cn`), not arbitrary URLs or namespace hosts;
+there is no fallback to
+`https://servicebus.windows.net`. Token errors expose only a category/stage,
+HTTP status and an AADSTS code when present, never the identity response or
+token. Subscription PUT must succeed before topic POST; queue results report
+`serviceBusPublished` and redacted `serviceBusCategory`, `serviceBusStage`,
+`serviceBusReason`, `serviceBusStatusCode`. An accepted broker JSON queue entry
+is not proof of Service Bus publication. The hosted queue's drain/ack operations
+remain broker-durable-JSON mediated, not direct Entra client transport.
 
 After an authorized disposable setup, run the explicitly approved
 [live audience/SAS isolation gate](./BROKER_FREE_V34.md#required-live-azure-gate)

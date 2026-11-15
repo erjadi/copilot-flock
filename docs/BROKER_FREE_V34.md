@@ -73,6 +73,15 @@ Canonical and legacy script entrypoints use the same protocol selection.
 
 ## Active transport and authorization
 
+Broker-free Azure transport requires Service Bus SAS/local authentication.
+Copilot's provisioning wrapper explicitly requests
+`serviceBusDisableLocalAuth=false` and verifies the effective namespace setting
+before key reads or installation. Subscription policy can deny or override that
+request. `AUTH_MODE_UNSUPPORTED` / `POLICY_BLOCKED` is a stop, not permission to
+weaken policy or migrate an existing installation. The explicitly selected
+hosted-broker Entra/RBAC path keeps local authentication disabled and preserves
+legacy broker/device semantics; it is not direct broker-free Entra support.
+
 The shared Serverless SignalR hub is `copilotbridge`; the Standard Service Bus
 topic is `copilot-bridge-offline`. Group traffic is encrypted, not isolated by
 separate v3 broker hubs. Every envelope derives its AES-256-GCM key using
@@ -302,6 +311,34 @@ network failures do not count as isolation. Cleanup attempts deletion of
 both exact fixture subscriptions and reports failures. Never point it at
 enrolled/production resources, infer permission from environment flags, or
 mark an unexecuted gate passed.
+
+For an explicitly approved **hosted** deployment, the same harness accepts a
+private configuration with `serviceBusAuth: "entra-rbac"`, `disposable: true`,
+`serviceBusDisableLocalAuth: true`, `signalrEndpoint`, `serviceBusEndpoint`,
+`bootstrapUrl`, and the verified maintainer's `githubUser` / `githubUserId`.
+All three endpoints must match the independent SignalR, Service Bus and
+`COPILOT_FLOCK_LIVE_BOOTSTRAP_ENDPOINT` pins derived from that disposable
+deployment. The isolated runner supplies its existing authorized GitHub token
+through `COPILOT_FLOCK_LIVE_GITHUB_TOKEN`; never publish it or the private
+configuration. Provisioning evidence must confirm effective
+`disableLocalAuth=true`, the broker's system-assigned identity, and its exact
+namespace-scoped Service Bus Data Owner assignment.
+
+The hosted gate creates two fresh Ed25519 devices and exercises signed
+enqueue/drain/ack/leave, cross-peer and guest denials, invalid signatures, and
+departed-device denial. Only authorization/transient provider categories can
+retry for at most 180 seconds; MSI configuration/rejection (including an
+AADSTS code) and client errors stop immediately. Its receipt uses the labels
+`broker-msi-subscription-put-and-topic-publish`,
+`broker-durable-json-own-queue-drain-and-ack`, and
+`broker-msi-subscription-delete-on-leave`. The MSI resource is explicitly
+`https://servicebus.azure.net`. This proves broker MSI publication/deletion
+and broker-durable-JSON queue mediation, **not** direct Entra client Listen or
+the broker-free SAS isolation gate. Global `LocalAuthDisabled` responses are
+auth-mode blockers, never successful negative controls. Original authorization
+failures and cleanup failures are both retained. Afterwards, synchronously
+remove only the approved fresh disposable resource group and verify absence;
+incomplete teardown keeps the gate pending.
 
 The distinct wrong-hub fixture is `fixture_forbidden`, shared by the REST and
 WebSocket probes. [Azure's documented hub-name syntax](https://learn.microsoft.com/en-us/azure/azure-signalr/swagger/signalr-data-plane-rest-v1)

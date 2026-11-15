@@ -21,12 +21,15 @@ const outputs = (changes = {}) => Object.fromEntries(Object.entries({ ...values,
   .map(([key, value]) => [key, { type: "string", value }]));
 const signalr = "Endpoint=https://demo-signalr.service.signalr.net;AccessKey=synthetic-secret;";
 const serviceBus = "Endpoint=sb://demo-sb.servicebus.windows.net/;SharedAccessKeyName=RootManageSharedAccessKey;SharedAccessKey=synthetic-secret;";
+const namespaceMetadata = { name: values.serviceBusNamespaceName, disableLocalAuth: false,
+  id: `/subscriptions/${subscription}/resourceGroups/rg-demo/providers/Microsoft.ServiceBus/namespaces/demo-sb` };
 
 function adapters(overrides = {}) {
   const events = [];
   return { events,
     runAz: async (args) => {
       events.push(["az", args]);
+      if (args[0] === "servicebus" && args[2] === "show") return JSON.stringify(namespaceMetadata);
       return JSON.stringify({ primaryConnectionString: args[0] === "signalr" ? signalr
         : serviceBus.replace("RootManageSharedAccessKey", args[args.indexOf("--name") + 1]) });
     },
@@ -51,6 +54,7 @@ cp.execFileSync = (command, argv, options) => {
   const args = process.platform === "win32" ? JSON.parse(options.env.COPILOT_FLOCK_AZ_ARGS) : argv;
   assert.equal(command, process.platform === "win32" ? "powershell.exe" : "az");
   calls++;
+  if (args[0] === "servicebus" && args[2] === "show") return ${JSON.stringify(JSON.stringify(namespaceMetadata))};
   return JSON.stringify({ primaryConnectionString: args[0] === "signalr"
     ? ${JSON.stringify(signalr)}
     : ${JSON.stringify(serviceBus)}.replace("RootManageSharedAccessKey", args[args.indexOf("--name") + 1]) });
@@ -62,7 +66,7 @@ await runManagedSetup(${JSON.stringify(outputs({ webAppName: "", bootstrapUrl: "
   ${JSON.stringify({ ...options, legacyBroker: false })}, {
     install: async () => { installed = true; return {}; },
   });
-assert.equal(calls, 4);
+assert.equal(calls, 5);
 assert.equal(installed, true);
 `;
   const result = spawnSync(process.execPath, ["--input-type=module", "-e", script], {
@@ -71,13 +75,119 @@ assert.equal(installed, true);
   assert.equal(result.status, 0, result.stderr);
 });
 
+test("hosted MSI audience, terminal token failures, PUT-gates-POST, leave classifications and signed live-gate flow are secret-safe", () => {
+  const script = `
+import assert from "node:assert/strict";
+import fs from "node:fs"; import os from "node:os"; import path from "node:path";
+import http from "node:http"; import https from "node:https";
+import { EventEmitter } from "node:events";
+import { syncBuiltinESMExports } from "node:module";
+process.env.SERVICEBUS_NAMESPACE="demo-sb.servicebus.windows.net";
+process.env.SIGNALR_CONNECTION_STRING=${JSON.stringify(signalr)};
+process.env.PLATFORM_MAINTAINER_USER="demo-owner";
+delete process.env.SERVICEBUS_ENTRA_RESOURCE;
+delete process.env.IDENTITY_ENDPOINT; delete process.env.MSI_ENDPOINT;
+delete process.env.IDENTITY_HEADER; delete process.env.MSI_SECRET;
+const calls=[]; let msiStatus=400; let putStatus=201; let postStatus=202; let deleteStatus=204;
+const mock=(url, options, callback) => {
+ if(typeof options==="function") {callback=options;options=url;url=null;}
+ const identity=url instanceof URL && url.hostname==="127.0.0.1";
+ const req=new EventEmitter(); req.destroy=()=>{};req.write=()=>{};
+ req.end=()=>queueMicrotask(()=>{
+  const hostname=options.hostname || url?.hostname;
+  calls.push(identity?{resource:url.searchParams.get("resource")}:{method:options.method,host:hostname});
+  const response=new EventEmitter();
+  response.statusCode=identity?msiStatus:hostname==="demo-sb.servicebus.windows.net"
+    ? options.method==="PUT"?putStatus:options.method==="POST"?postStatus:deleteStatus : 202;
+  response.resume=()=>{};
+  callback(response);
+  if(identity) response.emit("data",msiStatus===200?JSON.stringify({access_token:"SECRET_MSI_TOKEN",expires_on:String(Math.floor(Date.now()/1000)+3600)}):"AADSTS500011 SECRET_ERROR_RESPONSE");
+  response.emit("end");
+ });
+ return req;
+};
+http.request=mock;https.request=mock;syncBuiltinESMExports();
+const broker=await import(${JSON.stringify(new URL("../bootstrap-server.mjs", import.meta.url).href)});
+assert.equal(broker.DEFAULT_SERVICEBUS_RESOURCE,"https://servicebus.azure.net");
+assert.equal((await broker.acquireServiceBusTokenDetailed()).category,"msi_unconfigured");
+process.env.IDENTITY_ENDPOINT="http://127.0.0.1/identity";process.env.IDENTITY_HEADER="SECRET_IDENTITY_HEADER";
+let result=await broker.acquireServiceBusTokenDetailed();
+assert.equal(result.category,"msi_token_rejected");assert.equal(result.reason,"AADSTS500011");
+assert.doesNotMatch(JSON.stringify(result),/SECRET/);
+assert.equal(calls.at(-1).resource,"https://servicebus.azure.net");
+for(const status of [429,503]){
+ msiStatus=status;assert.equal((await broker.acquireServiceBusTokenDetailed()).category,"msi_transient_error");
+}
+msiStatus=200;
+await broker.acquireServiceBusTokenDetailed();const cachedCalls=calls.length;
+await broker.acquireServiceBusTokenDetailed();assert.equal(calls.length,cachedCalls);
+process.env.SERVICEBUS_ENTRA_RESOURCE="https://servicebus.usgovcloudapi.net";
+await broker.acquireServiceBusTokenDetailed();assert.equal(calls.length,cachedCalls+1);
+process.env.SERVICEBUS_ENTRA_RESOURCE="https://servicebus.windows.net/";
+assert.equal((await broker.acquireServiceBusTokenDetailed()).category,"msi_unconfigured");
+delete process.env.SERVICEBUS_ENTRA_RESOURCE;
+let injected=0;const tokenProvider=async()=>{injected++;return "SECRET_INJECTED_TOKEN";};
+await broker.acquireServiceBusTokenDetailed({tokenProvider});await broker.acquireServiceBusTokenDetailed({tokenProvider});
+assert.equal(injected,2);
+const entry={requestId:"fixture-request",toMachine:"FIXTURE-PEER"};
+for(const [status,category] of [[401,"servicebus_authz_denied"],[403,"servicebus_authz_denied"],
+ [404,"servicebus_client_error"],[429,"servicebus_transient_error"],[500,"servicebus_transient_error"]]){
+ putStatus=status;const before=calls.length;
+ result=await broker.publishToServiceBusRest(entry,60,{tokenProvider});
+ assert.equal(result.published,false);assert.equal(result.category,category);assert.equal(result.stage,"subscription_put");
+ assert.equal(result.reason,"subscription_ensure_failed");assert.equal(calls.length,before+1);
+ assert.doesNotMatch(JSON.stringify(result),/SECRET/);
+}
+putStatus=201;postStatus=403;
+result=await broker.publishToServiceBusRest(entry,60,{tokenProvider});
+assert.equal(result.published,false);assert.equal(result.stage,"topic_post");assert.equal(result.category,"servicebus_authz_denied");
+postStatus=202;
+assert.equal((await broker.publishToServiceBusRest(entry,60,{tokenProvider})).published,true);
+for(const status of [200,204,404,403]){
+ deleteStatus=status;
+ result=await broker.deleteLegacyPeerSubscription({machineId:"FIXTURE-PEER"},{tokenProvider});
+ assert.equal(result.confirmed,status!==403);assert.equal(result.stage,"subscription_delete");
+ if(status===403) assert.equal(result.category,"servicebus_authz_denied");
+}
+deleteStatus=204;
+const root=fs.mkdtempSync(path.join(os.tmpdir(),"flock-entra-gate-test-"));
+const server=broker.createBootstrapServer({v3StorePath:path.join(root,"v3.json"),membersPath:path.join(root,"members.json"),
+ queuePath:path.join(root,"queue.json"),serviceBusTokenProvider:tokenProvider,
+ apiGet:async(route)=>route==="/user"?{statusCode:200,body:{login:"demo-owner",id:1001}}:
+ {statusCode:200,body:{full_name:"erjadi/copilot-flock",permissions:{push:true}}}});
+await new Promise(resolve=>server.listen(0,"127.0.0.1",resolve));
+try {
+ const {runHostedEntraGate}=await import(${JSON.stringify(new URL("./azure-hosted-gate.mjs", import.meta.url).href)});
+ const diagnostics=[];
+ const config={disposable:true,serviceBusAuth:"entra-rbac",serviceBusDisableLocalAuth:true,
+  signalrEndpoint:"https://demo-signalr.service.signalr.net",serviceBusEndpoint:"https://demo-sb.servicebus.windows.net",
+  bootstrapUrl:"https://demo-broker.azurewebsites.net",githubUser:"demo-owner",githubUserId:1001};
+ await runHostedEntraGate({diagnostic:value=>diagnostics.push(value)},config,{
+  pins:{signalr:config.signalrEndpoint,serviceBus:config.serviceBusEndpoint,bootstrap:config.bootstrapUrl},
+  maintainerToken:"fixture-maintainer",fetchImpl:(url,options)=>fetch("http://127.0.0.1:"+server.address().port+new URL(url).pathname,options)});
+ assert.ok(diagnostics.some(value=>value.includes("broker-msi-subscription-put-and-topic-publish")));
+ assert.ok(diagnostics.some(value=>value.includes("broker-durable-json-own-queue-drain-and-ack")));
+ assert.ok(diagnostics.some(value=>value.includes("broker-msi-subscription-delete-on-leave")));
+ assert.doesNotMatch(diagnostics.join(""),/SECRET|topic-send-and-own-subscription-listen/);
+}finally{server.closeAllConnections();await new Promise(resolve=>server.close(resolve));fs.rmSync(root,{recursive:true,force:true});}
+`;
+  const result = spawnSync(process.execPath, ["--input-type=module", "-e", script], {
+    encoding: "utf8", timeout: 30000, windowsHide: true,
+  });
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
+});
+
 test("complete conditional ARM stack wires runtime, credentials, persistent storage, identity and namespace role", () => {
   const template = JSON.parse(fs.readFileSync(path.join(root, "infra", "azuredeploy.json"), "utf8"));
   assert.equal(template.parameters.deployTokenBroker.defaultValue, false);
+  assert.equal(template.parameters.serviceBusDisableLocalAuth.defaultValue, true);
+  assert.equal(template.resources.find((r) => r.type === "Microsoft.ServiceBus/namespaces").properties.disableLocalAuth,
+    "[parameters('serviceBusDisableLocalAuth')]");
   assert.deepEqual(template.resources.filter((r) => !r.condition && r.type.split("/").length === 2).map((r) => r.type),
     ["Microsoft.SignalRService/signalR", "Microsoft.ServiceBus/namespaces"]);
   const policies = template.resources.filter((r) => r.type.endsWith("/AuthorizationRules"));
   assert.deepEqual(policies.map((r) => r.properties.rights), [["Send"], ["Listen"]]);
+  assert.ok(policies.every((r) => r.condition === "[not(parameters('serviceBusDisableLocalAuth'))]"));
   assert.equal(template.parameters.appServiceSku.defaultValue, "B1");
   assert.equal(template.parameters.allowedGithubRepo.defaultValue, "erjadi/copilot-flock");
   for (const name of ["signalrName", "serviceBusNamespaceName", "webAppName", "appServicePlanName"]) {
@@ -100,7 +210,7 @@ test("complete conditional ARM stack wires runtime, credentials, persistent stor
   assert.match(template.variables.serviceBusDataOwnerRole, /090c5cfd-751d-490a-894a-3ce6f1109419/);
   const settings = Object.fromEntries(site.properties.siteConfig.appSettings.map((s) => [s.name, s.value]));
   assert.match(settings.SIGNALR_CONNECTION_STRING, /listKeys/);
-  assert.match(settings.SERVICEBUS_CONNECTION_STRING, /RootManageSharedAccessKey/);
+  assert.equal(settings.SERVICEBUS_CONNECTION_STRING, undefined);
   assert.match(settings.SERVICEBUS_NAMESPACE, /servicebus\.windows\.net/);
   assert.equal(settings.SERVICEBUS_TOPIC, "[parameters('serviceBusTopicName')]");
   assert.equal(settings.PLATFORM_MAINTAINER_USER, "[parameters('platformMaintainerUser')]");
@@ -116,18 +226,17 @@ test("managed installation pins key reads and broker origin, deploys temporary Z
   const a = adapters();
   const old = process.env.COPILOT_FLOCK_ALLOWED_BOOTSTRAP_ORIGIN;
   await runManagedSetup(outputs(), options, a);
-  assert.deepEqual(a.events.map((e) => e[0]), ["az", "az", "zip", "az", "health", "install"]);
+  assert.deepEqual(a.events.map((e) => e[0]), ["az", "zip", "az", "health", "install"]);
   for (const [, args] of a.events.filter((e) => e[0] === "az")) {
     assert.equal(args[args.indexOf("--subscription") + 1], subscription);
     assert.equal(args[args.indexOf("--resource-group") + 1], "rg-demo");
     assert.ok(!args.some((arg) => arg.includes("synthetic-secret")));
   }
   assert.ok(a.events[0][1].includes("demo-signalr"));
-  assert.ok(a.events[1][1].includes("demo-sb"));
-  assert.ok(a.events[1][1].includes("RootManageSharedAccessKey"));
+  assert.ok(!a.events.some((e) => e[0] === "az" && e[1][0] === "servicebus"));
   const installed = a.events.at(-1);
   assert.equal(installed[1].connectionStringArg, signalr);
-  assert.equal(installed[1].serviceBusConnectionStringArg, serviceBus);
+  assert.equal(Object.hasOwn(installed[1], "serviceBusConnectionStringArg"), false);
   assert.equal(installed[1].bootstrapUrlArg, values.bootstrapUrl);
   assert.equal(installed[2], values.bootstrapUrl);
   assert.equal(process.env.COPILOT_FLOCK_ALLOWED_BOOTSTRAP_ORIGIN, old);
@@ -137,12 +246,36 @@ test("managed installation pins key reads and broker origin, deploys temporary Z
 test("default broker-free has separate scoped policy reads and no ZIP, webapp, health or bootstrap origin", async () => {
   const a = adapters();
   await runManagedSetup(outputs({ webAppName: "", bootstrapUrl: "" }), { ...options, legacyBroker: undefined }, a);
-  assert.deepEqual(a.events.map((e) => e[0]), ["az", "az", "az", "az", "install"]);
+  assert.deepEqual(a.events.map((e) => e[0]), ["az", "az", "az", "az", "az", "install"]);
+  assert.deepEqual(a.events[0][1].slice(0, 3), ["servicebus", "namespace", "show"]);
   assert.equal(a.events.at(-1)[1].bootstrapUrlArg, null);
   assert.equal(a.events.at(-1)[1].protocolArg, "broker-free-v34");
   assert.equal(a.events.at(-1)[1].flockIdArg, "demo-owner/personal");
   assert.match(a.events.at(-1)[1].serviceBusSendConnectionStringArg, /SharedAccessKeyName=FlockSendRule;/);
   assert.match(a.events.at(-1)[1].serviceBusListenConnectionStringArg, /SharedAccessKeyName=FlockListenRule;/);
+});
+
+test("broker-free setup rejects disabled, missing, malformed, denied and foreign-resource local-auth metadata before reading any keys", async () => {
+  for (const [value, code] of [
+    [{ ...namespaceMetadata, disableLocalAuth: true }, "AUTH_MODE_UNSUPPORTED"],
+    [{ ...namespaceMetadata, disableLocalAuth: undefined }, "POLICY_BLOCKED"],
+    [{ ...namespaceMetadata, disableLocalAuth: "false" }, "POLICY_BLOCKED"],
+    [{ ...namespaceMetadata, id: "/subscriptions/foreign" }, "POLICY_BLOCKED"],
+    [null, "POLICY_BLOCKED"], ["malformed", "POLICY_BLOCKED"], ["denied", "POLICY_BLOCKED"],
+  ]) {
+    let reads = 0;
+    const a = adapters({ runAz: async (args) => {
+      reads++;
+      assert.deepEqual(args.slice(0, 3), ["servicebus", "namespace", "show"]);
+      if (value === "denied") throw Error("synthetic-secret");
+      return value === "malformed" ? "synthetic-secret" : JSON.stringify(value);
+    } });
+    await assert.rejects(runManagedSetup(outputs({ webAppName: "", bootstrapUrl: "" }),
+      { ...options, legacyBroker: false }, a), (error) =>
+      error.code === code && !error.message.includes("synthetic-secret"));
+    assert.equal(reads, 1);
+    assert.equal(a.events.length, 0);
+  }
 });
 
 test("invalid metadata and legacy secret outputs reject before key reads or initialization", async () => {

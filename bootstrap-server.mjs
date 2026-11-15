@@ -45,8 +45,19 @@ const V3_FLOCKS_PATH = path.join(DATA_DIR, "v3-flocks.json");
 const V3_PREVIEW_FLOCKS_PATH = path.join(DATA_DIR, "v3-preview-flocks.json");
 const V3_PREVIEW_QUEUE_PATH = path.join(DATA_DIR, "v3-preview-queue.json");
 
-let cachedSbToken = null;
-let cachedSbTokenExpiresAt = 0;
+export const DEFAULT_SERVICEBUS_RESOURCE = "https://servicebus.azure.net";
+const serviceBusTokens = new Map();
+const serviceBusResources = new Set([DEFAULT_SERVICEBUS_RESOURCE,
+  "https://servicebus.usgovcloudapi.net", "https://servicebus.chinacloudapi.cn"]);
+
+function serviceBusResource() {
+  const value = process.env.SERVICEBUS_ENTRA_RESOURCE || DEFAULT_SERVICEBUS_RESOURCE;
+  return serviceBusResources.has(value.replace(/\/$/, "")) ? value.replace(/\/$/, "") : null;
+}
+
+function serviceBusFailure(category, stage, reason, statusCode = null) {
+  return { ok: false, category, stage, reason, statusCode };
+}
 
 function sanitizeSbEntityName(name) {
   return String(name || "unknown")
@@ -57,20 +68,37 @@ function sanitizeSbEntityName(name) {
     .slice(0, 48);
 }
 
-async function acquireServiceBusToken() {
+export async function acquireServiceBusTokenDetailed({ tokenProvider } = {}) {
   const now = Date.now();
-  if (cachedSbToken && now < cachedSbTokenExpiresAt - 60000) {
-    return cachedSbToken;
+  const resource = serviceBusResource();
+  if (!resource) return serviceBusFailure("msi_unconfigured", "msi_token", "invalid_servicebus_resource");
+  if (tokenProvider) {
+    try {
+      const provided = await tokenProvider(resource);
+      if (typeof provided === "string" && provided) return { ok: true, token: provided, resource };
+      return serviceBusFailure("msi_token_rejected", "msi_token", "invalid_test_token_response");
+    } catch (error) {
+      const aadsts = String(error?.message || "").match(/\bAADSTS\d{5,9}\b/)?.[0];
+      return serviceBusFailure(aadsts ? "msi_token_rejected" : "msi_transient_error", "msi_token",
+        aadsts || "test_token_provider_unavailable");
+    }
   }
   const endpoint = process.env.IDENTITY_ENDPOINT || process.env.MSI_ENDPOINT;
   const header = process.env.IDENTITY_HEADER || process.env.MSI_SECRET;
-  if (!endpoint || !header) return null;
+  if (!endpoint || !header) return serviceBusFailure("msi_unconfigured", "msi_token", "identity_endpoint_unconfigured");
+  const cached = serviceBusTokens.get(resource);
+  if (cached && now < cached.expiresAt - 60000) return { ok: true, ...cached, resource };
 
   return new Promise((resolve) => {
+    let settled = false;
+    const finish = (result) => { if (!settled) { settled = true; resolve(result); } };
     try {
       const u = new URL(endpoint);
+      if (!["http:", "https:"].includes(u.protocol) || u.username || u.password) {
+        return finish(serviceBusFailure("msi_unconfigured", "msi_token", "invalid_identity_endpoint"));
+      }
       u.searchParams.set("api-version", process.env.IDENTITY_ENDPOINT ? "2019-08-01" : "2017-09-01");
-      u.searchParams.set("resource", "https://servicebus.windows.net/");
+      u.searchParams.set("resource", resource);
       const mod = u.protocol === "https:" ? https : http;
       const headers = process.env.IDENTITY_ENDPOINT
         ? { "X-IDENTITY-HEADER": header, Metadata: "true" }
@@ -80,122 +108,103 @@ async function acquireServiceBusToken() {
         { method: "GET", headers, timeout: 5000 },
         (res) => {
           let data = "";
-          res.on("data", (c) => (data += c));
+          res.on("data", (c) => {
+            if (data.length + c.length > 65536) {
+              finish(serviceBusFailure("msi_token_rejected", "msi_token", "oversized_token_response", res.statusCode));
+              req.destroy();
+            } else data += c;
+          });
+          res.on("error", () => finish(serviceBusFailure("msi_transient_error", "msi_token", "token_response_failed")));
           res.on("end", () => {
+            if (settled) return;
+            const status = res.statusCode || 500;
+            if (status === 429 || status >= 500) {
+              return finish(serviceBusFailure("msi_transient_error", "msi_token", "identity_endpoint_unavailable", status));
+            }
+            if (status < 200 || status >= 300) {
+              return finish(serviceBusFailure("msi_token_rejected", "msi_token",
+                data.match(/\bAADSTS\d{5,9}\b/)?.[0] || "token_request_rejected", status));
+            }
             try {
               const j = JSON.parse(data);
-              if (j?.access_token) {
-                cachedSbToken = j.access_token;
-                const expSec = Number(j.expires_on);
-                cachedSbTokenExpiresAt = expSec > 1e9 ? expSec * 1000 : Date.now() + 1800000;
-                return resolve(cachedSbToken);
+              const expiresAt = Number(j.expires_on) > 1e9 ? Number(j.expires_on) * 1000 : Date.parse(j.expires_on);
+              if (typeof j?.access_token === "string" && j.access_token && Number.isFinite(expiresAt) && expiresAt > now) {
+                const credential = { token: j.access_token, expiresAt };
+                serviceBusTokens.set(resource, credential);
+                return finish({ ok: true, ...credential, resource });
               }
             } catch {}
-            resolve(null);
+            finish(serviceBusFailure("msi_token_rejected", "msi_token", "invalid_token_response", status));
           });
         }
       );
-      req.on("error", () => resolve(null));
+      req.on("error", () => finish(serviceBusFailure("msi_transient_error", "msi_token", "token_request_failed")));
       req.on("timeout", () => {
+        finish(serviceBusFailure("msi_transient_error", "msi_token", "token_request_timeout"));
         req.destroy();
-        resolve(null);
       });
       req.end();
     } catch {
-      resolve(null);
+      finish(serviceBusFailure("msi_unconfigured", "msi_token", "invalid_identity_endpoint"));
+    }
+  });
+}
+
+function requestServiceBus({ token, method, apiPath, stage, body, ttlSeconds, messageId, machineId }) {
+  return new Promise((resolve) => {
+    try {
+      const req = https.request({
+        hostname: SERVICEBUS_NAMESPACE, port: 443, path: apiPath, method, timeout: 6000,
+        headers: { Authorization: `Bearer ${token}`,
+          ...(body ? { "Content-Type": stage === "subscription_put" ? "application/atom+xml;type=entry;charset=utf-8" : "application/json; charset=utf-8",
+            "Content-Length": Buffer.byteLength(body) } : {}),
+          ...(stage === "topic_post" ? { BrokerProperties: JSON.stringify({ MessageId: messageId,
+            TimeToLive: Math.max(60, Number(ttlSeconds) || 86400), Label: String(machineId || "").toLowerCase() }),
+          toMachine: JSON.stringify(String(machineId || "").toLowerCase()) } : {}) },
+      }, (res) => {
+        res.resume();
+        res.on("error", () => resolve(serviceBusFailure("servicebus_transient_error", stage, "response_failed")));
+        res.on("end", () => {
+          const statusCode = res.statusCode || 500;
+          if ((statusCode >= 200 && statusCode < 300) || (method === "DELETE" && statusCode === 404)) {
+            return resolve({ ok: true, category: "servicebus_ok", stage, reason: null, statusCode });
+          }
+          resolve(serviceBusFailure([401, 403].includes(statusCode) ? "servicebus_authz_denied"
+            : statusCode === 429 || statusCode >= 500 ? "servicebus_transient_error" : "servicebus_client_error",
+          stage, "servicebus_request_rejected", statusCode));
+        });
+      });
+      req.on("error", () => resolve(serviceBusFailure("servicebus_transient_error", stage, "request_failed")));
+      req.on("timeout", () => { resolve(serviceBusFailure("servicebus_transient_error", stage, "request_timeout")); req.destroy(); });
+      req.end(body);
+    } catch {
+      resolve(serviceBusFailure("servicebus_client_error", stage, "invalid_servicebus_request"));
     }
   });
 }
 
 async function ensureServiceBusSubscription(sbToken, machineId) {
-  if (!sbToken || !SERVICEBUS_NAMESPACE || !SERVICEBUS_TOPIC || !machineId) return false;
+  if (!sbToken || !SERVICEBUS_NAMESPACE || !SERVICEBUS_TOPIC || !machineId) {
+    return serviceBusFailure("msi_unconfigured", "subscription_put", "servicebus_namespace_unconfigured");
+  }
   const subName = `sub-${sanitizeSbEntityName(machineId)}`;
   const bodyXml = `<entry xmlns="http://www.w3.org/2005/Atom"><content type="application/xml"><SubscriptionDescription xmlns="http://schemas.microsoft.com/netservices/2010/10/servicebus/connect" xmlns:i="http://www.w3.org/2001/XMLSchema-instance"><LockDuration>PT1M</LockDuration><RequiresSession>false</RequiresSession><DefaultMessageTimeToLive>P1D</DefaultMessageTimeToLive><DeadLetteringOnMessageExpiration>false</DeadLetteringOnMessageExpiration><MaxDeliveryCount>10</MaxDeliveryCount></SubscriptionDescription></content></entry>`;
 
-  const putXml = (apiPath, xml) =>
-    new Promise((resolve) => {
-      const payload = Buffer.from(xml, "utf8");
-      const req = https.request(
-        {
-          hostname: SERVICEBUS_NAMESPACE,
-          port: 443,
-          path: apiPath,
-          method: "PUT",
-          headers: {
-            Authorization: `Bearer ${sbToken}`,
-            "Content-Type": "application/atom+xml;type=entry;charset=utf-8",
-            "Content-Length": payload.length,
-          },
-          timeout: 6000,
-        },
-        (res) => {
-          res.resume();
-          res.on("end", () => resolve(res.statusCode || 500));
-        }
-      );
-      req.on("error", () => resolve(500));
-      req.on("timeout", () => {
-        req.destroy();
-        resolve(504);
-      });
-      req.write(payload);
-      req.end();
-    });
-
-  const status = await putXml(
-    `/${encodeURIComponent(SERVICEBUS_TOPIC)}/subscriptions/${encodeURIComponent(subName)}?api-version=2017-04`,
-    bodyXml
-  );
-  return status >= 200 && status < 300;
+  return requestServiceBus({ token: sbToken, method: "PUT", stage: "subscription_put",
+    apiPath: `/${encodeURIComponent(SERVICEBUS_TOPIC)}/subscriptions/${encodeURIComponent(subName)}?api-version=2017-04`,
+    body: bodyXml });
 }
 
-async function publishToServiceBusRest(item, ttlSeconds = 86400) {
-  const sbToken = await acquireServiceBusToken();
-  if (!sbToken || !SERVICEBUS_NAMESPACE || !SERVICEBUS_TOPIC) {
-    return { published: false, reason: "no_msi_token" };
-  }
-  await ensureServiceBusSubscription(sbToken, item.toMachine);
+export async function publishToServiceBusRest(item, ttlSeconds = 86400, { tokenProvider } = {}) {
+  const authorization = await acquireServiceBusTokenDetailed({ tokenProvider });
+  if (!authorization.ok) return { published: false, ...authorization };
+  const subscription = await ensureServiceBusSubscription(authorization.token, item.toMachine);
+  if (!subscription.ok) return { published: false, ...subscription, reason: "subscription_ensure_failed" };
   const body = Buffer.from(JSON.stringify(item), "utf8");
-  const brokerProps = JSON.stringify({
-    MessageId: item.requestId,
-    TimeToLive: Math.max(60, Number(ttlSeconds) || 86400),
-    Label: String(item.toMachine || "").toLowerCase(),
-  });
-
-  return new Promise((resolve) => {
-    const req = https.request(
-      {
-        hostname: SERVICEBUS_NAMESPACE,
-        port: 443,
-        path: `/${encodeURIComponent(SERVICEBUS_TOPIC)}/messages?api-version=2017-04`,
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${sbToken}`,
-          "Content-Type": "application/json; charset=utf-8",
-          "Content-Length": body.length,
-          BrokerProperties: brokerProps,
-          toMachine: JSON.stringify(String(item.toMachine || "").toLowerCase()),
-        },
-        timeout: 6000,
-      },
-      (res) => {
-        res.resume();
-        res.on("end", () => {
-          resolve({
-            published: (res.statusCode || 500) >= 200 && (res.statusCode || 500) < 300,
-            statusCode: res.statusCode,
-          });
-        });
-      }
-    );
-    req.on("error", (err) => resolve({ published: false, error: err.message }));
-    req.on("timeout", () => {
-      req.destroy();
-      resolve({ published: false, error: "timeout" });
-    });
-    req.write(body);
-    req.end();
-  });
+  const result = await requestServiceBus({ token: authorization.token, method: "POST", stage: "topic_post",
+    apiPath: `/${encodeURIComponent(SERVICEBUS_TOPIC)}/messages?api-version=2017-04`,
+    body, ttlSeconds, messageId: item.requestId, machineId: item.toMachine });
+  return { published: result.ok, ...result };
 }
 
 let queueStoreMutex = Promise.resolve();
@@ -274,6 +283,17 @@ export async function enqueueOfflineStoreItem({
   // Perform async Service Bus publish outside the file lock, then serialize file read-modify-write inside the mutex
   const sbRes = publishFn ? await publishFn(entry, safeTtl) : { published: false };
   entry.serviceBusPublished = Boolean(sbRes?.published);
+  entry.serviceBusCategory = ["msi_unconfigured", "msi_token_rejected", "msi_transient_error",
+    "servicebus_authz_denied", "servicebus_client_error", "servicebus_transient_error", "servicebus_ok"].includes(sbRes?.category)
+    ? sbRes.category : "servicebus_transient_error";
+  entry.serviceBusStage = ["msi_token", "subscription_put", "topic_post"].includes(sbRes?.stage) ? sbRes.stage : null;
+  entry.serviceBusReason = ["invalid_servicebus_resource", "invalid_test_token_response", "test_token_provider_unavailable",
+    "identity_endpoint_unconfigured", "invalid_identity_endpoint", "identity_endpoint_unavailable", "token_request_rejected",
+    "invalid_token_response", "token_response_failed", "token_request_failed", "token_request_timeout", "oversized_token_response",
+    "request_timeout", "request_failed", "response_failed", "servicebus_request_rejected", "servicebus_namespace_unconfigured",
+    "subscription_ensure_failed", "invalid_servicebus_request"].includes(sbRes?.reason) ? sbRes.reason
+      : /^AADSTS\d{5,9}$/.test(sbRes?.reason || "") ? sbRes.reason : null;
+  entry.serviceBusStatusCode = Number.isInteger(sbRes?.statusCode) && sbRes.statusCode >= 100 && sbRes.statusCode <= 599 ? sbRes.statusCode : null;
   entry.serviceBusNamespace = SERVICEBUS_NAMESPACE;
   entry.serviceBusTopic = SERVICEBUS_TOPIC;
 
@@ -301,6 +321,10 @@ export async function enqueueOfflineStoreItem({
       serviceBusNamespace: SERVICEBUS_NAMESPACE,
       serviceBusTopic: SERVICEBUS_TOPIC,
       serviceBusPublished: entry.serviceBusPublished,
+      serviceBusReason: entry.serviceBusReason,
+      serviceBusCategory: entry.serviceBusCategory,
+      serviceBusStage: entry.serviceBusStage,
+      serviceBusStatusCode: entry.serviceBusStatusCode,
     };
   });
 }
@@ -1857,17 +1881,15 @@ export async function kickV3FlockMember(
   });
 }
 
-async function deleteLegacyPeerSubscription(member) {
-  const token = await acquireServiceBusToken();
-  if (!token || !SERVICEBUS_NAMESPACE) {
-    return { confirmed: false, reason: "Service Bus management authorization unavailable" };
-  }
+export async function deleteLegacyPeerSubscription(member, { tokenProvider } = {}) {
+  const authorization = await acquireServiceBusTokenDetailed({ tokenProvider });
+  if (!authorization.ok) return { confirmed: false, ...authorization };
+  if (!SERVICEBUS_NAMESPACE) return { confirmed: false,
+    ...serviceBusFailure("msi_unconfigured", "subscription_delete", "servicebus_namespace_unconfigured") };
   const sub = `sub-${sanitizeSbEntityName(member.machineId)}`;
-  const response = await fetch(`https://${SERVICEBUS_NAMESPACE}/${encodeURIComponent(SERVICEBUS_TOPIC)}/subscriptions/${encodeURIComponent(sub)}?api-version=2017-04`, {
-    method: "DELETE", redirect: "error", signal: AbortSignal.timeout(6000),
-    headers: { Authorization: `Bearer ${token}` },
-  });
-  return { confirmed: response.ok || response.status === 404, status: response.status };
+  const result = await requestServiceBus({ token: authorization.token, method: "DELETE", stage: "subscription_delete",
+    apiPath: `/${encodeURIComponent(SERVICEBUS_TOPIC)}/subscriptions/${encodeURIComponent(sub)}?api-version=2017-04` });
+  return { confirmed: result.ok, ...result };
 }
 
 export function planV3DeviceLeave(request, { storePath = V3_FLOCKS_PATH } = {}) {
@@ -2346,6 +2368,7 @@ export function verifyTokenLocalDeviceHttpAuth(
   const store = loadV3FlockStore(storePath);
   const pinnedKeys = new Set();
   const allowedPeerMachines = new Set();
+  const allowedEnqueueMachines = new Set();
   let githubUser = null;
   let githubUserId = null;
   let machineId = null;
@@ -2386,6 +2409,9 @@ export function verifyTokenLocalDeviceHttpAuth(
     }
     for (const peer of activeMembers) {
       if (peer.machineId) allowedPeerMachines.add(String(peer.machineId).toLowerCase());
+      if (peer.machineId && ["owner", "collaborator"].includes(matching.trustTier)) {
+        allowedEnqueueMachines.add(String(peer.machineId).toLowerCase());
+      }
     }
   }
 
@@ -2423,6 +2449,7 @@ export function verifyTokenLocalDeviceHttpAuth(
     githubUserId,
     hasCollaboratorOrOwner,
     allowedPeerMachines,
+    allowedEnqueueMachines,
   };
 }
 
@@ -2434,6 +2461,7 @@ export function createBootstrapServer({
   queuePath = OFFLINE_QUEUE_PATH,
   supportRoot = path.join(path.dirname(v3StorePath), "support-quarantine", "mailbox"),
   supportOptions = {},
+  serviceBusTokenProvider,
 } = {}) {
   const supportMailbox = new SupportMailbox(supportRoot, supportOptions);
   return http.createServer(async (req, res) => {
@@ -2532,6 +2560,7 @@ export function createBootstrapServer({
       serviceBusNamespace: SERVICEBUS_NAMESPACE,
       serviceBusTopic: SERVICEBUS_TOPIC,
       msiConfigured: Boolean(process.env.IDENTITY_ENDPOINT || process.env.MSI_ENDPOINT),
+      serviceBusResource: serviceBusResource(),
       configured: Boolean(process.env.SIGNALR_CONNECTION_STRING),
       registeredMemberCount: Object.keys(registry).length,
       queuedOfflineMessageCount: qStore.items.length,
@@ -2596,7 +2625,9 @@ export function createBootstrapServer({
     if ((subPath === "/flocks/leave" || subPath === "/flocks/leave-plan") && req.method === "POST") {
       try {
         const out = subPath === "/flocks/leave-plan" ? planV3DeviceLeave(bodyData, { storePath })
-          : await leaveV3Device(bodyData, { storePath, membersPath });
+          : await leaveV3Device(bodyData, { storePath, membersPath,
+            ...(serviceBusTokenProvider ? { deleteSubscription: (member) =>
+              deleteLegacyPeerSubscription(member, { tokenProvider: serviceBusTokenProvider }) } : {}) });
         sendJson(res, out.ok ? 200 : 409, out);
       } catch (error) {
         sendJson(res, 403, { ok: false, confirmed: false, error: error.message });
@@ -3176,6 +3207,10 @@ export function createBootstrapServer({
           enqueuedAt: x.enqueuedAt,
           expiresAt: new Date(x.expiresAtMs).toISOString(),
           serviceBusPublished: Boolean(x.serviceBusPublished),
+          serviceBusReason: x.serviceBusReason || null,
+          serviceBusCategory: x.serviceBusCategory || null,
+          serviceBusStage: x.serviceBusStage || null,
+          serviceBusStatusCode: x.serviceBusStatusCode ?? null,
         })),
       });
       return;
@@ -3188,7 +3223,7 @@ export function createBootstrapServer({
       }
       if (deviceAuth) {
         const targetLower = String(bodyData.toMachine || "").trim().toLowerCase();
-        if (!deviceAuth.hasCollaboratorOrOwner || !targetLower || !deviceAuth.allowedPeerMachines.has(targetLower)) {
+        if (!targetLower || !deviceAuth.allowedEnqueueMachines.has(targetLower)) {
           sendJson(res, 403, {
             ok: false,
             error: "Token-local device can only enqueue offline messages to peers in an active shared flock.",
@@ -3204,6 +3239,7 @@ export function createBootstrapServer({
           githubUser,
           machineId: deviceAuth ? deviceAuth.machineId : machineId,
           ttlSeconds: bodyData.ttlSeconds,
+          publishFn: (entry, ttl) => publishToServiceBusRest(entry, ttl, { tokenProvider: serviceBusTokenProvider }),
         });
         sendJson(res, 200, result);
       } catch (err) {
@@ -3251,6 +3287,11 @@ export function createBootstrapServer({
 
     if (url.pathname === "/api/queue/ack") {
       const ackTarget = deviceAuth?.machineId || machineId;
+      if (deviceAuth && bodyData.machineId &&
+          String(bodyData.machineId).trim().toLowerCase() !== String(ackTarget || "").trim().toLowerCase()) {
+        sendJson(res, 403, { ok: false, error: "Token-local device can only acknowledge its own machineId." });
+        return;
+      }
       if (!isMaintainer && !ownsQueue(ackTarget)) {
         sendJson(res, 403, { ok: false, error: "Queue acknowledgement requires ownership of the target machine" });
         return;

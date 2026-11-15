@@ -85,7 +85,7 @@ if ($ProvisionAzure) {
         $ErrorActionPreference = "Continue"
         $DeploymentOutput = & az deployment group create --subscription $SubscriptionId --resource-group $ResourceGroup `
             --template-file (Join-Path $ScriptDir "infra\azuredeploy.json") `
-            --parameters "location=$Location" "namePrefix=$NamePrefix" "deployTokenBroker=$((-not $SkipBroker).ToString().ToLowerInvariant())" "platformMaintainerUser=$GitHubUser" `
+            --parameters "location=$Location" "namePrefix=$NamePrefix" "deployTokenBroker=$((-not $SkipBroker).ToString().ToLowerInvariant())" "serviceBusDisableLocalAuth=$((-not $SkipBroker).ToString().ToLowerInvariant())" "platformMaintainerUser=$GitHubUser" `
             --query "properties.outputs" --output json 2>$null
         $DeploymentStatus = $LASTEXITCODE
     } finally {

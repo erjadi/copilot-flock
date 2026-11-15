@@ -237,6 +237,8 @@ test("managed ARM template deploys Serverless SignalR and Standard Service Bus w
   assert.deepEqual(signalr.properties.cors.allowedOrigins, ["*"]);
   assert.equal(serviceBus.apiVersion, "2022-10-01-preview");
   assert.equal(serviceBus.sku.name, "[parameters('serviceBusSku')]");
+  assert.equal(template.parameters.serviceBusDisableLocalAuth.defaultValue, true);
+  assert.equal(serviceBus.properties.disableLocalAuth, "[parameters('serviceBusDisableLocalAuth')]");
   assert.ok(topic.dependsOn.includes("[resourceId('Microsoft.ServiceBus/namespaces', variables('serviceBusNamespaceName'))]"));
   assert.equal(template.parameters.serviceBusTopicName.defaultValue, "copilot-bridge-offline");
   assert.ok(template.outputs.bootstrapUrl && template.outputs.webAppName);

@@ -5,19 +5,28 @@ import crypto from "node:crypto";
 import { AzureTransport, azureEndpoints, parseAzureConnection, HUB, TOPIC, jwt, sas } from "../flock-azure.mjs";
 import { createDeviceIdentity, createOwnerState, createJoinCode, approveJoin, acceptWelcome, ownerFingerprint, peerSubscription } from "../flock-protocol.mjs";
 import { connectSignalRClient } from "../flock.mjs";
-import { OTHER_HUB, createOtherHubClientControl, runAzureNegativeProbes, classifySignalRClientDenial } from "./azure-negative-probes.mjs";
+import { OTHER_HUB, createOtherHubClientControl, runAzureNegativeProbes, classifySignalRClientDenial, withAzureGateCleanup } from "./azure-negative-probes.mjs";
+import { runHostedEntraGate } from "./azure-hosted-gate.mjs";
+import { REQUIRED_RUNTIME_MODULES } from "../flock-lifecycle.mjs";
 
 // Deliberately excluded from npm test. Never point this gate at an enrolled/production namespace.
 test("LIVE RELEASE GATE: scoped Azure clients, REST JWTs and subscription-only SAS isolation", {
   skip: process.env.COPILOT_FLOCK_LIVE_AZURE_APPROVED !== "1" ? "UNRUN: explicit approval and a disposable Azure namespace are required" : false,
-  timeout: 240000,
+  timeout: 420000,
 }, async (t) => {
-  const files = ["flock.mjs", "bridge.mjs", "flock-azure.mjs", "flock-protocol.mjs", "flock-broker-free.mjs",
-    "flock-lifecycle.mjs", "test/flock-azure.live.test.mjs", "test/azure-negative-probes.mjs"];
+  const files = [...REQUIRED_RUNTIME_MODULES, "runtime-manifest.json", "bootstrap-server.mjs",
+    "managed-azure-setup.mjs", "infra/azuredeploy.json", "test/flock-azure.live.test.mjs",
+    "test/azure-negative-probes.mjs", "test/azure-hosted-gate.mjs"];
   t.diagnostic(JSON.stringify({ kind: "live-gate-source-hashes", sha256: Object.fromEntries(files.map((file) =>
     [file, crypto.createHash("sha256").update(fs.readFileSync(new URL(`../${file}`, import.meta.url))).digest("hex")])) }));
   const config = JSON.parse(fs.readFileSync(process.env.COPILOT_FLOCK_LIVE_AZURE_CONFIG, "utf8"));
   assert.equal(config.disposable, true, "Only an explicitly disposable deployment is eligible");
+  if (config.serviceBusAuth === "entra-rbac") {
+    await runHostedEntraGate(t, config);
+    return;
+  }
+  assert.ok(config.serviceBusAuth === undefined || config.serviceBusAuth === "sas", "Unsupported live Service Bus auth mode");
+  assert.notEqual(config.serviceBusDisableLocalAuth, true, "AUTH_MODE_UNSUPPORTED: LocalAuthDisabled cannot qualify SAS isolation");
   const signalr = parseAzureConnection(config.connectionString, "signalr");
   const manage = parseAzureConnection(config.manageConnectionString, "servicebus");
   const send = parseAzureConnection(config.sendConnectionString, "servicebus");
@@ -43,7 +52,7 @@ test("LIVE RELEASE GATE: scoped Azure clients, REST JWTs and subscription-only S
       Authorization: new URL(url).origin === signalr.endpoint ? `Bearer ${token}` : token,
       "Content-Type": "application/json" },
     ...(body === undefined ? {} : { body: JSON.stringify(body) }) });
-  try {
+  await withAzureGateCleanup(async () => {
     const ownerTransport = await azure.issue(state.cert, state.ownerPublicKey);
     const ticket = await approveJoin({ code, ownerIdentity: owner, ownerPublicKey: state.ownerPublicKey,
       rotationOwnerPeerId: state.rotationOwnerPeerId, flockId: state.flockId, role: "guest",
@@ -112,11 +121,11 @@ test("LIVE RELEASE GATE: scoped Azure clients, REST JWTs and subscription-only S
       "All original isolation probes require HTTP 401/403; acceptance, missing entities and request failures fail the gate");
     assert.equal(clientIsolation?.outcome, "denied",
       "Client JWT must be denied on another hub with typed HTTP 401/403; HTTP400/close/network/timeouts do not pass this gate");
-  } finally {
+  }, async () => {
     clients.forEach((client) => client.close());
     // Exactly the two freshly generated fixture peers, never a namespace/topic or preexisting subscription.
     const cleanup = await Promise.allSettled(peerIds.map((peerId) => azure.subscription(peerId, "DELETE")));
     const failures = cleanup.filter((result) => result.status === "rejected").map((result) => result.reason);
     if (failures.length) throw new AggregateError(failures, "Disposable fixture subscription cleanup incomplete");
-  }
+  });
 });

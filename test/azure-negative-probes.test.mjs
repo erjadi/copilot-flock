@@ -1,7 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
-import { OTHER_HUB, createOtherHubClientControl, runAzureNegativeProbes, classifySignalRClientDenial } from "./azure-negative-probes.mjs";
+import { OTHER_HUB, createOtherHubClientControl, runAzureNegativeProbes, classifySignalRClientDenial, withAzureGateCleanup } from "./azure-negative-probes.mjs";
+import { validateHostedGate, pollHostedRbac } from "./azure-hosted-gate.mjs";
 import { HUB } from "../flock-azure.mjs";
 import { peerSubscription } from "../flock-protocol.mjs";
 
@@ -14,6 +15,42 @@ const fixture = {
   expiredRestToken: "fixture-expired-rest", expiredListenSas: "fixture-expired-listen",
 };
 
+test("Azure gate retains both primary authorization and cleanup failures", async () => {
+  const primary = new Error("primary auth failure");
+  const cleanup = new Error("cleanup failure");
+  await assert.rejects(withAzureGateCleanup(async () => { throw primary; }, async () => { throw cleanup; }),
+    (error) => error instanceof AggregateError && error.errors[0] === primary && error.errors[1] === cleanup);
+});
+
+test("hosted Entra gate requires all disposable endpoint pins and retries only bounded authz/transient outcomes", async () => {
+  const config = { disposable: true, serviceBusAuth: "entra-rbac", serviceBusDisableLocalAuth: true,
+    signalrEndpoint: fixture.signalrEndpoint, serviceBusEndpoint: fixture.serviceBusEndpoint,
+    bootstrapUrl: "https://fixture.azurewebsites.net", githubUser: "fixture", githubUserId: 1001 };
+  const pins = { signalr: config.signalrEndpoint, serviceBus: config.serviceBusEndpoint, bootstrap: config.bootstrapUrl };
+  validateHostedGate(config, pins);
+  for (const change of [{ disposable: false }, { serviceBusDisableLocalAuth: false }, { bootstrapUrl: "https://attacker.invalid" }]) {
+    assert.throws(() => validateHostedGate({ ...config, ...change }, pins));
+  }
+  for (const field of Object.keys(pins)) assert.throws(() => validateHostedGate(config, { ...pins, [field]: undefined }));
+  for (const category of ["msi_unconfigured", "msi_token_rejected", "servicebus_client_error"]) {
+    let calls = 0;
+    await assert.rejects(pollHostedRbac(async () => { calls++; return { serviceBusCategory: category }; }), /terminal/);
+    assert.equal(calls, 1);
+  }
+  let now = 0;
+  let calls = 0;
+  await assert.rejects(pollHostedRbac(async () => { calls++; return { serviceBusCategory: "servicebus_authz_denied" }; },
+    { clock: () => now, delay: async (ms) => { now += ms; } }), /180 seconds/);
+  assert.equal(now, 180000);
+  assert.ok(calls <= 37);
+});
+
+test("global LocalAuthDisabled responses are auth-mode blockers, never successful isolation denials", async () => {
+  const results = await runAzureNegativeProbes({ ...fixture, request: async () =>
+    new Response('Local authentication is disabled. LocalAuthDisabled sensitive-token', { status: 401 }) });
+  assert.ok(results.every((result) => result.outcome === "auth-mode-blocked" && result.code === "LOCAL_AUTH_DISABLED"));
+  assert.doesNotMatch(JSON.stringify(results), /sensitive-token/);
+});
 test("Azure wrong-hub fixture is syntactically valid and its positive control has matching scoped credentials", () => {
   assert.match(OTHER_HUB, /^[A-Za-z][A-Za-z0-9_]*$/);
   assert.notEqual(OTHER_HUB.toLowerCase(), HUB.toLowerCase());

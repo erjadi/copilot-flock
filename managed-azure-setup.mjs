@@ -132,6 +132,27 @@ export async function runManagedSetup(outputs, options, adapters = {}) {
   const metadata = validateDeployment(outputs, options);
   const azure = adapters.runAz || runAz;
   const coordinates = ["--subscription", options.subscription, "--resource-group", options.resourceGroup];
+  if (options.skipBroker) {
+    let namespace;
+    try {
+      namespace = JSON.parse(await azure(["servicebus", "namespace", "show",
+        "--name", metadata.serviceBusNamespaceName, ...coordinates, "--output", "json"]));
+    } catch {
+      throw Object.assign(new Error("POLICY_BLOCKED: Cannot verify Service Bus local authentication; local installation was not started. Use an approved hosted Entra/RBAC deployment or resolve metadata access."),
+        { code: "POLICY_BLOCKED" });
+    }
+    const expectedId = `/subscriptions/${options.subscription}/resourceGroups/${options.resourceGroup}/providers/Microsoft.ServiceBus/namespaces/${metadata.serviceBusNamespaceName}`;
+    if (namespace?.name !== metadata.serviceBusNamespaceName ||
+        typeof namespace.disableLocalAuth !== "boolean" ||
+        typeof namespace.id !== "string" || namespace.id.toLowerCase() !== expectedId.toLowerCase()) {
+      throw Object.assign(new Error("POLICY_BLOCKED: Service Bus authentication metadata is missing or does not match the selected resource; local installation was not started."),
+        { code: "POLICY_BLOCKED" });
+    }
+    if (namespace.disableLocalAuth) {
+      throw Object.assign(new Error("AUTH_MODE_UNSUPPORTED: Broker-free transport requires Service Bus SAS, but local authentication is disabled. Choose an explicitly approved hosted Entra/RBAC deployment; do not bypass subscription policy."),
+        { code: "AUTH_MODE_UNSUPPORTED" });
+    }
+  }
   const getKey = async (args, endpoint, policy = "RootManageSharedAccessKey") => {
     let value;
     try {
@@ -151,12 +172,13 @@ export async function runManagedSetup(outputs, options, adapters = {}) {
   };
   const signalr = await getKey(["signalr", "key", "list", "--name", metadata.signalrName],
     `https://${metadata.signalrHostName}`);
-  const serviceBus = await getKey(["servicebus", "namespace", "authorization-rule", "keys", "list",
-    "--namespace-name", metadata.serviceBusNamespaceName, "--name", "RootManageSharedAccessKey"],
-  metadata.serviceBusEndpoint);
+  let serviceBus;
   let send;
   let listen;
   if (options.skipBroker) {
+    serviceBus = await getKey(["servicebus", "namespace", "authorization-rule", "keys", "list",
+      "--namespace-name", metadata.serviceBusNamespaceName, "--name", "RootManageSharedAccessKey"],
+    metadata.serviceBusEndpoint);
     for (const rule of ["FlockSendRule", "FlockListenRule"]) {
       const credential = await getKey(["servicebus", "namespace", "authorization-rule", "keys", "list",
         "--namespace-name", metadata.serviceBusNamespaceName, "--name", rule], metadata.serviceBusEndpoint, rule);
@@ -193,12 +215,13 @@ export async function runManagedSetup(outputs, options, adapters = {}) {
     let result;
     try {
       result = await install({
-        connectionStringArg: signalr, serviceBusConnectionStringArg: serviceBus,
+        connectionStringArg: signalr,
         bootstrapUrlArg: options.skipBroker ? null : metadata.bootstrapUrl,
         subscriptionArg: options.subscription, resourceGroupArg: options.resourceGroup,
         signalrNameArg: metadata.signalrName, githubUserArg: options.githubUser,
         scopeArg: options.scope || null, machineIdArg: options.machineId || null,
         ...(options.skipBroker ? { protocolArg: "broker-free-v34",
+          serviceBusConnectionStringArg: serviceBus,
           flockIdArg: `${options.githubUser}/${options.scope}`,
           serviceBusSendConnectionStringArg: send, serviceBusListenConnectionStringArg: listen } : {}),
       });

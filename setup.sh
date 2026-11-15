@@ -95,6 +95,7 @@ if [[ "$PROVISION_AZURE" == true ]]; then
   DEPLOYMENT_OUTPUT="$(az deployment group create --subscription "$SUBSCRIPTION" --resource-group "$RESOURCE_GROUP" \
     --template-file "$SCRIPT_DIR/infra/azuredeploy.json" \
     --parameters "location=$LOCATION" "namePrefix=$NAME_PREFIX" "deployTokenBroker=$([[ "$SKIP_BROKER" == false ]] && echo true || echo false)" \
+    "serviceBusDisableLocalAuth=$([[ "$SKIP_BROKER" == false ]] && echo true || echo false)" \
     "platformMaintainerUser=$GITHUB_USER" --query "properties.outputs" --output json 2>/dev/null)" ||
     fail "Azure ARM deployment failed; captured output withheld."
   MANAGED_ARGS=("$SCRIPT_DIR/managed-azure-setup.mjs" "--subscription" "$SUBSCRIPTION" "--resource-group" "$RESOURCE_GROUP")

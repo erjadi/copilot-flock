@@ -52,6 +52,10 @@ try {
       log("managed-az", args);
       if (process.env.MOCK_FAIL === "keys") throw Error("synthetic-key-do-not-print");
       if (args[0] === "webapp") return "";
+      if (args[0] === "servicebus" && args[2] === "show") return JSON.stringify({
+        name: "demo-sb", disableLocalAuth: false,
+        id: "/subscriptions/${subscription}/resourceGroups/rg-demo/providers/Microsoft.ServiceBus/namespaces/demo-sb",
+      });
       return JSON.stringify({primaryConnectionString: args[0] === "signalr"
         ? "Endpoint=https://demo-signalr.service.signalr.net;AccessKey=synthetic-key-do-not-print;"
         : "Endpoint=sb://demo-sb.servicebus.windows.net/;SharedAccessKeyName=" + args[args.indexOf("--name")+1] + ";SharedAccessKey=synthetic-key-do-not-print;"});
@@ -135,6 +139,7 @@ function checkManaged(result, skip = false, githubUser = "demo-owner") {
   assert.ok(deployment.args.includes("namePrefix=example"));
   assert.ok(deployment.args.includes("location=westus2"));
   assert.ok(deployment.args.includes(`deployTokenBroker=${!skip}`));
+  assert.ok(deployment.args.includes(`serviceBusDisableLocalAuth=${!skip}`));
   assert.ok(deployment.args.includes("--subscription"));
   assert.ok(result.events.some((event) => event.kind === "az" && event.args[1] === "set"));
   const install = result.events.find((event) => event.kind === "install");
