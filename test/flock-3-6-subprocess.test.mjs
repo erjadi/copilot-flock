@@ -11,7 +11,7 @@ import { createBootstrapServer, enrollV3Device, createV3FlockInvite } from "../b
 import { SupportMailbox } from "../flock-support.mjs";
 import { REQUIRED_RUNTIME_MODULES, computeRuntimeManifest, inspectProcess } from "../flock-lifecycle.mjs";
 import { openFlockMembershipRegistry } from "../flock.mjs";
-import { resolveOpenSsl } from "./openssl.mjs";
+import { resolveOpenSsl, createTlsFixture as tlsFixture } from "./openssl.mjs";
 
 const repo = path.resolve(".");
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -37,28 +37,60 @@ test("Windows TLS fixture OpenSSL resolves PATH, Git-derived and standard locati
   assert.throws(() => probe([], { PATH: "" }), /OpenSSL is required/);
 });
 
-function temp(t, cleanup = true) {
+function temp(t, cleanup = async () => {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "flock-subprocess-"));
-  if (cleanup) t.after(() => fs.rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }));
+  t.after(async () => {
+    try { await cleanup(); }
+    finally { fs.rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
+  });
   return root;
 }
+
+test("no-OpenSSL TLS fixture creates a trusted localhost certificate with DNS and IP SANs using only Node", async (t) => {
+  const root = temp(t);
+  const tls = tlsFixture(root, { platform: "win32", env: { PATH: "" }, isFile: () => false,
+    run: () => assert.fail("No external certificate command is available") });
+  const certificate = new crypto.X509Certificate(tls.cert);
+  assert.equal(certificate.subject, "CN=localhost");
+  assert.equal(certificate.checkHost("localhost"), "localhost");
+  assert.equal(certificate.checkIP("127.0.0.1"), "127.0.0.1");
+  assert.equal(certificate.verify(certificate.publicKey), true);
+  assert.equal(certificate.checkPrivateKey(crypto.createPrivateKey(tls.key)), true);
+  const server = https.createServer(tls, (_req, res) => res.end("trusted"));
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    const result = await new Promise((resolve, reject) => {
+      https.get({ hostname: "127.0.0.1", port: server.address().port, ca: tls.cert, agent: false }, (res) => {
+        let body = "";
+        res.on("data", (chunk) => { body += chunk; });
+        res.on("end", () => resolve(body));
+        res.on("error", reject);
+      }).on("error", reject);
+    });
+    assert.equal(result, "trusted");
+  } finally { server.closeAllConnections(); await new Promise((resolve) => server.close(resolve)); }
+});
+
+test("subprocess fixture cleanup is registered before TLS setup failure and runs after resource teardown", async () => {
+  const after = [];
+  let tornDown = false;
+  const root = temp({ after: (callback) => after.push(callback) }, async () => {
+    assert.equal(fs.existsSync(root), true);
+    tornDown = true;
+  });
+  try {
+    assert.throws(() => tlsFixture(root, { platform: "win32", env: { PATH: "X:\\fixture" },
+      isFile: () => true, run: () => { throw new Error("injected certificate setup failure"); } }), /injected certificate setup failure/);
+  } finally { await after[0](); }
+  assert.equal(tornDown, true);
+  assert.equal(fs.existsSync(root), false);
+});
 
 function key(deviceId) {
   return { deviceId, ...crypto.generateKeyPairSync("ed25519", {
     publicKeyEncoding: { type: "spki", format: "pem" },
     privateKeyEncoding: { type: "pkcs8", format: "pem" },
   }) };
-}
-
-function tlsFixture(root) {
-  const filename = path.join(root, "tls-key.pem");
-  const cert = path.join(root, "tls-cert.pem");
-  execFileSync(resolveOpenSsl(), [
-    "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", filename,
-    "-out", cert, "-days", "1", "-subj", "/CN=localhost",
-    "-addext", "subjectAltName=DNS:localhost,IP:127.0.0.1",
-  ], { stdio: "ignore", windowsHide: true });
-  return { key: fs.readFileSync(filename), cert: fs.readFileSync(cert), certPath: cert };
 }
 
 function childEnv(home, certPath) {
@@ -209,7 +241,18 @@ function frame(text) {
 }
 
 test("real daemon connection failures persist only credential-free WebSocket diagnostics in log and state", async (t) => {
-  const root = temp(t, false);
+  let child;
+  let service;
+  const root = temp(t, async () => {
+    if (child) {
+      child.kill();
+      await new Promise((resolve) => child.exitCode !== null || child.signalCode !== null ? resolve() : child.once("exit", resolve));
+    }
+    if (service?.listening) {
+      service.closeAllConnections();
+      await new Promise((resolve) => service.close(resolve));
+    }
+  });
   const home = path.join(root, "home");
   const runtime = path.join(home, "flock");
   fs.mkdirSync(runtime, { recursive: true });
@@ -219,8 +262,9 @@ test("real daemon connection failures persist only credential-free WebSocket dia
   const tls = tlsFixture(root);
   const canaries = ["WS_LOCAL_CANARY", "WS_SIGNATURE_CANARY", "WS_SIG_CANARY"];
   const capturedTokens = [];
-  const service = https.createServer(tls, (_req, res) => { res.writeHead(404); res.end(); });
+  service = https.createServer(tls, (_req, res) => { res.writeHead(404); res.end(); });
   service.on("upgrade", (req, socket) => {
+    socket.on("error", () => {});
     capturedTokens.push(new URL(req.url, "https://localhost").searchParams.get("access_token"));
     socket.end(`HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\nwss://fixture.invalid/?token=${canaries[0]}&signature=${canaries[1]}&sig=${canaries[2]}`);
   });
@@ -230,15 +274,8 @@ test("real daemon connection failures persist only credential-free WebSocket dia
     connectionString: `Endpoint=https://127.0.0.1:${service.address().port};AccessKey=fixture-only-key;Version=1.0;`,
     specs: { cpu: { model: "fixture" } },
   }));
-  const child = spawn(process.execPath, [path.join(runtime, "flock.mjs"), "daemon"], {
+  child = spawn(process.execPath, [path.join(runtime, "flock.mjs"), "daemon"], {
     env: childEnv(home, tls.certPath), stdio: "ignore", windowsHide: true,
-  });
-  t.after(async () => {
-    child.kill();
-    await new Promise((resolve) => child.exitCode !== null || child.signalCode !== null ? resolve() : child.once("exit", resolve));
-    service.closeAllConnections();
-    await new Promise((resolve) => service.close(resolve));
-    fs.rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   });
   const state = await until(() => {
     try {
@@ -255,9 +292,41 @@ test("real daemon connection failures persist only credential-free WebSocket dia
 });
 
 test("resident daemon self_update flushes its RPC response before real activator replaces its PID and records terminal verification", { timeout: 240000 }, async (t) => {
-  const root = temp(t, false);
+  let mcp;
+  let daemon;
+  let service;
+  let runtime;
+  const sockets = new Set();
+  const root = temp(t, async () => {
+    const candidates = new Set(daemon ? [daemon.pid] : []);
+    try { candidates.add(Number(fs.readFileSync(path.join(runtime, "daemon.pid"), "utf8"))); }
+    catch (error) { if (error.code !== "ENOENT") throw error; }
+    for (const pid of candidates) {
+      const identity = inspectProcess(pid);
+      if (identity?.command?.includes(runtime) || identity?.argv?.some((arg) => arg.includes(runtime))) {
+        try { process.kill(pid); } catch {}
+      }
+    }
+    if (mcp) {
+      mcp.kill();
+      await new Promise((resolve) => mcp.exitCode !== null || mcp.signalCode !== null ? resolve() : mcp.once("exit", resolve));
+    }
+    for (const socket of sockets) socket.destroy();
+    if (service?.listening) {
+      service.closeAllConnections();
+      await new Promise((resolve) => service.close(resolve));
+    }
+    if (mcp) await sleep(500);
+    try {
+      const journal = JSON.parse(fs.readFileSync(path.join(runtime, "update-activation.json"), "utf8"));
+      if (journal.rollbackSource && path.dirname(journal.rollbackSource) === os.tmpdir() &&
+          path.basename(journal.rollbackSource).startsWith(`flock-update-rollback-${journal.updateId}-`)) {
+        fs.rmSync(journal.rollbackSource, { recursive: true, force: true });
+      }
+    } catch (error) { if (error.code !== "ENOENT") throw error; }
+  });
   const home = path.join(root, "home");
-  const runtime = path.join(home, "flock");
+  runtime = path.join(home, "flock");
   const source = path.join(root, "copilot-flock");
   fs.mkdirSync(runtime, { recursive: true });
   fs.mkdirSync(source, { recursive: true });
@@ -279,11 +348,10 @@ test("resident daemon self_update flushes its RPC response before real activator
   execFileSync("git", ["clone", "--bare", source, bare], { stdio: "ignore", windowsHide: true });
   git(["remote", "add", "origin", bare]);
   const tls = tlsFixture(root);
-  const sockets = new Set();
   const clients = new Map();
   const responses = [];
   let oldDaemonAliveAtReply = false;
-  const service = https.createServer(tls, (req, res) => {
+  service = https.createServer(tls, (req, res) => {
     let body = "";
     req.on("data", (chunk) => { body += chunk; });
     req.on("end", () => {
@@ -360,37 +428,11 @@ test("resident daemon self_update flushes its RPC response before real activator
   openFlockMembershipRegistry(path.join(runtime, "flocks.json")).reconcileV3BrokerFlock(flock);
   openFlockMembershipRegistry(path.join(runtime, "flocks.json")).reconcileV3BrokerFlock({ ...flock, flockId: "owner" });
   const env = childEnv(home, tls.certPath);
-  const mcp = spawn(process.execPath, [path.join(runtime, "flock.mjs"), "mcp"], { env, stdio: ["pipe", "pipe", "pipe"], windowsHide: true });
+  mcp = spawn(process.execPath, [path.join(runtime, "flock.mjs"), "mcp"], { env, stdio: ["pipe", "pipe", "pipe"], windowsHide: true });
   const mcpRpc = stdioRpc(mcp);
   assert.equal((await mcpRpc("initialize")).result.serverInfo.name, "copilot-flock");
   await until(() => fs.existsSync(path.join(runtime, "daemon.pid")));
-  const daemon = { pid: Number(fs.readFileSync(path.join(runtime, "daemon.pid"), "utf8")) };
-  t.after(async () => {
-    const candidates = new Set([daemon.pid]);
-    try { candidates.add(Number(fs.readFileSync(path.join(runtime, "daemon.pid"), "utf8"))); } catch {}
-    for (const pid of candidates) {
-      const identity = inspectProcess(pid);
-      if (identity?.command?.includes(runtime) || identity?.argv?.some((arg) => arg.includes(runtime))) {
-        try { process.kill(pid); } catch {}
-      }
-      mcp.kill();
-      await new Promise((resolve) => mcp.exitCode !== null || mcp.signalCode !== null ? resolve() : mcp.once("exit", resolve));
-    }
-    for (const socket of sockets) socket.destroy();
-    service.closeAllConnections();
-    await new Promise((resolve) => service.close(resolve));
-    await sleep(500);
-    try {
-      const journal = JSON.parse(fs.readFileSync(path.join(runtime, "update-activation.json"), "utf8"));
-      if (journal.rollbackSource && path.dirname(journal.rollbackSource) === os.tmpdir() &&
-          path.basename(journal.rollbackSource).startsWith(`flock-update-rollback-${journal.updateId}-`)) {
-        fs.rmSync(journal.rollbackSource, { recursive: true, force: true });
-      }
-    } catch (error) {
-      if (error.code !== "ENOENT") throw error;
-    }
-    fs.rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
-  });
+  daemon = { pid: Number(fs.readFileSync(path.join(runtime, "daemon.pid"), "utf8")) };
   await until(() => clients.get("TARGET"), 30000);
   const requestId = crypto.randomUUID();
   const params = { flock: "owner/work", operationId: requestId, correlationId: "subprocess-correlation" };
