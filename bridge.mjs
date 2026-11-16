@@ -11068,7 +11068,7 @@ function findOwnerBuiltInPeer(context, machineId) {
     candidates.push({ ...peer, publicKey: peer.publicKey || peer.deviceEd25519Pub });
   }
   const cached = ownerBuiltInPinCache.get(cacheKey);
-  if (cached?.expiresAt > now && cached.result) {
+  if (!candidates.length && cached?.expiresAt > now && cached.result) {
     const response = cached.result;
     for (const summary of response.ownedFlocks) {
       const id = summary.flockId;
@@ -11112,7 +11112,8 @@ function findOwnerBuiltInPeer(context, machineId) {
       !m.removed && String(m.machineId || "").toLowerCase() === cleanMachine);
     if (Object.values(record.removedMachines || {}).some((entry) => entry.peerId === matched.peerId ||
         (entry.keyFingerprint && entry.keyFingerprint === matched.keyFingerprint) ||
-        (!stillPresent && String(entry.machineId || "").toLowerCase() === cleanMachine))) return null;
+        (!entry.peerId && !entry.keyFingerprint && !stillPresent &&
+          String(entry.machineId || "").toLowerCase() === cleanMachine))) return null;
   }
   return matched;
 }
@@ -11125,24 +11126,27 @@ async function refreshOwnerBuiltInPinsForRequest(cfg, req) {
   catch { return; }
   const context = ownerBuiltInPinContext(cfg, req.flocksConfigPath);
   if (!context.localAuthorized) return;
-  const machine = req.auth.fromMachine || req.fromMachine;
+  const machine = req.auth.fromMachine || req.fromMachine || req.params?.fromMachine || "unknown";
   const pinned = findOwnerBuiltInPeer(context, machine);
   if (pinned?.publicKey?.trim() === req.auth.publicKey?.trim()) return;
   try {
     if (typeof req.auth.publicKey !== "string" || req.auth.publicKey.length > 4096 ||
         crypto.createPublicKey(req.auth.publicKey).asymmetricKeyType !== "ed25519") return;
   } catch { return; }
-  const signature = verifyRpcSignature({ requestId: req.requestId, sentAt: req.auth.sentAt,
-    fromMachine: machine, toMachine: req.toMachine || cfg.machineId, action: req.action,
+  const signature = verifyRpcSignature({ requestId: req.requestId, sentAt: req.auth.sentAt || req.sentAt,
+    fromMachine: machine, toMachine: req.toMachine || cfg?.machineId || "*", action: req.action,
     params: req.params || {}, publicKey: req.auth.publicKey, signature: req.auth.signature });
   if (!signature.valid) return;
   let entry = ownerBuiltInPinCache.get(context.cacheKey);
-  if (!entry || context.now - entry.windowStartedAt >= 15000) {
-    entry = { ...entry, windowStartedAt: context.now, refreshes: 0 };
+  if (!entry) {
+    entry = { windowStartedAt: context.now, refreshes: 0 };
     if (ownerBuiltInPinCache.size >= 128 && !ownerBuiltInPinCache.has(context.cacheKey)) {
       ownerBuiltInPinCache.delete(ownerBuiltInPinCache.keys().next().value);
     }
     ownerBuiltInPinCache.set(context.cacheKey, entry);
+  } else if (!entry.inFlight && context.now - entry.windowStartedAt >= 15000) {
+    entry.windowStartedAt = context.now;
+    entry.refreshes = 0;
   }
   if (!entry.inFlight) {
     if (entry.refreshes >= 4) return;

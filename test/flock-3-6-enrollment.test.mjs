@@ -193,6 +193,7 @@ test("Gate8a genuinely reconciled personal/work hosts resolve root pins in memor
   const work = ownerRootRoutingFixture(t, runtime, "work");
   const hosts = [personal, work];
   const records = hosts.map((host) => host.record(`owner/${host.cfg.scope}`, [host.self]));
+  const brokerRoot = personal.record("owner", []);
   const reconcile = (host) => {
     runtime.applyV3EnrollmentResult(host.cfg, { ok: true, githubUser: "owner", githubUserId: 1001,
       deviceId: host.cfg.identity.fingerprint, peerId: `1001:${host.cfg.identity.fingerprint}`,
@@ -209,7 +210,7 @@ test("Gate8a genuinely reconciled personal/work hosts resolve root pins in memor
     host.cfg.fetchOwnerBuiltInFlocksFn = async (cfg) => {
       host.fetches++;
       assert.equal(cfg.identity.fingerprint, host.cfg.identity.fingerprint);
-      return { ok: true, githubUser: "owner", githubUserId: 1001, ownedFlocks: structuredClone(records) };
+      return { ok: true, githubUser: "owner", githubUserId: 1001, ownedFlocks: structuredClone([brokerRoot, ...records]) };
     };
   }
   const before = hosts.map((host) => [fs.readFileSync(host.flocksPath), fs.readFileSync(host.registry.filename)]);
@@ -237,13 +238,20 @@ test("Gate8a genuinely reconciled personal/work hosts resolve root pins in memor
     assert.deepEqual(fs.readFileSync(host.flocksPath), before[index][0]);
     assert.deepEqual(fs.readFileSync(host.registry.filename), before[index][1]);
   });
+  records[1].rosterEpoch++;
+  reconcile(work);
+  const workFetches = work.fetches;
+  assert.equal((await invoke(work, work, "send_message", {
+    targetSession: "latest", message: "Fresher local epoch must ignore stale cache", dryRun: true })).result.status, "dry_run_verified");
+  assert.equal(work.fetches, workFetches);
   const oldWork = { ...work.cfg };
   const oldPeer = work.self;
   const rotated = ownerRoutingIdentity();
   work.cfg.identity = rotated;
   work.self = work.member(work.cfg.machineId, "work", rotated);
-  records[1] = work.record("owner/work", [work.self], { rosterEpoch: 13,
-    removedMachines: [{ ...oldPeer, removedAtEpoch: 13 }] });
+  records[1] = work.record("owner/work", [work.self], { rosterEpoch: 14,
+    removedMachines: [{ ...oldPeer, removedAtEpoch: 14 }] });
+  brokerRoot.removedMachines = [{ ...oldPeer, removedAtEpoch: 14 }];
   reconcile(work);
   const newKeyResult = await invoke(work, personal, "send_message", {
     targetSession: "latest", message: "Rotated key without sleeping", dryRun: true });
@@ -261,7 +269,8 @@ test("Gate8a broker owner pin lookup rejects stale floors, retained tombstones a
   const runtime = await import("../flock.mjs");
   for (const mode of ["retained-root-tombstone", "retained-scope-tombstone", "kicked-local", "stale-epoch",
     "shared-only", "joined-only", "collaborator", "guest", "time-bound", "foreign-user", "foreign-response",
-    "forged-fingerprint", "forged-peer-id", "ambiguous-key", "broker-revocation", "broker-removed", "expired-scope"]) {
+    "forged-fingerprint", "forged-peer-id", "ambiguous-key", "broker-revocation", "broker-removed",
+    "legacy-root-removal", "expired-scope"]) {
     await t.test(mode, async (t) => {
       const f = ownerRootRoutingFixture(t, runtime, "personal");
       const key = ownerRoutingIdentity();
@@ -296,6 +305,8 @@ test("Gate8a broker owner pin lookup rejects stale floors, retained tombstones a
         return { ok: true, githubUser: mode === "foreign-response" ? "other" : "owner", githubUserId: 1001,
           ownedFlocks: mode === "joined-only" ? [] : [policy, ...(mode === "ambiguous-key" ? [
             f.record("owner", [{ ...f.member(peer.machineId, "work", ownerRoutingIdentity()) }]),
+          ] : mode === "legacy-root-removal" ? [
+            f.record("owner", [], { removedMachines: [{ machineId: peer.machineId }] }),
           ] : [])], joinedFlocks: [policy] };
       };
       const before = [fs.readFileSync(f.flocksPath), fs.readFileSync(f.registry.filename)];
@@ -344,6 +355,41 @@ test("Gate8a owner pin refresh is fresh-signature gated, single-flight, burst bo
   t.mock.method(Date, "now", () => now + 61000);
   assert.equal((await runtime.handleRpcAction(f.cfg, request())).status, "dry_run_verified");
   assert.equal(fetches, 5);
+});
+
+test("Gate8a owner pin refresh keeps its single-flight result attached across a refresh-window rollover", async (t) => {
+  const runtime = await import("../flock.mjs");
+  const f = ownerRootRoutingFixture(t, runtime, "personal");
+  const key = ownerRoutingIdentity();
+  const peer = f.member("WORK-PEER", "work", key);
+  let release;
+  const pending = new Promise((resolve) => { release = resolve; });
+  let fetches = 0;
+  f.cfg.bootstrapUrl = "https://owner-pins.invalid/api/bootstrap";
+  f.cfg.fetchOwnerBuiltInFlocksFn = async () => {
+    fetches++;
+    await pending;
+    return { ok: true, githubUser: "owner", githubUserId: 1001,
+      ownedFlocks: [f.record("owner/work", [peer])] };
+  };
+  const makeRequest = () => {
+    const request = signedRequest({ key, machineId: peer.machineId, action: "send_message",
+      params: { flock: "owner", fromMachine: peer.machineId, targetSession: "latest",
+        message: "Window rollover", dryRun: true }, toMachine: f.cfg.machineId });
+    delete request.auth.sentAt;
+    delete request.auth.fromMachine;
+    return request;
+  };
+  const first = runtime.handleRpcAction(f.cfg, makeRequest());
+  const now = Date.now();
+  t.mock.method(Date, "now", () => now + 16000);
+  const second = runtime.handleRpcAction(f.cfg, makeRequest());
+  assert.equal(fetches, 1);
+  release();
+  const results = await Promise.all([first, second]);
+  assert.ok(results.every((result) => result.status === "dry_run_verified"));
+  assert.equal((await runtime.handleRpcAction(f.cfg, makeRequest())).status, "dry_run_verified");
+  assert.equal(fetches, 1, "The completed result must remain in the map rather than a detached entry");
 });
 
 test("Gate8a cross-scope owner pins use the existing HTTPS my-flocks endpoint and configured device identity without GitHub credentials", async (t) => {
