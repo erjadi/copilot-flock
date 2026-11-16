@@ -364,15 +364,6 @@ const DEFAULT_BOOTSTRAP_ORIGIN = DEFAULT_BOOTSTRAP_URL
 const RECORD_SEP = "\x1e";
 
 const HOME_DIR = os.homedir();
-const COPILOT_DIR = canonicalCopilotHome(process.env.COPILOT_HOME || path.join(HOME_DIR, ".copilot"));
-const LEGACY_BRIDGE_HOME = path.join(COPILOT_DIR, "signalr-bridge");
-const BRIDGE_HOME = path.join(COPILOT_DIR, "flock");
-const CONFIG_PATH = path.join(BRIDGE_HOME, "config.json");
-const STATE_PATH = path.join(BRIDGE_HOME, "state.json");
-const INBOX_PATH = path.join(BRIDGE_HOME, "inbox.jsonl");
-const OUTBOX_PATH = path.join(BRIDGE_HOME, "outbox.jsonl");
-const DAEMON_LOG_PATH = path.join(BRIDGE_HOME, "daemon.log");
-const DAEMON_PID_PATH = path.join(BRIDGE_HOME, "daemon.pid");
 
 function getIdentityKeyPath() {
   return path.join(getBridgeHome(), "identity.json");
@@ -565,6 +556,10 @@ function getLegacyBridgeHome() {
 
 function getConfigPath() {
   return path.join(getBridgeHome(), "config.json");
+}
+
+function getPrimaryConfigPath() {
+  return path.join(getCopilotDir(), "flock", "config.json");
 }
 
 function getStatePath() {
@@ -3196,14 +3191,15 @@ export function loadConfig({ autoFetchAz = true, refreshSpecs = false, passive =
     ensureBridgeDir();
   }
   const activeConfigPath = getConfigPath();
+  const primaryConfigPath = getPrimaryConfigPath();
   let cfg = {};
   if (fs.existsSync(activeConfigPath)) {
     try {
       cfg = JSON.parse(fs.readFileSync(activeConfigPath, "utf8"));
     } catch {}
-  } else if (isSandboxV3Mode() && fs.existsSync(CONFIG_PATH)) {
+  } else if (isSandboxV3Mode() && fs.existsSync(primaryConfigPath)) {
     try {
-      cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf8"));
+      cfg = JSON.parse(fs.readFileSync(primaryConfigPath, "utf8"));
     } catch {}
   }
 
@@ -10093,7 +10089,7 @@ export async function createLocalSession({
 
     if (!targetCwd) {
       const dateStr = new Date().toISOString().slice(0, 10);
-      targetCwd = path.join(COPILOT_DIR, "chats", dateStr, `remote-${crypto.randomUUID().slice(0, 8)}`);
+      targetCwd = path.join(getCopilotDir(), "chats", dateStr, `remote-${crypto.randomUUID().slice(0, 8)}`);
       fs.mkdirSync(targetCwd, { recursive: true });
     }
 
@@ -15599,7 +15595,7 @@ export async function executeMcpTool(cfg, name, args = {}, options = {}) {
 
     ensureBridgeDir();
     fs.appendFileSync(
-      OUTBOX_PATH,
+      getOutboxPath(),
       JSON.stringify({
         sentAt: new Date().toISOString(),
         action: "create_session",
@@ -15745,7 +15741,7 @@ export async function executeMcpTool(cfg, name, args = {}, options = {}) {
 
     ensureBridgeDir();
     fs.appendFileSync(
-      OUTBOX_PATH,
+      getOutboxPath(),
       JSON.stringify({
         action: "broadcast",
         ...summary,
@@ -20877,6 +20873,7 @@ export async function installBridge({
 
   ensureBridgeDir();
   const activeConfigPath = getConfigPath();
+  const primaryConfigPath = getPrimaryConfigPath();
   const sandboxMode = isSandboxV3Mode();
 
   let existing = {};
@@ -20889,9 +20886,9 @@ export async function installBridge({
       try {
         existing = JSON.parse(fs.readFileSync(activeConfigPath, "utf8"));
       } catch {}
-    } else if (sandboxMode && fs.existsSync(CONFIG_PATH)) {
+    } else if (sandboxMode && fs.existsSync(primaryConfigPath)) {
       try {
-        existing = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf8"));
+        existing = JSON.parse(fs.readFileSync(primaryConfigPath, "utf8"));
       } catch {}
     }
     if (protocolArg === "broker-free-v34" || welcomeTicketArg ||
@@ -23023,10 +23020,11 @@ export function repairStoredConfigScopeBeforeLoad(
 ) {
   const repairedScope = normalizeScope(scopeArg, "work");
   const activeConfigPath = configPath || getConfigPath();
+  const primaryConfigPath = getPrimaryConfigPath();
   const targetPath = fs.existsSync(activeConfigPath)
     ? activeConfigPath
-    : isSandboxV3Mode() && fs.existsSync(CONFIG_PATH)
-    ? CONFIG_PATH
+    : isSandboxV3Mode() && fs.existsSync(primaryConfigPath)
+    ? primaryConfigPath
     : activeConfigPath;
   if (!fs.existsSync(targetPath)) {
     return { repaired: false, scope: repairedScope, configPath: targetPath, backupPath: null };

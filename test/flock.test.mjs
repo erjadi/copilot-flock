@@ -656,6 +656,50 @@ test("Desktop session creation with allowAll=false never requests allow-all, aut
   }
 });
 
+test("Desktop chat creation resolves its default directory from COPILOT_HOME at call time in both entrypoints", async () => {
+  const env = setupTempCopilotEnv();
+  const frames = [];
+  const server = await startMockCopilotWsServer((frame, client) => {
+    if (frame.type === "create_session") {
+      frames.push(frame);
+      client.sendJson({ type: "session_created", request_id: frame.request_id, session_id: `dynamic-${frames.length}`,
+        session_type: "general_chat", cwd: frame.cwd });
+    }
+  });
+  try {
+    env.writeWsConfig(server.port);
+    for (const filename of ["flock.mjs", "bridge.mjs"]) {
+      const initial = path.join(env.tempRoot, `${filename}-import-home`);
+      fs.mkdirSync(initial, { mode: 0o700 });
+      const result = await new Promise((resolve, reject) => {
+        const child = spawn(process.execPath, ["--input-type=module", "-e", `
+import fs from "node:fs";import path from "node:path";import assert from "node:assert/strict";
+const initial=process.env.COPILOT_HOME;
+const {createLocalSession}=await import(${JSON.stringify(new URL(`../${filename}`, import.meta.url).href)});
+process.env.COPILOT_HOME=${JSON.stringify(env.tempRoot)};
+const session=await createLocalSession({cfg:{machineId:"FIXTURE",scope:"work"},allowAll:false});
+assert.ok(session.cwd.startsWith(path.join(process.env.COPILOT_HOME,"chats")+path.sep),session.cwd);
+assert.ok(fs.statSync(session.cwd).isDirectory());
+assert.equal(fs.existsSync(path.join(initial,"chats")),false);
+process.stdout.write(JSON.stringify({cwd:session.cwd}),()=>process.exit(0));
+`], { windowsHide: true, env: { ...process.env, COPILOT_HOME: initial, COPILOT_CLI_PATH: "",
+          COPILOT_FLOCK_SANDBOX: "", COPILOT_BRIDGE_SANDBOX: "", NODE_OPTIONS: "", NODE_PATH: "" },
+          stdio: ["ignore", "pipe", "pipe"] });
+        let stdout = "";
+        let stderr = "";
+        const timer = setTimeout(() => child.kill(), 20000);
+        child.stdout.on("data", (chunk) => { stdout += chunk; });
+        child.stderr.on("data", (chunk) => { stderr += chunk; });
+        child.once("error", (error) => { clearTimeout(timer); reject(error); });
+        child.once("close", (status) => { clearTimeout(timer); resolve({ status, stdout, stderr }); });
+      });
+      assert.equal(result.status, 0, `${filename}\n${result.stdout}\n${result.stderr}`);
+      assert.ok(JSON.parse(result.stdout).cwd.startsWith(path.join(env.tempRoot, "chats") + path.sep));
+    }
+    assert.equal(frames.length, 2);
+  } finally { await server.close(); env.cleanup(); }
+});
+
 test("trusted local tracker installation and diagnostic coordinator creation request allow-all and autopilot Desktop frames", async () => {
   const env = setupTempCopilotEnv();
   const previous = process.env.COPILOT_HOME;

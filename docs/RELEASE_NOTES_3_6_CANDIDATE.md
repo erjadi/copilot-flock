@@ -150,6 +150,19 @@ and a repeated NEXUS canary before any broader client rollout. Earlier receipts
 do not transfer automatically. This source change itself authorizes no live
 queue edits, cloud deployment, vote, publication or fleet update.
 
+### Post-Gate-2 isolated-home path correction
+
+The Linux qualification rejection of `de36e083` remains retained evidence.
+Session-creation/broadcast outbox writes and Desktop chat directories now use
+the current canonical `COPILOT_HOME` getters instead of import-time paths.
+Sandbox config fallback still uses the primary installation config, but resolves
+it under the current home; a sandbox's own config continues to take precedence.
+Unused eager Copilot path constants are removed. Regression fixtures import
+both entrypoints under one isolated home, switch homes, and verify that logs,
+chat directories and config repair never escape to the import-time home.
+This replacement needs new exact-SHA platform qualification; earlier passing
+platform results do not override the Linux rejection.
+
 ### Final release-boundary hardening
 
 Release candidate execution is a protected owner-only RPC, including on shared

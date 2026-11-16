@@ -112,6 +112,56 @@ test("explicit empty CLI path disables cached PATH and absolute POSIX fallbacks 
   }
 });
 
+test("MCP creation and broadcast audit paths and sandbox config follow COPILOT_HOME changes after import", (t) => {
+  const root = fixture(t);
+  for (const entrypoint of ["flock.mjs", "bridge.mjs"]) {
+    const initial = path.join(root, `${entrypoint}-import-home`);
+    fs.mkdirSync(initial, { mode: 0o700 });
+    const script = `
+import fs from "node:fs";import path from "node:path";import assert from "node:assert/strict";
+const runtime=await import(${JSON.stringify(pathToFileURL(path.resolve(entrypoint)).href)});
+const initial=process.env.COPILOT_HOME;
+for(const name of ["first","second"]){
+ const home=path.join(${JSON.stringify(root)},${JSON.stringify(entrypoint)}+"-"+name);
+ process.env.COPILOT_HOME=home;
+ const dir=path.join(home,"flock");fs.mkdirSync(dir,{recursive:true,mode:0o700});
+ fs.writeFileSync(path.join(dir,"daemon.pid"),String(process.pid));
+ fs.writeFileSync(path.join(dir,"state.json"),JSON.stringify({status:"connected",pid:process.pid,updatedAt:new Date().toISOString()}));
+ const peer={machineId:"REMOTE",githubUser:"owner",scope:"work",role:"owner"};
+ fs.writeFileSync(path.join(dir,"flocks.json"),JSON.stringify({flocks:{owner:{flockId:"owner",ownerGitHubUser:"owner",trustTier:"owner",members:[peer]}}}));
+ const cfg={machineId:"LOCAL",githubUser:"owner",scope:"work",connectionString:"fixture",
+  rpcTransport:async request=>request.action==="ping"?[{fromMachine:"REMOTE",result:peer}]:
+   {fromMachine:request.toMachine,result:{status:"created",sessionId:"remote-session"}}};
+ await runtime.executeMcpTool(cfg,"create_remote_session",{to_machine:"REMOTE",title:name});
+ await runtime.executeMcpTool(cfg,"broadcast_remote_session_message",{new_session:true,message:name});
+ const log=fs.readFileSync(path.join(dir,"outbox.jsonl"),"utf8").trim().split("\\n").map(line=>JSON.parse(line));
+ assert.deepEqual(log.map(item=>item.action),["create_session","broadcast"]);
+ assert.equal(fs.existsSync(path.join(initial,"flock","outbox.jsonl")),false);
+ const config={machineId:"CONFIG-"+name,scope:"work",githubUser:"owner",connectionString:"Endpoint=https://fixture.service.signalr.net;AccessKey=fixture-only;Version=1.0;"};
+ fs.writeFileSync(path.join(dir,"config.json"),JSON.stringify(config));
+ process.env.COPILOT_FLOCK_SANDBOX="v3";
+ assert.equal(runtime.loadConfig({passive:true,autoFetchAz:false}).machineId,config.machineId);
+ const repaired=runtime.repairStoredConfigScopeBeforeLoad("personal");
+ assert.equal(repaired.configPath,path.join(dir,"config.json"));
+ assert.equal(JSON.parse(fs.readFileSync(repaired.configPath)).scope,"personal");
+ const sandboxConfig=path.join(runtime.getBridgeHome(),"config.json");
+ fs.mkdirSync(path.dirname(sandboxConfig),{recursive:true});
+ fs.writeFileSync(sandboxConfig,JSON.stringify({...config,machineId:"SANDBOX-"+name}));
+ assert.equal(runtime.loadConfig({passive:true,autoFetchAz:false}).machineId,"SANDBOX-"+name);
+ assert.equal(runtime.repairStoredConfigScopeBeforeLoad("personal").configPath,sandboxConfig);
+ delete process.env.COPILOT_FLOCK_SANDBOX;
+}
+assert.deepEqual(fs.readdirSync(initial),[],"Import-time home must stay read-only");
+`;
+    const result = spawnSync(process.execPath, ["--input-type=module", "-e", script], {
+      encoding: "utf8", windowsHide: true, timeout: 30000,
+      env: { ...process.env, COPILOT_HOME: initial, COPILOT_CLI_PATH: "",
+        COPILOT_FLOCK_SANDBOX: "", COPILOT_BRIDGE_SANDBOX: "", NODE_OPTIONS: "", NODE_PATH: "" },
+    });
+    assert.equal(result.status, 0, `${entrypoint}\n${result.stdout}\n${result.stderr}`);
+  }
+});
+
 test("owner fleet mutations exclude collaborators before update, reprovision queue, diagnose and session creation", async (t) => {
   const root = fixture(t);
   useCopilotHome(t, root);
