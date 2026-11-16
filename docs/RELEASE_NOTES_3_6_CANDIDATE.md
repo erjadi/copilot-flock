@@ -199,17 +199,30 @@ changed runtime bytes.
 The `f634e24f` canary rejection is retained evidence; it does not qualify this
 successor. After a verified complete membership sync prunes a synthetic owner
 root, legacy default protected RPCs and the self-test can still use `<owner>`
-as a same-owner routing alias. Pinned sender verification now considers the
-authoritative active built-in personal/work rosters for that owner. It does
-not recreate or persist root enrollment, search shared/retained/foreign-owner
-flocks, accept caller-supplied keys, or change broker-free selection rules.
+as a same-owner routing alias. The receiver must retain active built-in owner
+membership. Its own scoped pins remain the zero-network fast path. For a
+missing/rotated cross-scope pin, a fresh signed request can trigger the existing
+authenticated HTTPS `/my-flocks` owner overview, held in memory only for 60
+seconds. Refreshes are single-flight and limited to four per 15-second window,
+with bounded responses/cache size. Neither the opposite scope nor root
+enrollment is persisted. Shared, joined, guest and foreign-owner records and
+the legacy global member listing cannot supply positive root-alias pins.
 
-Revocation, tombstones, expired or non-owner members and conflicting machine
-pins fail closed. Explicit non-root selectors retain exact-flock pin lookup
-and target scope walls; an owner alias is not permission to fall back from an
-explicit shared or scoped request. Regressions cover reconciled personal/work
-self-test RPCs, default protected requests across active built-in scopes,
-unchanged membership bytes, and isolation/forged-key denials.
+Active and retained epoch floors, identity-specific tombstones and revocations
+remain authoritative negatives. Broker members require the owner's numeric ID,
+owner role, canonical device/peer binding and a fingerprint derived from their
+Ed25519 key (including the existing legacy 32-hex PEM fingerprint format).
+Expired, ambiguous or unproven pins fail closed; a self-signed caller key alone
+never grants authority. Explicit non-root selectors retain exact-flock lookup
+and target scope walls; broker-free selection is unchanged.
+
+The rejected `075a0a58` evidence is retained: its cross-scope fixture incorrectly
+kept opposite scopes active. The successor covers two genuinely reconciled
+hosts with only their own scope active, bidirectional protected RPCs, rotation,
+retained tombstones, stale broker epochs, kicked receivers, cache/refresh limits,
+and real token-local HTTPS owner lookup without disk enrollment changes or
+GitHub credential forwarding. The remaining directory-swap test hooks reuse a
+test-only bounded helper; failures remain explicit fixture errors.
 
 ### Final release-boundary hardening
 

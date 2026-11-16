@@ -11015,57 +11015,194 @@ export function assertSafeTransferFilePath(targetPath) {
   return norm;
 }
 
+const ownerBuiltInPinCache = new Map();
+
+function ownerBuiltInPinContext(cfg, customPath) {
+  const owner = normalizeGitHubUser(cfg?.githubUser)?.toLowerCase();
+  const filename = path.resolve(customPath || cfg?.flocksConfigPath || getFlocksConfigPath());
+  const registry = openFlockMembershipRegistry(filename);
+  const state = registry.read();
+  const policies = readRawStoredFlocksConfig(cfg, filename).flocks;
+  const identity = legacyRosterIdentity(cfg, filename);
+  const ids = [owner, `${owner}/personal`, `${owner}/work`];
+  const now = Date.now();
+  const allowedPolicy = (id, policy) => policy && policy.trustTier === "owner" &&
+    normalizeGitHubUser(policy.ownerGitHubUser)?.toLowerCase() === owner &&
+    (!policy.flockType || policy.flockType === (id === owner ? "owner_root" : "owner_scope")) &&
+    !policy.targetMachineId && !policy.revoked && !isExplicitOptInFlockPolicy(policy) &&
+    policy.membershipExpiresAt == null && policy.membershipExpiresAtMs == null &&
+    (policy.expiresAtMs == null || Number(policy.expiresAtMs) > now);
+  const active = ids.filter((id) => state.flocks[id]?.protocol === "v3-broker" &&
+    normalizeGitHubUser(state.flocks[id].ownerGitHubUser)?.toLowerCase() === owner &&
+    allowedPolicy(id, policies[id]));
+  const localAuthorized = active.some((id) => {
+    const self = registry.findActiveMember(id, { machineId: cfg.machineId, now });
+    return self?.githubUser === owner && self.role === "owner" &&
+      (id === owner || id === `${owner}/${self.scope}`) &&
+      self.membershipExpiresAtMs == null && self.certExpiresAtMs == null &&
+      !isAuthoritativePrincipalRevoked(policies[id], self) &&
+      (!identity?.publicKey || self.deviceEd25519Pub?.trim() === identity.publicKey.trim());
+  });
+  let origin = null;
+  try { origin = new URL(cfg?.bootstrapUrl || DEFAULT_BOOTSTRAP_URL).origin; } catch {}
+  const cacheKey = JSON.stringify([origin, owner, filename, cfg?.machineId, identity?.fingerprint]);
+  return { owner, filename, registry, state, policies, ids, active, localAuthorized, now, cacheKey, identity };
+}
+
+function findOwnerBuiltInPeer(context, machineId) {
+  const { owner, state, policies, ids, active, localAuthorized, now, cacheKey } = context;
+  if (!localAuthorized) return null;
+  const cleanMachine = String(machineId || "").trim().toLowerCase();
+  const candidates = [];
+  const negatives = ids.flatMap((id) => [state.flocks[id], state.retainedFlocks?.[id], policies[id]].filter(Boolean));
+  for (const id of ids) {
+    const record = state.flocks[id];
+    if (!record) continue;
+    const matches = Object.values(record.members || {}).filter((m) =>
+      String(m.machineId || "").toLowerCase() === cleanMachine);
+    if (!matches.length) continue;
+    if (!active.includes(id) || matches.length !== 1) return null;
+    const peer = context.registry.findActiveMember(id, { machineId: cleanMachine, now });
+    if (!peer || peer.githubUser !== owner || peer.role !== "owner" ||
+        (id !== owner && id !== `${owner}/${peer.scope}`)) return null;
+    candidates.push({ ...peer, publicKey: peer.publicKey || peer.deviceEd25519Pub });
+  }
+  const cached = ownerBuiltInPinCache.get(cacheKey);
+  if (cached?.expiresAt > now && cached.result) {
+    const response = cached.result;
+    for (const summary of response.ownedFlocks) {
+      const id = summary.flockId;
+      const floor = Math.max(...[state.flocks[id], state.retainedFlocks?.[id]].flatMap(
+        (entry) => [Number(entry?.rosterEpoch) || 0, Number(entry?.minAcceptedEpoch) || 0]));
+      if (!Number.isSafeInteger(summary.rosterEpoch) || summary.rosterEpoch < Math.max(1, floor)) return null;
+      if (summary.membershipExpiresAt != null || summary.membershipExpiresAtMs != null ||
+          (summary.expiresAtMs != null && Number(summary.expiresAtMs) <= now) ||
+          (summary.trustTier && summary.trustTier !== "owner")) return null;
+      negatives.push(summary);
+      const matches = summary.members.filter((m) => String(m.machineId || "").toLowerCase() === cleanMachine && !m.removed);
+      for (const member of matches) {
+        const deviceId = String(member.deviceId || "").toLowerCase();
+        const fingerprint = String(member.keyFingerprint || deviceId).toLowerCase();
+        let derived;
+        try {
+          const full = deriveKeyFingerprint(member.publicKey);
+          derived = fingerprint.length === 32
+            ? crypto.createHash("sha256").update(member.publicKey.trim()).digest("hex").slice(0, 32) : full;
+        } catch { return null; }
+        if (normalizeGitHubUser(member.githubUser)?.toLowerCase() !== owner ||
+            Number(member.githubUserId) !== response.githubUserId || member.trustTier !== "owner" ||
+            member.revoked || member.membershipExpiresAt != null || member.membershipExpiresAtMs != null ||
+            member.certExpiresAtMs != null || !["personal", "work"].includes(member.scope) ||
+            (id !== owner && id !== `${owner}/${member.scope}`) ||
+            derived !== fingerprint || deviceId !== fingerprint ||
+            member.peerId !== `${response.githubUserId}:${deviceId}`) return null;
+        candidates.push({ ...member, githubUser: owner, publicKey: member.publicKey.trim(), keyFingerprint: fingerprint });
+      }
+    }
+  }
+  const matched = candidates[0];
+  if (!matched?.publicKey || candidates.some((peer) =>
+    peer.peerId !== matched.peerId || peer.publicKey?.trim() !== matched.publicKey.trim())) return null;
+  for (const record of negatives) {
+    if (isAuthoritativePrincipalRevoked(record, matched) ||
+        isPrincipalRevokedInFlock(record, { ...matched, machineId: cleanMachine })) return null;
+    if (Object.values(record.tombstones || {}).some((entry) => entry.peerId === matched.peerId ||
+        (entry.keyFingerprint && entry.keyFingerprint === matched.keyFingerprint))) return null;
+    const stillPresent = Object.values(record.members || {}).some((m) =>
+      !m.removed && String(m.machineId || "").toLowerCase() === cleanMachine);
+    if (Object.values(record.removedMachines || {}).some((entry) => entry.peerId === matched.peerId ||
+        (entry.keyFingerprint && entry.keyFingerprint === matched.keyFingerprint) ||
+        (!stillPresent && String(entry.machineId || "").toLowerCase() === cleanMachine))) return null;
+  }
+  return matched;
+}
+
+async function refreshOwnerBuiltInPinsForRequest(cfg, req) {
+  if (cfg?.protocol === "broker-free-v34" || !req.auth || Array.isArray(req.registryMembers)) return;
+  const owner = normalizeGitHubUser(cfg?.githubUser)?.toLowerCase();
+  if (!owner || !req.params?.flock) return;
+  try { if (parseFlockAddress(req.params.flock).flockId !== owner) return; }
+  catch { return; }
+  const context = ownerBuiltInPinContext(cfg, req.flocksConfigPath);
+  if (!context.localAuthorized) return;
+  const machine = req.auth.fromMachine || req.fromMachine;
+  const pinned = findOwnerBuiltInPeer(context, machine);
+  if (pinned?.publicKey?.trim() === req.auth.publicKey?.trim()) return;
+  try {
+    if (typeof req.auth.publicKey !== "string" || req.auth.publicKey.length > 4096 ||
+        crypto.createPublicKey(req.auth.publicKey).asymmetricKeyType !== "ed25519") return;
+  } catch { return; }
+  const signature = verifyRpcSignature({ requestId: req.requestId, sentAt: req.auth.sentAt,
+    fromMachine: machine, toMachine: req.toMachine || cfg.machineId, action: req.action,
+    params: req.params || {}, publicKey: req.auth.publicKey, signature: req.auth.signature });
+  if (!signature.valid) return;
+  let entry = ownerBuiltInPinCache.get(context.cacheKey);
+  if (!entry || context.now - entry.windowStartedAt >= 15000) {
+    entry = { ...entry, windowStartedAt: context.now, refreshes: 0 };
+    if (ownerBuiltInPinCache.size >= 128 && !ownerBuiltInPinCache.has(context.cacheKey)) {
+      ownerBuiltInPinCache.delete(ownerBuiltInPinCache.keys().next().value);
+    }
+    ownerBuiltInPinCache.set(context.cacheKey, entry);
+  }
+  if (!entry.inFlight) {
+    if (entry.refreshes >= 4) return;
+    entry.refreshes++;
+    entry.inFlight = (async () => {
+      const identity = context.identity;
+      if (!identity?.fingerprint) throw new Error("Local device identity is required for owner pin resolution");
+      const deviceCfg = { ...cfg, identity };
+      const response = cfg.fetchOwnerBuiltInFlocksFn
+        ? await cfg.fetchOwnerBuiltInFlocksFn(deviceCfg)
+        : cfg.fetchV3MyFlocks
+          ? await cfg.fetchV3MyFlocks(deviceCfg)
+          : await callBootstrapV3Endpoint(deviceCfg,
+            `/my-flocks?deviceId=${encodeURIComponent(identity.fingerprint)}`, { method: "GET" });
+      if (response?.ok !== true || normalizeGitHubUser(response.githubUser)?.toLowerCase() !== owner ||
+          !Number.isSafeInteger(Number(response.githubUserId)) || Number(response.githubUserId) <= 0 ||
+          !Array.isArray(response.ownedFlocks) || Buffer.byteLength(JSON.stringify(response)) > 1024 * 1024) {
+        throw new Error("Authoritative owner roster response is unavailable or invalid");
+      }
+      const ownedFlocks = response.ownedFlocks.filter((summary) =>
+        context.ids.includes(summary?.flockId) &&
+        summary.flockType === (summary.flockId === owner ? "owner_root" : "owner_scope") &&
+        !summary.targetMachineId &&
+        normalizeGitHubUser(summary.ownerGitHubUser)?.toLowerCase() === owner &&
+        (summary.ownerGitHubUserId == null || Number(summary.ownerGitHubUserId) === Number(response.githubUserId)));
+      if (ownedFlocks.length > 3 || ownedFlocks.some((summary) =>
+        !Array.isArray(summary.members) || summary.members.length > 512)) throw new Error("Owner roster exceeds bounded limits");
+      const fields = ["peerId", "githubUser", "githubUserId", "deviceId", "machineId", "scope", "trustTier",
+        "publicKey", "keyFingerprint", "removed", "revoked", "membershipExpiresAt", "membershipExpiresAtMs", "certExpiresAtMs"];
+      entry.result = { githubUserId: Number(response.githubUserId), ownedFlocks: ownedFlocks.map((summary) => ({
+        flockId: summary.flockId, rosterEpoch: summary.rosterEpoch, revoked: summary.revoked,
+        trustTier: summary.trustTier, membershipExpiresAt: summary.membershipExpiresAt,
+        membershipExpiresAtMs: summary.membershipExpiresAtMs, expiresAtMs: summary.expiresAtMs,
+        revokedPrincipals: Object.fromEntries(Object.entries(summary.revokedPrincipals || {})
+          .filter(([, value]) => value).map(([key]) => [key, true])),
+        removedMachines: Object.values(summary.removedMachines || {}).map((member) => ({
+          peerId: member.peerId, keyFingerprint: member.keyFingerprint, machineId: member.machineId,
+        })),
+        members: summary.members.map((member) => Object.fromEntries(fields.filter((key) => member[key] !== undefined)
+          .map((key) => [key, member[key]]))),
+      })) };
+      entry.expiresAt = Date.now() + 60000;
+    })();
+  }
+  try { await entry.inFlight; }
+  catch (cause) {
+    entry.result = null;
+    entry.expiresAt = 0;
+    throw Object.assign(new Error("Cannot verify owner-root peer: authoritative built-in roster lookup failed; check broker connectivity and membership", { cause }),
+      { code: "UNPINNED_PEER_KEY", statusCode: 403 });
+  } finally { entry.inFlight = null; }
+}
+
 function findPinnedPeerInStoredFlocks(cfg, machineId, customPath = null, flockId = null) {
   const cleanMachine = String(machineId || "").trim().toLowerCase();
   if (!cleanMachine) return null;
   const resolvedPath = customPath || cfg?.flocksConfigPath || getFlocksConfigPath();
   const owner = normalizeGitHubUser(cfg?.githubUser)?.toLowerCase();
   if (cfg?.protocol !== "broker-free-v34" && owner && flockId === owner) {
-    const registry = openFlockMembershipRegistry(resolvedPath);
-    const state = registry.read();
-    const scopedIds = [`${owner}/personal`, `${owner}/work`];
-    if (scopedIds.some((id) => state.flocks[id] || state.retainedFlocks?.[id])) {
-      // The legacy owner root is a routing alias, not an enrollment or a shared-flock key search.
-      const policies = readRawStoredFlocksConfig(cfg, resolvedPath).flocks;
-      const now = Date.now();
-      let matched = null;
-      const tombstones = [];
-      for (const id of [owner, ...scopedIds]) {
-        const record = state.flocks[id];
-        const policy = policies[id];
-        if (!record || record.protocol !== "v3-broker" || !policy ||
-            normalizeGitHubUser(record.ownerGitHubUser)?.toLowerCase() !== owner) continue;
-        tombstones.push(...Object.values(record.tombstones || {}).filter(
-          (entry) => String(entry.machineId || "").toLowerCase() === cleanMachine
-        ));
-        const peer = registry.findActiveMember(id, { machineId: cleanMachine, now });
-        if (!peer) {
-          if (Object.values(record.members || {}).some(
-            (entry) => String(entry.machineId || "").toLowerCase() === cleanMachine
-          )) return null;
-          continue;
-        }
-        const publicKey = peer.publicKey || peer.deviceEd25519Pub;
-        if (!publicKey || peer.githubUser !== owner || peer.role !== "owner" ||
-            (id !== owner && id !== `${owner}/${peer.scope}`) ||
-            normalizeGitHubUser(policy.ownerGitHubUser)?.toLowerCase() !== owner ||
-            (policy.flockType && policy.flockType !== (id === owner ? "owner_root" : "owner_scope")) ||
-            policy.targetMachineId ||
-            policy.trustTier !== "owner" || isExplicitOptInFlockPolicy(policy) ||
-            policy.revoked === true ||
-            (policy.membershipExpiresAtMs != null && Number(policy.membershipExpiresAtMs) <= now) ||
-            (policy.expiresAtMs != null && Number(policy.expiresAtMs) <= now) ||
-            isPrincipalRevokedInFlock(policy, { githubUser: owner, machineId: cleanMachine, peerId: peer.peerId }) ||
-            policy.revokedPrincipals?.[String(peer.githubUserId)] ||
-            policy.revokedPrincipals?.[peer.deviceId]) return null;
-        if (matched && (matched.publicKey.trim() !== publicKey.trim() ||
-            matched.peerId !== peer.peerId)) return null;
-        matched = { ...peer, publicKey };
-      }
-      if (matched && tombstones.some((entry) => entry.peerId === matched.peerId ||
-          (entry.keyFingerprint && entry.keyFingerprint === matched.keyFingerprint))) return null;
-      return matched;
-    }
+    return findOwnerBuiltInPeer(ownerBuiltInPinContext(cfg, resolvedPath), cleanMachine);
   }
   if (flockId) {
     const exact = openFlockMembershipRegistry(resolvedPath).findActiveMember(flockId, {
@@ -11203,9 +11340,15 @@ export function resolveVerifiedSenderIdentity(cfg, req) {
       throw err;
     }
     if (req.auth.publicKey && regPubKey.trim() !== String(req.auth.publicKey).trim()) {
-      throw new Error(
+      const error = new Error(
         `Security error: Ed25519 public key mismatch for machine "${rawClaimedMachine}" — spoofed sender rejected.`
       );
+      if (cfg?.protocol !== "broker-free-v34" &&
+          exactFlockId === normalizeGitHubUser(cfg?.githubUser)?.toLowerCase()) {
+        error.code = "UNPINNED_PEER_KEY";
+        error.statusCode = 403;
+      }
+      throw error;
     }
     const effectiveMaxSkewMs = Math.max(300000, Number(req.maxSkewMs) || 300000);
     const ver = verifyRpcSignature({
@@ -11537,6 +11680,7 @@ export async function handleRpcAction(cfg, req) {
     }
   };
 
+  await refreshOwnerBuiltInPinsForRequest(cfg, req);
   let senderIdentity;
   try {
     senderIdentity = resolveVerifiedSenderIdentity(cfg, req);
@@ -20849,7 +20993,7 @@ export function callBootstrapV3Endpoint(
             method,
             pathnameWithSearch: u.pathname + u.search,
             body: serializedBody,
-          })
+          }, cfg?.identity || undefined)
         : null;
     const extraEnv = devAuth
       ? {

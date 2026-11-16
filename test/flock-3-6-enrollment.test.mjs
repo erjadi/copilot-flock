@@ -37,6 +37,7 @@ import {
 } from "../flock.mjs";
 import { createSignedRosterSnapshot, signLeave } from "../flock-membership.mjs";
 import { createTlsFixture } from "./openssl.mjs";
+import { renameFixtureDirectory } from "./fixture-filesystem.mjs";
 
 function decodeJwtPayload(token) {
   const encoded = String(token || "").split(".")[1];
@@ -78,6 +79,13 @@ function signedRequest({ key, machineId, action, params = {}, toMachine = "LOCAL
   return { requestId, sentAt, action, params, toMachine, auth };
 }
 
+function ownerRoutingIdentity() {
+  const key = identity();
+  key.publicKey = key.publicKey.trim();
+  key.fingerprint = crypto.createHash("sha256").update(key.publicKey).digest("hex").slice(0, 32);
+  return key;
+}
+
 function ownerRootRoutingFixture(t, runtime, scope) {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "flock-owner-root-routing-"));
   const previous = process.env.COPILOT_HOME;
@@ -90,7 +98,7 @@ function ownerRootRoutingFixture(t, runtime, scope) {
   const directory = path.join(home, "flock");
   fs.mkdirSync(directory);
   const flocksPath = path.join(directory, "flocks.json");
-  const key = identity();
+  const key = ownerRoutingIdentity();
   const member = (machineId, memberScope, device = key, githubUser = "owner") => ({
     peerId: `1001:${device.fingerprint}`, githubUser, githubUserId: 1001, deviceId: device.fingerprint,
     keyFingerprint: device.fingerprint, publicKey: device.publicKey, machineId, scope: memberScope, trustTier: "owner",
@@ -106,6 +114,7 @@ function ownerRootRoutingFixture(t, runtime, scope) {
   const registry = runtime.openFlockMembershipRegistry(flocksPath);
   registry.reconcileV3BrokerFlock(syntheticRoot);
   const cfg = { machineId: self.machineId, githubUser: "owner", scope, identity: key, flocksConfigPath: flocksPath };
+  cfg.fetchOwnerBuiltInFlocksFn = async () => { throw new Error("Fixture owner roster is unavailable"); };
   cfg.syncFlockMembershipsFn = async () => {
     throw Object.assign(new Error("Fixture membership sync is offline"), { code: "FIXTURE_SYNC_OFFLINE" });
   };
@@ -175,37 +184,237 @@ test("Gate8a reconciled personal/work owner self-tests and default protected RPC
   }
 });
 
-test("Gate8a same-owner personal/work root aliases aggregate active built-in pins but explicit flock selectors stay exact", async (t) => {
+test("Gate8a genuinely reconciled personal/work hosts resolve root pins in memory, rotate keys and retain exact selector isolation", async (t) => {
   const runtime = await import("../flock.mjs");
-  for (const scope of ["personal", "work"]) {
-    await t.test(scope, async (t) => {
-      const f = ownerRootRoutingFixture(t, runtime, scope);
-      const remoteScope = scope === "personal" ? "work" : "personal";
-      const remoteKey = identity();
-      const remote = f.member(`REMOTE-${remoteScope.toUpperCase()}`, remoteScope, remoteKey);
-      const previous = f.member(remote.machineId, remoteScope, identity());
-      f.add(f.record(`owner/${remoteScope}`, [previous]));
-      f.add(f.record(`owner/${remoteScope}`, [remote], { rosterEpoch: 13 }));
-      assert.ok(Object.values(f.registry.read().flocks[`owner/${remoteScope}`].tombstones)
-        .some((entry) => entry.peerId === previous.peerId));
-      const invoke = async (action, params = {}) => {
-        const caller = { ...f.cfg, machineId: remote.machineId, identity: remoteKey, scope: remoteScope };
-        return runtime.invokeRemoteRpc(caller, { toMachine: f.cfg.machineId, action, params });
+  const original = process.env.COPILOT_HOME;
+  const personal = ownerRootRoutingFixture(t, runtime, "personal");
+  if (original === undefined) delete process.env.COPILOT_HOME;
+  else process.env.COPILOT_HOME = original;
+  const work = ownerRootRoutingFixture(t, runtime, "work");
+  const hosts = [personal, work];
+  const records = hosts.map((host) => host.record(`owner/${host.cfg.scope}`, [host.self]));
+  const reconcile = (host) => {
+    runtime.applyV3EnrollmentResult(host.cfg, { ok: true, githubUser: "owner", githubUserId: 1001,
+      deviceId: host.cfg.identity.fingerprint, peerId: `1001:${host.cfg.identity.fingerprint}`,
+      completeMembershipSnapshot: true, enrolledFlocks: [records.find((r) => r.flockId === `owner/${host.cfg.scope}`)],
+    }, host.flocksPath, { requireMemberProof: true });
+  };
+  for (const host of hosts) {
+    for (const record of records) host.add(record);
+    reconcile(host);
+    assert.deepEqual(host.registry.listFlockIds(), [`owner/${host.cfg.scope}`]);
+    assert.ok(host.registry.read().retainedFlocks[host.cfg.scope === "personal" ? "owner/work" : "owner/personal"]);
+    host.fetches = 0;
+    host.cfg.bootstrapUrl = "https://owner-pins.invalid/api/bootstrap";
+    host.cfg.fetchOwnerBuiltInFlocksFn = async (cfg) => {
+      host.fetches++;
+      assert.equal(cfg.identity.fingerprint, host.cfg.identity.fingerprint);
+      return { ok: true, githubUser: "owner", githubUserId: 1001, ownedFlocks: structuredClone(records) };
+    };
+  }
+  const before = hosts.map((host) => [fs.readFileSync(host.flocksPath), fs.readFileSync(host.registry.filename)]);
+  const invoke = (caller, receiver, action, params = {}) => runtime.invokeRemoteRpc({
+    ...caller.cfg, rpcTransport: async (request) => {
+      process.env.COPILOT_HOME = receiver.home;
+      return { fromMachine: receiver.cfg.machineId, result: await runtime.handleRpcAction(receiver.cfg, request) };
+    },
+  }, { toMachine: receiver.cfg.machineId, action, params });
+  for (const [caller, receiver] of [[personal, work], [work, personal]]) {
+    const dry = await invoke(caller, receiver, "send_message", { targetSession: "latest",
+      message: "Genuine post-reconcile cross-scope owner", dryRun: true });
+    assert.equal(dry.result.status, "dry_run_verified");
+    const acquired = await invoke(caller, receiver, "acquire_lock", { resource: "cross-scope", ownerSessionId: "fixture-session" });
+    assert.equal(acquired.result.acquired, true);
+    assert.equal((await invoke(caller, receiver, "release_lock", { resource: "cross-scope",
+      ownerSessionId: "fixture-session", leaseId: acquired.result.leaseId })).result.released, true);
+    assert.equal(receiver.fetches, 1, "A fresh authoritative cache avoids repeated broker calls");
+    await assert.rejects(() => invoke(caller, receiver, "send_message", { flock: `owner/${receiver.cfg.scope}`,
+      targetSession: "latest", message: "Wrong exact scope", dryRun: true }),
+    (error) => error.originalAuthorizationError?.code === "UNPINNED_PEER_KEY");
+    assert.equal(receiver.fetches, 1, "Explicit selectors must not use root-alias broker resolution");
+  }
+  hosts.forEach((host, index) => {
+    assert.deepEqual(fs.readFileSync(host.flocksPath), before[index][0]);
+    assert.deepEqual(fs.readFileSync(host.registry.filename), before[index][1]);
+  });
+  const oldWork = { ...work.cfg };
+  const oldPeer = work.self;
+  const rotated = ownerRoutingIdentity();
+  work.cfg.identity = rotated;
+  work.self = work.member(work.cfg.machineId, "work", rotated);
+  records[1] = work.record("owner/work", [work.self], { rosterEpoch: 13,
+    removedMachines: [{ ...oldPeer, removedAtEpoch: 13 }] });
+  reconcile(work);
+  const newKeyResult = await invoke(work, personal, "send_message", {
+    targetSession: "latest", message: "Rotated key without sleeping", dryRun: true });
+  assert.equal(newKeyResult.result.status, "dry_run_verified");
+  assert.equal(personal.fetches, 2);
+  await assert.rejects(() => invoke({ cfg: oldWork }, personal, "send_message", {
+    targetSession: "latest", message: "Old key must stay rejected", dryRun: true }),
+  (error) => error.code === "UNPINNED_PEER_KEY" && error.statusCode === 403);
+  assert.equal((await invoke(personal, work, "send_message", {
+    targetSession: "latest", message: "Reverse direction after rotation", dryRun: true })).result.status, "dry_run_verified");
+  hosts.forEach((host) => assert.deepEqual(host.registry.listFlockIds(), [`owner/${host.cfg.scope}`]));
+});
+
+test("Gate8a broker owner pin lookup rejects stale floors, retained tombstones and unproven memberships without persisting authority", async (t) => {
+  const runtime = await import("../flock.mjs");
+  for (const mode of ["retained-root-tombstone", "retained-scope-tombstone", "kicked-local", "stale-epoch",
+    "shared-only", "joined-only", "collaborator", "guest", "time-bound", "foreign-user", "foreign-response",
+    "forged-fingerprint", "forged-peer-id", "ambiguous-key", "broker-revocation", "broker-removed", "expired-scope"]) {
+    await t.test(mode, async (t) => {
+      const f = ownerRootRoutingFixture(t, runtime, "personal");
+      const key = ownerRoutingIdentity();
+      const peer = f.member("WORK-PEER", "work", key);
+      let policy = f.record("owner/work", [peer]);
+      f.add(policy);
+      f.registry.retainFlocks(["owner/work"]);
+      if (mode === "retained-root-tombstone" || mode === "retained-scope-tombstone") {
+        const id = mode === "retained-root-tombstone" ? "owner" : "owner/work";
+        f.registry.reconcileV3BrokerFlock(f.record(id, [peer]));
+        f.registry.recordRemovalTombstone(id, peer);
+        f.registry.retainFlocks([id]);
+      }
+      if (mode === "stale-epoch") policy.rosterEpoch--;
+      if (mode === "shared-only") policy = f.record("owner/team", [peer]);
+      if (mode === "collaborator" || mode === "guest") policy.members[0].trustTier = mode;
+      if (mode === "time-bound") policy.members[0].membershipExpiresAtMs = Date.now() + 600000;
+      if (mode === "expired-scope") policy.expiresAtMs = Date.now() - 1;
+      if (mode === "foreign-user") policy.members[0].githubUser = "alice";
+      if (mode === "forged-fingerprint") policy.members[0].keyFingerprint = "0".repeat(32);
+      if (mode === "forged-peer-id") policy.members[0].peerId = `2002:${key.fingerprint}`;
+      if (mode === "broker-revocation") policy.revokedPrincipals = { [peer.peerId]: true };
+      if (mode === "broker-removed") policy.removedMachines = [{ ...peer }];
+      if (mode === "kicked-local") {
+        f.registry.retainFlocks(["owner/personal"]);
+        fs.writeFileSync(f.flocksPath, '{"flocks":{}}');
+      }
+      let fetches = 0;
+      f.cfg.bootstrapUrl = "https://owner-pins.invalid/api/bootstrap";
+      f.cfg.fetchOwnerBuiltInFlocksFn = async () => {
+        fetches++;
+        return { ok: true, githubUser: mode === "foreign-response" ? "other" : "owner", githubUserId: 1001,
+          ownedFlocks: mode === "joined-only" ? [] : [policy, ...(mode === "ambiguous-key" ? [
+            f.record("owner", [{ ...f.member(peer.machineId, "work", ownerRoutingIdentity()) }]),
+          ] : [])], joinedFlocks: [policy] };
       };
-      const dry = await invoke("send_message", { targetSession: "latest", message: "Cross-scope owner", dryRun: true });
-      assert.equal(dry.result.status, "dry_run_verified");
-      const acquired = await invoke("acquire_lock", { resource: "cross-scope", ownerSessionId: "fixture-session" });
-      assert.equal(acquired.result.acquired, true);
-      assert.equal((await invoke("release_lock", { resource: "cross-scope",
-        ownerSessionId: "fixture-session", leaseId: acquired.result.leaseId })).result.released, true);
-      await assert.rejects(() => invoke("send_message", { flock: `owner/${scope}`,
-        targetSession: "latest", message: "Wrong exact scope", dryRun: true }),
-      (error) => error.originalAuthorizationError?.code === "UNPINNED_PEER_KEY");
-      await assert.rejects(() => invoke("send_message", { flock: `owner/${remoteScope}`,
-        targetSession: "latest", message: "Wrong target scope", dryRun: true }),
-      (error) => error.code === "FLOCK_SCOPE_FORBIDDEN" && error.statusCode === 403);
+      const before = [fs.readFileSync(f.flocksPath), fs.readFileSync(f.registry.filename)];
+      const request = signedRequest({ key, machineId: peer.machineId, action: "send_message",
+        params: { flock: "owner", targetSession: "latest", message: "Must not dispatch", dryRun: true }, toMachine: f.cfg.machineId });
+      await assert.rejects(() => runtime.handleRpcAction(f.cfg, request),
+        (error) => error.code === "UNPINNED_PEER_KEY" && error.statusCode === 403);
+      assert.equal(fetches, mode === "kicked-local" ? 0 : 1);
+      assert.deepEqual(fs.readFileSync(f.flocksPath), before[0]);
+      assert.deepEqual(fs.readFileSync(f.registry.filename), before[1]);
     });
   }
+});
+
+test("Gate8a owner pin refresh is fresh-signature gated, single-flight, burst bounded and expires after sixty seconds", async (t) => {
+  const runtime = await import("../flock.mjs");
+  const f = ownerRootRoutingFixture(t, runtime, "personal");
+  const key = ownerRoutingIdentity();
+  const peer = f.member("WORK-PEER", "work", key);
+  const policy = f.record("owner/work", [peer]);
+  let fetches = 0;
+  f.cfg.bootstrapUrl = "https://owner-pins.invalid/api/bootstrap";
+  f.cfg.fetchOwnerBuiltInFlocksFn = async () => {
+    fetches++;
+    await new Promise((resolve) => setImmediate(resolve));
+    return { ok: true, githubUser: "owner", githubUserId: 1001, ownedFlocks: [policy] };
+  };
+  const request = (device = key, machineId = peer.machineId) => signedRequest({ key: device, machineId,
+    action: "send_message", params: { flock: "owner", targetSession: "latest", message: "Cache check", dryRun: true },
+    toMachine: f.cfg.machineId });
+  const invalid = request();
+  invalid.auth.signature = Buffer.alloc(64).toString("base64");
+  await assert.rejects(() => runtime.handleRpcAction(f.cfg, invalid), /no pinned roster key/);
+  const stale = request();
+  stale.auth.sentAt = new Date(Date.now() - 600000).toISOString();
+  await assert.rejects(() => runtime.handleRpcAction(f.cfg, stale), /no pinned roster key/);
+  assert.equal(fetches, 0);
+  const results = await Promise.all([runtime.handleRpcAction(f.cfg, request()), runtime.handleRpcAction(f.cfg, request())]);
+  assert.ok(results.every((result) => result.status === "dry_run_verified"));
+  assert.equal(fetches, 1);
+  for (let index = 0; index < 8; index++) {
+    await assert.rejects(() => runtime.handleRpcAction(f.cfg, request(ownerRoutingIdentity(), `UNKNOWN-${index}`)), /no pinned roster key/);
+  }
+  assert.equal(fetches, 4);
+  const now = Date.now();
+  t.mock.method(Date, "now", () => now + 61000);
+  assert.equal((await runtime.handleRpcAction(f.cfg, request())).status, "dry_run_verified");
+  assert.equal(fetches, 5);
+});
+
+test("Gate8a cross-scope owner pins use the existing HTTPS my-flocks endpoint and configured device identity without GitHub credentials", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "flock-owner-pin-https-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const device = ownerRoutingIdentity();
+  const remote = ownerRoutingIdentity();
+  const storePath = path.join(root, "broker.json");
+  const enroll = (key, machineId, scope) => enrollV3Device({ githubUser: "owner", githubUserId: 1001,
+    deviceId: key.fingerprint, machineId, scope, publicKey: key.publicKey, keyFingerprint: key.fingerprint },
+  { storePath, connectionString: "" });
+  const enrollment = await enroll(device, "PERSONAL-RECEIVER", "personal");
+  await enroll(remote, "WORK-SENDER", "work");
+  const inputPath = path.join(root, "input.json");
+  fs.writeFileSync(inputPath, JSON.stringify({ device, remote, enrollment }));
+  const tls = createTlsFixture(root);
+  const broker = createBootstrapServer({ v3StorePath: storePath, membersPath: path.join(root, "members.json"),
+    apiGet: async () => { throw new Error("Owner pin resolution must not request GitHub credentials"); } });
+  const requests = [];
+  const server = https.createServer(tls, (req, res) => {
+    requests.push({ path: req.url, device: req.headers["x-flock-device-id"], authorization: req.headers.authorization });
+    broker.listeners("request")[0](req, res);
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(async () => { server.closeAllConnections(); await new Promise((resolve) => server.close(resolve)); });
+  const origin = `https://127.0.0.1:${server.address().port}`;
+  const home = path.join(root, "home");
+  fs.mkdirSync(path.join(home, "flock"), { recursive: true });
+  const child = spawn(process.execPath, ["--input-type=module", "-e", `
+    import fs from "node:fs";import path from "node:path";import assert from "node:assert/strict";
+    import {applyV3EnrollmentResult,handleRpcAction,signRpcRequest,openFlockMembershipRegistry}
+      from ${JSON.stringify(new URL("../flock.mjs", import.meta.url).href)};
+    const data=JSON.parse(fs.readFileSync(${JSON.stringify(inputPath)}));
+    const file=path.join(process.env.COPILOT_HOME,"flock","flocks.json");
+    const cfg={githubUser:"owner",machineId:"PERSONAL-RECEIVER",scope:"personal",tokenLocalAuth:true,
+      identity:data.device,bootstrapUrl:${JSON.stringify(origin + "/api/bootstrap")},flocksConfigPath:file};
+    applyV3EnrollmentResult(cfg,{...data.enrollment,completeMembershipSnapshot:true,
+      enrolledFlocks:data.enrollment.enrolledFlocks.filter(f=>f.flockId==="owner/personal")},file,{requireMemberProof:true});
+    fs.writeFileSync(path.join(path.dirname(file),"cli-sessions.json"),JSON.stringify([
+      {session_id:"fixture-session",title:"Fixture",session_type:"cli",updated_at:new Date().toISOString()}]));
+    const before=fs.readFileSync(file), registry=openFlockMembershipRegistry(file), registryBefore=fs.readFileSync(registry.filename);
+    for(let i=0;i<2;i++){
+      const requestId="owner-pin-https-"+i,sentAt=new Date().toISOString();
+      const params={flock:"owner",targetSession:"latest",message:"HTTPS owner pin check",dryRun:true};
+      const auth=signRpcRequest({requestId,sentAt,fromMachine:"WORK-SENDER",toMachine:cfg.machineId,
+        action:"send_message",params,identity:data.remote});
+      const result=await handleRpcAction(cfg,{requestId,sentAt,auth,toMachine:cfg.machineId,action:"send_message",params});
+      assert.equal(result.status,"dry_run_verified");
+    }
+    assert.deepEqual(fs.readFileSync(file),before);
+    assert.deepEqual(fs.readFileSync(registry.filename),registryBefore);
+    assert.deepEqual(registry.listFlockIds(),["owner/personal"]);
+    assert.equal(fs.existsSync(path.join(path.dirname(file),"identity.json")),false,"Configured identity must be used without creating another key");
+    console.log("HTTPS owner pins verified without membership persistence");
+  `], { windowsHide: true, env: { ...process.env, COPILOT_HOME: home, COPILOT_CLI_PATH: "",
+    HOME: root, USERPROFILE: root, APPDATA: path.join(root, "AppData"), LOCALAPPDATA: path.join(root, "LocalAppData"),
+    GITHUB_TOKEN: "must-not-forward-github-canary", GH_TOKEN: "must-not-forward-github-canary",
+    NODE_OPTIONS: "", NODE_PATH: "", NODE_EXTRA_CA_CERTS: tls.certPath, COPILOT_FLOCK_ALLOWED_BOOTSTRAP_ORIGIN: origin },
+    stdio: ["ignore", "pipe", "pipe"] });
+  t.after(() => { if (child.exitCode === null && child.signalCode === null) child.kill(); });
+  let stdout = "";
+  let stderr = "";
+  child.stdout.on("data", (chunk) => { stdout += chunk; });
+  child.stderr.on("data", (chunk) => { stderr += chunk; });
+  const code = await new Promise((resolve, reject) => { child.once("error", reject); child.once("close", resolve); });
+  assert.equal(code, 0, `${stdout}\n${stderr}`);
+  assert.match(stdout, /HTTPS owner pins verified/);
+  assert.equal(requests.length, 1, "The second request must reuse the in-memory cache");
+  assert.ok(requests[0].path.includes(`/my-flocks?deviceId=${device.fingerprint}`));
+  assert.equal(requests[0].device, device.fingerprint);
+  assert.equal(requests[0].authorization, undefined);
 });
 
 test("Gate8a owner-root verification rejects shared/retained/cross-owner/unpinned/conflicting and revoked scoped keys", async (t) => {
@@ -241,8 +450,7 @@ test("Gate8a owner-root verification rejects shared/retained/cross-owner/unpinne
           fromGitHubUser: "owner", fromScope: "work", dryRun: true },
         toMachine: f.cfg.machineId });
       await assert.rejects(() => runtime.handleRpcAction(f.cfg, request),
-        (error) => mode === "forged-key" ? /public key mismatch/.test(error.message)
-          : error.code === "UNPINNED_PEER_KEY" && error.statusCode === 403);
+        (error) => error.code === "UNPINNED_PEER_KEY" && error.statusCode === 403);
       assert.equal(f.registry.hasFlock("owner"), false);
     });
   }
@@ -419,14 +627,18 @@ test("broker replacement retries reject parent link swaps and retain displaced s
   let outside;
   let calls = 0;
   let displacedTemporary;
+  let setupError;
   t.mock.method(Atomics, "wait", () => "timed-out");
   t.mock.method(fs, "renameSync", (source, destination) => {
     if (destination !== target) return rename(source, destination);
     calls++;
-    rename(directory, retained);
-    displacedTemporary = path.join(outside, path.basename(source));
-    fs.writeFileSync(displacedTemporary, "external evidence");
-    fs.symlinkSync(outside, directory, process.platform === "win32" ? "junction" : "dir");
+    if (calls === 1) {
+      try { renameFixtureDirectory(directory, retained, rename); }
+      catch (error) { setupError = error; throw error; }
+      displacedTemporary = path.join(outside, path.basename(source));
+      fs.writeFileSync(displacedTemporary, "external evidence");
+      fs.symlinkSync(outside, directory, process.platform === "win32" ? "junction" : "dir");
+    }
     throw Object.assign(new Error("synthetic sharing violation"), { code: "EPERM" });
   });
   for (const kind of ["v3", "queue", "members-leave"]) {
@@ -439,7 +651,9 @@ test("broker replacement retries reject parent link swaps and retain displaced s
     fs.writeFileSync(path.join(outside, "state.json"), '{"external":"preserve"}');
     const before = fs.readFileSync(target);
     calls = 0;
+    setupError = null;
     await assert.rejects(async () => f.write(), /link|junction|escape/);
+    assert.ifError(setupError);
     assert.equal(calls, 1, kind);
     assert.equal(fs.readFileSync(displacedTemporary, "utf8"), "external evidence");
     assert.deepEqual(fs.readFileSync(path.join(retained, "state.json")), before);

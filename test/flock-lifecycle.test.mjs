@@ -13,8 +13,50 @@ import { lifecyclePaths, atomicJson, atomicReplaceFile, recordInstalledArtifact,
   prepareOutsideLinuxServiceCgroupSpawn, spawnSessionSafeProcess } from "../flock-lifecycle.mjs";
 import { matchesMember, signLeave, verifyLeave } from "../flock-membership.mjs";
 import { leaveV3Device, leaveV3EvictionTarget, kickV3FlockMember, planV3DeviceLeave } from "../bootstrap-server.mjs";
+import { renameFixtureDirectory } from "./fixture-filesystem.mjs";
 
 const uninstallFlock = (options) => runUninstall({ findProcesses: async () => [], ...options });
+
+test("fixture directory swaps bound real sharing-lock retries without repeating setup or hiding permanent failures", (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "flock-fixture-swap-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const rename = fs.renameSync;
+  t.mock.method(fs, "renameSync", () => assert.fail("Fixture must use its captured rename"));
+  t.mock.method(Atomics, "wait", () => assert.fail("Fixture must use its independent wait"));
+  for (const code of ["EPERM", "EACCES", "EBUSY", "EIO", "ENOSPC", "EEXIST"]) {
+    for (const mode of ["transient", "exhausted"]) {
+      const directory = path.join(root, `${code}-${mode}`);
+      const retained = `${directory}-retained`;
+      fs.mkdirSync(directory);
+      fs.writeFileSync(path.join(directory, "evidence"), "preserve");
+      let calls = 0;
+      const waits = [];
+      const move = (from, to) => {
+        calls++;
+        if (mode === "exhausted" || calls <= 2) throw Object.assign(new Error("fixture setup fault"), { code });
+        return rename(from, to);
+      };
+      const run = () => renameFixtureDirectory(directory, retained, move,
+        (_a, _b, _c, ms) => { waits.push(ms); });
+      const retryable = ["EPERM", "EACCES", "EBUSY"].includes(code);
+      if (mode === "transient" && retryable) {
+        run();
+        assert.equal(calls, 3);
+        assert.deepEqual(waits, [10, 20]);
+        assert.equal(fs.existsSync(directory), false);
+        assert.equal(fs.readFileSync(path.join(retained, "evidence"), "utf8"), "preserve");
+        fs.symlinkSync(retained, directory, process.platform === "win32" ? "junction" : "dir");
+        assert.equal(fs.readdirSync(directory).length, 1, "Setup runs once, without an EEXIST retry artifact");
+      } else {
+        assert.throws(run, (error) => error.code === "FLOCK_TEST_SWAP_SETUP_FAILED" && error.cause.code === code);
+        assert.equal(calls, retryable ? 9 : 1);
+        assert.deepEqual(waits, retryable ? [10, 20, 40, 80, 160, 200, 200, 200] : []);
+        assert.equal(fs.existsSync(retained), false);
+        assert.equal(fs.readFileSync(path.join(directory, "evidence"), "utf8"), "preserve");
+      }
+    }
+  }
+});
 
 test("binary atomic replacement bounds sharing-lock retries and retains source/destination on permanent, CAS and path failures", (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "flock-binary-replace-"));
@@ -79,13 +121,18 @@ test("binary atomic replacement bounds sharing-lock retries and retains source/d
   fs.writeFileSync(target, before);
   fs.writeFileSync(path.join(outside, "runtime.bin"), "external");
   let calls = 0;
+  let setupError;
   hook = () => {
     calls++;
-    rename(parent, displaced);
-    fs.symlinkSync(outside, parent, process.platform === "win32" ? "junction" : "dir");
+    if (calls === 1) {
+      try { renameFixtureDirectory(parent, displaced, rename); }
+      catch (error) { setupError = error; throw error; }
+      fs.symlinkSync(outside, parent, process.platform === "win32" ? "junction" : "dir");
+    }
     throw Object.assign(new Error("sharing lock"), { code: "EPERM" });
   };
   assert.throws(() => atomicReplaceFile(source, target), /link|physical|canonical|reparse/i);
+  assert.ifError(setupError);
   assert.equal(calls, 1);
   assert.equal(fs.readFileSync(path.join(outside, "runtime.bin"), "utf8"), "external");
   assert.deepEqual(fs.readFileSync(path.join(displaced, "runtime.bin")), before);
@@ -103,44 +150,11 @@ test("self-contained early membership/Azure rollback bounds faults, detects conc
     import crypto from "node:crypto";
     import assert from "node:assert/strict";
     import { pathToFileURL } from "node:url";
+    import { renameFixtureDirectory } from ${JSON.stringify(new URL("./fixture-filesystem.mjs", import.meta.url).href)};
     const root = ${JSON.stringify(root)};
     const sources = ${JSON.stringify(sources)};
     const realRename = fs.renameSync;
     const realWait = Atomics.wait;
-    const renameFixtureDirectory = (from, to, rename = realRename, wait = realWait) => {
-      for (let attempt = 0; ; attempt++) {
-        try { rename(from, to); return; }
-        catch (cause) {
-          if (!["EPERM", "EACCES", "EBUSY"].includes(cause.code) || attempt >= 8) {
-            throw Object.assign(new Error("Fixture directory swap failed", { cause }),
-              { code: "FLOCK_TEST_SWAP_SETUP_FAILED" });
-          }
-          wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Math.min(10 * 2 ** attempt, 200));
-        }
-      }
-    };
-    for (const code of ["EPERM", "EACCES", "EBUSY", "EIO", "ENOSPC"]) {
-      for (const mode of ["transient", "exhausted"]) {
-        let calls = 0;
-        const waits = [];
-        const replace = () => {
-          calls++;
-          if (mode === "exhausted" || calls <= 2) throw Object.assign(new Error("fixture setup fault"), { code });
-        };
-        const run = () => renameFixtureDirectory("fixture-source", "fixture-destination", replace,
-          (_a, _b, _c, ms) => { waits.push(ms); });
-        const retryable = ["EPERM", "EACCES", "EBUSY"].includes(code);
-        if (mode === "transient" && retryable) {
-          run();
-          assert.equal(calls, 3);
-          assert.deepEqual(waits, [10, 20]);
-        } else {
-          assert.throws(run, (error) => error.code === "FLOCK_TEST_SWAP_SETUP_FAILED" && error.cause.code === code);
-          assert.equal(calls, retryable ? 9 : 1);
-          assert.deepEqual(waits, retryable ? [10, 20, 40, 80, 160, 200, 200, 200] : []);
-        }
-      }
-    }
     const before = Buffer.from("original verified runtime\\r\\n");
     const candidate = Buffer.from("candidate runtime\\n");
     const expectedHash = crypto.createHash("sha256").update(before.toString().replace(/\\r\\n/g, "\\n")).digest("hex");
@@ -995,16 +1009,21 @@ test("atomic JSON replacement retries and cleanup reject a parent junction swap"
   const rename = fs.renameSync;
   let displacedTemporary;
   let calls = 0;
+  let setupError;
   t.mock.method(Atomics, "wait", () => "timed-out");
   t.mock.method(fs, "renameSync", (source) => {
     calls++;
-    rename(directory, retained);
-    displacedTemporary = path.join(outside, path.basename(source));
-    fs.writeFileSync(displacedTemporary, "external evidence");
-    fs.symlinkSync(outside, directory, process.platform === "win32" ? "junction" : "dir");
+    if (calls === 1) {
+      try { renameFixtureDirectory(directory, retained, rename); }
+      catch (error) { setupError = error; throw error; }
+      displacedTemporary = path.join(outside, path.basename(source));
+      fs.writeFileSync(displacedTemporary, "external evidence");
+      fs.symlinkSync(outside, directory, process.platform === "win32" ? "junction" : "dir");
+    }
     throw Object.assign(new Error("fixture replacement lock"), { code: "EPERM" });
   });
   assert.throws(() => atomicJson(filename, { after: true }), /link|junction|escape/);
+  assert.ifError(setupError);
   assert.equal(calls, 1);
   assert.equal(fs.readFileSync(displacedTemporary, "utf8"), "external evidence");
   assert.deepEqual(JSON.parse(fs.readFileSync(path.join(outside, "config.json"))), { external: "preserve" });
