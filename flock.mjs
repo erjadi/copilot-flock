@@ -12490,33 +12490,20 @@ export function saveProcessedOfflineState(
     });
   }
 
-  const tmp = `${customPath}.${process.pid}.${crypto.randomUUID()}.tmp`;
   try {
     fs.mkdirSync(path.dirname(customPath), { recursive: true });
-    fs.writeFileSync(
-      tmp,
-      JSON.stringify(
-        {
-          processedIds: dedupProcessed,
-          pendingAckIds: dedupPending,
-          inFlightIds: dedupInFlight,
-          ambiguousIds: dedupAmbiguous,
-          updatedAt: new Date().toISOString(),
-        },
-        null,
-        2
-      ),
-      "utf8"
-    );
-    fs.renameSync(tmp, customPath);
+    atomicJson(customPath, {
+      processedIds: dedupProcessed,
+      pendingAckIds: dedupPending,
+      inFlightIds: dedupInFlight,
+      ambiguousIds: dedupAmbiguous,
+      updatedAt: new Date().toISOString(),
+    });
     inMemoryOfflineStateByPath.set(customPath, {
       ...nextMemState,
       dirtyFromFailedDiskWrite: false,
     });
   } catch (err) {
-    try {
-      if (fs.existsSync(tmp)) fs.unlinkSync(tmp);
-    } catch {}
     const storageErr = new Error(`Processed offline state storage failure: ${err.message}`);
     storageErr.code = "OFFLINE_STATE_STORAGE_ERROR";
     storageErr.statusCode = 500;

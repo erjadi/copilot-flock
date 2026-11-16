@@ -1938,7 +1938,7 @@ const EMBEDDED_RUNTIME_MANIFEST_FALLBACK = (() => {
     operationsSha = hashRuntimeModule(fs.readFileSync(path.join(__lifecycleDir, "flock-operations.mjs")));
     supportSha = hashRuntimeModule(fs.readFileSync(path.join(__lifecycleDir, "flock-support.mjs")));
   } catch {}
-  const entrypointSha = "c18a0c853c5f633b8b462ea8e08cfc71ac52a2083c6aeb166f3fb982106017ef";
+  const entrypointSha = "e89268cbc1b2e719f8e6c29f3211b0e23698ef3650516b6509485e3ad3f9f092";
   const fallback = {
     type: "copilot-flock-runtime-manifest-v1",
     schema: 1,
@@ -1959,7 +1959,7 @@ const EMBEDDED_RUNTIME_MANIFEST_FALLBACK = (() => {
       },
       "flock-azure.mjs": {
         role: "companion",
-        sha256: "cce5b56a64877e35df0f93f8d81a7e09c95827056d83eccfde9f7b1443026d5f",
+        sha256: "cb0999e993a109b7d803589007d7f3d1388127d641d197e5648740eee8ec393a",
         imports: ["./flock-protocol.mjs"],
       },
       "flock-broker-free.mjs": {
@@ -1984,7 +1984,7 @@ const EMBEDDED_RUNTIME_MANIFEST_FALLBACK = (() => {
       },
       "flock-membership.mjs": {
         role: "companion",
-        sha256: "c4c61a28c3bf47b1ddfdf1c875f49c654decfb1392ac492de554ea55a8f380a7",
+        sha256: "2d855d5e92d5c8ce5933294014f38c9ea322c1bbd4effed6842764746c06aaeb",
         imports: [
           "./flock-lifecycle.mjs",
           "./flock-protocol.mjs",
@@ -2242,12 +2242,28 @@ export function verifyStagedRuntimeClosure(stageDir, manifest, {
   };
 }
 
-function atomicReplaceFile(sourcePath, destinationPath) {
-  assertNoLinks(sourcePath);
-  assertNoLinks(destinationPath);
+export function atomicReplaceFile(sourcePath, destinationPath, {
+  expectedDestination = undefined,
+} = {}) {
+  sourcePath = assertNoLinks(sourcePath);
+  destinationPath = assertNoLinks(destinationPath);
+  const sourceBytes = fs.readFileSync(sourcePath);
+  const destinationBefore = expectedDestination === undefined
+    ? fs.existsSync(destinationPath) ? fs.readFileSync(destinationPath) : null
+    : expectedDestination;
   for (let attempt = 0; ; attempt++) {
+    assertNoLinks(sourcePath);
+    assertNoLinks(destinationPath);
+    if (!fs.readFileSync(sourcePath).equals(sourceBytes)) {
+      throw runtimeError("RUNTIME_REPLACE_CONFLICT", "Replacement source changed; original files retained");
+    }
+    const current = fs.existsSync(destinationPath) ? fs.readFileSync(destinationPath) : null;
+    if (destinationBefore === null ? current !== null : !current?.equals(destinationBefore)) {
+      throw runtimeError("RUNTIME_REPLACE_CONFLICT", "Replacement destination changed; concurrent files retained");
+    }
     try {
       fs.renameSync(sourcePath, destinationPath);
+      assertNoLinks(destinationPath);
       break;
     } catch (error) {
       if (!["EPERM", "EACCES", "EBUSY"].includes(error.code) || attempt >= 8) throw error;
@@ -2502,6 +2518,9 @@ export function downgradeRuntime35({
   const allTargets = [...new Set([...writes.map((write) => write.target), path.join(root, "installation.json"),
     ...archiveNames.map((name) => path.join(root, name))])];
   for (const target of allTargets) assertNoLinks(target);
+  const originals = allTargets.map((target) => ({
+    target, content: fs.existsSync(target) ? fs.readFileSync(target) : null,
+  }));
   const checkTree = (dir) => {
     assertNoLinks(dir);
     if (fs.existsSync(dir)) for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
@@ -2517,14 +2536,24 @@ export function downgradeRuntime35({
   if (fs.existsSync(daemonPid) && inspectProcess(Number(fs.readFileSync(daemonPid, "utf8")))) abort("Daemon started during downgrade planning; no files changed");
   const archive = assertNoLinks(path.join(root, ".downgrade-archives", `${Date.now()}-${crypto.randomUUID()}`));
   fs.mkdirSync(archive, { recursive: true, mode: 0o700 });
-  const originals = allTargets.map((target, index) => {
-    const content = fs.existsSync(target) ? fs.readFileSync(target) : null;
-    if (content) fs.writeFileSync(path.join(archive, `${index}.backup`), content, { mode: 0o600 });
-    return { target, content };
+  originals.forEach(({ content }, index) => {
+    if (content !== null) fs.writeFileSync(path.join(archive, `${index}.backup`), content, { mode: 0o600 });
   });
   if (fs.existsSync(support)) fs.cpSync(support, path.join(archive, "support-quarantine"), { recursive: true });
   atomicJson(path.join(archive, "recovery.json"), { ...plan, targets: allTargets, status: "archived" });
-  const touched = new Set();
+  const touched = new Map();
+  const replacePlannedFile = (target, content, expectedDestination) => {
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    const temporary = `${target}.${crypto.randomUUID()}.tmp`;
+    writeBinarySecure(temporary, content);
+    try {
+      atomicReplaceFile(temporary, target, { expectedDestination });
+    } finally {
+      if (fs.existsSync(assertNoLinks(temporary)) && fs.readFileSync(temporary).equals(content)) {
+        fs.unlinkSync(temporary);
+      }
+    }
+  };
   try {
     for (const write of writes) {
       assertNoLinks(write.target);
@@ -2536,24 +2565,22 @@ export function downgradeRuntime35({
           (registryBefore === null || !fs.readFileSync(registryPath).equals(registryBefore))) {
         abort("Registry state changed during downgrade; retain current epoch/tombstone state and retry");
       }
-      fs.mkdirSync(path.dirname(write.target), { recursive: true });
-      const temporary = `${write.target}.${crypto.randomUUID()}.tmp`;
-      fs.writeFileSync(temporary, write.content, { mode: 0o600 });
-      fs.renameSync(temporary, write.target);
-      touched.add(write.target);
+      replacePlannedFile(write.target, write.content,
+        originals.find((original) => original.target === write.target).content);
+      touched.set(write.target, write.content);
       if (write.target !== paths.configs[0].path) installation.artifacts[write.target] = hash(write.content);
     }
     for (const name of archiveNames) {
       const target = assertNoLinks(path.join(root, name));
-      if (fs.existsSync(target)) { fs.unlinkSync(target); touched.add(target); }
+      if (fs.existsSync(target)) { fs.unlinkSync(target); touched.set(target, null); }
       delete installation.artifacts[target];
     }
     if (fs.existsSync(support)) fs.rmSync(assertNoLinks(support), { recursive: true });
     if (computeRuntimeManifest(root, { version: manifest.version, entrypoints: manifest.entrypoints, requiredModules: Object.keys(manifest.files) }).manifestDigest !== expectedManifestDigest) {
       abort("Restored runtime does not match the pinned 3.5 manifest");
     }
-    touched.add(path.join(root, "installation.json"));
     atomicJson(path.join(root, "installation.json"), installation);
+    touched.set(path.join(root, "installation.json"), Buffer.from(JSON.stringify(installation, null, 2) + "\n"));
     atomicJson(path.join(archive, "recovery.json"), { ...plan, targets: allTargets, status: "restored" });
     return { ...plan, status: "restored", archive, activated: false, verification: "3.5 imports and pinned artifact closure; runtime not started" };
   } catch (error) {
@@ -2562,8 +2589,13 @@ export function downgradeRuntime35({
       if (!touched.has(original.target)) continue;
       try {
         assertNoLinks(original.target);
-        if (original.content) fs.writeFileSync(original.target, original.content);
-        else if (fs.existsSync(original.target)) fs.unlinkSync(original.target);
+        const current = fs.existsSync(original.target) ? fs.readFileSync(original.target) : null;
+        const expected = touched.get(original.target);
+        if (expected === null ? current !== null : !current?.equals(expected)) {
+          throw runtimeError("RUNTIME_REPLACE_CONFLICT", "Concurrent downgrade destination retained; use archived evidence for recovery");
+        }
+        if (original.content !== null) replacePlannedFile(original.target, original.content, expected);
+        else if (current !== null) fs.unlinkSync(original.target);
       } catch (failure) { recoveryErrors.push(redactDiagnosticText(failure.message)); }
     }
     if (fs.existsSync(path.join(archive, "support-quarantine")) && !fs.existsSync(support)) {

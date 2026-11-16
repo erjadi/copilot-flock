@@ -16,6 +16,7 @@ import https from "node:https";
 import crypto from "node:crypto";
 import { matchesMember, verifyLeave, isPrincipalRevokedInFlock } from "./flock-membership.mjs";
 import { SupportMailbox } from "./flock-support.mjs";
+import { atomicJson } from "./flock-lifecycle.mjs";
 
 const PORT = Number(process.env.PORT) || 8080;
 const ALLOWED_REPO = (
@@ -267,15 +268,10 @@ export function saveOfflineQueueStore(store, customPath = OFFLINE_QUEUE_PATH) {
   const valid = (store.items || [])
     .filter((x) => x && (!x.expiresAtMs || x.expiresAtMs > now))
     .slice(-500);
-  const tmpPath = `${customPath}.${process.pid}.${crypto.randomUUID()}.tmp`;
   try {
     fs.mkdirSync(path.dirname(customPath), { recursive: true });
-    fs.writeFileSync(tmpPath, JSON.stringify({ items: valid }, null, 2), "utf8");
-    fs.renameSync(tmpPath, customPath);
+    atomicJson(customPath, { items: valid });
   } catch (err) {
-    try {
-      if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath);
-    } catch {}
     const storageErr = new Error(`Offline queue storage failure: ${err.message}`);
     storageErr.code = "QUEUE_STORAGE_ERROR";
     storageErr.statusCode = 500;
@@ -968,14 +964,8 @@ export function saveV3FlockStore(store, customPath = V3_FLOCKS_PATH) {
       nonces[k] = v;
     }
   }
-  const tmpPath = `${customPath}.${process.pid}.${crypto.randomUUID()}.tmp`;
   fs.mkdirSync(path.dirname(customPath), { recursive: true });
-  fs.writeFileSync(
-    tmpPath,
-    JSON.stringify({ flocks: store.flocks || {}, nonces, updatedAt: new Date(now).toISOString() }, null, 2),
-    "utf8"
-  );
-  fs.renameSync(tmpPath, customPath);
+  atomicJson(customPath, { flocks: store.flocks || {}, nonces, updatedAt: new Date(now).toISOString() });
 }
 
 function buildFlockHubName(flockUuid, { sandbox = false, isGuestPass = false } = {}) {
@@ -2083,14 +2073,13 @@ export async function leaveV3Device(request, {
     if (confirmed && membersPath && fs.existsSync(membersPath) &&
         !Object.values(store.flocks).some((other) => Object.values(other.members || {}).some((peer) =>
           peer.deviceId === member.deviceId))) {
-      const registry = JSON.parse(fs.readFileSync(membersPath, "utf8"));
+      const before = fs.readFileSync(membersPath);
+      const registry = JSON.parse(before.toString("utf8"));
       for (const [id, registered] of Object.entries(registry)) {
         if (String(registered.machineId).toLowerCase() === String(member.machineId).toLowerCase() &&
             registered.publicKey?.trim() === member.publicKey?.trim()) delete registry[id];
       }
-      const temporary = `${membersPath}.${crypto.randomUUID()}.tmp`;
-      fs.writeFileSync(temporary, JSON.stringify(registry, null, 2), { mode: 0o600, flag: "wx" });
-      fs.renameSync(temporary, membersPath);
+      atomicJson(membersPath, registry, before);
     }
     flock.leaveReceipts[request.requestId].confirmed = confirmed;
     saveV3FlockStore(store, storePath);

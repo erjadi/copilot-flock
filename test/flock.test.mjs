@@ -319,6 +319,7 @@ test("broker HTTP routes admit signed invited devices without repo write access 
   const server = createBootstrapServer({
     v3StorePath: storePath,
     v3PreviewStorePath: storePath,
+    membersPath: path.join(tempRoot, "members.json"),
     apiGet: async (apiPath, token) => apiPath === "/user"
       ? { statusCode: principals[token] ? 200 : 401, body: principals[token] || {} }
       : { statusCode: 200, body: { full_name: fullName, owner: { login: "source-owner" }, private: false, permissions: { pull: true, push: false, admin: false } } },

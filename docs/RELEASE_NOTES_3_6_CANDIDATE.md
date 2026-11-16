@@ -163,6 +163,37 @@ chat directories and config repair never escape to the import-time home.
 This replacement needs new exact-SHA platform qualification; earlier passing
 platform results do not override the Linux rejection.
 
+### Post-Gate-2 durability-critical atomic replacement correction
+
+The Windows Node 26 rejection of `e5fb8b7` is preserved as failed qualification
+evidence. Broker membership, offline-queue and signed-leave member-registry
+writes now reuse the existing hardened `atomicJson` primitive: exclusive
+owner-only staging, fsync, bounded sharing-violation retries, per-retry path and
+concurrent-write checks, and safe temporary cleanup. The destination is never
+unlinked to force replacement. Leave acknowledgement still requires successful
+persistence, and the queue retains its explicit storage-error contract.
+Deterministic tests cover transient and exhausted `EPERM`/`EACCES`/`EBUSY`,
+permanent errors, intervening writes and parent-link swaps across all three
+broker paths. No live membership, queue, credential or transport migration is
+performed by this correction.
+
+Processed-offline state uses the same JSON primitive while retaining its
+pre-dispatch failure and post-dispatch dirty-memory behavior. Binary downgrade
+artifacts use the existing bounded atomic replacement helper with planning-time
+destination CAS, source-byte and per-retry physical-path checks, and owned
+staging cleanup. Rollback refuses to overwrite an intervening writer and
+retains its recovery archive on failure.
+
+Early membership/Azure crash recovery keeps its self-contained, mixed-generation
+boot path: no new imports or runtime companions. Equivalent bounded replacement
+loops verify backup digests, source/destination bytes and physical paths on each
+retry. Incomplete recovery preserves the journal and backups for explicit retry.
+Failure diagnostics also refuse to write through a swapped runtime parent.
+Deterministic fault, concurrent-writer, link-swap and source-preservation tests
+supplement the existing all-cutover-index mixed-layout coverage. Best-effort
+log rotation is unchanged. Earlier qualification does not transfer to these
+changed runtime bytes.
+
 ### Final release-boundary hardening
 
 Release candidate execution is a protected owner-only RPC, including on shared

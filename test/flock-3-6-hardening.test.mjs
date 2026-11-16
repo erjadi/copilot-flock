@@ -1244,7 +1244,79 @@ test("GitHub-token broker callers cannot bootstrap masters or drain/ack foreign 
     const before = fs.readFileSync(path.join(root, "flocks.json"), "utf8");
     assert.equal(downgradeRuntime35(options).status, "planned");
     assert.equal(fs.readFileSync(path.join(root, "flocks.json"), "utf8"), before);
-    const result = downgradeRuntime35({ ...options, apply: true });
+    const target = path.join(root, "flock.mjs");
+    const targetBefore = fs.readFileSync(target);
+    const sourceBefore = fs.readFileSync(path.join(source, "flock.mjs"));
+    const rename = fs.renameSync;
+    const open = fs.openSync;
+    const waitMock = t.mock.method(Atomics, "wait", () => "timed-out");
+    for (const code of ["EPERM", "EACCES", "EBUSY", "EIO", "ENOSPC", "planning-CAS", "source-CAS"]) {
+      let calls = 0;
+      let retainedTemporary;
+      const renameMock = t.mock.method(fs, "renameSync", (from, to) => {
+        if (to !== target) return rename(from, to);
+        calls++;
+        if (code === "source-CAS") {
+          retainedTemporary = from;
+          fs.writeFileSync(from, "external staged evidence");
+        }
+        throw Object.assign(new Error("synthetic downgrade sharing failure"),
+          { code: code === "source-CAS" ? "EPERM" : code });
+      });
+      const openMock = t.mock.method(fs, "openSync", (filename, ...args) => {
+        if (code === "planning-CAS" && typeof filename === "string" && filename.startsWith(target + ".") && filename.endsWith(".tmp")) {
+          fs.writeFileSync(target, "intervening writer");
+        }
+        return open(filename, ...args);
+      });
+      try {
+        assert.throws(() => downgradeRuntime35({ ...options, apply: true }),
+          (error) => error.code === "DOWNGRADE_RESTORE_FAILED");
+      } finally { renameMock.mock.restore(); openMock.mock.restore(); }
+      assert.equal(calls, ["EPERM", "EACCES", "EBUSY"].includes(code) ? 9 : code === "planning-CAS" ? 0 : 1);
+      assert.deepEqual(fs.readFileSync(target), code === "planning-CAS" ? Buffer.from("intervening writer") : targetBefore);
+      assert.deepEqual(fs.readFileSync(path.join(source, "flock.mjs")), sourceBefore);
+      if (retainedTemporary) {
+        assert.equal(fs.readFileSync(retainedTemporary, "utf8"), "external staged evidence");
+        fs.unlinkSync(retainedTemporary);
+      }
+      assert.equal(fs.readdirSync(root).some((name) => name.endsWith(".tmp")), false);
+      fs.writeFileSync(target, targetBefore);
+    }
+    const startupTarget = paths.persistence[0];
+    const archiveRoot = path.join(root, ".downgrade-archives");
+    const archivesBefore = new Set(fs.readdirSync(archiveRoot));
+    const concurrentMock = t.mock.method(fs, "renameSync", (from, to) => {
+      if (to === startupTarget) {
+        fs.writeFileSync(target, "concurrent writer after promotion");
+        throw Object.assign(new Error("permanent later artifact failure"), { code: "EIO" });
+      }
+      return rename(from, to);
+    });
+    try {
+      assert.throws(() => downgradeRuntime35({ ...options, apply: true }),
+        (error) => error.code === "DOWNGRADE_RESTORE_FAILED");
+    } finally { concurrentMock.mock.restore(); }
+    assert.equal(fs.readFileSync(target, "utf8"), "concurrent writer after promotion");
+    const failedArchive = fs.readdirSync(archiveRoot).find((name) => !archivesBefore.has(name));
+    const failedRecovery = JSON.parse(fs.readFileSync(path.join(archiveRoot, failedArchive, "recovery.json")));
+    assert.equal(failedRecovery.status, "failed");
+    assert.ok(failedRecovery.recoveryErrors.some((message) => /Concurrent downgrade destination retained/.test(message)));
+    assert.equal(fs.readdirSync(root).some((name) => name.endsWith(".tmp")), false);
+    fs.writeFileSync(target, targetBefore);
+    let transientCalls = 0;
+    const transientMock = t.mock.method(fs, "renameSync", (from, to) => {
+      if (to === target && ++transientCalls <= 3) {
+        throw Object.assign(new Error("transient downgrade sharing failure"),
+          { code: ["EPERM", "EACCES", "EBUSY"][transientCalls - 1] });
+      }
+      return rename(from, to);
+    });
+    let result;
+    try { result = downgradeRuntime35({ ...options, apply: true }); }
+    finally { transientMock.mock.restore(); waitMock.mock.restore(); }
+    assert.equal(transientCalls, 4);
+    assert.equal(fs.readdirSync(root).some((name) => name.endsWith(".tmp")), false);
     assert.equal(result.status, "restored");
     const local = JSON.parse(fs.readFileSync(path.join(root, "flocks.json"), "utf8"));
     assert.equal(local.flocks["owner/team"].trustTier, "collaborator");

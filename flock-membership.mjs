@@ -63,6 +63,47 @@ import { canonical, ownerFingerprint, signedControl, verifyControl } from "./flo
     return a.localeCompare(b);
   });
   const restoreErrors = [];
+  const checkRecoveryPath = (filename) => {
+    const absolute = path.resolve(filename);
+    let current = path.parse(absolute).root;
+    for (const component of absolute.slice(current.length).split(path.sep).filter(Boolean)) {
+      current = path.join(current, component);
+      let stat;
+      try { stat = fs.lstatSync(current); }
+      catch (error) { if (error.code === "ENOENT") continue; throw error; }
+      const real = fs.realpathSync.native(current);
+      if (stat.isSymbolicLink() || (process.platform === "win32"
+        ? real.toLowerCase() !== current.toLowerCase() : real !== current)) {
+        throw Object.assign(new Error("Unsafe runtime recovery path"), { code: "RUNTIME_REPLACE_CONFLICT" });
+      }
+    }
+  };
+  const replaceRecoveryFile = (source, destination, expectedHash) => {
+    checkRecoveryPath(source);
+    checkRecoveryPath(destination);
+    const sourceBefore = fs.readFileSync(source);
+    if (expectedHash && hashNormalized(sourceBefore) !== expectedHash) {
+      throw Object.assign(new Error("Recovery backup digest mismatch"), { code: "RUNTIME_REPLACE_CONFLICT" });
+    }
+    const before = fs.existsSync(destination) ? fs.readFileSync(destination) : null;
+    for (let attempt = 0; ; attempt++) {
+      checkRecoveryPath(source);
+      checkRecoveryPath(destination);
+      const current = fs.existsSync(destination) ? fs.readFileSync(destination) : null;
+      if (!fs.readFileSync(source).equals(sourceBefore) ||
+          (before === null ? current !== null : !current?.equals(before))) {
+        throw Object.assign(new Error("Runtime recovery files changed"), { code: "RUNTIME_REPLACE_CONFLICT" });
+      }
+      try {
+        fs.renameSync(source, destination);
+        checkRecoveryPath(destination);
+        return;
+      } catch (error) {
+        if (!["EPERM", "EACCES", "EBUSY"].includes(error.code) || attempt >= 8) throw error;
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Math.min(10 * 2 ** attempt, 200));
+      }
+    }
+  };
 
   for (const name of orderedNames) {
     const activeFile = path.join(dir, name);
@@ -82,7 +123,7 @@ import { canonical, ownerFingerprint, signedControl, verifyControl } from "./flo
           restoreErrors.push(`${name}: missing rollback backup file`);
           break;
         }
-        fs.renameSync(backupFile, activeFile);
+        replaceRecoveryFile(backupFile, activeFile, expectedPrevHash);
         if (!fs.existsSync(activeFile)) {
           restoreErrors.push(`${name}: restored file missing after rename`);
           break;
@@ -109,6 +150,7 @@ import { canonical, ownerFingerprint, signedControl, verifyControl } from "./flo
   const writeState = (stagedPatch) => {
     try {
       const statePath = path.join(dir, "runtime-state.json");
+      checkRecoveryPath(statePath);
       let current = {
         type: "copilot-flock-runtime-state-v1",
         staged: null,
@@ -123,6 +165,7 @@ import { canonical, ownerFingerprint, signedControl, verifyControl } from "./flo
       }
       current.staged = stagedPatch;
       current.updatedAt = new Date().toISOString();
+      checkRecoveryPath(statePath);
       fs.writeFileSync(statePath, JSON.stringify(current, null, 2) + "\n", "utf8");
     } catch {}
   };

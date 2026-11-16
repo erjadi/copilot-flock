@@ -6,7 +6,7 @@ import path from "node:path";
 import crypto from "node:crypto";
 import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { lifecyclePaths, atomicJson, recordInstalledArtifact, uninstallFlock as runUninstall, stopPinnedDaemon,
+import { lifecyclePaths, atomicJson, atomicReplaceFile, recordInstalledArtifact, uninstallFlock as runUninstall, stopPinnedDaemon,
   assertNoLinks, inspectProcess, findRuntimeClients, assertLinuxUnitsQuiescent,
   assertLinuxDaemonCgroupSafe, disablePersistence, buildLinuxSystemdUnit,
   configureLinuxSystemdPersistence, activateLinuxSystemdDaemon, readLinuxCgroupPids,
@@ -15,6 +15,189 @@ import { matchesMember, signLeave, verifyLeave } from "../flock-membership.mjs";
 import { leaveV3Device, leaveV3EvictionTarget, kickV3FlockMember, planV3DeviceLeave } from "../bootstrap-server.mjs";
 
 const uninstallFlock = (options) => runUninstall({ findProcesses: async () => [], ...options });
+
+test("binary atomic replacement bounds sharing-lock retries and retains source/destination on permanent, CAS and path failures", (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "flock-binary-replace-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const rename = fs.renameSync;
+  const waits = [];
+  let hook;
+  t.mock.method(fs, "renameSync", (...args) => hook(...args));
+  t.mock.method(Atomics, "wait", (_a, _b, _c, ms) => { waits.push(ms); return "timed-out"; });
+  const before = Buffer.from([255, 0, 192, 13, 10]);
+  const staged = Buffer.from([0, 254, 128, 10]);
+  for (const code of ["EPERM", "EACCES", "EBUSY", "EIO", "ENOSPC"]) {
+    for (const mode of ["transient", "exhausted", "source", "destination"]) {
+      const dir = path.join(root, `${code}-${mode}`);
+      fs.mkdirSync(dir);
+      const source = path.join(dir, "owned.tmp");
+      const destination = path.join(dir, "runtime.mjs");
+      fs.writeFileSync(source, staged);
+      fs.writeFileSync(destination, before);
+      let calls = 0;
+      waits.length = 0;
+      hook = (from, to) => {
+        calls++;
+        if (mode === "source") fs.writeFileSync(source, "external");
+        if (mode === "destination") fs.writeFileSync(destination, "external");
+        if (mode === "transient" && calls > 2) return rename(from, to);
+        throw Object.assign(new Error("synthetic binary replacement failure"), { code });
+      };
+      const retryable = ["EPERM", "EACCES", "EBUSY"].includes(code);
+      if (mode === "transient" && retryable) {
+        atomicReplaceFile(source, destination);
+        assert.equal(calls, 3);
+        assert.deepEqual(waits, [10, 20]);
+        assert.equal(fs.existsSync(source), false);
+        assert.deepEqual(fs.readFileSync(destination), staged);
+      } else {
+        assert.throws(() => atomicReplaceFile(source, destination),
+          (error) => error.code === (retryable && ["source", "destination"].includes(mode) ? "RUNTIME_REPLACE_CONFLICT" : code));
+        assert.equal(calls, mode === "exhausted" && retryable ? 9 : 1);
+        assert.deepEqual(waits, retryable ? mode === "exhausted" ? [10, 20, 40, 80, 160, 200, 200, 200] : [10] : []);
+        assert.deepEqual(fs.readFileSync(source), mode === "source" ? Buffer.from("external") : staged);
+        assert.deepEqual(fs.readFileSync(destination), mode === "destination" ? Buffer.from("external") : before);
+      }
+    }
+  }
+  const source = path.join(root, "planning.tmp");
+  const destination = path.join(root, "planning.bin");
+  fs.writeFileSync(source, staged);
+  fs.writeFileSync(destination, "intervening writer");
+  hook = () => assert.fail("Planning-time CAS must fail before rename");
+  assert.throws(() => atomicReplaceFile(source, destination, { expectedDestination: before }),
+    (error) => error.code === "RUNTIME_REPLACE_CONFLICT");
+  assert.deepEqual(fs.readFileSync(source), staged);
+  assert.equal(fs.readFileSync(destination, "utf8"), "intervening writer");
+
+  const parent = path.join(root, "active");
+  const displaced = path.join(root, "displaced");
+  const outside = path.join(root, "outside");
+  fs.mkdirSync(parent);
+  fs.mkdirSync(outside);
+  const target = path.join(parent, "runtime.bin");
+  fs.writeFileSync(target, before);
+  fs.writeFileSync(path.join(outside, "runtime.bin"), "external");
+  let calls = 0;
+  hook = () => {
+    calls++;
+    rename(parent, displaced);
+    fs.symlinkSync(outside, parent, process.platform === "win32" ? "junction" : "dir");
+    throw Object.assign(new Error("sharing lock"), { code: "EPERM" });
+  };
+  assert.throws(() => atomicReplaceFile(source, target), /link|physical|canonical|reparse/i);
+  assert.equal(calls, 1);
+  assert.equal(fs.readFileSync(path.join(outside, "runtime.bin"), "utf8"), "external");
+  assert.deepEqual(fs.readFileSync(path.join(displaced, "runtime.bin")), before);
+  assert.deepEqual(fs.readFileSync(source), staged);
+});
+
+test("self-contained early membership/Azure rollback bounds faults, detects concurrent/link swaps and preserves backups/journals", (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "flock-early-replace-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const sources = Object.fromEntries(["flock-membership.mjs", "flock-azure.mjs"].map((name) =>
+    [name, fs.readFileSync(new URL(`../${name}`, import.meta.url), "utf8")]));
+  const script = `
+    import fs from "node:fs";
+    import path from "node:path";
+    import crypto from "node:crypto";
+    import assert from "node:assert/strict";
+    import { pathToFileURL } from "node:url";
+    const root = ${JSON.stringify(root)};
+    const sources = ${JSON.stringify(sources)};
+    const realRename = fs.renameSync;
+    const realWait = Atomics.wait;
+    const before = Buffer.from("original verified runtime\\r\\n");
+    const candidate = Buffer.from("candidate runtime\\n");
+    const expectedHash = crypto.createHash("sha256").update(before.toString().replace(/\\r\\n/g, "\\n")).digest("hex");
+    for (const [name, sourceText] of Object.entries(sources)) {
+      for (const code of ["EPERM", "EACCES", "EBUSY", "EIO", "ENOSPC"]) {
+        for (const mode of ["transient", "exhausted", "source", "destination", "link", "destination-link", "bad-backup"]) {
+          const dir = path.join(root, name + "-" + code + "-" + mode);
+          const backups = path.join(dir, "backups");
+          fs.mkdirSync(backups, { recursive: true });
+          fs.writeFileSync(path.join(dir, name), sourceText);
+          fs.writeFileSync(path.join(dir, "flock-lifecycle.mjs"),
+            "export function atomicJson() { throw Error('early recovery must not depend on lifecycle'); } export function assertNoLinks() { throw Error('early recovery must be self-contained'); }");
+          fs.writeFileSync(path.join(dir, "flock-protocol.mjs"),
+            "export function canonical() {} export function ownerFingerprint() {} export function signedControl() {} export function verifyControl() {} export function validateCert() {} export function peerSubscription() {}");
+          const active = path.join(dir, "restore.bin");
+          const backup = path.join(backups, "restore.bin");
+          fs.writeFileSync(active, candidate);
+          fs.writeFileSync(backup, mode === "bad-backup" ? "corrupted" : before);
+          const journal = path.join(dir, ".runtime-cutover-journal.json");
+          const journalBytes = JSON.stringify({ type: "copilot-flock-cutover-journal-v1", pid: 0, backupDir: backups,
+            managedNames: ["restore.bin"], existedBefore: ["restore.bin"], backedUpFiles: ["restore.bin"],
+            previousFileHashes: { "restore.bin": expectedHash } });
+          fs.writeFileSync(journal, journalBytes);
+          let calls = 0;
+          const waits = [];
+          fs.renameSync = (from, to) => {
+            assert.equal(from, backup);
+            assert.equal(to, active);
+            calls++;
+            if (mode === "source") fs.writeFileSync(backup, "external source");
+            if (mode === "destination") fs.writeFileSync(active, "external destination");
+            if (mode === "link") {
+              const elsewhere = path.join(dir, "external");
+              fs.mkdirSync(elsewhere);
+              fs.writeFileSync(path.join(elsewhere, "restore.bin"), "external source");
+              realRename(backups, path.join(dir, "displaced"));
+              fs.symlinkSync(elsewhere, backups, process.platform === "win32" ? "junction" : "dir");
+            }
+            if (mode === "destination-link") {
+              const elsewhere = dir + "-external";
+              fs.mkdirSync(elsewhere);
+              fs.writeFileSync(path.join(elsewhere, "restore.bin"), "external destination");
+              realRename(dir, dir + "-displaced");
+              fs.symlinkSync(elsewhere, dir, process.platform === "win32" ? "junction" : "dir");
+            }
+            if (mode === "transient" && calls > 2) return realRename(from, to);
+            throw Object.assign(new Error("synthetic recovery fault"), { code });
+          };
+          Atomics.wait = (_a, _b, _c, ms) => { waits.push(ms); return "timed-out"; };
+          let error;
+          try { await import(pathToFileURL(path.join(dir, name))); } catch (caught) { error = caught; }
+          finally { fs.renameSync = realRename; Atomics.wait = realWait; }
+          const retryable = ["EPERM", "EACCES", "EBUSY"].includes(code);
+          const success = mode === "transient" && retryable;
+          assert.equal(calls, mode === "bad-backup" ? 0 : success ? 3 : mode === "exhausted" && retryable ? 9 : 1, name + mode);
+          assert.deepEqual(waits, mode === "bad-backup" || !retryable ? [] : success ? [10,20] :
+            mode === "exhausted" ? [10,20,40,80,160,200,200,200] : [10]);
+          if (success) {
+            assert.ifError(error);
+            assert.deepEqual(fs.readFileSync(active), before);
+            assert.equal(fs.existsSync(journal), false);
+            assert.equal(fs.existsSync(backups), false);
+          } else {
+            assert.equal(error?.code, "RUNTIME_CUTOVER_RECOVERY_FAILED", String(error?.stack));
+            const retainedDir = mode === "destination-link" ? dir + "-displaced" : dir;
+            assert.equal(fs.readFileSync(path.join(retainedDir, ".runtime-cutover-journal.json"), "utf8"), journalBytes);
+            assert.deepEqual(fs.readFileSync(active), ["destination", "destination-link"].includes(mode) ? Buffer.from("external destination") : candidate);
+            const retainedBackup = mode === "link" ? path.join(dir, "displaced", "restore.bin") : path.join(retainedDir, "backups", "restore.bin");
+            assert.deepEqual(fs.readFileSync(retainedBackup),
+              mode === "source" ? Buffer.from("external source") : mode === "bad-backup" ? Buffer.from("corrupted") : before);
+            if (mode === "destination-link") {
+              assert.deepEqual(fs.readdirSync(dir), ["restore.bin"], "Recovery diagnostics must not write through a swapped parent");
+              assert.deepEqual(fs.readFileSync(path.join(retainedDir, "restore.bin")), candidate);
+            } else {
+              assert.equal(JSON.parse(fs.readFileSync(path.join(dir, "runtime-state.json"))).staged.code, "RUNTIME_CUTOVER_RECOVERY_FAILED");
+            }
+            if (mode === "link") assert.equal(fs.readFileSync(backup, "utf8"), "external source");
+          }
+          assert.equal(fs.readdirSync(dir).some((file) => file.endsWith(".tmp")), false);
+        }
+      }
+    }
+    console.log("Both self-contained recovery fault matrices passed");
+  `;
+  const scriptPath = path.join(root, "recovery-matrix.mjs");
+  fs.writeFileSync(scriptPath, script);
+  const child = spawnSync(process.execPath, [scriptPath],
+    { encoding: "utf8", timeout: 60000, maxBuffer: 1024 * 1024 });
+  assert.equal(child.status, 0, child.stderr || child.stdout);
+  assert.match(child.stdout, /Both self-contained recovery fault matrices passed/);
+});
 
 function fixture(platform = "win32") {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "flock-uninstall-test-"));

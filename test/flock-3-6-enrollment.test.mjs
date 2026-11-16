@@ -14,6 +14,9 @@ import {
   syncV3DeviceMemberships,
   kickV3FlockMember,
   listV3UserFlocks,
+  saveV3FlockStore,
+  saveOfflineQueueStore,
+  leaveV3Device,
 } from "../bootstrap-server.mjs";
 import {
   applyV3EnrollmentResult,
@@ -32,7 +35,7 @@ import {
   syncFlockMemberships,
   verifyEnrollmentReadiness,
 } from "../flock.mjs";
-import { createSignedRosterSnapshot } from "../flock-membership.mjs";
+import { createSignedRosterSnapshot, signLeave } from "../flock-membership.mjs";
 import { createTlsFixture } from "./openssl.mjs";
 
 function decodeJwtPayload(token) {
@@ -74,6 +77,258 @@ function signedRequest({ key, machineId, action, params = {}, toMachine = "LOCAL
   });
   return { requestId, sentAt, action, params, toMachine, auth };
 }
+
+function brokerPersistenceFixture(root, kind) {
+  const directory = path.join(root, kind);
+  fs.mkdirSync(directory);
+  const filename = path.join(directory, "state.json");
+  fs.writeFileSync(filename, '{"before":true}');
+  if (kind === "members-leave") {
+    const key = identity();
+    const member = { githubUser: "owner", githubUserId: 1001, deviceId: key.fingerprint,
+      peerId: `1001:${key.fingerprint}`, publicKey: key.publicKey, machineId: "TARGET" };
+    const storePath = path.join(directory, "broker.json");
+    fs.writeFileSync(storePath, JSON.stringify({ flocks: { "owner/team": {
+      flockId: "owner/team", rosterEpoch: 7, members: { target: member }, revokedPrincipals: {},
+    } } }));
+    fs.writeFileSync(filename, JSON.stringify({ target: member, sibling: { machineId: "SIBLING", publicKey: "keep" } }));
+    const request = signLeave({ flockId: "owner/team", deviceId: key.fingerprint, machineId: "TARGET" }, key.privateKey);
+    return { directory, filename, storePath, requestId: request.requestId,
+      write: () => leaveV3Device(request, { storePath, membersPath: filename,
+        deleteSubscription: async () => ({ confirmed: true }), evict: async () => ({ evicted: true }) }),
+      verify: (result) => {
+        assert.equal(result.confirmed, true);
+        assert.deepEqual(JSON.parse(fs.readFileSync(filename)), { sibling: { machineId: "SIBLING", publicKey: "keep" } });
+        assert.equal(JSON.parse(fs.readFileSync(storePath)).flocks["owner/team"].leaveReceipts[request.requestId].confirmed, true);
+      } };
+  }
+  const now = Date.now();
+  return { directory, filename, write: () => kind === "v3"
+    ? saveV3FlockStore({ flocks: { "owner/team": { rosterEpoch: 9 } },
+      nonces: { keep: { issuedAtMs: now }, expired: { issuedAtMs: now - 7200000 } } }, filename)
+    : saveOfflineQueueStore({ items: [{ requestId: "keep", expiresAtMs: now + 600000 },
+      { requestId: "expired", expiresAtMs: now - 1000 }] }, filename),
+  verify: () => {
+    const stored = JSON.parse(fs.readFileSync(filename));
+    if (kind === "v3") {
+      assert.equal(stored.flocks["owner/team"].rosterEpoch, 9);
+      assert.deepEqual(Object.keys(stored.nonces), ["keep"]);
+      assert.ok(Number.isFinite(Date.parse(stored.updatedAt)));
+    } else assert.deepEqual(stored.items.map((item) => item.requestId), ["keep"]);
+  } };
+}
+
+test("broker V3, offline queue and signed leave writes retry transient replacement locks without unlinking existing state", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "flock-broker-replace-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const rename = fs.renameSync;
+  const unlink = fs.unlinkSync;
+  let target;
+  let before;
+  let code;
+  let calls = 0;
+  const delays = [];
+  t.mock.method(Atomics, "wait", (_buffer, _index, _value, timeout) => { delays.push(timeout); return "timed-out"; });
+  t.mock.method(fs, "unlinkSync", (filename) => {
+    assert.notEqual(filename, target, "Atomic replacement must never unlink the destination");
+    return unlink(filename);
+  });
+  t.mock.method(fs, "renameSync", (source, destination) => {
+    if (destination !== target) return rename(source, destination);
+    assert.deepEqual(fs.readFileSync(target), before);
+    if (++calls <= 2) throw Object.assign(new Error("synthetic sharing violation"), { code });
+    return rename(source, destination);
+  });
+  for (const kind of ["v3", "queue", "members-leave"]) for (code of ["EPERM", "EACCES", "EBUSY"]) {
+    const f = brokerPersistenceFixture(root, kind);
+    target = f.filename;
+    before = fs.readFileSync(target);
+    calls = 0;
+    delays.length = 0;
+    const result = await f.write();
+    assert.equal(calls, 3, `${kind}/${code}`);
+    assert.deepEqual(delays, [10, 20], `${kind}/${code}`);
+    f.verify(result);
+    assert.equal(fs.readdirSync(f.directory).some((name) => name.endsWith(".tmp")), false);
+    target = null;
+    fs.rmSync(f.directory, { recursive: true });
+  }
+});
+
+test("broker replacement exhaustion and permanent failures preserve the destination, clean staged files and never confirm an unpersisted leave", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "flock-broker-denied-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const rename = fs.renameSync;
+  let target;
+  let failure;
+  let calls = 0;
+  const delays = [];
+  t.mock.method(Atomics, "wait", (_buffer, _index, _value, timeout) => { delays.push(timeout); return "timed-out"; });
+  t.mock.method(fs, "renameSync", (source, destination) => {
+    if (destination !== target) return rename(source, destination);
+    calls++;
+    throw failure;
+  });
+  for (const kind of ["v3", "queue", "members-leave"]) for (const code of ["EPERM", "EACCES", "EBUSY", "EIO", "ENOSPC"]) {
+    const f = brokerPersistenceFixture(root, kind);
+    target = f.filename;
+    const before = fs.readFileSync(target);
+    failure = Object.assign(new Error("synthetic replacement failure"), { code });
+    calls = 0;
+    delays.length = 0;
+    await assert.rejects(async () => f.write(), (error) => kind === "queue"
+      ? error.code === "QUEUE_STORAGE_ERROR" && error.statusCode === 500
+      : error === failure);
+    const retryable = ["EPERM", "EACCES", "EBUSY"].includes(code);
+    assert.equal(calls, retryable ? 9 : 1, `${kind}/${code}`);
+    assert.deepEqual(delays, retryable ? [10, 20, 40, 80, 160, 200, 200, 200] : []);
+    assert.deepEqual(fs.readFileSync(target), before);
+    assert.equal(fs.readdirSync(f.directory).some((name) => name.endsWith(".tmp")), false);
+    if (kind === "members-leave") {
+      const state = JSON.parse(fs.readFileSync(f.storePath));
+      assert.equal(state.flocks["owner/team"].leaveReceipts[f.requestId].confirmed, false);
+      target = null;
+      f.verify(await f.write());
+    }
+    target = null;
+    fs.rmSync(f.directory, { recursive: true });
+  }
+});
+
+test("broker replacement retries reject intervening writers instead of overwriting concurrent state", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "flock-broker-replace-cas-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const rename = fs.renameSync;
+  const external = Buffer.from('{"external":"preserve"}');
+  let target;
+  let calls = 0;
+  t.mock.method(Atomics, "wait", () => "timed-out");
+  t.mock.method(fs, "renameSync", (source, destination) => {
+    if (destination !== target) return rename(source, destination);
+    calls++;
+    fs.writeFileSync(target, external);
+    throw Object.assign(new Error("synthetic sharing violation"), { code: "EPERM" });
+  });
+  for (const kind of ["v3", "queue", "members-leave"]) {
+    const f = brokerPersistenceFixture(root, kind);
+    target = f.filename;
+    calls = 0;
+    await assert.rejects(async () => f.write(), /Concurrent config change/);
+    assert.equal(calls, 1, kind);
+    assert.deepEqual(fs.readFileSync(target), external);
+    assert.equal(fs.readdirSync(f.directory).some((name) => name.endsWith(".tmp")), false);
+    target = null;
+  }
+  const preReadRoot = path.join(root, "pre-read-race");
+  fs.mkdirSync(preReadRoot);
+  const leave = brokerPersistenceFixture(preReadRoot, "members-leave");
+  const read = fs.readFileSync;
+  let observed = false;
+  t.mock.method(fs, "readFileSync", (filename, ...args) => {
+    const bytes = read(filename, ...args);
+    if (filename === leave.filename && !observed) {
+      observed = true;
+      fs.writeFileSync(leave.filename, external);
+    }
+    return bytes;
+  });
+  await assert.rejects(leave.write(), /Concurrent config change/);
+  assert.equal(observed, true);
+  assert.deepEqual(read(leave.filename), external, "Leave must bind replacement to its pre-read member-registry bytes");
+  assert.equal(JSON.parse(read(leave.storePath)).flocks["owner/team"].leaveReceipts[leave.requestId].confirmed, false);
+  assert.equal(fs.readdirSync(leave.directory).some((name) => name.endsWith(".tmp")), false);
+});
+
+test("broker replacement retries reject parent link swaps and retain displaced staged evidence", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "flock-broker-replace-link-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const rename = fs.renameSync;
+  let target;
+  let directory;
+  let retained;
+  let outside;
+  let calls = 0;
+  let displacedTemporary;
+  t.mock.method(Atomics, "wait", () => "timed-out");
+  t.mock.method(fs, "renameSync", (source, destination) => {
+    if (destination !== target) return rename(source, destination);
+    calls++;
+    rename(directory, retained);
+    displacedTemporary = path.join(outside, path.basename(source));
+    fs.writeFileSync(displacedTemporary, "external evidence");
+    fs.symlinkSync(outside, directory, process.platform === "win32" ? "junction" : "dir");
+    throw Object.assign(new Error("synthetic sharing violation"), { code: "EPERM" });
+  });
+  for (const kind of ["v3", "queue", "members-leave"]) {
+    const f = brokerPersistenceFixture(root, kind);
+    target = f.filename;
+    directory = f.directory;
+    retained = `${directory}-retained`;
+    outside = `${directory}-outside`;
+    fs.mkdirSync(outside);
+    fs.writeFileSync(path.join(outside, "state.json"), '{"external":"preserve"}');
+    const before = fs.readFileSync(target);
+    calls = 0;
+    await assert.rejects(async () => f.write(), /link|junction|escape/);
+    assert.equal(calls, 1, kind);
+    assert.equal(fs.readFileSync(displacedTemporary, "utf8"), "external evidence");
+    assert.deepEqual(fs.readFileSync(path.join(retained, "state.json")), before);
+    assert.equal(JSON.parse(fs.readFileSync(path.join(outside, "state.json"))).external, "preserve");
+    assert.ok(fs.readdirSync(retained).some((name) => name.endsWith(".tmp")),
+      "Unsafe-path cleanup must not delete displaced staged evidence");
+    target = null;
+  }
+});
+
+test("processed-offline persistence in both entrypoints retries sharing locks and preserves dirty-memory and pre-dispatch failure contracts", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "flock-offline-replace-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const rename = fs.renameSync;
+  let target;
+  let calls = 0;
+  let scenario;
+  let failure;
+  const external = Buffer.from('{"processedIds":["external"]}');
+  t.mock.method(Atomics, "wait", () => "timed-out");
+  t.mock.method(fs, "renameSync", (source, destination) => {
+    if (destination !== target) return rename(source, destination);
+    calls++;
+    if (scenario === "concurrent") fs.writeFileSync(target, external);
+    if (scenario !== "transient" || calls <= 2) throw failure;
+    return rename(source, destination);
+  });
+  for (const filename of ["flock.mjs", "bridge.mjs"]) {
+    const runtime = await import(new URL(`../${filename}`, import.meta.url));
+    for (const code of ["EPERM", "EACCES", "EBUSY", "EIO", "ENOSPC"]) {
+      for (const mode of ["transient", "exhausted", "concurrent"]) {
+        scenario = mode;
+        target = path.join(root, `${filename}-${code}-${scenario}.json`);
+        const before = Buffer.from('{"processedIds":["before"]}');
+        fs.writeFileSync(target, before);
+        calls = 0;
+        failure = Object.assign(new Error("synthetic sharing failure"), { code });
+        const input = { processedIds: ["next", "next"], inFlightIds: ["pending"], retainInMemoryOnFailure: false };
+        if (scenario === "transient" && ["EPERM", "EACCES", "EBUSY"].includes(code)) {
+          runtime.saveProcessedOfflineState(input, target);
+          assert.equal(calls, 3);
+          assert.deepEqual(runtime.loadProcessedOfflineState(target).processedIds, ["next"]);
+        } else {
+          assert.throws(() => runtime.saveProcessedOfflineState(input, target),
+            (error) => error.code === "OFFLINE_STATE_STORAGE_ERROR" && error.statusCode === 500);
+          const retryable = ["EPERM", "EACCES", "EBUSY"].includes(code);
+          assert.equal(calls, scenario === "exhausted" && retryable ? 9 : 1);
+          assert.deepEqual(fs.readFileSync(target), scenario === "concurrent" ? external : before);
+          assert.equal(runtime.loadProcessedOfflineState(target).processedIds.includes("next"), false);
+          scenario = "exhausted";
+          assert.throws(() => runtime.saveProcessedOfflineState({ processedIds: ["after-dispatch"] }, target),
+            (error) => error.code === "OFFLINE_STATE_STORAGE_ERROR");
+          assert.ok(runtime.loadProcessedOfflineState(target).processedIds.includes("after-dispatch"));
+        }
+        assert.equal(fs.readdirSync(root).some((name) => name.endsWith(".tmp")), false);
+      }
+    }
+  }
+});
 
 test("NEXUS personal reconciliation never turns account-owned work overviews into device enrollment or downgrades owner roles", async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "flock-nexus-roster-"));
