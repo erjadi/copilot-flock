@@ -194,6 +194,23 @@ supplement the existing all-cutover-index mixed-layout coverage. Best-effort
 log rotation is unchanged. Earlier qualification does not transfer to these
 changed runtime bytes.
 
+### Post-Gate-8a reconciled owner-root routing correction
+
+The `f634e24f` canary rejection is retained evidence; it does not qualify this
+successor. After a verified complete membership sync prunes a synthetic owner
+root, legacy default protected RPCs and the self-test can still use `<owner>`
+as a same-owner routing alias. Pinned sender verification now considers the
+authoritative active built-in personal/work rosters for that owner. It does
+not recreate or persist root enrollment, search shared/retained/foreign-owner
+flocks, accept caller-supplied keys, or change broker-free selection rules.
+
+Revocation, tombstones, expired or non-owner members and conflicting machine
+pins fail closed. Explicit non-root selectors retain exact-flock pin lookup
+and target scope walls; an owner alias is not permission to fall back from an
+explicit shared or scoped request. Regressions cover reconciled personal/work
+self-test RPCs, default protected requests across active built-in scopes,
+unchanged membership bytes, and isolation/forged-key denials.
+
 ### Final release-boundary hardening
 
 Release candidate execution is a protected owner-only RPC, including on shared

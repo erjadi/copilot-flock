@@ -11019,6 +11019,54 @@ function findPinnedPeerInStoredFlocks(cfg, machineId, customPath = null, flockId
   const cleanMachine = String(machineId || "").trim().toLowerCase();
   if (!cleanMachine) return null;
   const resolvedPath = customPath || cfg?.flocksConfigPath || getFlocksConfigPath();
+  const owner = normalizeGitHubUser(cfg?.githubUser)?.toLowerCase();
+  if (cfg?.protocol !== "broker-free-v34" && owner && flockId === owner) {
+    const registry = openFlockMembershipRegistry(resolvedPath);
+    const state = registry.read();
+    const scopedIds = [`${owner}/personal`, `${owner}/work`];
+    if (scopedIds.some((id) => state.flocks[id] || state.retainedFlocks?.[id])) {
+      // The legacy owner root is a routing alias, not an enrollment or a shared-flock key search.
+      const policies = readRawStoredFlocksConfig(cfg, resolvedPath).flocks;
+      const now = Date.now();
+      let matched = null;
+      const tombstones = [];
+      for (const id of [owner, ...scopedIds]) {
+        const record = state.flocks[id];
+        const policy = policies[id];
+        if (!record || record.protocol !== "v3-broker" || !policy ||
+            normalizeGitHubUser(record.ownerGitHubUser)?.toLowerCase() !== owner) continue;
+        tombstones.push(...Object.values(record.tombstones || {}).filter(
+          (entry) => String(entry.machineId || "").toLowerCase() === cleanMachine
+        ));
+        const peer = registry.findActiveMember(id, { machineId: cleanMachine, now });
+        if (!peer) {
+          if (Object.values(record.members || {}).some(
+            (entry) => String(entry.machineId || "").toLowerCase() === cleanMachine
+          )) return null;
+          continue;
+        }
+        const publicKey = peer.publicKey || peer.deviceEd25519Pub;
+        if (!publicKey || peer.githubUser !== owner || peer.role !== "owner" ||
+            (id !== owner && id !== `${owner}/${peer.scope}`) ||
+            normalizeGitHubUser(policy.ownerGitHubUser)?.toLowerCase() !== owner ||
+            (policy.flockType && policy.flockType !== (id === owner ? "owner_root" : "owner_scope")) ||
+            policy.targetMachineId ||
+            policy.trustTier !== "owner" || isExplicitOptInFlockPolicy(policy) ||
+            policy.revoked === true ||
+            (policy.membershipExpiresAtMs != null && Number(policy.membershipExpiresAtMs) <= now) ||
+            (policy.expiresAtMs != null && Number(policy.expiresAtMs) <= now) ||
+            isPrincipalRevokedInFlock(policy, { githubUser: owner, machineId: cleanMachine, peerId: peer.peerId }) ||
+            policy.revokedPrincipals?.[String(peer.githubUserId)] ||
+            policy.revokedPrincipals?.[peer.deviceId]) return null;
+        if (matched && (matched.publicKey.trim() !== publicKey.trim() ||
+            matched.peerId !== peer.peerId)) return null;
+        matched = { ...peer, publicKey };
+      }
+      if (matched && tombstones.some((entry) => entry.peerId === matched.peerId ||
+          (entry.keyFingerprint && entry.keyFingerprint === matched.keyFingerprint))) return null;
+      return matched;
+    }
+  }
   if (flockId) {
     const exact = openFlockMembershipRegistry(resolvedPath).findActiveMember(flockId, {
       machineId: cleanMachine,
