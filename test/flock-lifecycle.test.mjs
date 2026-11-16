@@ -26,7 +26,7 @@ test("binary atomic replacement bounds sharing-lock retries and retains source/d
   t.mock.method(Atomics, "wait", (_a, _b, _c, ms) => { waits.push(ms); return "timed-out"; });
   const before = Buffer.from([255, 0, 192, 13, 10]);
   const staged = Buffer.from([0, 254, 128, 10]);
-  for (const code of ["EPERM", "EACCES", "EBUSY", "EIO", "ENOSPC"]) {
+  for (const code of ["EPERM", "EACCES", "EBUSY", "EIO", "ENOSPC", "EEXIST"]) {
     for (const mode of ["transient", "exhausted", "source", "destination"]) {
       const dir = path.join(root, `${code}-${mode}`);
       fs.mkdirSync(dir);
@@ -107,6 +107,40 @@ test("self-contained early membership/Azure rollback bounds faults, detects conc
     const sources = ${JSON.stringify(sources)};
     const realRename = fs.renameSync;
     const realWait = Atomics.wait;
+    const renameFixtureDirectory = (from, to, rename = realRename, wait = realWait) => {
+      for (let attempt = 0; ; attempt++) {
+        try { rename(from, to); return; }
+        catch (cause) {
+          if (!["EPERM", "EACCES", "EBUSY"].includes(cause.code) || attempt >= 8) {
+            throw Object.assign(new Error("Fixture directory swap failed", { cause }),
+              { code: "FLOCK_TEST_SWAP_SETUP_FAILED" });
+          }
+          wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Math.min(10 * 2 ** attempt, 200));
+        }
+      }
+    };
+    for (const code of ["EPERM", "EACCES", "EBUSY", "EIO", "ENOSPC"]) {
+      for (const mode of ["transient", "exhausted"]) {
+        let calls = 0;
+        const waits = [];
+        const replace = () => {
+          calls++;
+          if (mode === "exhausted" || calls <= 2) throw Object.assign(new Error("fixture setup fault"), { code });
+        };
+        const run = () => renameFixtureDirectory("fixture-source", "fixture-destination", replace,
+          (_a, _b, _c, ms) => { waits.push(ms); });
+        const retryable = ["EPERM", "EACCES", "EBUSY"].includes(code);
+        if (mode === "transient" && retryable) {
+          run();
+          assert.equal(calls, 3);
+          assert.deepEqual(waits, [10, 20]);
+        } else {
+          assert.throws(run, (error) => error.code === "FLOCK_TEST_SWAP_SETUP_FAILED" && error.cause.code === code);
+          assert.equal(calls, retryable ? 9 : 1);
+          assert.deepEqual(waits, retryable ? [10, 20, 40, 80, 160, 200, 200, 200] : []);
+        }
+      }
+    }
     const before = Buffer.from("original verified runtime\\r\\n");
     const candidate = Buffer.from("candidate runtime\\n");
     const expectedHash = crypto.createHash("sha256").update(before.toString().replace(/\\r\\n/g, "\\n")).digest("hex");
@@ -132,24 +166,37 @@ test("self-contained early membership/Azure rollback bounds faults, detects conc
           fs.writeFileSync(journal, journalBytes);
           let calls = 0;
           const waits = [];
+          let setupError;
+          let setupCalls = 0;
+          const swapDirectory = (from, to) => {
+            try {
+              renameFixtureDirectory(from, to, (source, destination) => {
+                if (++setupCalls <= 3) {
+                  throw Object.assign(new Error("injected fixture directory sharing lock"),
+                    { code: ["EPERM", "EACCES", "EBUSY"][setupCalls - 1] });
+                }
+                return realRename(source, destination);
+              });
+            } catch (error) { setupError = error; throw error; }
+          };
           fs.renameSync = (from, to) => {
             assert.equal(from, backup);
             assert.equal(to, active);
             calls++;
             if (mode === "source") fs.writeFileSync(backup, "external source");
             if (mode === "destination") fs.writeFileSync(active, "external destination");
-            if (mode === "link") {
+            if (mode === "link" && calls === 1) {
               const elsewhere = path.join(dir, "external");
               fs.mkdirSync(elsewhere);
               fs.writeFileSync(path.join(elsewhere, "restore.bin"), "external source");
-              realRename(backups, path.join(dir, "displaced"));
+              swapDirectory(backups, path.join(dir, "displaced"));
               fs.symlinkSync(elsewhere, backups, process.platform === "win32" ? "junction" : "dir");
             }
-            if (mode === "destination-link") {
+            if (mode === "destination-link" && calls === 1) {
               const elsewhere = dir + "-external";
               fs.mkdirSync(elsewhere);
               fs.writeFileSync(path.join(elsewhere, "restore.bin"), "external destination");
-              realRename(dir, dir + "-displaced");
+              swapDirectory(dir, dir + "-displaced");
               fs.symlinkSync(elsewhere, dir, process.platform === "win32" ? "junction" : "dir");
             }
             if (mode === "transient" && calls > 2) return realRename(from, to);
@@ -159,6 +206,8 @@ test("self-contained early membership/Azure rollback bounds faults, detects conc
           let error;
           try { await import(pathToFileURL(path.join(dir, name))); } catch (caught) { error = caught; }
           finally { fs.renameSync = realRename; Atomics.wait = realWait; }
+          assert.ifError(setupError);
+          if (["link", "destination-link"].includes(mode)) assert.ok(setupCalls >= 4);
           const retryable = ["EPERM", "EACCES", "EBUSY"].includes(code);
           const success = mode === "transient" && retryable;
           assert.equal(calls, mode === "bad-backup" ? 0 : success ? 3 : mode === "exhausted" && retryable ? 9 : 1, name + mode);
