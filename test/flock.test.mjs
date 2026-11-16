@@ -1009,12 +1009,17 @@ test("parseTranscriptEventLine and reverse chunked tail reader preserve exact se
 test(
   "synthetic >512 MiB (>0x1fffffe8 V8 string limit) events.jsonl: get_transcript, non-wait send_message, wait send_message, and concurrent RPCs succeed rapidly without blocking event loop",
   { skip: process.env.BRIDGE_FAST_VOTE_TEST === "1" },
-  async () => {
+  async (t) => {
   const env = setupTempCopilotEnv();
   const prevCopilotHome = process.env.COPILOT_HOME;
   process.env.COPILOT_HOME = env.tempRoot;
 
   let wsServer = null;
+  let eventWriter = null;
+  let eventWrites = Promise.resolve();
+  let eventWriteError = null;
+  let lagInterval = null;
+  const eventTimers = [];
   try {
     assert.equal(BRIDGE_VERSION, "3.6.0");
 
@@ -1119,10 +1124,17 @@ test(
       installedScriptPath: path.join(env.tempRoot, "signalr-bridge", "bridge.mjs"),
     };
 
+    // The external runtime's writes must not synchronously block the RPC process being measured.
+    eventWriter = await fs.promises.open(eventsPath, "a");
+    const appendRuntimeEvent = (event) => {
+      eventWrites = eventWrites.then(() =>
+        eventWriter.appendFile(JSON.stringify(event) + "\n", "utf8"));
+      eventWrites.catch((error) => { eventWriteError ||= error; });
+    };
     wsServer = await startMockCopilotWsServer((frame) => {
       if (frame.type === "send_message") {
         // First append an UNRELATED user.message after 15ms to verify it cannot falsely ack our request
-        setTimeout(() => {
+        eventTimers.push(setTimeout(() => {
           const unrelated = {
             type: "user.message",
             id: crypto.randomUUID(),
@@ -1132,11 +1144,11 @@ test(
               content: "Unrelated local user prompt from another window",
             },
           };
-          fs.appendFileSync(eventsPath, JSON.stringify(unrelated) + "\n", "utf8");
-        }, 15);
+          appendRuntimeEvent(unrelated);
+        }, 15));
 
         // Then append the actual matching user.message after 45ms
-        setTimeout(() => {
+        eventTimers.push(setTimeout(() => {
           const matchedUser = {
             type: "user.message",
             id: crypto.randomUUID(),
@@ -1148,11 +1160,11 @@ test(
               transformedContent: frame.prompt,
             },
           };
-          fs.appendFileSync(eventsPath, JSON.stringify(matchedUser) + "\n", "utf8");
-        }, 45);
+          appendRuntimeEvent(matchedUser);
+        }, 45));
 
         // And append the assistant reply after 80ms (for wait_for_reply tests)
-        setTimeout(() => {
+        eventTimers.push(setTimeout(() => {
           const replyEv = {
             type: "assistant.message",
             id: crypto.randomUUID(),
@@ -1164,22 +1176,13 @@ test(
               toolRequests: [],
             },
           };
-          fs.appendFileSync(eventsPath, JSON.stringify(replyEv) + "\n", "utf8");
-        }, 80);
+          appendRuntimeEvent(replyEv);
+        }, 80));
       }
     });
     env.writeWsConfig(wsServer.port);
 
     // 4. Run concurrent get_transcript, ping, list_sessions, non-wait send_message, and wait send_message against the 540 MiB session
-    let maxTimerLagMs = 0;
-    let lastTick = performance.now();
-    const lagInterval = setInterval(() => {
-      const now = performance.now();
-      const lag = now - lastTick - 10;
-      if (lag > maxTimerLagMs) maxTimerLagMs = lag;
-      lastTick = now;
-    }, 10);
-
     const hugePeerKey = crypto.generateKeyPairSync("ed25519", {
       publicKeyEncoding: { type: "spki", format: "pem" },
       privateKeyEncoding: { type: "pkcs8", format: "pem" },
@@ -1218,11 +1221,22 @@ test(
       };
     };
 
+    const transcriptRequest = signedHugeRead("req-transcript-1", "get_transcript", { session: hugeSessionId, limit: 8 });
+    const pingRequest = signedHugeRead("req-ping-1", "ping", {});
+    const listRequest = signedHugeRead("req-list-1", "list_sessions", { limit: 10 });
+    let maxTimerLagMs = 0;
+    let lastTick = performance.now();
+    lagInterval = setInterval(() => {
+      const now = performance.now();
+      const lag = now - lastTick - 10;
+      if (lag > maxTimerLagMs) maxTimerLagMs = lag;
+      lastTick = now;
+    }, 10);
     const tConcurrent0 = performance.now();
     const [transcriptRes, pingRes, listRes, nonWaitSendRes, waitSendRes] = await Promise.all([
-      handleRpcAction(cfg, signedHugeRead("req-transcript-1", "get_transcript", { session: hugeSessionId, limit: 8 })),
-      handleRpcAction(cfg, signedHugeRead("req-ping-1", "ping", {})),
-      handleRpcAction(cfg, signedHugeRead("req-list-1", "list_sessions", { limit: 10 })),
+      handleRpcAction(cfg, transcriptRequest),
+      handleRpcAction(cfg, pingRequest),
+      handleRpcAction(cfg, listRequest),
       injectLocalSessionMessage({
         cfg,
         targetSession: hugeSessionId,
@@ -1247,6 +1261,9 @@ test(
     ]);
     const totalConcurrentMs = performance.now() - tConcurrent0;
     clearInterval(lagInterval);
+    await eventWrites;
+    assert.ifError(eventWriteError);
+    t.diagnostic(`540 MiB concurrent RPCs: ${totalConcurrentMs.toFixed(2)}ms; max timer lag: ${maxTimerLagMs.toFixed(2)}ms`);
 
     assert.equal(transcriptRes.messages.length, 8);
     assert.equal(pingRes.machineId, "TEST-MACHINE");
@@ -1269,10 +1286,19 @@ test(
       `Expected event-loop timer lag < 500ms during concurrent 540 MiB operations, got ${maxTimerLagMs.toFixed(2)}ms`
     );
   } finally {
-    if (wsServer) await wsServer.close();
-    if (prevCopilotHome === undefined) delete process.env.COPILOT_HOME;
-    else process.env.COPILOT_HOME = prevCopilotHome;
-    env.cleanup();
+    clearInterval(lagInterval);
+    for (const timer of eventTimers) clearTimeout(timer);
+    try {
+      if (wsServer) await wsServer.close();
+      await eventWrites;
+    } finally {
+      try { await eventWriter?.close(); }
+      finally {
+        if (prevCopilotHome === undefined) delete process.env.COPILOT_HOME;
+        else process.env.COPILOT_HOME = prevCopilotHome;
+        env.cleanup();
+      }
+    }
   }
 });
 
