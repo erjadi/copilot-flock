@@ -1938,7 +1938,7 @@ const EMBEDDED_RUNTIME_MANIFEST_FALLBACK = (() => {
     operationsSha = hashRuntimeModule(fs.readFileSync(path.join(__lifecycleDir, "flock-operations.mjs")));
     supportSha = hashRuntimeModule(fs.readFileSync(path.join(__lifecycleDir, "flock-support.mjs")));
   } catch {}
-  const entrypointSha = "97c42b8761378f7c45c3a7ab2f7eb53893dec31220014c78b22142ed9c2529f8";
+  const entrypointSha = "dc97ebd07eb10c4e0167f75b30520a74a9c848b9072c716eb82641b1cf7483d6";
   const fallback = {
     type: "copilot-flock-runtime-manifest-v1",
     schema: 1,

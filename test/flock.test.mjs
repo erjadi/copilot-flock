@@ -62,6 +62,8 @@ import {
   signV3RpcEnvelope,
   verifyV3RpcEnvelope,
   loadLocalFlocksConfig,
+  openFlockMembershipRegistry,
+  resolveAdmissibleKnownPeerEvidence,
   shareThreadWithFlock,
   unshareThreadFromFlock,
   listSharedThreadsForMachine,
@@ -11312,3 +11314,1051 @@ test("NEXUS-V2 regressions: live cutover inspection safety, fs.renameSync post-C
     fs.rmSync(scratchRoot, { recursive: true, force: true });
   }
 });
+
+test("false-offline regression: unscoped responder pin resolution, scoped list_remote_machines/status/list_flocks routing, bounded targeted knownPeers confirmation, and stale ws.port ping negative cache", async (t) => {
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "flock-false-offline-fix-"));
+  const prevCopilotHome = process.env.COPILOT_HOME;
+  const prevFastVote = process.env.BRIDGE_FAST_VOTE_TEST;
+  process.env.COPILOT_HOME = tempRoot;
+  delete process.env.BRIDGE_FAST_VOTE_TEST;
+  invalidateLocalWsConnectionCache();
+
+  t.after(() => {
+    if (prevCopilotHome === undefined) delete process.env.COPILOT_HOME;
+    else process.env.COPILOT_HOME = prevCopilotHome;
+    if (prevFastVote === undefined) delete process.env.BRIDGE_FAST_VOTE_TEST;
+    else process.env.BRIDGE_FAST_VOTE_TEST = prevFastVote;
+    invalidateLocalWsConnectionCache();
+    fs.rmSync(tempRoot, { recursive: true, force: true });
+  });
+
+  const makeIdentity = () => {
+    const kp = crypto.generateKeyPairSync("ed25519", {
+      publicKeyEncoding: { type: "spki", format: "pem" },
+      privateKeyEncoding: { type: "pkcs8", format: "pem" },
+    });
+    const fingerprint = crypto
+      .createHash("sha256")
+      .update(kp.publicKey.trim())
+      .digest("hex")
+      .slice(0, 32);
+    return {
+      publicKey: kp.publicKey,
+      privateKey: kp.privateKey,
+      fingerprint,
+    };
+  };
+
+  const localKey = makeIdentity();
+  const ue3Key = makeIdentity();
+  const workKey = makeIdentity();
+  const laptopKey = makeIdentity();
+
+  const storePath = path.join(tempRoot, "broker-v3.json");
+  const membersPath = path.join(tempRoot, "broker-members.json");
+  const testConnStr =
+    "Endpoint=https://test-flock.service.signalr.net;AccessKey=MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=;Version=1.0;";
+
+  const localEnroll = await enrollV3Device(
+    {
+      githubUser: "erjadi",
+      githubUserId: 1001,
+      deviceId: localKey.fingerprint,
+      machineId: "DESKTOP-2R3PAUG",
+      scope: "personal",
+      publicKey: localKey.publicKey,
+      keyFingerprint: localKey.fingerprint,
+    },
+    { storePath, connectionString: testConnStr }
+  );
+  await enrollV3Device(
+    {
+      githubUser: "erjadi",
+      githubUserId: 1001,
+      deviceId: workKey.fingerprint,
+      machineId: "STARLIGHT-BYTE",
+      scope: "work",
+      publicKey: workKey.publicKey,
+      keyFingerprint: workKey.fingerprint,
+    },
+    { storePath, connectionString: testConnStr }
+  );
+  await enrollV3Device(
+    {
+      githubUser: "erjadi",
+      githubUserId: 1001,
+      deviceId: laptopKey.fingerprint,
+      machineId: "LAPTOP-Q3JLH8RQ",
+      scope: "personal",
+      publicKey: laptopKey.publicKey,
+      keyFingerprint: laptopKey.fingerprint,
+    },
+    { storePath, connectionString: testConnStr }
+  );
+  const ue3Enroll = await enrollV3Device(
+    {
+      githubUser: "erjadi",
+      githubUserId: 1001,
+      deviceId: ue3Key.fingerprint,
+      machineId: "DESKTOP-UE3B1TD",
+      scope: "personal",
+      publicKey: ue3Key.publicKey,
+      keyFingerprint: ue3Key.fingerprint,
+    },
+    { storePath, connectionString: testConnStr }
+  );
+  // Sync local enrollment after UE3 joined so both workstations hold authoritative v3 pins
+  const syncedLocal = await syncV3DeviceMemberships(
+    {
+      githubUser: "erjadi",
+      githubUserId: 1001,
+      deviceId: localKey.fingerprint,
+      machineId: "DESKTOP-2R3PAUG",
+    },
+    { storePath, connectionString: testConnStr }
+  );
+
+  const syncedWork = await syncV3DeviceMemberships(
+    {
+      githubUser: "erjadi",
+      githubUserId: 1001,
+      deviceId: workKey.fingerprint,
+      machineId: "STARLIGHT-BYTE",
+    },
+    { storePath, connectionString: testConnStr }
+  );
+
+  const localFlocksPath = path.join(tempRoot, "flock", "flocks.json");
+  const ue3FlocksPath = path.join(tempRoot, "ue3-flock", "flocks.json");
+  const workFlocksPath = path.join(tempRoot, "work-flock", "flocks.json");
+  fs.mkdirSync(path.dirname(localFlocksPath), { recursive: true });
+  fs.mkdirSync(path.dirname(ue3FlocksPath), { recursive: true });
+  fs.mkdirSync(path.dirname(workFlocksPath), { recursive: true });
+
+  const baseLocalCfg = {
+    machineId: "DESKTOP-2R3PAUG",
+    githubUser: "erjadi",
+    scope: "personal",
+    hub: "copilotbridge",
+    endpoint: "https://test-flock.service.signalr.net",
+    connectionString: testConnStr,
+    bootstrapUrl: "https://unreachable-bootstrap.example.invalid/api/bootstrap",
+    flocksConfigPath: localFlocksPath,
+    configPath: path.join(tempRoot, "flock", "config.json"),
+    identity: localKey,
+    specs: { keyFingerprint: localKey.fingerprint, publicKey: localKey.publicKey },
+  };
+  writeConfigFileSecure(
+    {
+      machineId: baseLocalCfg.machineId,
+      githubUser: baseLocalCfg.githubUser,
+      scope: baseLocalCfg.scope,
+      hub: baseLocalCfg.hub,
+      connectionString: testConnStr,
+      bootstrapUrl: baseLocalCfg.bootstrapUrl,
+    },
+    baseLocalCfg.configPath
+  );
+  applyV3EnrollmentResult(baseLocalCfg, localEnroll, localFlocksPath);
+  applyV3EnrollmentResult(baseLocalCfg, syncedLocal, localFlocksPath, { requireMemberProof: true });
+
+  const ue3Cfg = {
+    machineId: "DESKTOP-UE3B1TD",
+    githubUser: "erjadi",
+    scope: "personal",
+    hub: "copilotbridge",
+    endpoint: "https://test-flock.service.signalr.net",
+    connectionString: testConnStr,
+    // Unreachable /api/members proves responder resolves pinned sender keys locally without network/subprocess hangs
+    bootstrapUrl: "https://127.0.0.1:1/api/bootstrap",
+    flocksConfigPath: ue3FlocksPath,
+    identity: ue3Key,
+    specs: { keyFingerprint: ue3Key.fingerprint, publicKey: ue3Key.publicKey },
+    sessionsOverride: [
+      {
+        session_id: "8114c9c6-862d-40e9-85d7-8e0316ba4bc1",
+        title: "Cross-PC Reachy coordination",
+        session_type: "desktop",
+        is_running: false,
+        repo: "erjadi/copilot-flock",
+        updated_at: new Date().toISOString(),
+      },
+    ],
+  };
+  applyV3EnrollmentResult(ue3Cfg, ue3Enroll, ue3FlocksPath);
+
+  const workCfg = {
+    machineId: "STARLIGHT-BYTE",
+    githubUser: "erjadi",
+    scope: "work",
+    hub: "copilotbridge",
+    endpoint: "https://test-flock.service.signalr.net",
+    connectionString: testConnStr,
+    bootstrapUrl: "https://127.0.0.1:1/api/bootstrap",
+    flocksConfigPath: workFlocksPath,
+    identity: workKey,
+    specs: { keyFingerprint: workKey.fingerprint, publicKey: workKey.publicKey },
+  };
+  applyV3EnrollmentResult(workCfg, syncedWork, workFlocksPath, { requireMemberProof: true });
+
+  const hosts = [
+    { cfg: baseLocalCfg, flocksPath: localFlocksPath },
+    { cfg: ue3Cfg, flocksPath: ue3FlocksPath },
+    { cfg: workCfg, flocksPath: workFlocksPath },
+  ];
+
+  // 1. Unscoped list_remote_sessions and unscoped discoverMachines resolve DESKTOP-2R3PAUG locally on DESKTOP-UE3B1TD (<500ms, no /api/members hang)
+  const sentPayloads = [];
+  let dropBroadcastFromUe3 = false;
+  const localCfg = {
+    ...baseLocalCfg,
+    rpcTransport: async (rpcPayload) => {
+      sentPayloads.push(rpcPayload);
+      const target = String(rpcPayload.toMachine || "*");
+      const targetAll = target === "*" || target.toLowerCase() === "all";
+      const candidates = targetAll
+        ? hosts
+        : hosts.filter((h) => h.cfg.machineId.toLowerCase() === target.toLowerCase());
+      const out = [];
+      for (const h of candidates) {
+        if (targetAll && dropBroadcastFromUe3 && h.cfg.machineId === "DESKTOP-UE3B1TD") {
+          continue;
+        }
+        try {
+          const result = await handleRpcAction(h.cfg, {
+            ...rpcPayload,
+            flocksConfigPath: h.flocksPath,
+            enforceSignature: true,
+            requireVerifiedAuth: true,
+          });
+          out.push({
+            requestId: rpcPayload.requestId,
+            fromMachine: h.cfg.machineId,
+            result,
+            respondedAt: new Date().toISOString(),
+          });
+        } catch (err) {
+          out.push({
+            requestId: rpcPayload.requestId,
+            fromMachine: h.cfg.machineId,
+            error: formatErrorDetail(err),
+            respondedAt: new Date().toISOString(),
+          });
+        }
+      }
+      return out;
+    },
+  };
+
+  const t0 = performance.now();
+  const unscopedSessions = await executeMcpTool(
+    localCfg,
+    "list_remote_sessions",
+    { machine: "DESKTOP-UE3B1TD", scope: "all", limit: 1 },
+    { ensureDaemon: async () => ({ running: true, pid: process.pid }) }
+  );
+  const unscopedElapsedMs = performance.now() - t0;
+  assert.ok(unscopedElapsedMs < 1500, `Unscoped list_remote_sessions took ${Math.round(unscopedElapsedMs)}ms`);
+  assert.equal(unscopedSessions.flockId, undefined);
+  assert.equal(unscopedSessions.sessions[0]?.session_id, "8114c9c6-862d-40e9-85d7-8e0316ba4bc1");
+
+  const unscopedDiscovered = await executeMcpTool(
+    localCfg,
+    "list_remote_machines",
+    { include_self: true, scope: "all" },
+    { ensureDaemon: async () => ({ running: true, pid: process.pid }) }
+  );
+  assert.deepEqual(
+    unscopedDiscovered.map((m) => m.machineId).sort(),
+    ["DESKTOP-2R3PAUG", "DESKTOP-UE3B1TD", "STARLIGHT-BYTE"]
+  );
+
+  // 2. Scoped list_remote_machines(flock: "erjadi/personal") attaches signed params.flock, includes DESKTOP-UE3B1TD, excludes work-scoped STARLIGHT-BYTE, and fails closed on unauthorized flock
+  sentPayloads.length = 0;
+  const scopedPersonalMachines = await executeMcpTool(
+    localCfg,
+    "list_remote_machines",
+    { flock: "erjadi/personal", scope: "all", include_self: true },
+    { ensureDaemon: async () => ({ running: true, pid: process.pid }) }
+  );
+  assert.equal(sentPayloads[0]?.params?.flock, "erjadi/personal");
+  assert.deepEqual(
+    scopedPersonalMachines.map((m) => m.machineId).sort(),
+    ["DESKTOP-2R3PAUG", "DESKTOP-UE3B1TD"]
+  );
+
+  sentPayloads.length = 0;
+  const singleTargetMachines = await executeMcpTool(
+    localCfg,
+    "list_remote_machines",
+    { flock: "erjadi/personal/DESKTOP-UE3B1TD", include_self: false },
+    { ensureDaemon: async () => ({ running: true, pid: process.pid }) }
+  );
+  assert.equal(sentPayloads[0]?.toMachine, "DESKTOP-UE3B1TD");
+  assert.deepEqual(singleTargetMachines.map((m) => m.machineId), ["DESKTOP-UE3B1TD"]);
+
+  await assert.rejects(
+    () =>
+      executeMcpTool(
+        localCfg,
+        "list_remote_machines",
+        { flock: "other/unauthorized" },
+        { ensureDaemon: async () => ({ running: true, pid: process.pid }) }
+      ),
+    (err) => err.code === "FLOCK_NOT_ENROLLED" && err.statusCode === 403
+  );
+
+  // 3. Bounded targeted confirmation when broadcast ping drops DESKTOP-UE3B1TD while state.json knownPeers has recent admissible presence (and skips expired 8m-old LAPTOP-Q3JLH8RQ)
+  const nowMs = Date.now();
+  const ue3RecentIso = new Date(nowMs - 2000).toISOString();
+  const laptopExpiredIso = new Date(nowMs - 8 * 60 * 1000).toISOString();
+  fs.writeFileSync(path.join(tempRoot, "flock", "daemon.pid"), String(process.pid), "utf8");
+  fs.writeFileSync(
+    path.join(tempRoot, "flock", "state.json"),
+    JSON.stringify({
+      status: "connected",
+      version: BRIDGE_VERSION,
+      machineId: "DESKTOP-2R3PAUG",
+      scope: "personal",
+      pid: process.pid,
+      updatedAt: new Date(nowMs).toISOString(),
+      knownPeers: [
+        {
+          machineId: "DESKTOP-UE3B1TD",
+          githubUser: "erjadi",
+          scope: "personal",
+          version: BRIDGE_VERSION,
+          lastSeenAt: ue3RecentIso,
+          specs: { keyFingerprint: ue3Key.fingerprint, publicKey: ue3Key.publicKey },
+        },
+        {
+          machineId: "LAPTOP-Q3JLH8RQ",
+          githubUser: "erjadi",
+          scope: "personal",
+          version: BRIDGE_VERSION,
+          lastSeenAt: laptopExpiredIso,
+          specs: { keyFingerprint: laptopKey.fingerprint, publicKey: laptopKey.publicKey },
+        },
+      ],
+    }),
+    "utf8"
+  );
+
+  dropBroadcastFromUe3 = true;
+  sentPayloads.length = 0;
+
+  const snapshotDirFiles = (dir) =>
+    Object.fromEntries(
+      fs
+        .readdirSync(dir)
+        .sort()
+        .map((f) => [f, fs.readFileSync(path.join(dir, f), "utf8")])
+    );
+  const beforePassiveDisk = snapshotDirFiles(path.join(tempRoot, "flock"));
+  const passiveStatus = await executeMcpTool(localCfg, "flock_status", { passive: true });
+  const afterPassiveDisk = snapshotDirFiles(path.join(tempRoot, "flock"));
+  assert.deepEqual(afterPassiveDisk, beforePassiveDisk, "Passive flock_status must not mutate disk state");
+  assert.equal(passiveStatus.status, "ok");
+  assert.deepEqual(
+    passiveStatus.onlineMachines.map((m) => m.machineId).sort(),
+    ["DESKTOP-2R3PAUG", "DESKTOP-UE3B1TD", "STARLIGHT-BYTE"]
+  );
+  const scopedPassiveStatus = await executeMcpTool(localCfg, "flock_status", {
+    passive: true,
+    flock: "erjadi/personal",
+  });
+  assert.deepEqual(
+    scopedPassiveStatus.onlineMachines.map((m) => m.machineId).sort(),
+    ["DESKTOP-2R3PAUG", "DESKTOP-UE3B1TD"]
+  );
+  // Targeted confirmation probed recent DESKTOP-UE3B1TD with exact flock erjadi/personal, and NEVER probed expired 8m-old LAPTOP-Q3JLH8RQ
+  assert.equal(
+    sentPayloads.some(
+      (p) => p.toMachine === "DESKTOP-UE3B1TD" && p.action === "ping" && p.params?.flock === "erjadi/personal"
+    ),
+    true
+  );
+  assert.equal(
+    sentPayloads.some((p) => p.toMachine === "LAPTOP-Q3JLH8RQ"),
+    false,
+    "Expired (>90s) cached peer LAPTOP-Q3JLH8RQ must not trigger targeted ping probes"
+  );
+
+  saveMemberRegistration(
+    {
+      machineId: "DESKTOP-2R3PAUG",
+      githubUser: "erjadi",
+      scope: "personal",
+      version: BRIDGE_VERSION,
+      publicKey: localKey.publicKey,
+      keyFingerprint: localKey.fingerprint,
+    },
+    membersPath
+  );
+  saveMemberRegistration(
+    {
+      machineId: "DESKTOP-UE3B1TD",
+      githubUser: "erjadi",
+      scope: "personal",
+      version: BRIDGE_VERSION,
+      publicKey: ue3Key.publicKey,
+      keyFingerprint: ue3Key.fingerprint,
+    },
+    membersPath
+  );
+
+  const probedFlocks = await executeMcpTool(
+    localCfg,
+    "list_flocks",
+    { detail: "full", probe_presence: true },
+    {
+      ensureDaemon: async () => inspectLocalDaemonPassive(localCfg),
+      fetchV3MyFlocks: async () => listV3UserFlocks({ githubUser: "erjadi", githubUserId: 1001 }, { storePath }),
+      fetchLegacyMembers: async () => ({
+        attempted: true,
+        ok: true,
+        status: "ok",
+        statusCode: 200,
+        fetchedAt: new Date().toISOString(),
+        error: null,
+        members: Object.values(JSON.parse(fs.readFileSync(membersPath, "utf8"))),
+      }),
+    }
+  );
+  const personalFlock = probedFlocks.flocks.find((f) => f.flockId === "erjadi/personal");
+  assert.equal(
+    personalFlock.members.find((m) => m.machineId === "DESKTOP-UE3B1TD")?.online,
+    true
+  );
+  assert.equal(
+    personalFlock.members.find((m) => m.machineId === "LAPTOP-Q3JLH8RQ")?.online,
+    false
+  );
+
+  // 4. Stale/dead ws.port negative cache keeps repeated pings fast instead of scanning OS ports on every ping
+  const runDir = path.join(tempRoot, "run");
+  fs.mkdirSync(runDir, { recursive: true });
+  const unusedServer = net.createServer();
+  await new Promise((r) => unusedServer.listen(0, "127.0.0.1", r));
+  const closedPort = unusedServer.address().port;
+  await new Promise((r) => unusedServer.close(r));
+  fs.writeFileSync(path.join(runDir, "ws.port"), String(closedPort), "utf8");
+  fs.writeFileSync(path.join(runDir, "ws.token"), "stale-token", "utf8");
+  invalidateLocalWsConnectionCache();
+
+  let discoverWsCalls = 0;
+  const firstVerify = await verifyLocalWsConnectionInfo({
+    forceRefresh: false,
+    retryPollMs: 0,
+    probeTimeoutMs: 150,
+    discoverWsFn: async () => {
+      discoverWsCalls++;
+      return null;
+    },
+  });
+  assert.equal(firstVerify, null);
+  assert.equal(discoverWsCalls, 1);
+
+  const fastStart = performance.now();
+  const secondVerify = await verifyLocalWsConnectionInfo({
+    forceRefresh: false,
+    retryPollMs: 0,
+    probeTimeoutMs: 600,
+    discoverWsFn: async () => {
+      discoverWsCalls++;
+      return null;
+    },
+  });
+  const fastVerifyElapsed = performance.now() - fastStart;
+  assert.equal(secondVerify, null);
+  assert.equal(discoverWsCalls, 1, "Dead ws.port negative cache must suppress repeat rediscovery within TTL");
+  assert.ok(fastVerifyElapsed < 50, `Expected negative-cached verifyLocalWsConnectionInfo < 50ms, took ${Math.round(fastVerifyElapsed)}ms`);
+
+  // 5. Split-brain unscoped key collision across two active flocks still fails closed without explicit flock selector
+  const collisionFlocksPath = path.join(tempRoot, "collision-flock", "flocks.json");
+  fs.mkdirSync(path.dirname(collisionFlocksPath), { recursive: true });
+  const aliceKey = makeIdentity();
+  const malloryKey = makeIdentity();
+  fs.writeFileSync(
+    collisionFlocksPath,
+    JSON.stringify({
+      flocks: {
+        "erjadi/team-a": {
+          flockId: "erjadi/team-a",
+          ownerGitHubUser: "erjadi",
+          trustTier: "collaborator",
+          sessionVisibility: "explicit_opt_in_only",
+          rosterEpoch: 1,
+          members: [
+            {
+              peerId: `2002:${aliceKey.fingerprint}`,
+              githubUser: "alice",
+              machineId: "SHARED-HOST",
+              scope: "work",
+              publicKey: aliceKey.publicKey,
+            },
+          ],
+        },
+        "other/team-b": {
+          flockId: "other/team-b",
+          ownerGitHubUser: "other",
+          trustTier: "collaborator",
+          sessionVisibility: "explicit_opt_in_only",
+          rosterEpoch: 1,
+          members: [
+            {
+              peerId: `3003:${malloryKey.fingerprint}`,
+              githubUser: "mallory",
+              machineId: "SHARED-HOST",
+              scope: "work",
+              publicKey: malloryKey.publicKey,
+            },
+          ],
+        },
+      },
+    }),
+    "utf8"
+  );
+  const sentAt = new Date().toISOString();
+  const collisionReqId = crypto.randomUUID();
+  const unscopedCollisionAuth = signRpcRequest({
+    requestId: collisionReqId,
+    sentAt,
+    fromMachine: "SHARED-HOST",
+    toMachine: "DESKTOP-2R3PAUG",
+    action: "ping",
+    params: {},
+    identity: aliceKey,
+  });
+  await assert.rejects(
+    () =>
+      handleRpcAction(
+        {
+          machineId: "DESKTOP-2R3PAUG",
+          githubUser: "erjadi",
+          scope: "personal",
+          bootstrapUrl: "https://127.0.0.1:1/api/bootstrap",
+          flocksConfigPath: collisionFlocksPath,
+        },
+        {
+          requestId: collisionReqId,
+          sentAt,
+          fromMachine: "SHARED-HOST",
+          toMachine: "DESKTOP-2R3PAUG",
+          action: "ping",
+          params: {},
+          auth: unscopedCollisionAuth,
+          flocksConfigPath: collisionFlocksPath,
+          enforceSignature: true,
+          requireVerifiedAuth: true,
+        }
+      ),
+    (err) => err.code === "UNPINNED_PEER_KEY" && err.statusCode === 403
+  );
+});
+
+test("presence freshness & security boundaries: admissible knownPeers updates lastSeenAt/version over days-old roster without false-online, preserves reconnect grace, and rejects spoofed/cross-flock/revoked entries", async (t) => {
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "flock-presence-freshness-"));
+  const prevCopilotHome = process.env.COPILOT_HOME;
+  process.env.COPILOT_HOME = tempRoot;
+  t.after(() => {
+    if (prevCopilotHome === undefined) delete process.env.COPILOT_HOME;
+    else process.env.COPILOT_HOME = prevCopilotHome;
+    fs.rmSync(tempRoot, { recursive: true, force: true });
+  });
+
+  const makeIdentity = () => {
+    const kp = crypto.generateKeyPairSync("ed25519", {
+      publicKeyEncoding: { type: "spki", format: "pem" },
+      privateKeyEncoding: { type: "pkcs8", format: "pem" },
+    });
+    const fingerprint = crypto
+      .createHash("sha256")
+      .update(kp.publicKey.trim())
+      .digest("hex")
+      .slice(0, 32);
+    return {
+      publicKey: kp.publicKey,
+      privateKey: kp.privateKey,
+      fingerprint,
+    };
+  };
+  const localKey = makeIdentity();
+  const laptopKey = makeIdentity();
+  const graceKey = makeIdentity();
+  const nexusKey = makeIdentity();
+  const spoofKey = makeIdentity();
+  const reneKey = makeIdentity();
+
+  const nowMs = Date.parse("2026-11-18T02:58:00.000Z");
+  const nov13Iso = "2026-11-13T09:00:00.000Z";
+  const nov16Iso = "2026-11-16T12:00:00.000Z";
+  const laptopRecentButExpiredIso = "2026-11-18T02:49:13.381Z"; // ~8m46s ago (> 90s expiry)
+  const gracePeerIso = new Date(nowMs - 5000).toISOString(); // 5s ago (<= 20s reconnectGraceMs)
+
+  const flocksPath = path.join(tempRoot, "flock", "flocks.json");
+  fs.mkdirSync(path.dirname(flocksPath), { recursive: true });
+  const statePath = path.join(tempRoot, "flock", "state.json");
+  fs.writeFileSync(path.join(tempRoot, "flock", "daemon.pid"), String(process.pid), "utf8");
+  fs.writeFileSync(
+    statePath,
+    JSON.stringify({
+      status: "connected",
+      version: BRIDGE_VERSION,
+      machineId: "DESKTOP-2R3PAUG",
+      scope: "personal",
+      pid: process.pid,
+      updatedAt: new Date().toISOString(),
+      knownPeers: [
+        {
+          // Valid admissible 8-min-old heartbeat from LAPTOP-Q3JLH8RQ running 3.6.0
+          machineId: "LAPTOP-Q3JLH8RQ",
+          githubUser: "erjadi",
+          scope: "personal",
+          version: "3.6.0",
+          lastSeenAt: laptopRecentButExpiredIso,
+          specs: { keyFingerprint: laptopKey.fingerprint, publicKey: laptopKey.publicKey },
+        },
+        {
+          // Valid admissible 5s-old heartbeat within reconnectGraceMs (20s)
+          machineId: "GRACE-PEER-PC",
+          githubUser: "erjadi",
+          scope: "personal",
+          version: "3.6.0",
+          lastSeenAt: gracePeerIso,
+          specs: { keyFingerprint: graceKey.fingerprint, publicKey: graceKey.publicKey },
+        },
+        {
+          // Spoofed/mismatched keyFingerprint claiming NEXUS-V2 — MUST be rejected!
+          machineId: "NEXUS-V2",
+          githubUser: "erjadi",
+          scope: "personal",
+          version: "9.9.9-spoof",
+          lastSeenAt: gracePeerIso,
+          specs: { keyFingerprint: spoofKey.fingerprint, publicKey: spoofKey.publicKey },
+        },
+        {
+          // Future-skewed timestamp — MUST be rejected!
+          machineId: "DESKTOP-7E16MBO",
+          githubUser: "erjadi",
+          scope: "work",
+          version: "3.6.0",
+          lastSeenAt: "2099-01-01T00:00:00.000Z",
+        },
+      ],
+    }),
+    "utf8"
+  );
+
+  // Direct unit check on resolveAdmissibleKnownPeerEvidence
+  const knownPeersList = JSON.parse(fs.readFileSync(statePath, "utf8")).knownPeers;
+  assert.equal(
+    resolveAdmissibleKnownPeerEvidence(
+      { machineId: "NEXUS-V2", githubUser: "erjadi", keyFingerprint: nexusKey.fingerprint },
+      knownPeersList,
+      { nowMs }
+    ),
+    null,
+    "Mismatched keyFingerprint in knownPeers must be rejected"
+  );
+  assert.equal(
+    resolveAdmissibleKnownPeerEvidence(
+      { machineId: "DESKTOP-7E16MBO", githubUser: "erjadi" },
+      knownPeersList,
+      { nowMs }
+    ),
+    null,
+    "Future-skewed timestamp in knownPeers must be rejected"
+  );
+
+  const myFlocksFixture = {
+    ok: true,
+    fetchedAt: new Date(nowMs).toISOString(),
+    githubUser: "erjadi",
+    githubUserId: 1001,
+    ownedFlocks: [
+      {
+        flockId: "erjadi",
+        flockUuid: "uuid-root",
+        flockType: "owner_root",
+        ownerGitHubUser: "erjadi",
+        ownerGitHubUserId: 1001,
+        allowedScopes: ["personal", "work"],
+        rosterEpoch: 4,
+        members: [
+          {
+            peerId: `1001:${localKey.fingerprint}`,
+            githubUser: "erjadi",
+            githubUserId: 1001,
+            deviceId: localKey.fingerprint,
+            machineId: "DESKTOP-2R3PAUG",
+            scope: "personal",
+            trustTier: "owner",
+            publicKey: localKey.publicKey,
+            keyFingerprint: localKey.fingerprint,
+            lastSeenAt: nov16Iso,
+          },
+          {
+            peerId: `1001:${laptopKey.fingerprint}`,
+            githubUser: "erjadi",
+            githubUserId: 1001,
+            deviceId: laptopKey.fingerprint,
+            machineId: "LAPTOP-Q3JLH8RQ",
+            scope: "personal",
+            trustTier: "owner",
+            publicKey: laptopKey.publicKey,
+            keyFingerprint: laptopKey.fingerprint,
+            lastSeenAt: nov16Iso,
+          },
+          {
+            peerId: `1001:${graceKey.fingerprint}`,
+            githubUser: "erjadi",
+            githubUserId: 1001,
+            deviceId: graceKey.fingerprint,
+            machineId: "GRACE-PEER-PC",
+            scope: "personal",
+            trustTier: "owner",
+            publicKey: graceKey.publicKey,
+            keyFingerprint: graceKey.fingerprint,
+            lastSeenAt: nov16Iso,
+          },
+          {
+            peerId: `1001:${nexusKey.fingerprint}`,
+            githubUser: "erjadi",
+            githubUserId: 1001,
+            deviceId: nexusKey.fingerprint,
+            machineId: "NEXUS-V2",
+            scope: "personal",
+            trustTier: "owner",
+            publicKey: nexusKey.publicKey,
+            keyFingerprint: nexusKey.fingerprint,
+            lastSeenAt: nov16Iso,
+          },
+          {
+            peerId: "1001:fp-7e16",
+            githubUser: "erjadi",
+            githubUserId: 1001,
+            deviceId: "fp-7e16",
+            machineId: "DESKTOP-7E16MBO",
+            scope: "work",
+            trustTier: "owner",
+            lastSeenAt: nov13Iso,
+          },
+        ],
+      },
+      {
+        flockId: "erjadi/experimental",
+        flockUuid: "uuid-exp",
+        flockType: "shared",
+        ownerGitHubUser: "erjadi",
+        ownerGitHubUserId: 1001,
+        allowedScopes: ["personal", "work"],
+        rosterEpoch: 2,
+        members: [
+          {
+            peerId: `1001:${localKey.fingerprint}`,
+            githubUser: "erjadi",
+            githubUserId: 1001,
+            deviceId: localKey.fingerprint,
+            machineId: "DESKTOP-2R3PAUG",
+            scope: "personal",
+            trustTier: "owner",
+            publicKey: localKey.publicKey,
+            keyFingerprint: localKey.fingerprint,
+            lastSeenAt: nov16Iso,
+          },
+          {
+            peerId: `2002:${reneKey.fingerprint}`,
+            githubUser: "renepajta",
+            machineId: "RENE-WORK-PC",
+            scope: "work",
+            trustTier: "collaborator",
+            publicKey: reneKey.publicKey,
+            keyFingerprint: reneKey.fingerprint,
+            lastSeenAt: nov16Iso,
+          },
+        ],
+      },
+    ],
+    joinedFlocks: [],
+  };
+
+  const legacyMembersList = [
+    {
+      machineId: "DESKTOP-2R3PAUG",
+      githubUser: "erjadi",
+      scope: "personal",
+      version: "3.6.0",
+      publicKey: localKey.publicKey,
+      keyFingerprint: localKey.fingerprint,
+      lastSeenAt: nov16Iso,
+    },
+    {
+      // Stale Nov 13 v3.5.0 entry in /api/members for LAPTOP-Q3JLH8RQ
+      machineId: "LAPTOP-Q3JLH8RQ",
+      githubUser: "erjadi",
+      scope: "personal",
+      version: "3.5.0",
+      publicKey: laptopKey.publicKey,
+      keyFingerprint: laptopKey.fingerprint,
+      lastSeenAt: nov13Iso,
+    },
+    {
+      machineId: "GRACE-PEER-PC",
+      githubUser: "erjadi",
+      scope: "personal",
+      version: "3.6.0",
+      publicKey: graceKey.publicKey,
+      keyFingerprint: graceKey.fingerprint,
+      lastSeenAt: nov13Iso,
+    },
+    {
+      machineId: "NEXUS-V2",
+      githubUser: "erjadi",
+      scope: "personal",
+      version: "3.5.0",
+      publicKey: nexusKey.publicKey,
+      keyFingerprint: nexusKey.fingerprint,
+      lastSeenAt: nov13Iso,
+    },
+    {
+      machineId: "DESKTOP-7E16MBO",
+      githubUser: "erjadi",
+      scope: "work",
+      version: "3.5.0",
+      lastSeenAt: nov13Iso,
+    },
+  ];
+
+  const cfg = {
+    machineId: "DESKTOP-2R3PAUG",
+    githubUser: "erjadi",
+    scope: "personal",
+    hub: "copilotbridge",
+    endpoint: "https://test-flock.service.signalr.net",
+    connectionString:
+      "Endpoint=https://test-flock.service.signalr.net;AccessKey=MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=;Version=1.0;",
+    bootstrapUrl: "https://bootstrap.example.invalid/api/bootstrap",
+    flocksConfigPath: flocksPath,
+    statePath,
+    identity: localKey,
+  };
+  fs.writeFileSync(
+    flocksPath,
+    JSON.stringify({
+      ownerGitHubUser: "erjadi",
+      scope: "personal",
+      flocks: {
+        erjadi: {
+          ...myFlocksFixture.ownedFlocks[0],
+          trustTier: "owner",
+          sessionVisibility: "all",
+          shareSpecs: "full",
+        },
+      },
+    }),
+    "utf8"
+  );
+
+  const rosterResolved = await resolveLegacyFlockRoster(cfg, {
+    now: nowMs,
+    fetchV3MyFlocks: async () => myFlocksFixture,
+    fetchLegacyMembers: async () => ({
+      attempted: true,
+      ok: true,
+      status: "ok",
+      statusCode: 200,
+      fetchedAt: new Date(nowMs).toISOString(),
+      error: null,
+      members: legacyMembersList,
+    }),
+    onlineMachines: [
+      {
+        machineId: "DESKTOP-2R3PAUG",
+        githubUser: "erjadi",
+        scope: "personal",
+        version: "3.6.0",
+        respondedAt: new Date(nowMs).toISOString(),
+      },
+    ],
+    liveSignalRSource: {
+      attempted: true,
+      ok: true,
+      status: "ok",
+      fetchedAt: new Date(nowMs).toISOString(),
+      error: null,
+    },
+  });
+  const projected = projectPublicFlocksResponse(
+    {
+      machineId: cfg.machineId,
+      protocol: "legacy-v3",
+      canonicalAddress: "erjadi/personal/DESKTOP-2R3PAUG",
+      scope: "personal",
+      ...rosterResolved,
+    },
+    { detail: "full" }
+  );
+
+  const byId = new Map(projected.knownMembers.map((m) => [m.machineId, m]));
+
+  // LAPTOP-Q3JLH8RQ: 8m-old admissible heartbeat is recent-but-not-current -> offline, yet reports 02:49:13.381Z & v3.6.0 (not Nov 16/13 & v3.5.0)
+  const laptop = byId.get("LAPTOP-Q3JLH8RQ");
+  assert.equal(laptop.online, false);
+  assert.equal(laptop.overallState, "offline");
+  assert.equal(laptop.presence, "offline");
+  assert.equal(laptop.lastSeenAt, laptopRecentButExpiredIso);
+  assert.equal(laptop.version, "3.6.0");
+  assert.equal(projected.offlineMembers.some((m) => m.machineId === "LAPTOP-Q3JLH8RQ"), true);
+
+  // GRACE-PEER-PC: 5s-old admissible heartbeat within reconnectGraceMs (20s) -> reconnecting, not in onlineMachines and not in definitive offlineMembers
+  const gracePeer = byId.get("GRACE-PEER-PC");
+  assert.equal(gracePeer.online, false);
+  assert.equal(gracePeer.overallState, "reconnecting");
+  assert.equal(gracePeer.presence, "reconnecting");
+  assert.equal(gracePeer.lastSeenAt, gracePeerIso);
+  assert.equal(projected.onlineMachines.some((m) => m.machineId === "GRACE-PEER-PC"), false);
+  assert.equal(projected.offlineMembers.some((m) => m.machineId === "GRACE-PEER-PC"), false);
+
+  // NEXUS-V2: spoofed knownPeers rejected; picks newer Nov 16 v3-flocks lastSeenAt over Nov 13 /api/members, stays offline with unknown auth/exec layers
+  const nexus = byId.get("NEXUS-V2");
+  assert.equal(nexus.online, false);
+  assert.equal(nexus.overallState, "offline");
+  assert.equal(nexus.lastSeenAt, nov16Iso);
+  assert.notEqual(nexus.version, "9.9.9-spoof");
+  assert.equal(nexus.presenceLayers.transport.state, "offline");
+  assert.equal(nexus.presenceLayers.authorization.state, "unknown");
+  assert.equal(nexus.presenceLayers.executionSurface.state, "unknown");
+
+  // DESKTOP-7E16MBO: future-skewed knownPeers rejected; stays offline with Nov 13 lastSeenAt
+  const desktop7e = byId.get("DESKTOP-7E16MBO");
+  assert.equal(desktop7e.online, false);
+  assert.equal(desktop7e.overallState, "offline");
+  assert.equal(desktop7e.lastSeenAt, nov13Iso);
+
+  // Scoped erjadi/experimental query discloses ZERO personal knownPeers machines
+  const scopedExp = await executeMcpTool(
+    cfg,
+    "list_flocks",
+    { flock: "erjadi/experimental", detail: "full" },
+    {
+      fetchV3MyFlocks: async () => myFlocksFixture,
+      fetchLegacyMembers: async () => ({
+        attempted: true,
+        ok: true,
+        status: "ok",
+        statusCode: 200,
+        fetchedAt: new Date(nowMs).toISOString(),
+        error: null,
+        members: legacyMembersList,
+      }),
+    }
+  );
+  assert.deepEqual(
+    scopedExp.knownMembers.map((m) => m.machineId).sort(),
+    ["DESKTOP-2R3PAUG", "RENE-WORK-PC"]
+  );
+
+  // diagnoseFleetMachines also reports LAPTOP-Q3JLH8RQ v3.6.0 & 02:49:13.381Z instead of Nov 13 & v3.5.0 while keeping it offline
+  // Advance state.json grace peer to real wall-clock now - 5s for diagnoseFleetMachines (which uses Date.now())
+  const realGraceIso = new Date(Date.now() - 5000).toISOString();
+  const realLaptopIso = new Date(Date.now() - 8 * 60 * 1000).toISOString();
+  fs.writeFileSync(
+    statePath,
+    JSON.stringify({
+      status: "connected",
+      version: BRIDGE_VERSION,
+      machineId: "DESKTOP-2R3PAUG",
+      scope: "personal",
+      pid: process.pid,
+      updatedAt: new Date().toISOString(),
+      knownPeers: [
+        {
+          machineId: "LAPTOP-Q3JLH8RQ",
+          githubUser: "erjadi",
+          scope: "personal",
+          version: BRIDGE_VERSION,
+          lastSeenAt: realLaptopIso,
+          specs: { keyFingerprint: laptopKey.fingerprint, publicKey: laptopKey.publicKey },
+        },
+        {
+          machineId: "GRACE-PEER-PC",
+          githubUser: "erjadi",
+          scope: "personal",
+          version: BRIDGE_VERSION,
+          lastSeenAt: realGraceIso,
+          specs: { keyFingerprint: graceKey.fingerprint, publicKey: graceKey.publicKey },
+        },
+        {
+          machineId: "NEXUS-V2",
+          githubUser: "erjadi",
+          scope: "personal",
+          version: "9.9.9-spoof",
+          lastSeenAt: realGraceIso,
+          specs: { keyFingerprint: spoofKey.fingerprint, publicKey: spoofKey.publicKey },
+        },
+      ],
+    }),
+    "utf8"
+  );
+
+  const diagReport = await diagnoseFleetMachines(cfg, {
+    passive: true,
+    pingFn: async (_c, req) =>
+      req.toMachine === "*"
+        ? [
+            {
+              fromMachine: "DESKTOP-2R3PAUG",
+              result: {
+                machineId: "DESKTOP-2R3PAUG",
+                githubUser: "erjadi",
+                scope: "personal",
+                version: BRIDGE_VERSION,
+              },
+            },
+          ]
+        : [],
+    fetchMembersFn: async () => legacyMembersList,
+    invokeBatchFn: async (_c, items) =>
+      items.map((item) => ({
+        item,
+        ok: true,
+        response: {
+          result: {
+            machineId: item.toMachine,
+            version: BRIDGE_VERSION,
+            protocolVersion: 36,
+            capabilities: {
+              brokerFreeOperations: true,
+              operationQueryCancel: true,
+              phasedRuntimeUpdate: true,
+              compactDiagnostics: true,
+            },
+            issues: [],
+            runtime: { copilotDesktopReachable: true, headlessCliAvailable: true },
+            threads: {
+              coordinator: { exists: true, healthy: true, permissionMode: "allow-all" },
+              threadTracker: { exists: true, healthy: true, permissionMode: "allow-all" },
+            },
+          },
+        },
+      })),
+  });
+  const diagLaptop = diagReport.members.find((m) => m.machineId === "LAPTOP-Q3JLH8RQ");
+  assert.equal(diagLaptop.online, false);
+  assert.equal(diagLaptop.overallState, "offline");
+  assert.equal(diagLaptop.version, BRIDGE_VERSION);
+  assert.equal(diagLaptop.versionMatch, true);
+  assert.equal(diagLaptop.presenceLayers.transport.lastSeenAt, realLaptopIso);
+
+  const diagGrace = diagReport.members.find((m) => m.machineId === "GRACE-PEER-PC");
+  assert.equal(diagGrace.online, false);
+  assert.equal(diagGrace.overallState, "reconnecting");
+
+  const diagNexus = diagReport.members.find((m) => m.machineId === "NEXUS-V2");
+  assert.equal(diagNexus.online, false);
+  assert.equal(diagNexus.overallState, "offline");
+  assert.equal(diagNexus.version, "3.5.0");
+  assert.equal(diagNexus.presenceLayers.transport.lastSeenAt, nov16Iso);
+});
+

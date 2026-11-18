@@ -2836,6 +2836,8 @@ export function createBootstrapServer({
             version: bodyData.version || "3.6.0",
             hostname: bodyData.hostname || bodyData.machineId,
             platform: bodyData.platform || null,
+            publicKey: bodyData.publicKey || null,
+            keyFingerprint: bodyData.keyFingerprint || null,
             specs: bodyData.specs || null,
           }, membersPath);
         }

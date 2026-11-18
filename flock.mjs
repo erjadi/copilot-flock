@@ -5014,7 +5014,7 @@ function projectPublicMember(member) {
   const out = {};
   for (const key of [
     "identityKey", "peerId", "keyFingerprint", "deviceId", "machineId", "githubUser",
-    "role", "trustTier", "scope", "membershipExpiresAt", "membershipExpiresAtMs",
+    "version", "role", "trustTier", "scope", "membershipExpiresAt", "membershipExpiresAtMs",
     "certIssuedAtMs", "certExpiresAt", "certExpiresAtMs", "addedAtEpoch",
     "addedAtRevision", "updatedAtRevision", "removed", "removedAtMs", "removedAtEpoch",
     "removedAtRevision", "reason", "presenceStatus", "lastSeenAt", "online", "presence",
@@ -7908,6 +7908,7 @@ export async function rediscoverLocalWsConnectionInfo({
   discoverWsFn = null,
   retryPollMs = 120,
   probeTimeoutMs = 500,
+  allowOsProcessScan = true,
 } = {}) {
   const copilotDir = getCopilotDir();
   invalidateLocalWsConnectionCache();
@@ -7964,7 +7965,7 @@ export async function rediscoverLocalWsConnectionInfo({
       };
       return { port: customPort, token: customToken, source: "custom_probe" };
     }
-  } else if (fallbackToken) {
+  } else if (fallbackToken && allowOsProcessScan) {
     const probed = await probeActiveDesktopWsListener({
       token: fallbackToken,
       excludePort: previousPort,
@@ -7993,6 +7994,7 @@ export async function verifyLocalWsConnectionInfo({
   discoverWsFn = null,
   probeTimeoutMs = 600,
   retryPollMs = 60,
+  allowOsProcessScan = true,
 } = {}) {
   const copilotDir = getCopilotDir();
   if (
@@ -8011,7 +8013,10 @@ export async function verifyLocalWsConnectionInfo({
       cached: true,
     };
   }
-  const current = getLocalWsConnectionInfo({ forceRefresh, allowStaleDiskFallback: true });
+  const current = getLocalWsConnectionInfo({
+    forceRefresh,
+    allowStaleDiskFallback: Boolean(forceRefresh),
+  });
   if (!current) return null;
   if (!probeReachability) return current;
 
@@ -8036,6 +8041,7 @@ export async function verifyLocalWsConnectionInfo({
     discoverWsFn,
     retryPollMs,
     probeTimeoutMs,
+    allowOsProcessScan,
   });
   if (
     rediscovered &&
@@ -10776,6 +10782,420 @@ export function filterBroadcastTargets(
   });
 }
 
+function parseBoundedTimestampMs(value, { nowMs = Date.now(), maxFutureSkewMs = 30000 } = {}) {
+  if (value === null || value === undefined || value === "") return null;
+  const ms = typeof value === "number" ? value : Date.parse(String(value));
+  if (!Number.isFinite(ms) || ms <= 0 || ms > nowMs + maxFutureSkewMs) return null;
+  return ms;
+}
+
+function selectNewerValidIsoTimestamp(candidates, { nowMs = Date.now(), maxFutureSkewMs = 30000 } = {}) {
+  let bestMs = null;
+  let bestIso = null;
+  for (const candidate of candidates || []) {
+    const ms = parseBoundedTimestampMs(candidate, { nowMs, maxFutureSkewMs });
+    if (ms === null) continue;
+    if (bestMs === null || ms > bestMs) {
+      bestMs = ms;
+      bestIso = new Date(ms).toISOString();
+    }
+  }
+  return bestIso;
+}
+
+function readLocalDaemonKnownPeersPassive(cfg = null, daemonStatus = null) {
+  if (Array.isArray(daemonStatus?.state?.knownPeers)) {
+    if (
+      !daemonStatus.state.machineId ||
+      !cfg?.machineId ||
+      String(daemonStatus.state.machineId).toLowerCase() === String(cfg.machineId).toLowerCase()
+    ) {
+      return daemonStatus.state.knownPeers;
+    }
+    return [];
+  }
+  let statePath = null;
+  if (cfg?.statePath) {
+    statePath = cfg.statePath;
+  } else if (cfg?.configPath) {
+    statePath = path.join(path.dirname(cfg.configPath), "state.json");
+  } else if (cfg?.flocksConfigPath) {
+    statePath = path.join(path.dirname(cfg.flocksConfigPath), "state.json");
+  } else {
+    statePath = getStatePath();
+  }
+  if (!statePath || !fs.existsSync(statePath)) return [];
+  try {
+    const parsed = JSON.parse(fs.readFileSync(statePath, "utf8"));
+    if (
+      parsed?.machineId &&
+      cfg?.machineId &&
+      String(parsed.machineId).toLowerCase() !== String(cfg.machineId).toLowerCase()
+    ) {
+      return [];
+    }
+    return Array.isArray(parsed?.knownPeers) ? parsed.knownPeers : [];
+  } catch {
+    return [];
+  }
+}
+
+function deriveCandidateKeyFingerprints(pubKeyPem) {
+  const clean = String(pubKeyPem || "").trim();
+  if (!clean) return [];
+  const out = new Set();
+  try {
+    out.add(deriveKeyFingerprint(clean).toLowerCase());
+  } catch {}
+  try {
+    out.add(crypto.createHash("sha256").update(clean).digest("hex").toLowerCase());
+    out.add(crypto.createHash("sha256").update(clean).digest("hex").slice(0, 32).toLowerCase());
+  } catch {}
+  return [...out];
+}
+
+function peerKeysConsistentWithMember(member, peer) {
+  const memberPub = String(
+    member?.publicKey || member?.deviceEd25519Pub || member?.specs?.publicKey || ""
+  ).trim();
+  const peerPub = String(peer?.publicKey || peer?.specs?.publicKey || "").trim();
+  if (memberPub && peerPub) {
+    return memberPub === peerPub;
+  }
+  const memberFp = String(
+    member?.keyFingerprint || member?.deviceId || member?.specs?.keyFingerprint || ""
+  )
+    .trim()
+    .toLowerCase();
+  const peerFp = String(peer?.keyFingerprint || peer?.specs?.keyFingerprint || "")
+    .trim()
+    .toLowerCase();
+  if (memberFp && peerFp) {
+    if (memberFp === peerFp) return true;
+    if (peerPub && deriveCandidateKeyFingerprints(peerPub).includes(memberFp)) return true;
+    if (memberPub && deriveCandidateKeyFingerprints(memberPub).includes(peerFp)) return true;
+    return false;
+  }
+  if (memberFp && peerPub) {
+    return deriveCandidateKeyFingerprints(peerPub).includes(memberFp);
+  }
+  if (peerFp && memberPub) {
+    return deriveCandidateKeyFingerprints(memberPub).includes(peerFp);
+  }
+  return true;
+}
+
+export function resolveAdmissibleKnownPeerEvidence(
+  member,
+  knownPeers,
+  { expectedOwner = null, nowMs = Date.now() } = {}
+) {
+  if (!member?.machineId || !Array.isArray(knownPeers) || knownPeers.length === 0) return null;
+  const membershipExpiresAtMs =
+    member.membershipExpiresAtMs ??
+    (member.membershipExpiresAt ? Date.parse(String(member.membershipExpiresAt)) : null);
+  if (
+    member.removed ||
+    member.revoked ||
+    member.tombstoned ||
+    member.tombstone ||
+    member.status === "removed" ||
+    member.status === "revoked" ||
+    member.status === "expired" ||
+    member.membershipStatus === "revoked" ||
+    member.membershipStatus === "expired" ||
+    (membershipExpiresAtMs != null && Number(membershipExpiresAtMs) <= nowMs)
+  ) {
+    return null;
+  }
+  const targetMachineLower = String(member.machineId).trim().toLowerCase();
+  const memberUser =
+    normalizeGitHubUser(member.githubUser || expectedOwner)?.toLowerCase() || null;
+  let memberScope = null;
+  if (member.scope !== undefined && member.scope !== null && member.scope !== "") {
+    try {
+      memberScope = normalizeScope(member.scope, "");
+    } catch {
+      return null;
+    }
+  }
+
+  let best = null;
+  for (const peer of knownPeers) {
+    if (!peer || typeof peer !== "object" || !peer.machineId) continue;
+    if (String(peer.machineId).trim().toLowerCase() !== targetMachineLower) continue;
+    const peerUser = normalizeGitHubUser(peer.githubUser)?.toLowerCase() || null;
+    if (memberUser && peerUser && memberUser !== peerUser) continue;
+    if (peer.scope !== undefined && peer.scope !== null && peer.scope !== "") {
+      let peerScope;
+      try {
+        peerScope = normalizeScope(peer.scope, "");
+      } catch {
+        continue;
+      }
+      if (memberScope && peerScope && memberScope !== peerScope) continue;
+    }
+    if (!peerKeysConsistentWithMember(member, peer)) continue;
+    const rawSeen = peer.lastSeenAt ?? peer.respondedAt ?? peer.timestamp ?? null;
+    const seenAtMs = parseBoundedTimestampMs(rawSeen, { nowMs, maxFutureSkewMs: 5000 });
+    if (seenAtMs === null) continue;
+    if (!best || seenAtMs > best.seenAtMs) {
+      best = {
+        peer,
+        seenAtMs,
+        lastSeenAt: new Date(seenAtMs).toISOString(),
+        version:
+          typeof peer.version === "string" && peer.version.trim() ? peer.version.trim() : null,
+        specs: peer.specs && typeof peer.specs === "object" ? peer.specs : null,
+      };
+    }
+  }
+  return best;
+}
+
+function selectFresherMemberVersion(member, peerEvidence, { nowMs = Date.now() } = {}) {
+  const memberVersion =
+    typeof member?.version === "string" && member.version.trim() ? member.version.trim() : null;
+  const peerVersion = peerEvidence?.version || null;
+  if (!peerVersion) return memberVersion;
+  if (!memberVersion) return peerVersion;
+  const memberSeenMs = parseBoundedTimestampMs(
+    member?.lastSeenAt || member?.updatedAt || member?.registeredAt,
+    { nowMs }
+  );
+  if (memberSeenMs === null || peerEvidence.seenAtMs >= memberSeenMs) {
+    return peerVersion;
+  }
+  return memberVersion;
+}
+
+function isMemberTombstonedInRegistryRecord(record, member, fallbackUser = null) {
+  if (!record?.tombstones) return false;
+  const mUser = normalizeGitHubUser(member?.githubUser || fallbackUser)?.toLowerCase() || null;
+  const mLower = String(member?.machineId || "").trim().toLowerCase();
+  return Object.values(record.tombstones).some(
+    (tombstone) =>
+      (member?.peerId && tombstone.peerId === member.peerId) ||
+      (member?.keyFingerprint && tombstone.keyFingerprint === member.keyFingerprint) ||
+      (mLower &&
+        String(tombstone.machineId || "").toLowerCase() === mLower &&
+        (!mUser || !tombstone.githubUser || String(tombstone.githubUser).toLowerCase() === mUser))
+  );
+}
+
+function resolveMissingRecentKnownPeerTargets(
+  cfg,
+  {
+    respondedMachinesLower,
+    flockSel = null,
+    scopeFilter = null,
+    githubUser = null,
+    passive = false,
+    knownPeers = null,
+    nowMs = Date.now(),
+    maxAgeMs = 90000,
+    maxPeers = 6,
+  } = {}
+) {
+  if (!cfg || cfg.protocol === "broker-free-v34") return [];
+  const peersList = Array.isArray(knownPeers)
+    ? knownPeers
+    : readLocalDaemonKnownPeersPassive(cfg);
+  if (peersList.length === 0) return [];
+
+  const customPath = cfg?.flocksConfigPath || getFlocksConfigPath();
+  let rawStored;
+  let registryState;
+  try {
+    rawStored = readRawStoredFlocksConfig(cfg, customPath);
+    registryState = openFlockMembershipRegistry(customPath).read();
+  } catch {
+    return [];
+  }
+
+  const callerOwner =
+    normalizeGitHubUser(cfg?.githubUser || rawStored?.ownerGitHubUser)?.toLowerCase() || null;
+  const localMachineLower = String(cfg?.machineId || "").trim().toLowerCase();
+
+  const candidateFlockIds = flockSel
+    ? [flockSel.flockId]
+    : Array.from(
+        new Set([
+          ...Object.keys(rawStored.flocks || {}),
+          ...Object.keys(registryState.flocks || {}),
+        ])
+      ).sort((a, b) => {
+        const rank = (id) => {
+          if (callerOwner && (id === `${callerOwner}/personal` || id === `${callerOwner}/work`)) {
+            return 0;
+          }
+          if (callerOwner && id === callerOwner) return 1;
+          return 2;
+        };
+        return rank(a) - rank(b) || String(a).localeCompare(String(b));
+      });
+
+  if (candidateFlockIds.length === 0) return [];
+
+  const findAuthorizedMemberInFlock = (fId, machineLower) => {
+    const policy = rawStored.flocks?.[fId] || null;
+    if (policy) {
+      if (policy.revoked === true) return null;
+      if (policy.membershipExpiresAtMs && Number(policy.membershipExpiresAtMs) <= nowMs) return null;
+      if (policy.expiresAtMs && Number(policy.expiresAtMs) <= nowMs) return null;
+    }
+    const regRecord = registryState.flocks?.[fId] || null;
+    const regMembers = Object.values(regRecord?.members || {}).filter(
+      (m) => m && !m.removed && String(m.machineId || "").trim().toLowerCase() === machineLower
+    );
+    const polMembers = extractPolicyMembersList(policy).filter(
+      (m) => m && !m.removed && String(m.machineId || "").trim().toLowerCase() === machineLower
+    );
+    const member = regMembers[0] || polMembers[0] || null;
+    if (!member) return null;
+    if (member.membershipExpiresAtMs && Number(member.membershipExpiresAtMs) <= nowMs) return null;
+    if (member.certExpiresAtMs && Number(member.certExpiresAtMs) <= nowMs) return null;
+    const flockOwner =
+      normalizeGitHubUser(
+        policy?.ownerGitHubUser || regRecord?.ownerGitHubUser || callerOwner
+      )?.toLowerCase() || null;
+    if (
+      policy &&
+      isPrincipalRevokedInFlock(policy, {
+        githubUser: member.githubUser || flockOwner,
+        machineId: member.machineId,
+        peerId: member.peerId,
+      })
+    ) {
+      return null;
+    }
+    if (isMemberTombstonedInRegistryRecord(regRecord, member, flockOwner)) return null;
+    return { member, flockOwner };
+  };
+
+  const selectedByMachine = new Map();
+  for (const peer of peersList) {
+    if (!peer || typeof peer !== "object" || !peer.machineId) continue;
+    const mLower = String(peer.machineId).trim().toLowerCase();
+    if (!mLower || mLower === localMachineLower || respondedMachinesLower.has(mLower)) continue;
+    if (flockSel?.targetMachineId && mLower !== flockSel.targetMachineId.toLowerCase()) continue;
+
+    const rawSeen = peer.lastSeenAt ?? peer.respondedAt ?? peer.timestamp ?? null;
+    const seenAtMs = parseBoundedTimestampMs(rawSeen, { nowMs, maxFutureSkewMs: 5000 });
+    if (seenAtMs === null || nowMs - seenAtMs > maxAgeMs) continue;
+
+    if (scopeFilter) {
+      let peerScope = null;
+      try {
+        peerScope = peer.scope ? normalizeScope(peer.scope, "") : null;
+      } catch {
+        continue;
+      }
+      if (peerScope && peerScope !== scopeFilter) continue;
+    }
+    if (
+      githubUser &&
+      peer.githubUser &&
+      !matchesSelectorList(peer.githubUser, githubUser, { stripAt: true })
+    ) {
+      continue;
+    }
+
+    if (passive && isTokenLocalAuthEnabled(cfg) && typeof cfg?.rpcTransport !== "function") {
+      const canSendNonMutating = Boolean(
+        cfg?.clientToken &&
+          cfg?.credentialExpiresAt > nowMs + 30000 &&
+          resolveSignalRRestUserToken(cfg, peer.machineId)
+      );
+      if (!canSendNonMutating) continue;
+    }
+
+    for (const fId of candidateFlockIds) {
+      const found = findAuthorizedMemberInFlock(fId, mLower);
+      if (!found) continue;
+      const evidence = resolveAdmissibleKnownPeerEvidence(found.member, [peer], {
+        expectedOwner: found.flockOwner,
+        nowMs,
+      });
+      if (!evidence) continue;
+      let authorizedSelector = null;
+      try {
+        authorizedSelector = authorizeCallerFlockSelection(cfg, fId, {
+          flocksConfigPath: customPath,
+        }).canonicalPath;
+      } catch {
+        continue;
+      }
+      const prev = selectedByMachine.get(mLower);
+      if (!prev || evidence.seenAtMs > prev.seenAtMs) {
+        selectedByMachine.set(mLower, {
+          machineId: found.member.machineId || peer.machineId,
+          flockSelector: authorizedSelector,
+          seenAtMs: evidence.seenAtMs,
+        });
+      }
+      break;
+    }
+  }
+
+  return Array.from(selectedByMachine.values())
+    .sort((a, b) => b.seenAtMs - a.seenAtMs)
+    .slice(0, maxPeers);
+}
+
+function isDiscoveredResponderAuthorizedForFlock(cfg, flockSel, item, nowMs = Date.now()) {
+  if (!flockSel || cfg?.protocol === "broker-free-v34") return true;
+  const parsed = flockSel.parsed;
+  const itemMachineLower = String(item?.machineId || "").trim().toLowerCase();
+  if (!itemMachineLower) return false;
+  if (
+    flockSel.targetMachineId &&
+    itemMachineLower !== String(flockSel.targetMachineId).toLowerCase()
+  ) {
+    return false;
+  }
+  const itemUserLower = normalizeGitHubUser(item?.githubUser)?.toLowerCase() || null;
+  if (parsed?.isBuiltInScope) {
+    if (item?.scope && item.scope !== parsed.flockName) return false;
+    if (itemUserLower && itemUserLower !== parsed.owner) return false;
+  } else if (parsed?.isOwnerRoot) {
+    if (itemUserLower && itemUserLower !== parsed.owner) return false;
+  }
+
+  const customPath = cfg?.flocksConfigPath || getFlocksConfigPath();
+  try {
+    const rawStored = readRawStoredFlocksConfig(cfg, customPath);
+    const policy = rawStored.flocks?.[flockSel.flockId] || null;
+    if (
+      policy &&
+      isPrincipalRevokedInFlock(policy, {
+        githubUser: itemUserLower,
+        machineId: item.machineId,
+      })
+    ) {
+      return false;
+    }
+    const regRecord = openFlockMembershipRegistry(customPath).read().flocks?.[flockSel.flockId] || null;
+    if (isMemberTombstonedInRegistryRecord(regRecord, item, parsed?.owner || null)) {
+      return false;
+    }
+    if (!parsed?.isOwnerRoot && !parsed?.isBuiltInScope) {
+      const activeIds = new Set([
+        ...Object.values(regRecord?.members || {})
+          .filter((m) => m && !m.removed && (!m.membershipExpiresAtMs || Number(m.membershipExpiresAtMs) > nowMs))
+          .map((m) => String(m.machineId || "").toLowerCase()),
+        ...extractPolicyMembersList(policy)
+          .filter((m) => m && !m.removed && (!m.membershipExpiresAtMs || Number(m.membershipExpiresAtMs) > nowMs))
+          .map((m) => String(m.machineId || "").toLowerCase()),
+      ]);
+      if (activeIds.size > 0 && !activeIds.has(itemMachineLower)) {
+        return false;
+      }
+    }
+  } catch {}
+  return true;
+}
+
 export async function discoverMachines(
   cfg,
   {
@@ -10787,6 +11207,8 @@ export async function discoverMachines(
     minFreeDiskGb = null,
     timeoutMs = 2500,
     flockId = cfg.flockId,
+    targetMachine = null,
+    knownPeers = null,
     passive = false,
   } = {}
 ) {
@@ -10794,21 +11216,75 @@ export async function discoverMachines(
     scope && String(scope).toLowerCase() !== "all" && String(scope).trim() !== "*"
       ? normalizeScope(scope, "")
       : null;
+  const hasExplicitFlock = flockId !== undefined && flockId !== null;
+  const flockSel = hasExplicitFlock ? authorizeCallerFlockSelection(cfg, flockId) : null;
+  const effectiveFlockSelector = flockSel ? flockSel.canonicalPath : flockId;
+  const effectiveToMachine = targetMachine || flockSel?.targetMachineId || "*";
+  const isBroadcastTarget =
+    !effectiveToMachine ||
+    effectiveToMachine === "*" ||
+    String(effectiveToMachine).toLowerCase() === "all";
   const effectiveTimeoutMs =
     process.env.BRIDGE_FAST_VOTE_TEST === "1" ? Math.min(timeoutMs, 150) : timeoutMs;
-  const replies = await invokeRemoteRpc(cfg, {
-    toMachine: "*",
+  const rawReplies = await invokeRemoteRpc(cfg, {
+    toMachine: effectiveToMachine,
     action: "ping",
     params: passive ? { passive: true } : {},
     timeoutMs: effectiveTimeoutMs,
-    collectAll: true,
-    flockId,
+    collectAll: isBroadcastTarget,
+    flockId: effectiveFlockSelector,
+    allowLoopback: Boolean(includeSelf),
     passive,
   });
+  const replies = Array.isArray(rawReplies) ? [...rawReplies] : rawReplies ? [rawReplies] : [];
+
+  if (isBroadcastTarget && process.env.BRIDGE_FAST_VOTE_TEST !== "1") {
+    const respondedMachinesLower = new Set(
+      replies
+        .filter((r) => Boolean(r?.result))
+        .map((r) => String(r.result?.machineId || r.fromMachine || "").trim().toLowerCase())
+        .filter(Boolean)
+    );
+    const missingCandidates = resolveMissingRecentKnownPeerTargets(cfg, {
+      respondedMachinesLower,
+      flockSel,
+      scopeFilter: normalizedScopeFilter,
+      githubUser,
+      passive,
+      knownPeers,
+    });
+    if (missingCandidates.length > 0) {
+      const confirmTimeoutMs = Math.min(2500, Math.max(1200, effectiveTimeoutMs));
+      const confirmed = await Promise.all(
+        missingCandidates.map(async (candidate) => {
+          try {
+            return await invokeRemoteRpc(cfg, {
+              toMachine: candidate.machineId,
+              action: "ping",
+              params: passive ? { passive: true } : {},
+              timeoutMs: confirmTimeoutMs,
+              collectAll: false,
+              flockId: candidate.flockSelector,
+              passive,
+            });
+          } catch {
+            return null;
+          }
+        })
+      );
+      for (const reply of confirmed) {
+        if (reply?.result) replies.push(reply);
+      }
+    }
+  }
 
   const byMachine = new Map();
   for (const r of replies) {
-    if (!includeSelf && r.fromMachine === cfg.machineId) continue;
+    const responderId = r?.result?.machineId || r?.fromMachine;
+    if (!responderId) continue;
+    if (!includeSelf && String(responderId).toLowerCase() === String(cfg.machineId || "").toLowerCase()) {
+      continue;
+    }
     if (r.result) {
       let peerScope;
       try {
@@ -10819,7 +11295,7 @@ export async function discoverMachines(
       }
       const respondedAt = r.respondedAt || r.result.respondedAt || r.result.timestamp || null;
       const baseItem = {
-        machineId: r.result.machineId || r.fromMachine,
+        machineId: responderId,
         version: r.result.version || "1.0.0-pre",
         scope: peerScope,
         githubUser: normalizeGitHubUser(r.result.githubUser) || null,
@@ -10829,13 +11305,14 @@ export async function discoverMachines(
       baseItem.version = r.result.version || "1.0.0-pre";
       baseItem.scope = peerScope;
       baseItem.githubUser = normalizeGitHubUser(r.result.githubUser) || null;
+      if (!isDiscoveredResponderAuthorizedForFlock(cfg, flockSel, baseItem)) continue;
       const layeredPresence = classifyLayeredPresence({ online: true, ping: baseItem });
       const item = {
         ...baseItem,
         overallState: layeredPresence.overallState,
         presenceLayers: layeredPresence.presenceLayers,
       };
-      byMachine.set(r.fromMachine, item);
+      byMachine.set(String(responderId).toLowerCase(), item);
     }
   }
   return filterBroadcastTargets(Array.from(byMachine.values()), {
@@ -10976,14 +11453,25 @@ export function resolveOrFindBridgeGitRepo({ noninteractive = false } = {}) {
 
 let cachedBootstrapMembersMap = new Map();
 let cachedBootstrapMembersLoadedAt = 0;
+let cachedBootstrapMembersAttemptedAt = 0;
+let cachedBootstrapMembersCacheKey = "";
 
 export function getCachedBootstrapMembersMap(cfg, { forceRefresh = false } = {}) {
   const now = Date.now();
-  if (!forceRefresh && cachedBootstrapMembersMap.size > 0 && now - cachedBootstrapMembersLoadedAt < 60000) {
-    return cachedBootstrapMembersMap;
+  const bootstrapUrl = cfg?.bootstrapUrl || DEFAULT_BOOTSTRAP_URL;
+  const cacheKey = `${bootstrapUrl || ""}|${isTokenLocalAuthEnabled(cfg) ? "token-local" : "github"}`;
+  if (!forceRefresh && cachedBootstrapMembersCacheKey === cacheKey) {
+    if (cachedBootstrapMembersMap.size > 0 && now - cachedBootstrapMembersLoadedAt < 60000) {
+      return cachedBootstrapMembersMap;
+    }
+    if (cachedBootstrapMembersAttemptedAt > 0 && now - cachedBootstrapMembersAttemptedAt < 15000) {
+      return cachedBootstrapMembersMap;
+    }
   }
+  cachedBootstrapMembersAttemptedAt = now;
+  cachedBootstrapMembersCacheKey = cacheKey;
   try {
-    const list = fetchBootstrapMembers({ bootstrapUrl: cfg?.bootstrapUrl || DEFAULT_BOOTSTRAP_URL });
+    const list = fetchBootstrapMembers({ bootstrapUrl, cfg });
     if (Array.isArray(list) && list.length > 0) {
       const m = new Map();
       for (const item of list) {
@@ -11227,32 +11715,101 @@ function findPinnedPeerInStoredFlocks(cfg, machineId, customPath = null, flockId
     resolvedPath
   );
   const now = Date.now();
-  let matched = null;
+  const builtInIds = owner ? new Set([owner, `${owner}/personal`, `${owner}/work`]) : new Set();
+  const registry = openFlockMembershipRegistry(resolvedPath);
+  const regState = registry.read();
+  const hasRegistryBuiltIns =
+    !flockId &&
+    cfg?.protocol !== "broker-free-v34" &&
+    owner &&
+    [...builtInIds].some((id) => Boolean(regState.flocks?.[id] || regState.retainedFlocks?.[id]));
+
+  const candidates = [];
+  const addCandidate = (entry) => {
+    const pubKey = String(entry?.publicKey || entry?.deviceEd25519Pub || entry?.specs?.publicKey || "").trim();
+    if (!pubKey) return;
+    candidates.push({
+      peerId: entry.peerId || null,
+      machineId: entry.machineId,
+      githubUser: entry.githubUser || null,
+      scope: entry.scope || null,
+      publicKey: pubKey,
+    });
+  };
+
+  if (!flockId && cfg?.protocol !== "broker-free-v34" && owner) {
+    const ownerBuiltInPeer = findOwnerBuiltInPeer(ownerBuiltInPinContext(cfg, resolvedPath), cleanMachine);
+    if (ownerBuiltInPeer?.publicKey) {
+      addCandidate(ownerBuiltInPeer);
+    }
+  }
+
+  if (!flockId) {
+    for (const [fId, record] of Object.entries(regState.flocks || {})) {
+      if (hasRegistryBuiltIns && builtInIds.has(String(fId).toLowerCase())) continue;
+      const policy = rawStored?.flocks?.[String(fId).toLowerCase()] || null;
+      if (policy) {
+        if (policy.revoked === true) continue;
+        if (policy.membershipExpiresAtMs && Number(policy.membershipExpiresAtMs) <= now) continue;
+        if (policy.expiresAtMs && Number(policy.expiresAtMs) <= now) continue;
+      }
+      const activeMember = registry.findActiveMember(fId, { machineId: cleanMachine, now });
+      if (!activeMember) continue;
+      if (
+        policy &&
+        isPrincipalRevokedInFlock(policy, {
+          githubUser: activeMember.githubUser,
+          machineId: activeMember.machineId,
+          peerId: activeMember.peerId,
+        })
+      ) {
+        continue;
+      }
+      addCandidate(activeMember);
+    }
+  }
+
   for (const policy of Object.values(rawStored?.flocks || {})) {
-    if (flockId && String(policy?.flockId || "").toLowerCase() !== String(flockId).toLowerCase()) {
+    const policyIdLower = String(policy?.flockId || "").toLowerCase();
+    if (flockId && policyIdLower !== String(flockId).toLowerCase()) {
+      continue;
+    }
+    if (!flockId && hasRegistryBuiltIns && builtInIds.has(policyIdLower)) {
       continue;
     }
     if (!policy || policy.revoked === true) continue;
     if (policy.membershipExpiresAtMs && Number(policy.membershipExpiresAtMs) <= now) continue;
     if (policy.expiresAtMs && Number(policy.expiresAtMs) <= now) continue;
+    const regRecord = policyIdLower ? regState.flocks?.[policyIdLower] || null : null;
     for (const member of extractPolicyMembersList(policy)) {
       if (!member || member.removed) continue;
       if (String(member.machineId || "").trim().toLowerCase() !== cleanMachine) continue;
       if (member.membershipExpiresAtMs && Number(member.membershipExpiresAtMs) <= now) continue;
-      const pubKey = member.publicKey || member.specs?.publicKey || null;
-      if (!pubKey) continue;
-      if (matched && matched.publicKey.trim() !== String(pubKey).trim()) {
-        return null;
+      if (
+        isPrincipalRevokedInFlock(policy, {
+          githubUser: member.githubUser || policy.ownerGitHubUser,
+          machineId: member.machineId,
+          peerId: member.peerId,
+        })
+      ) {
+        continue;
       }
-      matched = {
-        machineId: member.machineId,
-        githubUser: member.githubUser || null,
-        scope: member.scope || null,
-        publicKey: String(pubKey),
-      };
+      if (isMemberTombstonedInRegistryRecord(regRecord, member, policy.ownerGitHubUser || null)) {
+        continue;
+      }
+      addCandidate(member);
     }
   }
-  return matched;
+
+  if (candidates.length === 0) return null;
+  const primary = candidates[0];
+  for (const candidate of candidates.slice(1)) {
+    if (candidate.publicKey !== primary.publicKey) return null;
+    const pUser = normalizeGitHubUser(primary.githubUser)?.toLowerCase() || null;
+    const cUser = normalizeGitHubUser(candidate.githubUser)?.toLowerCase() || null;
+    if (pUser && cUser && pUser !== cUser) return null;
+  }
+  return primary;
 }
 
 export function resolveVerifiedSenderIdentity(cfg, req) {
@@ -11271,6 +11828,7 @@ export function resolveVerifiedSenderIdentity(cfg, req) {
   }
 
   const rawClaimedMachine = req.auth?.fromMachine || req.fromMachine || params.fromMachine || "unknown";
+  const claimedMachineLower = String(rawClaimedMachine).toLowerCase();
   const rawClaimedScope = normalizeScope(params.fromScope, "work");
   let exactFlockId = null;
   const rawFlockSelector = params.flock ?? req.flock ?? req.flockId ?? req.flockPolicy?.flockId;
@@ -11280,61 +11838,70 @@ export function resolveVerifiedSenderIdentity(cfg, req) {
     } catch {}
   }
 
-  let membersMap = null;
+  const customFlocksPath = req?.flocksConfigPath || cfg?.flocksConfigPath || null;
+  let regEntry = null;
+  let regPubKey = null;
   if (Array.isArray(req.registryMembers)) {
-    membersMap = new Map(
+    const membersMap = new Map(
       req.registryMembers
         .filter((m) => m && m.machineId)
         .map((m) => [String(m.machineId).toLowerCase(), m])
     );
+    regEntry = membersMap.get(claimedMachineLower) || null;
+    regPubKey = regEntry?.publicKey || regEntry?.specs?.publicKey || null;
   } else if (req.auth) {
     if (exactFlockId) {
       const storedPeer = findPinnedPeerInStoredFlocks(
         cfg,
         rawClaimedMachine,
-        req?.flocksConfigPath || cfg?.flocksConfigPath || null,
+        customFlocksPath,
         exactFlockId
       );
-      membersMap = new Map(
-        storedPeer ? [[String(rawClaimedMachine).toLowerCase(), storedPeer]] : []
-      );
+      regEntry = storedPeer || null;
+      regPubKey = regEntry?.publicKey || regEntry?.specs?.publicKey || null;
     } else {
-      membersMap = getCachedBootstrapMembersMap(cfg);
-      if (!membersMap.has(String(rawClaimedMachine).toLowerCase())) {
-        membersMap = getCachedBootstrapMembersMap(cfg, { forceRefresh: true });
+      // Fast local pinned-key lookup first (<1ms, zero subprocess/network calls)
+      const storedPeer = findPinnedPeerInStoredFlocks(
+        cfg,
+        rawClaimedMachine,
+        customFlocksPath,
+        null
+      );
+      const storedPubKey = storedPeer?.publicKey || storedPeer?.specs?.publicKey || null;
+      if (
+        storedPubKey &&
+        (!req.auth.publicKey || storedPubKey.trim() === String(req.auth.publicKey).trim())
+      ) {
+        regEntry = storedPeer;
+        regPubKey = storedPubKey;
+      } else {
+        const hadWarmMembersCache =
+          cachedBootstrapMembersMap.size > 0 && Date.now() - cachedBootstrapMembersLoadedAt < 60000;
+        let membersMap = getCachedBootstrapMembersMap(cfg);
+        let bootstrapEntry = membersMap ? membersMap.get(claimedMachineLower) : null;
+        let bootstrapPubKey = bootstrapEntry?.publicKey || bootstrapEntry?.specs?.publicKey || null;
+        if (
+          hadWarmMembersCache &&
+          (!bootstrapPubKey ||
+            (req.auth.publicKey && bootstrapPubKey.trim() !== String(req.auth.publicKey).trim()))
+        ) {
+          membersMap = getCachedBootstrapMembersMap(cfg, { forceRefresh: true });
+          bootstrapEntry = membersMap ? membersMap.get(claimedMachineLower) : null;
+          bootstrapPubKey = bootstrapEntry?.publicKey || bootstrapEntry?.specs?.publicKey || null;
+        }
+        if (bootstrapPubKey) {
+          regEntry = bootstrapEntry;
+          regPubKey = bootstrapPubKey;
+        } else if (storedPeer) {
+          regEntry = storedPeer;
+          regPubKey = storedPubKey;
+        }
       }
     }
   }
 
-  let regEntry = membersMap ? membersMap.get(String(rawClaimedMachine).toLowerCase()) : null;
-  let regPubKey = regEntry?.publicKey || regEntry?.specs?.publicKey || null;
-
   let senderVerified = false;
   if (req.auth) {
-    // Auto-refresh `/api/members` cache once if a peer rotated its Ed25519 key (e.g. after reprovision)
-    if (
-      !Array.isArray(req.registryMembers) &&
-      (!regPubKey || (req.auth.publicKey && regPubKey.trim() !== String(req.auth.publicKey).trim()))
-    ) {
-      membersMap = exactFlockId
-        ? new Map()
-        : getCachedBootstrapMembersMap(cfg, { forceRefresh: true });
-      regEntry = membersMap ? membersMap.get(String(rawClaimedMachine).toLowerCase()) : null;
-      regPubKey = regEntry?.publicKey || regEntry?.specs?.publicKey || null;
-      if (!regPubKey) {
-        const storedPeer = findPinnedPeerInStoredFlocks(
-          cfg,
-          rawClaimedMachine,
-          req?.flocksConfigPath || cfg?.flocksConfigPath || null,
-          exactFlockId
-        );
-        if (storedPeer) {
-          regEntry = storedPeer;
-          regPubKey = storedPeer.publicKey;
-        }
-      }
-    }
-
     if (!regPubKey) {
       const err = new Error(
         `Security error: no pinned roster key exists for machine "${rawClaimedMachine}"; self-supplied caller keys are rejected.`
@@ -11807,7 +12374,11 @@ export async function handleRpcAction(cfg, req) {
   }
 
   if (action === "ping") {
-    const wsInfo = await verifyLocalWsConnectionInfo({ forceRefresh: false, retryPollMs: 0 });
+    const wsInfo = await verifyLocalWsConnectionInfo({
+      forceRefresh: false,
+      retryPollMs: 0,
+      allowOsProcessScan: !params.passive,
+    });
     const headlessCliAvailable = Boolean(resolveCopilotCliBin());
     const sessionLimit = params.includeSessions ? Math.max(8, Number(params.sessionLimit) || 25) : 8;
     let sessions = senderIdentity?.isCrossUser && !hasExplicitFlock ? [] : queryLocalSessionsFromDb({
@@ -13808,6 +14379,11 @@ const MCP_TOOLS = [
           type: "string",
           description: "Optional filter by GitHub handle (e.g. 'erjadi' or comma-separated handles).",
         },
+        flock: {
+          type: "string",
+          description:
+            "Optional explicit flock selector (<owner>/<flock>[/<machineId>], or <owner> on legacy). Scopes discovery to that authorized flock and fails closed if invalid, non-member, or unauthorized.",
+        },
       },
     },
   },
@@ -15134,7 +15710,7 @@ export async function executeMcpTool(cfg, name, args = {}, options = {}) {
     }
 
     const rpcRouteSpec = {
-      list_remote_machines: { toMachine: "*", action: "ping", params: {} },
+      list_remote_machines: { toMachine: targetMachineFromFlock || "*", action: "ping", params: {} },
       broadcast_remote_session_message: {
         toMachine: "*",
         action: args.new_session ? "create_session" : "send_message",
@@ -15259,10 +15835,15 @@ export async function executeMcpTool(cfg, name, args = {}, options = {}) {
       }
 
       try {
+        const passiveTargetFlock = args.flock || cfg?.boundFlockId || null;
+        const passiveFlockSel = passiveTargetFlock
+          ? authorizeCallerFlockSelection(cfg, passiveTargetFlock)
+          : null;
         const machines = await discoverOnlineMachines(cfg, {
           includeSelf: true,
           timeoutMs: 2200,
           passive: true,
+          ...(passiveFlockSel ? { flockId: passiveFlockSel.canonicalPath } : {}),
         });
         const runtimeHealth = inspectLocalRuntimeHealth(cfg, {
           daemonStatus,
@@ -15320,15 +15901,27 @@ export async function executeMcpTool(cfg, name, args = {}, options = {}) {
     }
 
     const targetFlock = args.flock || cfg.boundFlockId || null;
+    let discoveryFlockSelector = null;
     if (targetFlock) {
       parseFlockAddress(targetFlock, cfg.githubUser || "erjadi");
+      try {
+        discoveryFlockSelector = authorizeCallerFlockSelection(cfg, targetFlock).canonicalPath;
+      } catch (selErr) {
+        if (selErr?.code !== "FLOCK_NOT_ENROLLED" && selErr?.code !== "FLOCK_NON_MEMBER") {
+          throw selErr;
+        }
+      }
     }
     const daemonStatus = await ensureDaemon(cfg);
     let discoveryError = null;
     const [liveOutcome, legacyRoster] = await Promise.all([
       (async () => {
         try {
-          const list = await discoverOnlineMachines(cfg, { includeSelf: true, timeoutMs: 2200 });
+          const list = await discoverOnlineMachines(cfg, {
+            includeSelf: true,
+            timeoutMs: 2200,
+            ...(discoveryFlockSelector ? { flockId: discoveryFlockSelector } : {}),
+          });
           return {
             machines: list,
             source: {
@@ -15376,7 +15969,8 @@ export async function executeMcpTool(cfg, name, args = {}, options = {}) {
     const merged = applyLivePresenceToLegacyRoster(
       legacyRoster,
       liveOutcome.machines,
-      liveOutcome.source
+      liveOutcome.source,
+      { daemonKnownPeers: readLocalDaemonKnownPeersPassive(cfg, daemonStatus) }
     );
     return projectStatus({
       localMachineId: cfg.machineId,
@@ -15409,6 +16003,16 @@ export async function executeMcpTool(cfg, name, args = {}, options = {}) {
   }
 
   if (name === "list_remote_machines") {
+    const rawFlock =
+      args.flock !== undefined && args.flock !== null
+        ? args.flock
+        : cfg.protocol === "broker-free-v34" && cfg.autoFlockId && !cfg.explicitFlock
+          ? undefined
+          : cfg.flockId || cfg.boundFlockId;
+    const flockSel =
+      rawFlock !== undefined && rawFlock !== null
+        ? authorizeCallerFlockSelection(cfg, rawFlock)
+        : null;
     await ensureDaemon(cfg);
     return (await discoverMachines(cfg, {
       includeSelf: args.include_self !== false,
@@ -15418,6 +16022,12 @@ export async function executeMcpTool(cfg, name, args = {}, options = {}) {
       minRamGb: args.min_ram_gb ?? null,
       minFreeDiskGb: args.min_free_disk_gb ?? null,
       timeoutMs: 2500,
+      ...(flockSel
+        ? {
+            flockId: flockSel.canonicalPath,
+            ...(flockSel.targetMachineId ? { targetMachine: flockSel.targetMachineId } : {}),
+          }
+        : {}),
     })).map(projectPublicOnlineMachine).filter(Boolean);
   }
 
@@ -16155,8 +16765,16 @@ export async function executeMcpTool(cfg, name, args = {}, options = {}) {
       });
     }
     const targetFlock = args.flock || cfg.boundFlockId || null;
+    let discoveryFlockSelector = null;
     if (targetFlock) {
       parseFlockAddress(targetFlock, cfg.githubUser || "erjadi");
+      try {
+        discoveryFlockSelector = authorizeCallerFlockSelection(cfg, targetFlock).canonicalPath;
+      } catch (selErr) {
+        if (selErr?.code !== "FLOCK_NOT_ENROLLED" && selErr?.code !== "FLOCK_NON_MEMBER") {
+          throw selErr;
+        }
+      }
     }
     if (!options.fetchV3MyFlocks && !options.fetchLegacyMembers) {
       const hasCfgBootstrap = Boolean(cfg && Object.prototype.hasOwnProperty.call(cfg, "bootstrapUrl"));
@@ -16168,10 +16786,15 @@ export async function executeMcpTool(cfg, name, args = {}, options = {}) {
     }
     let onlineMachines = null;
     let liveSignalRSource = null;
+    let daemonStatusForFlocks = null;
     if (args.probe_presence === true) {
-      await ensureDaemon(cfg);
+      daemonStatusForFlocks = await ensureDaemon(cfg);
       try {
-        onlineMachines = await discoverOnlineMachines(cfg, { includeSelf: true, timeoutMs: 2200 });
+        onlineMachines = await discoverOnlineMachines(cfg, {
+          includeSelf: true,
+          timeoutMs: 2200,
+          ...(discoveryFlockSelector ? { flockId: discoveryFlockSelector } : {}),
+        });
         liveSignalRSource = {
           attempted: true,
           ok: true,
@@ -16196,9 +16819,12 @@ export async function executeMcpTool(cfg, name, args = {}, options = {}) {
       targetFlock,
       deferPresenceMerge: true,
     });
+    const daemonKnownPeers = readLocalDaemonKnownPeersPassive(cfg, daemonStatusForFlocks);
     const resolved = onlineMachines !== null
-      ? applyLivePresenceToLegacyRoster(legacyRoster, onlineMachines, liveSignalRSource)
-      : applyLivePresenceToLegacyRoster(legacyRoster, null, null);
+      ? applyLivePresenceToLegacyRoster(legacyRoster, onlineMachines, liveSignalRSource, {
+          daemonKnownPeers,
+        })
+      : applyLivePresenceToLegacyRoster(legacyRoster, null, null, { daemonKnownPeers });
     let cachedFlocks = [];
     const hasRemoteRoster = resolved.enrolledRosterFlocks?.length > 0;
     try {
@@ -20178,6 +20804,7 @@ export function classifyLayeredPresence({
   online,
   member = {},
   ping = {},
+  peerEvidence = null,
   diagnostic = null,
   issues = [],
   nowMs = Date.now(),
@@ -20185,7 +20812,16 @@ export function classifyLayeredPresence({
   presenceExpiryMs = 90000,
 }) {
   const lastSeenAt =
-    ping.respondedAt || ping.timestamp || diagnostic?.checkedAt || member.lastSeenAt || member.updatedAt || null;
+    ping.respondedAt ||
+    ping.timestamp ||
+    diagnostic?.checkedAt ||
+    selectNewerValidIsoTimestamp(
+      [peerEvidence?.lastSeenAt, member.lastSeenAt, member.updatedAt],
+      { nowMs }
+    ) ||
+    member.lastSeenAt ||
+    member.updatedAt ||
+    null;
   const stateTracker = new PresenceStateTracker({
     clock: () => nowMs,
     reconnectGraceMs,
@@ -20414,23 +21050,101 @@ export async function diagnoseFleetMachines(
     });
   };
 
+  const daemonKnownPeers = readLocalDaemonKnownPeersPassive(cfg, daemonStatus);
   const pingsByMachine = new Map();
-  for (const r of pingReplies) {
-    if (!r.result?.machineId) continue;
+  const recordPingResult = (resultObj, respondedAt = null) => {
+    if (!resultObj?.machineId) return;
     let pingScope = "work";
     try {
-      pingScope = normalizeScope(r.result.scope, "work");
+      pingScope = normalizeScope(resultObj.scope, "work");
     } catch (err) {
       if (err?.code === "OBSOLETE_SCOPE" || err?.code === "INVALID_SCOPE") {
-        quarantineObsoletePeer(r.result, "live_ping");
-        continue;
+        quarantineObsoletePeer(resultObj, "live_ping");
+        return;
       }
       throw err;
     }
-    const key = String(r.result.machineId).toLowerCase();
+    const key = String(resultObj.machineId).toLowerCase();
     if (!pingsByMachine.has(key)) pingsByMachine.set(key, []);
-    pingsByMachine.get(key).push({ ...r.result, scope: pingScope });
+    pingsByMachine.get(key).push({
+      ...resultObj,
+      scope: pingScope,
+      ...(respondedAt && !resultObj.respondedAt ? { respondedAt } : {}),
+    });
+  };
+  for (const r of pingReplies) {
+    recordPingResult(r?.result, r?.respondedAt || null);
   }
+
+  if (process.env.BRIDGE_FAST_VOTE_TEST !== "1" && daemonKnownPeers.length > 0) {
+    const missingCandidates = resolveMissingRecentKnownPeerTargets(cfg, {
+      respondedMachinesLower: new Set(pingsByMachine.keys()),
+      scopeFilter: requestedScope,
+      passive: effectivePassive,
+      knownPeers: daemonKnownPeers,
+    }).filter((candidate) => matchesSelectorList(candidate.machineId, machines));
+    if (missingCandidates.length > 0) {
+      const confirmedReplies = await Promise.all(
+        missingCandidates.map(async (candidate) => {
+          try {
+            return await pingFn(cfg, {
+              toMachine: candidate.machineId,
+              action: "ping",
+              params: effectivePassive ? { passive: true } : {},
+              collectAll: false,
+              flockId: candidate.flockSelector,
+              timeoutMs: 2000,
+              passive: effectivePassive,
+            });
+          } catch {
+            return null;
+          }
+        })
+      );
+      for (const confirmed of confirmedReplies) {
+        const single = Array.isArray(confirmed) ? confirmed[0] : confirmed;
+        if (single?.result) {
+          recordPingResult(single.result, single.respondedAt || null);
+        }
+      }
+    }
+  }
+
+  const localOwnedRosterByMachine = new Map();
+  try {
+    const localOwner = normalizeGitHubUser(cfg?.githubUser)?.toLowerCase() || null;
+    if (localOwner) {
+      const customPath = cfg?.flocksConfigPath || getFlocksConfigPath();
+      const rawStored = readRawStoredFlocksConfig(cfg, customPath);
+      const regState = openFlockMembershipRegistry(customPath).read();
+      for (const builtInId of [localOwner, `${localOwner}/personal`, `${localOwner}/work`]) {
+        const pol = rawStored.flocks?.[builtInId];
+        const rec = regState.flocks?.[builtInId];
+        for (const m of [
+          ...Object.values(rec?.members || {}),
+          ...extractPolicyMembersList(pol),
+        ]) {
+          if (!m?.machineId || m.removed) continue;
+          const mUser = normalizeGitHubUser(m.githubUser || localOwner)?.toLowerCase() || null;
+          if (mUser !== localOwner) continue;
+          const k = String(m.machineId).toLowerCase();
+          const prev = localOwnedRosterByMachine.get(k);
+          localOwnedRosterByMachine.set(k, {
+            ...prev,
+            ...m,
+            lastSeenAt:
+              selectNewerValidIsoTimestamp([prev?.lastSeenAt, m.lastSeenAt]) ||
+              m.lastSeenAt ||
+              prev?.lastSeenAt ||
+              null,
+            publicKey: m.publicKey || m.deviceEd25519Pub || prev?.publicKey || null,
+            keyFingerprint: m.keyFingerprint || prev?.keyFingerprint || null,
+            version: m.version || prev?.version || null,
+          });
+        }
+      }
+    }
+  } catch {}
 
   const allMachineIds = new Map();
   for (const bm of bootstrapMembers) {
@@ -20445,7 +21159,29 @@ export async function diagnoseFleetMachines(
       }
       throw err;
     }
-    allMachineIds.set(String(bm.machineId).toLowerCase(), { ...bm, scope: bmScope });
+    const key = String(bm.machineId).toLowerCase();
+    const localRosterMember = localOwnedRosterByMachine.get(key) || null;
+    const mergedLastSeenAt =
+      selectNewerValidIsoTimestamp([localRosterMember?.lastSeenAt, bm.lastSeenAt]) ||
+      bm.lastSeenAt ||
+      localRosterMember?.lastSeenAt ||
+      null;
+    const bmSeenMs = parseBoundedTimestampMs(bm.lastSeenAt);
+    const localSeenMs = parseBoundedTimestampMs(localRosterMember?.lastSeenAt);
+    const mergedVersion =
+      localRosterMember?.version && bm.version
+        ? localSeenMs !== null && (bmSeenMs === null || localSeenMs >= bmSeenMs)
+          ? localRosterMember.version
+          : bm.version
+        : bm.version || localRosterMember?.version || null;
+    allMachineIds.set(key, {
+      ...bm,
+      scope: bmScope,
+      lastSeenAt: mergedLastSeenAt,
+      publicKey: localRosterMember?.publicKey || bm.publicKey || null,
+      keyFingerprint: localRosterMember?.keyFingerprint || bm.keyFingerprint || null,
+      ...(mergedVersion ? { version: mergedVersion } : {}),
+    });
   }
   for (const [key, list] of pingsByMachine.entries()) {
     if (!allMachineIds.has(key)) {
@@ -20511,7 +21247,16 @@ export async function diagnoseFleetMachines(
     };
 
     if (!online) {
-      const layeredPresence = classifyLayeredPresence({ online: false, member: bm });
+      const peerEvidence = resolveAdmissibleKnownPeerEvidence(bm, daemonKnownPeers, {
+        expectedOwner: cfg?.githubUser,
+      });
+      const layeredPresence = classifyLayeredPresence({
+        online: false,
+        member: bm,
+        peerEvidence,
+      });
+      const resolvedVersion = selectFresherMemberVersion(bm, peerEvidence);
+      const resolvedSpecs = peerEvidence?.specs || bm.specs || null;
       return {
         machineId: bm.machineId,
         online: false,
@@ -20519,18 +21264,18 @@ export async function diagnoseFleetMachines(
         healthy: false,
         scope: bm.scope || "work",
         githubUser: bm.githubUser || null,
-        os: bm.specs?.os
+        os: resolvedSpecs?.os
           ? {
-              summary: bm.specs.os,
+              summary: resolvedSpecs.os,
               platform: bm.platform || null,
-              arch: bm.specs?.cpu?.arch || null,
-              model: bm.specs?.model || null,
+              arch: resolvedSpecs?.cpu?.arch || null,
+              model: resolvedSpecs?.model || null,
             }
           : null,
-        specs: bm.specs || null,
-        version: bm.version || null,
+        specs: resolvedSpecs,
+        version: resolvedVersion,
         expectedVersion: BRIDGE_VERSION,
-        versionMatch: bm.version === BRIDGE_VERSION,
+        versionMatch: resolvedVersion === BRIDGE_VERSION,
         daemonInstanceCount: 0,
         issues: ["Machine is currently offline (no SignalR ping response)"],
         threads: null,
@@ -22006,6 +22751,7 @@ export async function resolveLegacyFlockRoster(cfg, options = {}) {
               publicKey: bm.publicKey || null,
               keyFingerprint: bm.keyFingerprint || null,
               specs: bm.specs || null,
+              ...(bm.version ? { version: bm.version } : {}),
               registeredAt: bm.registeredAt || null,
               lastSeenAt: bm.lastSeenAt || null,
               membershipExpiresAt: null,
@@ -22018,11 +22764,24 @@ export async function resolveLegacyFlockRoster(cfg, options = {}) {
           }
         } else {
           const cur = fEntry.members[existingIdx];
+          const curSeenMs = parseBoundedTimestampMs(cur.lastSeenAt, { nowMs });
+          const bmSeenMs = parseBoundedTimestampMs(bm.lastSeenAt, { nowMs });
+          const mergedVersion =
+            cur.version && bm.version
+              ? bmSeenMs !== null && (curSeenMs === null || bmSeenMs > curSeenMs)
+                ? bm.version
+                : cur.version
+              : cur.version || bm.version || null;
           fEntry.members[existingIdx] = {
             ...cur,
             specs: cur.specs || bm.specs || null,
-            lastSeenAt: cur.lastSeenAt || bm.lastSeenAt || null,
+            lastSeenAt:
+              selectNewerValidIsoTimestamp([cur.lastSeenAt, bm.lastSeenAt], { nowMs }) ||
+              cur.lastSeenAt ||
+              bm.lastSeenAt ||
+              null,
             registeredAt: cur.registeredAt || bm.registeredAt || null,
+            ...(mergedVersion ? { version: mergedVersion } : {}),
           };
         }
       }
@@ -22112,12 +22871,20 @@ export async function resolveLegacyFlockRoster(cfg, options = {}) {
   return applyLivePresenceToLegacyRoster(
     baseState,
     options.onlineMachines ?? null,
-    options.liveSignalRSource ?? null
+    options.liveSignalRSource ?? null,
+    { daemonKnownPeers: options.daemonKnownPeers ?? readLocalDaemonKnownPeersPassive(cfg) }
   );
 }
 
-function applyLivePresenceToLegacyRoster(baseState, onlineMachines, liveSignalRSource) {
+function applyLivePresenceToLegacyRoster(
+  baseState,
+  onlineMachines,
+  liveSignalRSource,
+  { daemonKnownPeers = [] } = {}
+) {
   const livePresenceProbed = Array.isArray(onlineMachines);
+  const nowEvalMs =
+    parseBoundedTimestampMs(baseState.nowIso, { nowMs: Date.now() + 60000 }) || Date.now();
   const errors = [...baseState.errors];
   const warnings = [...baseState.warnings];
   if (liveSignalRSource && liveSignalRSource.attempted && !liveSignalRSource.ok && liveSignalRSource.error) {
@@ -22203,14 +22970,54 @@ function applyLivePresenceToLegacyRoster(baseState, onlineMachines, liveSignalRS
       const rankRole = (r) => (r === "owner" ? 3 : r === "collaborator" ? 2 : 1);
       const mRole = m.trustTier || (mUser === f.ownerGitHubUser ? "owner" : "collaborator");
       const bestRole = prev && rankRole(prev.trustTier) >= rankRole(mRole) ? prev.trustTier : mRole;
-      const layeredPresence = livePresenceProbed
-        ? classifyLayeredPresence({ online: Boolean(live), member: m, ping: live || {} })
+      const peerEvidence = !live
+        ? resolveAdmissibleKnownPeerEvidence(m, daemonKnownPeers, {
+            expectedOwner: mUser,
+            nowMs: nowEvalMs,
+          })
         : null;
+      const layeredPresence = livePresenceProbed
+        ? classifyLayeredPresence({
+            online: Boolean(live),
+            member: m,
+            ping: live || {},
+            peerEvidence,
+            nowMs: nowEvalMs,
+          })
+        : null;
+      const resolvedMemberLastSeenAt =
+        live?.respondedAt ||
+        live?.timestamp ||
+        selectNewerValidIsoTimestamp(
+          [peerEvidence?.lastSeenAt, m.lastSeenAt, prev?.lastSeenAt],
+          { nowMs: nowEvalMs }
+        ) ||
+        m.lastSeenAt ||
+        prev?.lastSeenAt ||
+        null;
+      const resolvedFlockMemberLastSeenAt =
+        live?.respondedAt ||
+        live?.timestamp ||
+        selectNewerValidIsoTimestamp([peerEvidence?.lastSeenAt, m.lastSeenAt], {
+          nowMs: nowEvalMs,
+        }) ||
+        m.lastSeenAt ||
+        null;
+      const resolvedMemberVersion =
+        live?.version ||
+        selectFresherMemberVersion(m, peerEvidence, { nowMs: nowEvalMs }) ||
+        prev?.version ||
+        null;
+      const resolvedFlockMemberVersion =
+        live?.version ||
+        selectFresherMemberVersion(m, peerEvidence, { nowMs: nowEvalMs }) ||
+        null;
 
       const entry = {
         machineId: live?.machineId || m.machineId,
         peerId: m.peerId || prev?.peerId || null,
         githubUser: mUser,
+        ...(resolvedMemberVersion ? { version: resolvedMemberVersion } : {}),
         scope: resolvedScope,
         role: bestRole,
         trustTier: bestRole,
@@ -22234,8 +23041,10 @@ function applyLivePresenceToLegacyRoster(baseState, onlineMachines, liveSignalRS
         removed: false,
         rosterSource: prev?.rosterSource === "broker_v3_my_flocks" ? "broker_v3_my_flocks" : memberSource,
         rosterEpoch: mergedEpoch,
-        lastSeenAt: live?.respondedAt || live?.timestamp || m.lastSeenAt || prev?.lastSeenAt || null,
-        ...(mergedOwnerAccess ? { specs: live?.specs || m.specs || prev?.specs || null } : {}),
+        lastSeenAt: resolvedMemberLastSeenAt,
+        ...(mergedOwnerAccess
+          ? { specs: live?.specs || peerEvidence?.specs || m.specs || prev?.specs || null }
+          : {}),
         __ownerSpecs: mergedOwnerAccess,
       };
       knownMap.set(memberKey, entry);
@@ -22244,6 +23053,7 @@ function applyLivePresenceToLegacyRoster(baseState, onlineMachines, liveSignalRS
         peerId: m.peerId || null,
         githubUser: mUser,
         machineId: live?.machineId || m.machineId,
+        ...(resolvedFlockMemberVersion ? { version: resolvedFlockMemberVersion } : {}),
         scope: resolvedScope,
         trustTier: mRole,
         membershipAuthenticated: true,
@@ -22263,7 +23073,7 @@ function applyLivePresenceToLegacyRoster(baseState, onlineMachines, liveSignalRS
           : {}),
         heartbeatObserved: livePresenceProbed ? Boolean(live) : false,
         removed: false,
-        lastSeenAt: live?.respondedAt || live?.timestamp || m.lastSeenAt || null,
+        lastSeenAt: resolvedFlockMemberLastSeenAt,
       }];
     });
 
@@ -23786,6 +24596,7 @@ Usage:
       minRamGb: flags["min-ram-gb"] !== undefined ? Number(flags["min-ram-gb"]) : null,
       minFreeDiskGb: flags["min-free-disk-gb"] !== undefined ? Number(flags["min-free-disk-gb"]) : null,
       timeoutMs: 2500,
+      ...(flags.flock !== undefined ? { flockId: flags.flock } : {}),
     });
     console.log(JSON.stringify(machines, null, 2));
     return;
