@@ -10848,12 +10848,22 @@ function deriveCandidateKeyFingerprints(pubKeyPem) {
   return [...out];
 }
 
+function computePresenceSpecsDigest(specs) {
+  if (!specs || typeof specs !== "object") return null;
+  try {
+    return crypto.createHash("sha256").update(JSON.stringify(specs), "utf8").digest("hex");
+  } catch {
+    return null;
+  }
+}
+
 export function signPresencePayload(selfInfo, cfg = null) {
   if (!selfInfo || typeof selfInfo !== "object") return selfInfo;
   try {
     const idKey = cfg?.identity || readMachineIdentityKeypairPassive() || ensureMachineIdentityKeypair();
     if (!idKey?.privateKey || !selfInfo.machineId) return selfInfo;
     const sentAt = selfInfo.timestamp || new Date().toISOString();
+    const specsDigest = computePresenceSpecsDigest(selfInfo.specs);
     const requestId = `presence:${selfInfo.machineId}:${sentAt}`;
     const auth = signRpcRequest({
       requestId,
@@ -10867,6 +10877,7 @@ export function signPresencePayload(selfInfo, cfg = null) {
         githubUser: selfInfo.githubUser || cfg?.githubUser || null,
         version: selfInfo.version || BRIDGE_VERSION,
         manifestDigest: selfInfo.manifestDigest || null,
+        specsDigest,
         timestamp: sentAt,
       },
       identity: idKey,
@@ -10878,20 +10889,32 @@ export function signPresencePayload(selfInfo, cfg = null) {
   }
 }
 
-export function verifyPresencePayload(peer, pinnedPublicKey = null, nowMs = Date.now()) {
+export function verifyPresencePayload(
+  peer,
+  { pinnedPublicKey = null, pinnedFingerprint = null, maxSkewMs = 300000, nowMs = Date.now() } = {}
+) {
   if (!peer?.presenceAuth || typeof peer.presenceAuth !== "object") {
     return { present: false, valid: false };
   }
-  const pubKey = String(
-    pinnedPublicKey || peer?.publicKey || peer?.specs?.publicKey || peer?.presenceAuth?.publicKey || ""
-  ).trim();
-  if (!pubKey || !peer.machineId) {
+  const cleanPinnedPub = String(pinnedPublicKey || "").trim();
+  const cleanPinnedFp = String(pinnedFingerprint || "").trim().toLowerCase();
+  if (!cleanPinnedPub && !cleanPinnedFp) {
     return { present: true, valid: false };
   }
-  if (peer.presenceAuth.publicKey && String(peer.presenceAuth.publicKey).trim() !== pubKey) {
+  const candidatePub = String(
+    cleanPinnedPub || peer?.presenceAuth?.publicKey || peer?.publicKey || peer?.specs?.publicKey || ""
+  ).trim();
+  if (!candidatePub || !peer.machineId) {
+    return { present: true, valid: false };
+  }
+  if (cleanPinnedPub && peer.presenceAuth.publicKey && String(peer.presenceAuth.publicKey).trim() !== cleanPinnedPub) {
+    return { present: true, valid: false };
+  }
+  if (cleanPinnedFp && !deriveCandidateKeyFingerprints(candidatePub).includes(cleanPinnedFp)) {
     return { present: true, valid: false };
   }
   const sentAt = peer.presenceAuth.sentAt || peer.timestamp || peer.lastSeenAt;
+  const specsDigest = computePresenceSpecsDigest(peer.specs);
   const requestId = `presence:${peer.machineId}:${sentAt}`;
   const ver = verifyRpcSignature({
     requestId,
@@ -10905,17 +10928,18 @@ export function verifyPresencePayload(peer, pinnedPublicKey = null, nowMs = Date
       githubUser: peer.githubUser || null,
       version: peer.version || BRIDGE_VERSION,
       manifestDigest: peer.manifestDigest || null,
+      specsDigest,
       timestamp: sentAt,
     },
-    publicKey: pubKey,
+    publicKey: candidatePub,
     signature: peer.presenceAuth.signature,
-    maxSkewMs: 365 * 24 * 3600 * 1000,
+    maxSkewMs,
     nowMs,
   });
-  return { present: true, valid: Boolean(ver.valid) };
+  return { present: true, valid: Boolean(ver.valid), sentAt };
 }
 
-function peerKeysConsistentWithMember(member, peer) {
+function peerKeysConsistentWithMember(member, peer, { nowMs = Date.now() } = {}) {
   const memberPub = String(
     member?.publicKey || member?.deviceEd25519Pub || member?.specs?.publicKey || ""
   ).trim();
@@ -10948,7 +10972,14 @@ function peerKeysConsistentWithMember(member, peer) {
     if (!deriveCandidateKeyFingerprints(memberPub).includes(peerFp)) return false;
   }
   if (peer?.presenceAuth !== undefined) {
-    const ver = verifyPresencePayload(peer, memberPub || peerPub || null);
+    const rawSeen = peer.lastSeenAt ?? peer.respondedAt ?? peer.timestamp ?? peer.presenceAuth.sentAt;
+    const referenceMs = parseBoundedTimestampMs(rawSeen, { nowMs, maxFutureSkewMs: 5000 }) ?? nowMs;
+    const ver = verifyPresencePayload(peer, {
+      pinnedPublicKey: memberPub || null,
+      pinnedFingerprint: memberFp || null,
+      maxSkewMs: 300000,
+      nowMs: referenceMs,
+    });
     if (!ver.valid) return false;
   }
   return true;
@@ -11004,8 +11035,8 @@ export function resolveAdmissibleKnownPeerEvidence(
       }
       if (memberScope && peerScope && memberScope !== peerScope) continue;
     }
-    if (!peerKeysConsistentWithMember(member, peer)) continue;
-    const rawSeen = peer.lastSeenAt ?? peer.respondedAt ?? peer.timestamp ?? null;
+    if (!peerKeysConsistentWithMember(member, peer, { nowMs })) continue;
+    const rawSeen = peer.presenceAuth?.sentAt ?? peer.lastSeenAt ?? peer.respondedAt ?? peer.timestamp ?? null;
     const seenAtMs = parseBoundedTimestampMs(rawSeen, { nowMs, maxFutureSkewMs: 5000 });
     if (seenAtMs === null) continue;
     if (!best || seenAtMs > best.seenAtMs) {
@@ -13798,29 +13829,60 @@ export async function runDaemon(cfg) {
   const pidPath = getDaemonPidPath();
   const statePath = getStatePath();
   const pinPath = assertNoLinks(path.join(root, "daemon-identity.json"));
-  const existingDaemon = isLocalDaemonRunning();
-  if (existingDaemon.running && existingDaemon.pid && existingDaemon.pid !== process.pid) {
+  const startupLockPath = assertNoLinks(path.join(root, "daemon-startup.lock"));
+  const myIdentity = inspectProcess(process.pid);
+  if (!myIdentity?.start) throw new Error("Cannot pin daemon process creation identity");
+  if (fs.existsSync(startupLockPath)) {
     try {
-      const pin = fs.existsSync(pinPath) ? JSON.parse(fs.readFileSync(pinPath, "utf8")) : null;
-      const live = inspectProcess(existingDaemon.pid);
-      if (pin && live && pin.pid === existingDaemon.pid && pin.start === live.start) {
+      const existingLock = JSON.parse(fs.readFileSync(startupLockPath, "utf8"));
+      const lockLive = existingLock?.identity?.pid ? inspectProcess(existingLock.identity.pid) : null;
+      if (lockLive && lockLive.start === existingLock.identity.start && existingLock.identity.pid !== process.pid) {
         return;
       }
+      fs.unlinkSync(startupLockPath);
     } catch {}
   }
-  pinDaemonIdentity(root, __filename);
-  const daemonSnapshot = captureCallerMcpSnapshot(cfg, { surface: "resident-daemon" });
-  fs.writeFileSync(pidPath, String(process.pid), "utf8");
+  let lockFd = null;
   try {
-    assertDaemonAutostartAllowed();
+    lockFd = fs.openSync(startupLockPath, "wx", 0o600);
+    fs.writeFileSync(lockFd, JSON.stringify({ type: "copilot-flock-daemon-startup-lock-v1", identity: myIdentity }));
   } catch (error) {
-    try {
-      if (fs.existsSync(pidPath) && Number(fs.readFileSync(pidPath, "utf8").trim()) === process.pid) {
-        fs.unlinkSync(pidPath);
-      }
-    } catch {}
+    if (error?.code === "EEXIST") return;
     throw error;
   }
+  try {
+    assertDaemonAutostartAllowed();
+    if (fs.existsSync(pidPath)) {
+      const existingPid = Number(fs.readFileSync(pidPath, "utf8").trim());
+      if (Number.isSafeInteger(existingPid) && existingPid > 0 && existingPid !== process.pid) {
+        try {
+          const pin = fs.existsSync(pinPath) ? JSON.parse(fs.readFileSync(pinPath, "utf8")) : null;
+          const live = inspectProcess(existingPid);
+          if (pin && live && pin.pid === existingPid && pin.start === live.start) {
+            return;
+          }
+        } catch {}
+      }
+    }
+    atomicJson(pinPath, { ...myIdentity, script: path.resolve(__filename) });
+    fs.writeFileSync(pidPath, String(process.pid), "utf8");
+    try {
+      assertDaemonAutostartAllowed();
+    } catch (error) {
+      try {
+        if (fs.existsSync(pidPath) && Number(fs.readFileSync(pidPath, "utf8").trim()) === process.pid) {
+          fs.unlinkSync(pidPath);
+        }
+      } catch {}
+      throw error;
+    }
+  } finally {
+    if (lockFd !== null) {
+      try { fs.closeSync(lockFd); } catch {}
+      try { fs.unlinkSync(startupLockPath); } catch {}
+    }
+  }
+  const daemonSnapshot = captureCallerMcpSnapshot(cfg, { surface: "resident-daemon" });
   if (cfg.protocol === "broker-free-v34") {
     const daemon = await brokerFreeRuntime(cfg).start();
     try {
@@ -13945,14 +14007,13 @@ export async function runDaemon(cfg) {
             if (payload.machineId && payload.machineId !== cfg.machineId) {
               const storedPeer = findPinnedPeerInStoredFlocks(cfg, payload.machineId, cfg?.flocksConfigPath || null, null);
               const pinnedPubKey = storedPeer?.publicKey || storedPeer?.specs?.publicKey || null;
-              if (payload.presenceAuth !== undefined) {
-                if (!verifyPresencePayload(payload, pinnedPubKey).valid) {
-                  return;
-                }
+              const pinnedFp = storedPeer?.keyFingerprint || storedPeer?.deviceId || storedPeer?.specs?.keyFingerprint || null;
+              if (!verifyPresencePayload(payload, { pinnedPublicKey: pinnedPubKey, pinnedFingerprint: pinnedFp }).valid) {
+                return;
               }
               knownPeers.set(payload.machineId, {
                 ...payload,
-                lastSeenAt: new Date().toISOString(),
+                lastSeenAt: payload.presenceAuth?.sentAt || new Date().toISOString(),
               });
               updateStateFile("connected");
             }
@@ -14243,18 +14304,20 @@ export function isLocalDaemonRunning() {
         const st = JSON.parse(fs.readFileSync(statePath, "utf8"));
         const updatedMs = st?.updatedAt ? Date.parse(st.updatedAt) : 0;
         if (st?.protocol !== "broker-free-v34" && updatedMs > 0 && Date.now() - updatedMs > 120000) {
-          let canSignalStale = process.platform !== "linux";
-          if (process.platform === "linux") {
-            try {
-              const pinPath = assertNoLinks(path.join(getBridgeHome(), "daemon-identity.json"));
-              const pin = fs.existsSync(pinPath) ? JSON.parse(fs.readFileSync(pinPath, "utf8")) : null;
-              const live = inspectProcess(pid);
-              if (pin && live && pin.pid === pid && pin.start === live.start) {
-                assertLinuxDaemonCgroupSafe(pid);
-                canSignalStale = true;
-              }
-            } catch {}
-          }
+          let canSignalStale = false;
+          try {
+            const pinPath = assertNoLinks(path.join(getBridgeHome(), "daemon-identity.json"));
+            const pin = fs.existsSync(pinPath) ? JSON.parse(fs.readFileSync(pinPath, "utf8")) : null;
+            const live = inspectProcess(pid);
+            if (pin && live && pin.pid === pid && pin.start === live.start &&
+                pin.executable === live.executable && pin.command === live.command &&
+                JSON.stringify(pin.argv) === JSON.stringify(live.argv) &&
+                lifecyclePaths().scripts.includes(canonicalRuntimePath(pin.script)) &&
+                commandIsDaemon(live, [canonicalRuntimePath(pin.script)])) {
+              if (process.platform === "linux") assertLinuxDaemonCgroupSafe(pid);
+              canSignalStale = true;
+            }
+          } catch {}
           if (canSignalStale) {
             try {
               process.kill(pid);

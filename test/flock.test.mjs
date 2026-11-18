@@ -11981,11 +11981,11 @@ test("presence freshness & security boundaries: admissible knownPeers updates la
       manifestDigest: "1234",
       timestamp: gracePeerIso,
       lastSeenAt: gracePeerIso,
-      specs: { keyFingerprint: nexusKey.fingerprint, publicKey: nexusKey.publicKey },
+      specs: { cpu: { model: "fixture" }, keyFingerprint: nexusKey.fingerprint, publicKey: nexusKey.publicKey },
     },
     { identity: nexusKey }
   );
-  assert.equal(verifyPresencePayload(signedValidPeer, nexusKey.publicKey, nowMs).valid, true);
+  assert.equal(verifyPresencePayload(signedValidPeer, { pinnedPublicKey: nexusKey.publicKey, nowMs }).valid, true);
   assert.equal(
     resolveAdmissibleKnownPeerEvidence(
       { machineId: "NEXUS-V2", githubUser: "erjadi", publicKey: nexusKey.publicKey, keyFingerprint: nexusKey.fingerprint },
@@ -11998,7 +11998,25 @@ test("presence freshness & security boundaries: admissible knownPeers updates la
     ...signedValidPeer,
     version: "9.9.9-forged",
   };
-  assert.equal(verifyPresencePayload(forgedSignedPeer, nexusKey.publicKey, nowMs).valid, false);
+  assert.equal(verifyPresencePayload(forgedSignedPeer, { pinnedPublicKey: nexusKey.publicKey, nowMs }).valid, false);
+  const tamperedSpecsPeer = {
+    ...signedValidPeer,
+    specs: { ...signedValidPeer.specs, cpu: { model: "tampered-cpu" } },
+  };
+  assert.equal(verifyPresencePayload(tamperedSpecsPeer, { pinnedPublicKey: nexusKey.publicKey, nowMs }).valid, false);
+  assert.equal(
+    verifyPresencePayload(signedValidPeer, {
+      pinnedPublicKey: nexusKey.publicKey,
+      nowMs: nowMs + 10 * 60 * 1000,
+    }).valid,
+    false,
+    "Replayed signed presence older than maxSkewMs must be rejected"
+  );
+  assert.equal(
+    verifyPresencePayload(signedValidPeer, { nowMs }).valid,
+    false,
+    "Signed presence without a pinned key or fingerprint must be rejected"
+  );
   assert.equal(
     resolveAdmissibleKnownPeerEvidence(
       { machineId: "NEXUS-V2", githubUser: "erjadi", publicKey: nexusKey.publicKey, keyFingerprint: nexusKey.fingerprint },
