@@ -64,6 +64,8 @@ import {
   loadLocalFlocksConfig,
   openFlockMembershipRegistry,
   resolveAdmissibleKnownPeerEvidence,
+  signPresencePayload,
+  verifyPresencePayload,
   shareThreadWithFlock,
   unshareThreadFromFlock,
   listSharedThreadsForMachine,
@@ -11969,6 +11971,42 @@ test("presence freshness & security boundaries: admissible knownPeers updates la
     ),
     null,
     "Keyless knownPeers entry must be rejected when member record pins a key or fingerprint"
+  );
+  const signedValidPeer = signPresencePayload(
+    {
+      machineId: "NEXUS-V2",
+      githubUser: "erjadi",
+      scope: "personal",
+      version: "3.6.1",
+      manifestDigest: "1234",
+      timestamp: gracePeerIso,
+      lastSeenAt: gracePeerIso,
+      specs: { keyFingerprint: nexusKey.fingerprint, publicKey: nexusKey.publicKey },
+    },
+    { identity: nexusKey }
+  );
+  assert.equal(verifyPresencePayload(signedValidPeer, nexusKey.publicKey, nowMs).valid, true);
+  assert.equal(
+    resolveAdmissibleKnownPeerEvidence(
+      { machineId: "NEXUS-V2", githubUser: "erjadi", publicKey: nexusKey.publicKey, keyFingerprint: nexusKey.fingerprint },
+      [signedValidPeer],
+      { nowMs }
+    )?.version,
+    "3.6.1"
+  );
+  const forgedSignedPeer = {
+    ...signedValidPeer,
+    version: "9.9.9-forged",
+  };
+  assert.equal(verifyPresencePayload(forgedSignedPeer, nexusKey.publicKey, nowMs).valid, false);
+  assert.equal(
+    resolveAdmissibleKnownPeerEvidence(
+      { machineId: "NEXUS-V2", githubUser: "erjadi", publicKey: nexusKey.publicKey, keyFingerprint: nexusKey.fingerprint },
+      [forgedSignedPeer],
+      { nowMs }
+    ),
+    null,
+    "Presence entry with tampered version or invalid signature must be rejected"
   );
   assert.equal(
     resolveAdmissibleKnownPeerEvidence(

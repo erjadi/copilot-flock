@@ -10848,6 +10848,73 @@ function deriveCandidateKeyFingerprints(pubKeyPem) {
   return [...out];
 }
 
+export function signPresencePayload(selfInfo, cfg = null) {
+  if (!selfInfo || typeof selfInfo !== "object") return selfInfo;
+  try {
+    const idKey = cfg?.identity || readMachineIdentityKeypairPassive() || ensureMachineIdentityKeypair();
+    if (!idKey?.privateKey || !selfInfo.machineId) return selfInfo;
+    const sentAt = selfInfo.timestamp || new Date().toISOString();
+    const requestId = `presence:${selfInfo.machineId}:${sentAt}`;
+    const auth = signRpcRequest({
+      requestId,
+      sentAt,
+      fromMachine: selfInfo.machineId,
+      toMachine: "*",
+      action: "bridgePresence",
+      params: {
+        machineId: selfInfo.machineId,
+        scope: selfInfo.scope || cfg?.scope || "work",
+        githubUser: selfInfo.githubUser || cfg?.githubUser || null,
+        version: selfInfo.version || BRIDGE_VERSION,
+        manifestDigest: selfInfo.manifestDigest || null,
+        timestamp: sentAt,
+      },
+      identity: idKey,
+      passive: true,
+    });
+    return auth ? { ...selfInfo, timestamp: sentAt, presenceAuth: auth } : selfInfo;
+  } catch {
+    return selfInfo;
+  }
+}
+
+export function verifyPresencePayload(peer, pinnedPublicKey = null, nowMs = Date.now()) {
+  if (!peer?.presenceAuth || typeof peer.presenceAuth !== "object") {
+    return { present: false, valid: false };
+  }
+  const pubKey = String(
+    pinnedPublicKey || peer?.publicKey || peer?.specs?.publicKey || peer?.presenceAuth?.publicKey || ""
+  ).trim();
+  if (!pubKey || !peer.machineId) {
+    return { present: true, valid: false };
+  }
+  if (peer.presenceAuth.publicKey && String(peer.presenceAuth.publicKey).trim() !== pubKey) {
+    return { present: true, valid: false };
+  }
+  const sentAt = peer.presenceAuth.sentAt || peer.timestamp || peer.lastSeenAt;
+  const requestId = `presence:${peer.machineId}:${sentAt}`;
+  const ver = verifyRpcSignature({
+    requestId,
+    sentAt,
+    fromMachine: peer.machineId,
+    toMachine: "*",
+    action: "bridgePresence",
+    params: {
+      machineId: peer.machineId,
+      scope: peer.scope || "work",
+      githubUser: peer.githubUser || null,
+      version: peer.version || BRIDGE_VERSION,
+      manifestDigest: peer.manifestDigest || null,
+      timestamp: sentAt,
+    },
+    publicKey: pubKey,
+    signature: peer.presenceAuth.signature,
+    maxSkewMs: 365 * 24 * 3600 * 1000,
+    nowMs,
+  });
+  return { present: true, valid: Boolean(ver.valid) };
+}
+
 function peerKeysConsistentWithMember(member, peer) {
   const memberPub = String(
     member?.publicKey || member?.deviceEd25519Pub || member?.specs?.publicKey || ""
@@ -10869,16 +10936,20 @@ function peerKeysConsistentWithMember(member, peer) {
     return false;
   }
   if (memberFp && peerFp) {
-    if (memberFp === peerFp) return true;
-    if (peerPub && deriveCandidateKeyFingerprints(peerPub).includes(memberFp)) return true;
-    if (memberPub && deriveCandidateKeyFingerprints(memberPub).includes(peerFp)) return true;
-    return false;
+    if (memberFp !== peerFp) {
+      const matchedViaPub =
+        (peerPub && deriveCandidateKeyFingerprints(peerPub).includes(memberFp)) ||
+        (memberPub && deriveCandidateKeyFingerprints(memberPub).includes(peerFp));
+      if (!matchedViaPub) return false;
+    }
+  } else if (memberFp && peerPub) {
+    if (!deriveCandidateKeyFingerprints(peerPub).includes(memberFp)) return false;
+  } else if (peerFp && memberPub) {
+    if (!deriveCandidateKeyFingerprints(memberPub).includes(peerFp)) return false;
   }
-  if (memberFp && peerPub) {
-    return deriveCandidateKeyFingerprints(peerPub).includes(memberFp);
-  }
-  if (peerFp && memberPub) {
-    return deriveCandidateKeyFingerprints(memberPub).includes(peerFp);
+  if (peer?.presenceAuth !== undefined) {
+    const ver = verifyPresencePayload(peer, memberPub || peerPub || null);
+    if (!ver.valid) return false;
   }
   return true;
 }
@@ -13723,10 +13794,22 @@ export async function dispatchDaemonRpcRequest(cfg, request, sendResponse) {
 export async function runDaemon(cfg) {
   assertDaemonAutostartAllowed();
   ensureBridgeDir();
-  pinDaemonIdentity(getBridgeHome(), __filename);
-  const daemonSnapshot = captureCallerMcpSnapshot(cfg, { surface: "resident-daemon" });
+  const root = getBridgeHome();
   const pidPath = getDaemonPidPath();
   const statePath = getStatePath();
+  const pinPath = assertNoLinks(path.join(root, "daemon-identity.json"));
+  const existingDaemon = isLocalDaemonRunning();
+  if (existingDaemon.running && existingDaemon.pid && existingDaemon.pid !== process.pid) {
+    try {
+      const pin = fs.existsSync(pinPath) ? JSON.parse(fs.readFileSync(pinPath, "utf8")) : null;
+      const live = inspectProcess(existingDaemon.pid);
+      if (pin && live && pin.pid === existingDaemon.pid && pin.start === live.start) {
+        return;
+      }
+    } catch {}
+  }
+  pinDaemonIdentity(root, __filename);
+  const daemonSnapshot = captureCallerMcpSnapshot(cfg, { surface: "resident-daemon" });
   fs.writeFileSync(pidPath, String(process.pid), "utf8");
   try {
     assertDaemonAutostartAllowed();
@@ -13742,6 +13825,13 @@ export async function runDaemon(cfg) {
     const daemon = await brokerFreeRuntime(cfg).start();
     try {
       assertDaemonAutostartAllowed();
+      if (fs.existsSync(pidPath)) {
+        const activePid = Number(fs.readFileSync(pidPath, "utf8").trim());
+        if (activePid && activePid !== process.pid) {
+          await daemon.close().catch(() => {});
+          return;
+        }
+      }
     } catch (error) {
       await daemon.close().catch(() => {});
       throw error;
@@ -13763,7 +13853,28 @@ export async function runDaemon(cfg) {
       updatedAt: new Date().toISOString(),
     });
     await new Promise((resolve) => {
-      const shutdown = () => { daemon.close().then(resolve, (error) => { logDaemon(error.message); process.exitCode = 1; resolve(); }); };
+      let finished = false;
+      let watchTimer = null;
+      const shutdown = () => {
+        if (finished) return;
+        finished = true;
+        if (watchTimer) clearInterval(watchTimer);
+        daemon.close().then(resolve, (error) => { logDaemon(error.message); process.exitCode = 1; resolve(); });
+      };
+      watchTimer = setInterval(() => {
+        try {
+          assertDaemonAutostartAllowed();
+          if (fs.existsSync(pidPath)) {
+            const activePid = Number(fs.readFileSync(pidPath, "utf8").trim());
+            if (activePid && activePid !== process.pid) {
+              shutdown();
+            }
+          }
+        } catch {
+          shutdown();
+        }
+      }, 2000);
+      watchTimer.unref?.();
       process.once("SIGTERM", shutdown);
       process.once("SIGINT", shutdown);
     });
@@ -13832,6 +13943,13 @@ export async function runDaemon(cfg) {
           const payload = args[0] || {};
           if (target === "bridgePresence") {
             if (payload.machineId && payload.machineId !== cfg.machineId) {
+              const storedPeer = findPinnedPeerInStoredFlocks(cfg, payload.machineId, cfg?.flocksConfigPath || null, null);
+              const pinnedPubKey = storedPeer?.publicKey || storedPeer?.specs?.publicKey || null;
+              if (payload.presenceAuth !== undefined) {
+                if (!verifyPresencePayload(payload, pinnedPubKey).valid) {
+                  return;
+                }
+              }
               knownPeers.set(payload.machineId, {
                 ...payload,
                 lastSeenAt: new Date().toISOString(),
@@ -13889,7 +14007,10 @@ export async function runDaemon(cfg) {
 
       // Announce presence & drain any offline Service Bus messages queued while offline
       try {
-        const selfInfo = await handleRpcAction(cfg, { action: "ping", inProcessSelfPing: true });
+        const selfInfo = signPresencePayload(
+          await handleRpcAction(cfg, { action: "ping", inProcessSelfPing: true }),
+          cfg
+        );
         await sendSignalRBroadcast(cfg, "bridgePresence", selfInfo);
       } catch {}
       drainAndProcessOfflineQueue(cfg).catch(() => {});
@@ -13925,7 +14046,11 @@ export async function runDaemon(cfg) {
             }
           );
         },
-        collectPresenceFn: () => handleRpcAction(cfg, { action: "ping", inProcessSelfPing: true }),
+        collectPresenceFn: async () =>
+          signPresencePayload(
+            await handleRpcAction(cfg, { action: "ping", inProcessSelfPing: true }),
+            cfg
+          ),
         publishPresenceFn: async (selfInfo) => {
           await sendSignalRBroadcast(cfg, "bridgePresence", selfInfo);
         },
