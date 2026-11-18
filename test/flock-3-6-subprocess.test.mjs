@@ -10,7 +10,7 @@ import { pathToFileURL } from "node:url";
 import { createBootstrapServer, enrollV3Device, createV3FlockInvite } from "../bootstrap-server.mjs";
 import { SupportMailbox } from "../flock-support.mjs";
 import { REQUIRED_RUNTIME_MODULES, computeRuntimeManifest, inspectProcess } from "../flock-lifecycle.mjs";
-import { openFlockMembershipRegistry } from "../flock.mjs";
+import { BRIDGE_VERSION, openFlockMembershipRegistry } from "../flock.mjs";
 import { resolveOpenSsl, createTlsFixture as tlsFixture } from "./openssl.mjs";
 
 const repo = path.resolve(".");
@@ -142,6 +142,43 @@ function stdioRpc(child) {
   };
 }
 
+test("manual stop survives MCP host restarts and direct persistence launches without starting a daemon", async (t) => {
+  const root = temp(t);
+  const home = path.join(root, "home");
+  const runtime = path.join(home, "flock");
+  fs.mkdirSync(runtime, { recursive: true });
+  fs.writeFileSync(path.join(runtime, "config.json"), JSON.stringify({
+    machineId: "STOPPED-FIXTURE", scope: "personal", githubUser: "fixture",
+    connectionString: "Endpoint=https://fixture.invalid;AccessKey=Zml4dHVyZQ==;Version=1.0;",
+  }));
+  const env = childEnv(home, "");
+  const stopped = JSON.parse(execFileSync(process.execPath, [path.join(repo, "flock.mjs"), "stop-daemon"], {
+    env, encoding: "utf8", windowsHide: true, timeout: 10000,
+  }));
+  assert.equal(stopped.autostart, false);
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const child = spawn(process.execPath, [path.join(repo, "flock.mjs"), "mcp"], {
+      env, stdio: ["pipe", "pipe", "pipe"], windowsHide: true,
+    });
+    try {
+      const rpc = stdioRpc(child);
+      assert.equal((await rpc("initialize")).result.serverInfo.version, BRIDGE_VERSION);
+      const result = await rpc("tools/call", { name: "list_remote_machines", arguments: {} });
+      assert.equal(result.result.isError, true);
+      assert.match(result.result.content[0].text, /explicitly stopped/);
+      assert.equal(fs.existsSync(path.join(runtime, "daemon.pid")), false);
+    } finally {
+      const exited = new Promise((resolve) => child.once("exit", resolve));
+      child.kill();
+      await exited;
+    }
+  }
+  assert.throws(() => execFileSync(process.execPath, [path.join(repo, "flock.mjs"), "daemon"], {
+    env, encoding: "utf8", windowsHide: true, stdio: ["ignore", "pipe", "pipe"], timeout: 10000,
+  }), (error) => /explicitly stopped/.test(String(error.stderr)));
+  assert.equal(fs.existsSync(path.join(runtime, "daemon.pid")), false);
+});
+
 test("unconfigured and missing-vault MCP subprocesses initialize and submit support without credential helpers or transport authority", async (t) => {
   const root = temp(t);
   const tls = tlsFixture(root);
@@ -258,7 +295,7 @@ test("real daemon connection failures persist only credential-free WebSocket dia
   fs.mkdirSync(runtime, { recursive: true });
   for (const filename of REQUIRED_RUNTIME_MODULES) fs.copyFileSync(path.join(repo, filename), path.join(runtime, filename));
   fs.writeFileSync(path.join(runtime, "runtime-manifest.json"),
-    JSON.stringify(computeRuntimeManifest(runtime, { version: "3.6.0" })));
+    JSON.stringify(computeRuntimeManifest(runtime, { version: BRIDGE_VERSION })));
   const tls = tlsFixture(root);
   const canaries = ["WS_LOCAL_CANARY", "WS_SIGNATURE_CANARY", "WS_SIG_CANARY"];
   const capturedTokens = [];
@@ -334,11 +371,11 @@ test("resident daemon self_update flushes its RPC response before real activator
     fs.copyFileSync(path.join(repo, filename), path.join(runtime, filename));
     fs.copyFileSync(path.join(repo, filename), path.join(source, filename));
   }
-  const manifest = computeRuntimeManifest(runtime, { version: "3.6.0" });
+  const manifest = computeRuntimeManifest(runtime, { version: BRIDGE_VERSION });
   for (const dir of [runtime, source]) fs.writeFileSync(path.join(dir, "runtime-manifest.json"), JSON.stringify(manifest));
   fs.appendFileSync(path.join(source, "flock.mjs"), "\n// subprocess update generation\n");
   fs.appendFileSync(path.join(source, "bridge.mjs"), "\n// subprocess update generation\n");
-  const candidate = computeRuntimeManifest(source, { version: "3.6.0" });
+  const candidate = computeRuntimeManifest(source, { version: BRIDGE_VERSION });
   fs.writeFileSync(path.join(source, "runtime-manifest.json"), JSON.stringify(candidate));
   const git = (args, cwd = source) => execFileSync("git", ["-C", cwd, ...args], { stdio: "ignore", windowsHide: true });
   git(["init", "-b", "main"]);

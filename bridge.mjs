@@ -83,6 +83,7 @@ import {
   PersistentOperationStore,
   PresenceStateTracker,
   compactOperation,
+  runCredentialHelperSync,
 } from "./flock-operations.mjs";
 import { SupportMailbox, createSupportTicket, ensureSupportDeviceKey, validateSupportReport, validateSupportText } from "./flock-support.mjs";
 
@@ -203,7 +204,7 @@ function copyRuntimeModules(sourceDirectory, destinationDirectory, installedEntr
   }
 }
 
-export const BRIDGE_VERSION = "3.6.0";
+export const BRIDGE_VERSION = "3.6.1";
 export const FLOCK_PROTOCOL_VERSION = 36;
 export const FLOCK_CAPABILITIES = Object.freeze({
   brokerFreeOperations: true,
@@ -6536,45 +6537,37 @@ export function buildTokenLocalDeviceAuthHeaders(
   };
 }
 
-export function resolveLocalGitHubToken(cfg = null) {
+const credentialRetryAfter = new Map();
+const CREDENTIAL_RETRY_MS = 60000;
+
+export function resolveLocalGitHubToken(cfg = null, {
+  env = process.env, run = runCredentialHelperSync, now = Date.now, warn = console.error,
+} = {}) {
   if (isTokenLocalAuthEnabled(cfg)) return null;
-  const envTok = (process.env.GITHUB_TOKEN || process.env.GH_TOKEN || "").trim();
+  const envTok = (env.GITHUB_TOKEN || env.GH_TOKEN || "").trim();
   if (envTok) return envTok;
-
-  // 1. Try GitHub CLI (`gh auth token`)
+  const retryKey = JSON.stringify([cfg?.configPath || getConfigPath(), cfg?.bootstrapUrl || "",
+    env.GH_CONFIG_DIR || "", env.PATH || ""]);
+  if ((credentialRetryAfter.get(retryKey) || 0) > now()) return null;
   try {
-    const out =
-      process.platform === "win32"
-        ? execFileSync("cmd.exe", ["/d", "/s", "/c", "gh auth token"], {
-            encoding: "utf8",
-            stdio: ["ignore", "pipe", "ignore"],
-            timeout: 8000,
-            windowsHide: true,
-          }).trim()
-        : execFileSync("gh", ["auth", "token"], {
-            encoding: "utf8",
-            stdio: ["ignore", "pipe", "ignore"],
-            timeout: 8000,
-            windowsHide: true,
-          }).trim();
+    const out = run("gh", ["auth", "token"], { env }).trim();
     if (out && !out.includes(" ")) return out.split(/\r?\n/)[0].trim();
-  } catch {}
-
-  // 2. Fallback to Git Credential Manager (`git credential fill` for https://github.com)
+  } catch (error) {
+    if (!["CREDENTIAL_HELPER_FAILED", "CREDENTIAL_HELPER_TIMEOUT"].includes(error.code)) throw error;
+  }
   try {
-    const credOut = execFileSync("git", ["credential", "fill"], {
+    const credOut = run("git", ["-c", "credential.interactive=never", "-c", "core.askPass=", "credential", "fill"], {
       input: "protocol=https\nhost=github.com\n\n",
-      encoding: "utf8",
-      stdio: ["pipe", "pipe", "ignore"],
-      timeout: 8000,
-      windowsHide: true,
+      env,
     });
     const m = credOut.match(/^password=(.+)$/m);
-    if (m && m[1].trim()) {
-      return m[1].trim();
-    }
-  } catch {}
-
+    if (m && m[1].trim()) return m[1].trim();
+  } catch (error) {
+    if (!["CREDENTIAL_HELPER_FAILED", "CREDENTIAL_HELPER_TIMEOUT"].includes(error.code)) throw error;
+  }
+  if (credentialRetryAfter.size >= 64) credentialRetryAfter.delete(credentialRetryAfter.keys().next().value);
+  credentialRetryAfter.set(retryKey, now() + CREDENTIAL_RETRY_MS);
+  warn("GITHUB_AUTH_UNAVAILABLE: noninteractive credential lookup failed; retry deferred for 60s. Ask Copilot to sign in explicitly.");
   return null;
 }
 
@@ -6657,16 +6650,17 @@ export function fetchConnectionStringViaGitHubBootstrap({
   return null;
 }
 
-export function registerWithBootstrapServer({
-  bootstrapUrl = DEFAULT_BOOTSTRAP_URL,
-  machineId = os.hostname(),
-  scope = "work",
-  githubUser = null,
-  specs = null,
-  tokenLocalAuth = false,
-} = {}) {
-  if (tokenLocalAuth || isTokenLocalAuthEnabled()) return { ok: true, tokenLocal: true };
-  const ghToken = resolveLocalGitHubToken();
+export function registerWithBootstrapServer(cfg = {}) {
+  const {
+    bootstrapUrl = DEFAULT_BOOTSTRAP_URL,
+    machineId = os.hostname(),
+    scope = "work",
+    githubUser = null,
+    specs = null,
+    tokenLocalAuth = false,
+  } = cfg;
+  if (tokenLocalAuth || isTokenLocalAuthEnabled(cfg)) return { ok: true, tokenLocal: true };
+  const ghToken = resolveLocalGitHubToken(cfg);
   if (!ghToken || !bootstrapUrl) return null;
 
   try {
@@ -11188,11 +11182,14 @@ function isDiscoveredResponderAuthorizedForFlock(cfg, flockSel, item, nowMs = Da
           .filter((m) => m && !m.removed && (!m.membershipExpiresAtMs || Number(m.membershipExpiresAtMs) > nowMs))
           .map((m) => String(m.machineId || "").toLowerCase()),
       ]);
-      if (activeIds.size > 0 && !activeIds.has(itemMachineLower)) {
+      if (!activeIds.has(itemMachineLower)) {
         return false;
       }
     }
-  } catch {}
+  } catch (error) {
+    throw Object.assign(new Error(`Presence authorization could not be verified: ${redactDiagnosticText(error.message)}`),
+      { code: "PRESENCE_AUTHORITY_UNAVAILABLE" });
+  }
   return true;
 }
 
@@ -13720,6 +13717,7 @@ export async function dispatchDaemonRpcRequest(cfg, request, sendResponse) {
 }
 
 export async function runDaemon(cfg) {
+  assertDaemonAutostartAllowed();
   ensureBridgeDir();
   pinDaemonIdentity(getBridgeHome(), __filename);
   const daemonSnapshot = captureCallerMcpSnapshot(cfg, { surface: "resident-daemon" });
@@ -14109,7 +14107,32 @@ export function isLocalDaemonRunning() {
   }
 }
 
-export async function ensureDaemonStarted(cfg) {
+export function assertDaemonAutostartAllowed(root = getBridgeHome()) {
+  const controlPath = assertNoLinks(path.join(root, "daemon-control.json"));
+  if (!fs.existsSync(controlPath)) return;
+  const control = JSON.parse(fs.readFileSync(controlPath, "utf8"));
+  if (control.type !== "copilot-flock-daemon-control-v1" || control.manuallyStopped !== true) {
+    throw new Error("Invalid daemon control state; automatic startup refused");
+  }
+  throw Object.assign(new Error("Flock daemon was explicitly stopped. Ask Copilot to start the daemon explicitly; automatic startup is disabled."),
+    { code: "DAEMON_MANUALLY_STOPPED" });
+}
+
+export async function stopLocalDaemon({
+  root = getBridgeHome(), paths = lifecyclePaths(), stop = stopPinnedDaemon,
+} = {}) {
+  const controlPath = assertNoLinks(path.join(root, "daemon-control.json"));
+  atomicJson(controlPath, { type: "copilot-flock-daemon-control-v1", manuallyStopped: true,
+    stoppedAt: new Date().toISOString() });
+  await stop(root, paths);
+  return { stopped: true, autostart: false };
+}
+
+export async function ensureDaemonStarted(cfg, { explicitStart = false } = {}) {
+  if (explicitStart) {
+    const controlPath = assertNoLinks(path.join(getBridgeHome(), "daemon-control.json"));
+    if (fs.existsSync(controlPath)) fs.unlinkSync(controlPath);
+  } else assertDaemonAutostartAllowed();
   if (cfg?.skipDaemonEnsure || typeof cfg?.rpcTransport === "function") {
     return { running: true, pid: process.pid };
   }
@@ -14191,6 +14214,7 @@ export async function ensureDaemonStarted(cfg) {
 
   let launchedViaWscript = false;
   let child;
+  assertDaemonAutostartAllowed();
   if (vbsCandidate) {
     launchedViaWscript = true;
     child = spawnSessionSafeProcess(
@@ -21617,7 +21641,7 @@ export function callBootstrapV3Endpoint(
       body?.timestamp
   );
   const useTokenLocal = isTokenLocalConfig || isTokenLocalVoucherEnroll || isTokenLocalSync;
-  const ghToken = useTokenLocal ? null : resolveLocalGitHubToken();
+  const ghToken = useTokenLocal ? null : resolveLocalGitHubToken(cfg);
   const hasCfgBootstrap = Boolean(
     cfg && Object.prototype.hasOwnProperty.call(cfg, "bootstrapUrl")
   );
@@ -24147,6 +24171,7 @@ Usage:
   node bridge.mjs self-test
   node bridge.mjs daemon
   node bridge.mjs stop-daemon
+  node bridge.mjs start-daemon
   node bridge.mjs mcp
 `);
     return;
@@ -24242,19 +24267,11 @@ Usage:
   }
 
   if (command === "stop-daemon") {
-    const st = isLocalDaemonRunning();
-    if (st.running && st.pid) {
-      if (process.platform === "linux" && !flags["allow-disruptive-restart"] && !flags["maintenance-consent"]) {
-        await stopPinnedDaemon(getBridgeHome(), lifecyclePaths({ home: HOME_DIR, copilotHome: getCopilotDir() }));
-      } else {
-        process.kill(st.pid);
-      }
-      console.log(JSON.stringify({ stopped: true, pid: st.pid }, null, 2));
-    } else {
-      console.log(JSON.stringify({ stopped: false, reason: "Daemon not running" }, null, 2));
-    }
+    console.log(JSON.stringify(await stopLocalDaemon(), null, 2));
     return;
   }
+
+  if (command === "daemon") assertDaemonAutostartAllowed();
 
   const passiveCli =
     (command === "status" && parseBooleanOption(flags.passive, false)) ||
@@ -24288,13 +24305,18 @@ Usage:
       console.log(JSON.stringify(view, null, 2));
       return;
     }
-    const supported = new Set(["daemon", "mcp", "machines", "sessions", "send", "transcript", "broadcast",
+    const supported = new Set(["daemon", "start-daemon", "mcp", "machines", "sessions", "send", "transcript", "broadcast",
       "status", "self-info", "mcp-self-info", "flocks", "my-flocks", "version", "versions", "specs", "share-thread", "unshare-thread", "shared-threads", "kick"]);
     if (!supported.has(command)) throw new Error(`Command ${command} is not available in broker-free mode; legacy fallback is forbidden`);
   }
 
   if (command === "daemon") {
     await runDaemon(cfg);
+    return;
+  }
+
+  if (command === "start-daemon") {
+    console.log(JSON.stringify(await ensureDaemonStarted(cfg, { explicitStart: true }), null, 2));
     return;
   }
 

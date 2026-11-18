@@ -1023,7 +1023,7 @@ test(
   let lagInterval = null;
   const eventTimers = [];
   try {
-    assert.equal(BRIDGE_VERSION, "3.6.0");
+    assert.equal(BRIDGE_VERSION, "3.6.1");
 
     const hugeSessionId = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
     const eventsPath = env.insertSession({

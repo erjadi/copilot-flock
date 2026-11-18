@@ -20,9 +20,10 @@ import {
   uninstallFlock,
   downgradeRuntime35,
 } from "../flock-lifecycle.mjs";
-import { compactOperation } from "../flock-operations.mjs";
+import { compactOperation, noninteractiveCredentialEnv, runCredentialHelperSync } from "../flock-operations.mjs";
 import { SupportMailbox, ensureSupportDeviceKey } from "../flock-support.mjs";
 import {
+  BRIDGE_VERSION,
   dispatchBrokerFreeRpc,
   FLOCK_CAPABILITIES,
   FLOCK_PROTOCOL_VERSION,
@@ -47,6 +48,13 @@ import {
   reprovisionFleetMachines,
   diagnoseFleetMachines,
   resolveCopilotCliBin,
+  resolveLocalGitHubToken,
+  registerWithBootstrapServer,
+  ensureDaemonStarted,
+  stopLocalDaemon,
+  assertDaemonAutostartAllowed,
+  runDaemon,
+  discoverMachines,
 } from "../flock.mjs";
 import { createBootstrapServer, enrollV3Device, createV3FlockInvite } from "../bootstrap-server.mjs";
 
@@ -55,6 +63,132 @@ function fixture(t) {
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   return root;
 }
+
+test("credential lookup is token-local gated, noninteractive, cfg-scoped and missing-auth rate limited", (t) => {
+  const root = fixture(t);
+  const cfg = { configPath: path.join(root, "config.json"), tokenLocalAuth: false };
+  let time = 1000;
+  const calls = [];
+  const warnings = [];
+  const fail = Object.assign(new Error("secret-bearing helper error"), { code: "CREDENTIAL_HELPER_FAILED" });
+  const options = { env: {}, now: () => time, warn: (message) => warnings.push(message),
+    run: (...args) => { calls.push(args); throw fail; } };
+  assert.equal(resolveLocalGitHubToken({ ...cfg, tokenLocalAuth: true }, options), null);
+  assert.equal(calls.length, 0);
+  assert.equal(resolveLocalGitHubToken(cfg, options), null);
+  assert.deepEqual(calls.map(([file]) => file), ["gh", "git"]);
+  assert.deepEqual(calls[1][1], ["-c", "credential.interactive=never", "-c", "core.askPass=", "credential", "fill"]);
+  assert.equal(calls[1][2].input, "protocol=https\nhost=github.com\n\n");
+  assert.equal(resolveLocalGitHubToken(cfg, options), null);
+  assert.equal(calls.length, 2);
+  assert.equal(warnings.length, 1);
+  assert.doesNotMatch(warnings[0], /secret-bearing/);
+  assert.equal(resolveLocalGitHubToken(cfg, { ...options, env: { GH_TOKEN: "fixture-env-token" } }), "fixture-env-token");
+  time += 60001;
+  assert.equal(resolveLocalGitHubToken(cfg, options), null);
+  assert.equal(calls.length, 4);
+  assert.equal(warnings.length, 2);
+  const other = { ...cfg, configPath: path.join(root, "other.json") };
+  assert.equal(resolveLocalGitHubToken(other, { ...options,
+    run: (file) => file === "gh" ? "" : "username=fixture\npassword=fixture-git-token\n" }), "fixture-git-token");
+  assert.equal(resolveLocalGitHubToken(other, { ...options,
+    run: () => "fixture-gh-token\n" }), "fixture-gh-token");
+  assert.throws(() => resolveLocalGitHubToken(other, { ...options,
+    run: () => { throw new Error("unexpected programming error"); } }), /unexpected programming error/);
+  assert.deepEqual(registerWithBootstrapServer({ ...cfg, tokenLocalAuth: true }), { ok: true, tokenLocal: true });
+  const safeEnv = noninteractiveCredentialEnv({ NODE_OPTIONS: "--require unsafe", NODE_PATH: "unsafe",
+    GIT_ASKPASS: "unsafe", SSH_ASKPASS: "unsafe", GH_CONFIG_DIR: "fixture" });
+  assert.equal(safeEnv.GIT_TERMINAL_PROMPT, "0");
+  assert.equal(safeEnv.GCM_INTERACTIVE, "Never");
+  assert.equal(safeEnv.GCM_GUI_PROMPT, "0");
+  assert.equal(safeEnv.GH_PROMPT_DISABLED, "1");
+  assert.equal(safeEnv.GIT_ASKPASS, "");
+  assert.equal(safeEnv.SSH_ASKPASS, "");
+  assert.equal(safeEnv.NODE_OPTIONS, undefined);
+  assert.equal(safeEnv.NODE_PATH, undefined);
+  assert.equal(safeEnv.GH_CONFIG_DIR, "fixture");
+});
+
+test("credential helpers execute inside bounded containment and leave no descendants on success or timeout", async (t) => {
+  const root = fixture(t);
+  const output = runCredentialHelperSync(process.execPath, ["-e",
+    "process.stdout.write(JSON.stringify(Object.fromEntries(['GIT_TERMINAL_PROMPT','GCM_INTERACTIVE','GIT_ASKPASS','SSH_ASKPASS','GH_PROMPT_DISABLED'].map(k=>[k,process.env[k]]))))"]);
+  assert.deepEqual(JSON.parse(output), { GIT_TERMINAL_PROMPT: "0", GCM_INTERACTIVE: "Never",
+    GIT_ASKPASS: "", SSH_ASKPASS: "", GH_PROMPT_DISABLED: "1" });
+  for (const timeout of [false, true]) {
+    const pidFile = path.join(root, `descendant-${timeout}`);
+    const script = `
+      const {spawn}=require("node:child_process"), fs=require("node:fs");
+      const child=spawn(process.execPath,["-e","setInterval(()=>{},1000)"],{stdio:"ignore"});
+      fs.writeFileSync(${JSON.stringify(pidFile)},String(child.pid));
+      ${timeout ? "setInterval(()=>{},1000)" : "child.unref(); process.stdout.write('stored-token-fixture')"}
+    `;
+    if (timeout) {
+      assert.throws(() => runCredentialHelperSync(process.execPath, ["-e", script], { timeoutMs: 1500 }),
+        { code: /CREDENTIAL_HELPER_(TIMEOUT|FAILED)/ });
+    } else assert.equal(runCredentialHelperSync(process.execPath, ["-e", script]), "stored-token-fixture");
+    const pid = Number(fs.readFileSync(pidFile, "utf8"));
+    assert.ok(pid > 0 && pid !== process.pid);
+    let exited = false;
+    for (let attempt = 0; attempt < 30; attempt++) {
+      try { process.kill(pid, 0); }
+      catch (error) { if (error.code !== "ESRCH") throw error; exited = true; break; }
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    assert.equal(exited, true, `Owned helper descendant ${pid} survived containment`);
+  }
+  assert.throws(() => runCredentialHelperSync("unused", [], {
+    run: () => ({ status: 1, stderr: "password=secret", stdout: "secret" }),
+  }), (error) => error.code === "CREDENTIAL_HELPER_FAILED" && !/secret/.test(error.message));
+});
+
+test("manual daemon stop persists across automatic callers and only explicit start clears it", async (t) => {
+  const root = fixture(t);
+  const previous = process.env.COPILOT_HOME;
+  process.env.COPILOT_HOME = path.join(root, "home");
+  t.after(() => {
+    if (previous === undefined) delete process.env.COPILOT_HOME;
+    else process.env.COPILOT_HOME = previous;
+  });
+  const runtime = path.join(process.env.COPILOT_HOME, "flock");
+  fs.mkdirSync(runtime, { recursive: true });
+  let stops = 0;
+  const cfg = { skipDaemonEnsure: true, tokenLocalAuth: false };
+  const stopped = await stopLocalDaemon({ root: runtime, stop: async () => { stops++; } });
+  assert.deepEqual(stopped, { stopped: true, autostart: false });
+  assert.equal(stops, 1);
+  assert.throws(() => assertDaemonAutostartAllowed(runtime), { code: "DAEMON_MANUALLY_STOPPED" });
+  await assert.rejects(ensureDaemonStarted(cfg), { code: "DAEMON_MANUALLY_STOPPED" });
+  await assert.rejects(runDaemon(cfg), { code: "DAEMON_MANUALLY_STOPPED" });
+  assert.equal(fs.existsSync(path.join(runtime, "daemon.pid")), false);
+  assert.equal(fs.existsSync(path.join(runtime, "daemon-identity.json")), false);
+  assert.equal((await ensureDaemonStarted(cfg, { explicitStart: true })).running, true);
+  assert.doesNotThrow(() => assertDaemonAutostartAllowed(runtime));
+  await stopLocalDaemon({ root: runtime, stop: async () => { throw new Error("Unverified daemon retained"); } })
+    .then(() => assert.fail("Unproven stop must fail"), (error) => assert.match(error.message, /Unverified/));
+  assert.throws(() => assertDaemonAutostartAllowed(runtime), { code: "DAEMON_MANUALLY_STOPPED" });
+});
+
+test("scoped presence never admits responders from an empty collaborator roster or unreadable authority", async (t) => {
+  const root = fixture(t);
+  useCopilotHome(t, root);
+  const flocksPath = path.join(root, "flocks.json");
+  const peer = { machineId: "PEER", githubUser: "collaborator", scope: "work" };
+  const policy = { flockId: "owner/team", ownerGitHubUser: "owner", allowedScopes: ["work"],
+    trustTier: "collaborator", members: [] };
+  const cfg = { machineId: "LOCAL", githubUser: "owner", scope: "work", flocksConfigPath: flocksPath,
+    flocks: { "owner/team": policy },
+    rpcTransport: async () => [{ fromMachine: peer.machineId, result: peer }] };
+  assert.deepEqual(await discoverMachines(cfg, { flockId: "owner/team" }), []);
+  policy.members = [{ machineId: "LOCAL", githubUser: "owner", scope: "work" }, peer];
+  assert.equal((await discoverMachines(cfg, { flockId: "owner/team" }))[0].machineId, "PEER");
+  cfg.rpcTransport = async () => {
+    fs.writeFileSync(path.join(root, "flock-registry.json"), "{invalid");
+    return [{ fromMachine: peer.machineId, result: peer }];
+  };
+  await assert.rejects(discoverMachines(cfg, { flockId: "owner/team" }),
+    { code: "PRESENCE_AUTHORITY_UNAVAILABLE" });
+});
 
 function ownedUpdateId(t) {
   const updateId = crypto.randomUUID();
@@ -241,7 +375,7 @@ test("legacy compatibility checkout sync failure is persisted and returned witho
   fs.mkdirSync(path.join(legacy, ".git"), { recursive: true });
   fs.writeFileSync(path.join(legacy, "preserve.txt"), "unrelated checkout evidence");
   for (const filename of REQUIRED_RUNTIME_MODULES) fs.copyFileSync(path.resolve(filename), path.join(source, filename));
-  fs.writeFileSync(path.join(source, "runtime-manifest.json"), JSON.stringify(computeRuntimeManifest(source, { version: "3.6.0" })));
+  fs.writeFileSync(path.join(source, "runtime-manifest.json"), JSON.stringify(computeRuntimeManifest(source, { version: BRIDGE_VERSION })));
   const result = await performLocalSelfUpdate({ machineId: "OWNER", scope: "work", githubUser: "owner" }, {
     sourceDir: source, targetDir: target, legacyDir: legacy, spawnInstall: false, updateId: ownedUpdateId(t),
   });
@@ -326,8 +460,8 @@ test("launcher failure rolls installed artifacts back to the previous verified r
   }
   fs.appendFileSync(path.join(sourceV2, "flock.mjs"), "\n// milestone-4-candidate\n");
   fs.appendFileSync(path.join(sourceV2, "bridge.mjs"), "\n// milestone-4-candidate\n");
-  const manifestV1 = computeRuntimeManifest(sourceV1, { version: "3.6.0" });
-  const manifestV2 = computeRuntimeManifest(sourceV2, { version: "3.6.0" });
+  const manifestV1 = computeRuntimeManifest(sourceV1, { version: BRIDGE_VERSION });
+  const manifestV2 = computeRuntimeManifest(sourceV2, { version: BRIDGE_VERSION });
   fs.writeFileSync(path.join(sourceV1, "runtime-manifest.json"), JSON.stringify(manifestV1, null, 2));
   fs.writeFileSync(path.join(sourceV2, "runtime-manifest.json"), JSON.stringify(manifestV2, null, 2));
   stageAndActivateRuntime({
@@ -337,7 +471,7 @@ test("launcher failure rolls installed artifacts back to the previous verified r
     resident: {
       running: true,
       pid: process.pid,
-      version: "3.6.0",
+      version: BRIDGE_VERSION,
       manifestDigest: manifestV1.manifestDigest,
     },
   });
@@ -360,7 +494,7 @@ test("launcher failure rolls installed artifacts back to the previous verified r
   const state = readRuntimeState(target);
   assert.equal(state.update.phase, "rolled_back");
   assert.equal(state.update.correlationId, "corr-candidate");
-  assert.equal(computeRuntimeManifest(target, { version: "3.6.0" }).manifestDigest, manifestV1.manifestDigest);
+  assert.equal(computeRuntimeManifest(target, { version: BRIDGE_VERSION }).manifestDigest, manifestV1.manifestDigest);
 });
 
 test("support mailbox enforces device binding, single use, inert schema, quotas, authorization, and closure", (t) => {
@@ -856,13 +990,13 @@ test("spawnInstall activation waits for resident digest and self-test verificati
     const target = path.join(root, `target-${fails}`);
     fs.mkdirSync(source, { recursive: true });
     for (const filename of REQUIRED_RUNTIME_MODULES) fs.copyFileSync(path.resolve(filename), path.join(source, filename));
-    const manifest = computeRuntimeManifest(source, { version: "3.6.0" });
+    const manifest = computeRuntimeManifest(source, { version: BRIDGE_VERSION });
     fs.writeFileSync(path.join(source, "runtime-manifest.json"), JSON.stringify(manifest));
-    const resident = { running: true, pid: process.pid, version: "3.6.0", manifestDigest: manifest.manifestDigest };
+    const resident = { running: true, pid: process.pid, version: BRIDGE_VERSION, manifestDigest: manifest.manifestDigest };
     stageAndActivateRuntime({ sourceDir: source, targetDir: target, resident });
     fs.appendFileSync(path.join(source, "flock.mjs"), "\n// next artifact\n");
     fs.appendFileSync(path.join(source, "bridge.mjs"), "\n// next artifact\n");
-    const next = computeRuntimeManifest(source, { version: "3.6.0" });
+    const next = computeRuntimeManifest(source, { version: BRIDGE_VERSION });
     fs.writeFileSync(path.join(source, "runtime-manifest.json"), JSON.stringify(next));
     let selfTests = 0;
     const execute = performLocalSelfUpdate({ machineId: "PC", scope: "work" }, {
@@ -875,7 +1009,7 @@ test("spawnInstall activation waits for resident digest and self-test verificati
           try {
             await activateRuntimeUpdate({ machineId: "PC" }, { root: target, updateId }, {
               restartRuntime: async () => {
-                const current = computeRuntimeManifest(target, { version: "3.6.0" });
+                const current = computeRuntimeManifest(target, { version: BRIDGE_VERSION });
                 return { ...resident, manifestDigest: current.manifestDigest };
               },
               selfTest: async () => {
@@ -894,7 +1028,7 @@ test("spawnInstall activation waits for resident digest and self-test verificati
     if (fails) {
       await assert.rejects(execute, (error) => error.code === "RUNTIME_ACTIVATION_ROLLED_BACK");
       assert.equal(readRuntimeState(target).update.phase, "rolled_back");
-      assert.equal(computeRuntimeManifest(target, { version: "3.6.0" }).manifestDigest, manifest.manifestDigest);
+      assert.equal(computeRuntimeManifest(target, { version: BRIDGE_VERSION }).manifestDigest, manifest.manifestDigest);
       assert.equal(selfTests, 2);
     } else {
       const result = await execute;
@@ -1089,7 +1223,7 @@ test("unlaunched update failures restore the previous closure and remove blockin
   const target = path.join(root, "target");
   fs.mkdirSync(source);
   for (const filename of REQUIRED_RUNTIME_MODULES) fs.copyFileSync(path.resolve(filename), path.join(source, filename));
-  const previous = computeRuntimeManifest(source, { version: "3.6.0" });
+  const previous = computeRuntimeManifest(source, { version: BRIDGE_VERSION });
   fs.writeFileSync(path.join(source, "runtime-manifest.json"), JSON.stringify(previous));
   stageAndActivateRuntime({ sourceDir: source, targetDir: target });
   for (const code of ["UPDATE_REPLY_FLUSH_FAILED", "RUNTIME_ACTIVATION_SPAWN_FAILED"]) {
@@ -1106,7 +1240,7 @@ test("unlaunched update failures restore the previous closure and remove blockin
     recoverUnlaunchedRuntimeUpdate(target, updateId, new Error("transport/spawn failed"), code);
     assert.equal(fs.existsSync(path.join(target, "update-activation.json")), false);
     assert.equal(fs.existsSync(backup), false);
-    assert.equal(computeRuntimeManifest(target, { version: "3.6.0" }).manifestDigest, previous.manifestDigest);
+    assert.equal(computeRuntimeManifest(target, { version: BRIDGE_VERSION }).manifestDigest, previous.manifestDigest);
     assert.equal(readRuntimeState(target).update.phase, "rolled_back");
     assert.equal(readRuntimeState(target).update.code, code);
   }

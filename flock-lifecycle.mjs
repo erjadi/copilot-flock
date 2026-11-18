@@ -31,7 +31,7 @@ const runtimeFiles = [
   "flock.mjs", "bridge.mjs", "flock-lifecycle.mjs", "flock-operations.mjs", "flock-membership.mjs", "flock-registry.mjs",
   "flock-support.mjs",
   "config.json", "identity.json", "flocks.json", "flock-registry.json", "state.json", "daemon.pid",
-  "daemon-identity.json", "daemon.log", "inbox.jsonl", "outbox.jsonl", "locks.json",
+  "daemon-identity.json", "daemon-control.json", "daemon.log", "inbox.jsonl", "outbox.jsonl", "locks.json",
   "cli-sessions.json", "operations.json", "cli-leases.json", "flock-credentials.json",
   "processed-offline-ids.json", "last-vote-report.json",
   "installation.json", "uninstall-progress.json",
@@ -1938,11 +1938,11 @@ const EMBEDDED_RUNTIME_MANIFEST_FALLBACK = (() => {
     operationsSha = hashRuntimeModule(fs.readFileSync(path.join(__lifecycleDir, "flock-operations.mjs")));
     supportSha = hashRuntimeModule(fs.readFileSync(path.join(__lifecycleDir, "flock-support.mjs")));
   } catch {}
-  const entrypointSha = "dc97ebd07eb10c4e0167f75b30520a74a9c848b9072c716eb82641b1cf7483d6";
+  const entrypointSha = "8c671a1421ebf838492027b3f1206102c4cd567a07295e89a1001814221a3391";
   const fallback = {
     type: "copilot-flock-runtime-manifest-v1",
     schema: 1,
-    version: "3.6.0",
+    version: "3.6.1",
     entrypoints: ["flock.mjs", "bridge.mjs"],
     files: {
       "bridge.mjs": {

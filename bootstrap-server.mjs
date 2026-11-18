@@ -2664,7 +2664,7 @@ export function createBootstrapServer({
     sendJson(res, 200, {
       ok: true,
       service: "copilot-flock-bootstrap",
-      version: "3.6.0",
+      version: "3.6.1",
       allowedRepo: ALLOWED_REPO,
       hub: DEFAULT_HUB,
       serviceBusNamespace: SERVICEBUS_NAMESPACE,
@@ -2702,7 +2702,7 @@ export function createBootstrapServer({
     if (subPath === "/capabilities" && req.method === "GET") {
       sendJson(res, 200, {
         ok: true,
-        version: "3.6.0",
+        version: "3.6.1",
         correlationId,
         capabilities: {
           rosterSync: true,
@@ -2833,7 +2833,7 @@ export function createBootstrapServer({
             githubUser: matchedUser,
             githubName: null,
             scope: bodyData.scope || "work",
-            version: bodyData.version || "3.6.0",
+            version: bodyData.version || "3.6.1",
             hostname: bodyData.hostname || bodyData.machineId,
             platform: bodyData.platform || null,
             publicKey: bodyData.publicKey || null,

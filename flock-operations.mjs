@@ -1,8 +1,128 @@
 import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { atomicJson, inspectProcess, redactDiagnosticText } from "./flock-lifecycle.mjs";
+
+export function noninteractiveCredentialEnv(env = process.env) {
+  const result = { ...env, GIT_TERMINAL_PROMPT: "0", GCM_INTERACTIVE: "Never",
+    GIT_ASKPASS: "", SSH_ASKPASS: "", GH_PROMPT_DISABLED: "1", GCM_GUI_PROMPT: "0" };
+  delete result.NODE_OPTIONS;
+  delete result.NODE_PATH;
+  return result;
+}
+
+// The worker cannot invoke a helper until its parent has assigned the Windows job.
+const CREDENTIAL_WORKER = `
+  let input = "";
+  process.stdin.setEncoding("utf8");
+  process.stdin.on("data", chunk => input += chunk);
+  process.stdin.on("end", () => {
+    const request = JSON.parse(input);
+    const result = require("node:child_process").spawnSync(request.file, request.args, {
+      input: request.input, encoding: "utf8", windowsHide: true,
+      timeout: request.timeoutMs, maxBuffer: 65536, stdio: ["pipe", "pipe", "pipe"]
+    });
+    process.stdout.write(JSON.stringify({
+      ok: !result.error && result.status === 0, stdout: result.status === 0 ? result.stdout : "",
+      code: result.error?.code || (result.status === 0 ? null : "CREDENTIAL_HELPER_FAILED")
+    }));
+  });
+`;
+
+const WINDOWS_CREDENTIAL_JOB = `
+$ErrorActionPreference = 'Stop'
+$request = [Console]::In.ReadToEnd()
+$config = $request | ConvertFrom-Json
+Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class FlockCredentialJob {
+  [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+  public static extern IntPtr CreateJobObject(IntPtr attributes, string name);
+  [DllImport("kernel32.dll", SetLastError=true)]
+  public static extern bool SetInformationJobObject(IntPtr job, int type, IntPtr info, uint length);
+  [DllImport("kernel32.dll", SetLastError=true)]
+  public static extern bool AssignProcessToJobObject(IntPtr job, IntPtr process);
+  [DllImport("kernel32.dll")] public static extern bool CloseHandle(IntPtr handle);
+}
+'@
+$job = [FlockCredentialJob]::CreateJobObject([IntPtr]::Zero, $null)
+if ($job -eq [IntPtr]::Zero) { throw 'Credential containment unavailable' }
+$child = $null
+try {
+  $size = if ([IntPtr]::Size -eq 8) { 144 } else { 112 }
+  $info = [Runtime.InteropServices.Marshal]::AllocHGlobal($size)
+  try {
+    for ($i=0; $i -lt $size; $i++) { [Runtime.InteropServices.Marshal]::WriteByte($info, $i, 0) }
+    [Runtime.InteropServices.Marshal]::WriteInt32($info, 16, 0x2000)
+    if (-not [FlockCredentialJob]::SetInformationJobObject($job, 9, $info, $size)) { throw 'Credential containment unavailable' }
+  } finally { [Runtime.InteropServices.Marshal]::FreeHGlobal($info) }
+  $start = New-Object Diagnostics.ProcessStartInfo
+  $start.FileName = $config.node
+  $start.Arguments = '-e "eval(Buffer.from(''${Buffer.from(CREDENTIAL_WORKER).toString("base64")}'',''base64'').toString())"'
+  $start.UseShellExecute = $false
+  $start.CreateNoWindow = $true
+  $start.RedirectStandardInput = $true
+  $start.RedirectStandardOutput = $true
+  $start.RedirectStandardError = $true
+  $child = New-Object Diagnostics.Process
+  $child.StartInfo = $start
+  if (-not $child.Start()) { throw 'Credential worker unavailable' }
+  if (-not [FlockCredentialJob]::AssignProcessToJobObject($job, $child.Handle)) {
+    $child.Kill()
+    throw 'Credential containment unavailable'
+  }
+  $output = $child.StandardOutput.ReadToEndAsync()
+  $errors = $child.StandardError.ReadToEndAsync()
+  $child.StandardInput.Write($request)
+  $child.StandardInput.Close()
+  $finished = $child.WaitForExit([int]$config.timeoutMs)
+  [void][FlockCredentialJob]::CloseHandle($job)
+  $job = [IntPtr]::Zero
+  if (-not $finished) {
+    [Console]::Out.Write('{"ok":false,"code":"ETIMEDOUT"}')
+    return
+  }
+  if ($child.ExitCode -ne 0) { throw 'Credential worker failed' }
+  [Console]::Out.Write($output.Result)
+} finally {
+  if ($job -ne [IntPtr]::Zero) { [void][FlockCredentialJob]::CloseHandle($job) }
+  if ($null -ne $child) { $child.Dispose() }
+}
+`;
+
+export function runCredentialHelperSync(file, args, {
+  input = "", timeoutMs = 8000, env = process.env, platform = process.platform,
+  run = spawnSync, kill = process.kill,
+} = {}) {
+  const request = JSON.stringify({ node: process.execPath, file, args, input, timeoutMs });
+  const windows = platform === "win32";
+  const result = run(windows ? "powershell.exe" : process.execPath,
+    windows ? ["-NoProfile", "-NonInteractive", "-EncodedCommand", Buffer.from(WINDOWS_CREDENTIAL_JOB, "utf16le").toString("base64")]
+      : ["-e", CREDENTIAL_WORKER], {
+      input: request, encoding: "utf8", windowsHide: true, detached: !windows,
+      timeout: timeoutMs + (windows ? 12000 : 1000), maxBuffer: 65536,
+      env: noninteractiveCredentialEnv(env), stdio: ["pipe", "pipe", "pipe"],
+    });
+  if (!windows && result.pid) {
+    try { kill(-result.pid, "SIGKILL"); }
+    catch (error) { if (error.code !== "ESRCH") throw error; }
+  }
+  // Helper stderr/output may contain credentials; only fixed error codes escape.
+  if (result.error || result.status !== 0) {
+    throw Object.assign(new Error("Noninteractive credential helper failed or timed out"), {
+      code: result.error?.code === "ETIMEDOUT" ? "CREDENTIAL_HELPER_TIMEOUT" : "CREDENTIAL_HELPER_FAILED",
+    });
+  }
+  let response;
+  try { response = JSON.parse(result.stdout); }
+  catch { throw Object.assign(new Error("Invalid credential helper response"), { code: "CREDENTIAL_HELPER_FAILED" }); }
+  if (!response.ok) throw Object.assign(new Error("Noninteractive credential unavailable"), {
+    code: response.code === "ETIMEDOUT" ? "CREDENTIAL_HELPER_TIMEOUT" : "CREDENTIAL_HELPER_FAILED",
+  });
+  return response.stdout;
+}
 
 const TERMINAL_STATES = new Set(["completed", "failed", "cancelled"]);
 const TRANSITIONS = Object.freeze({

@@ -4,7 +4,14 @@ Licensed under [Apache-2.0](./LICENSE). Copyright 2026 Eric Jadi.
 Viewer preview data, hostnames, network addresses and governance examples are
 synthetic, not captured conversations or real signed release evidence.
 
-**3.6 candidate, not yet released or deployed:** Milestones 1-4 add guarded
+**3.6.1 candidate, not yet released or deployed:** Adds noninteractive,
+process-contained credential lookup, a persistent explicit-stop/autostart guard,
+and authorized fresh-presence discovery fixes to the complete 3.6 baseline.
+Ask Copilot to stop the Flock daemon to disable automatic startup, and to start
+the daemon explicitly to resume it. See
+[3.6.1 candidate notes](./docs/RELEASE_NOTES_3_6_1_CANDIDATE.md).
+
+**3.6 baseline:** Milestones 1-4 add guarded
 enrollment and operations, schema-36 capability negotiation, phased runtime
 updates with rollback/error journals, compact diagnostics, and a separate
 text-only newcomer support quarantine. The support capability grants no flock,
