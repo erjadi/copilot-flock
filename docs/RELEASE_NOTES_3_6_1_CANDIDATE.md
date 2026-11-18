@@ -23,13 +23,30 @@ or GCM child runs outside containment. Job closure terminates remaining
 descendants on success, failure, timeout, or wrapper termination. Failure to
 establish containment refuses helper execution. POSIX helpers use a dedicated
 process group that is cleaned after each invocation. No process-name scanning,
-unverified PID-tree termination, or App/MCP termination is used.
+unverified PID-tree termination, or App/MCP termination is used. Each helper has
+an 8-second inner execution timeout (`timeoutMs = 8000`) plus a 12-second
+Windows PowerShell/Job-Object startup allowance (`20s` per helper on Windows;
+`9s` on POSIX). Because `resolveLocalGitHubToken` is synchronous and tries
+`gh auth token` then `git credential fill`, a cold missing-auth lookup on a
+legacy non-token-local daemon is bounded at up to ~16 seconds of helper wait
+(and up to 40 seconds worst-case outer wrapper ceiling on Windows, or 18 seconds
+on POSIX), which still blocks the event loop and exceeds a single 2.2s-2.5s
+discovery wait or 8s RPC window on that initial cold miss before the 60-second
+missing-auth cooldown and 15-second `/api/members` negative cache suppress
+repeat probes.
 
 Ask Copilot to **stop the Flock daemon** to persist an autostart opt-out, even
 when no daemon is running. Automatic MCP startup, later communication calls, and
 OS persistence launches respect it. Ask Copilot to **start the daemon explicitly**
-to clear that opt-out. The stop uses creation-pinned ownership checks and retains
-the opt-out if stopping cannot be proved safe. For contributor automation these
+to clear that opt-out. `stopLocalDaemon` / `stop-daemon` writes
+`daemon-control.json` (`autostart: false`) first and returns a structured
+outcome (`{ stopped, status, pid, reason, autostart }`): `stopped: true` is
+reported only when a creation-pinned daemon is verified terminated by an
+independent postcondition check, while absent/stale PIDs report
+`status: "not_running"`, reused/unrelated PIDs report `status: "unowned_pid"`
+without signalling them, and unverified guard outcomes report
+`status: "unknown"`, all with `stopped: false`. Unproven running daemons fail
+closed while retaining the opt-out marker. For contributor automation these
 operations are `stop-daemon` and `start-daemon`; the existing `start` alias still
 means remote session creation, not daemon startup.
 

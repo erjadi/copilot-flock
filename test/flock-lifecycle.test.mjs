@@ -1118,17 +1118,32 @@ test("Windows daemon quoting never admits extra arguments, different scripts or 
 test("stale PID never kills unrelated process; pinned identity must match immediately before signalling", async () => {
   const f = fixture();
   try {
+    const noPidOutcome = await stopPinnedDaemon(f.root, f.paths);
+    assert.deepEqual(noPidOutcome, { stopped: false, status: "not_running", pid: null, reason: "no_daemon_pid" });
     const pid = 123456;
     fs.writeFileSync(path.join(f.root, "daemon.pid"), String(pid));
+    const staleOutcome = await stopPinnedDaemon(f.root, f.paths, { inspect: () => null });
+    assert.deepEqual(staleOutcome, { stopped: false, status: "not_running", pid, reason: "stale_daemon_pid" });
     const unrelated = { pid, start: "old", executable: process.execPath, argv: [process.execPath, "unrelated.mjs"] };
     let killed = 0;
-    await stopPinnedDaemon(f.root, f.paths, { inspect: () => unrelated, kill: () => killed++ });
+    const unpinnedUnrelated = await stopPinnedDaemon(f.root, f.paths, { inspect: () => unrelated, kill: () => killed++ });
+    assert.deepEqual(unpinnedUnrelated, {
+      stopped: false, status: "unowned_pid", pid, reason: "missing_creation_pin_unrelated_process",
+    });
     assert.equal(killed, 0);
     const live = { pid, start: "created", executable: process.execPath,
       argv: [process.execPath, path.join(f.root, "flock.mjs"), "daemon"] };
     await assert.rejects(stopPinnedDaemon(f.root, f.paths, { inspect: () => live, kill: () => killed++ }), /creation-identity/);
     atomicJson(path.join(f.root, "daemon-identity.json"), { ...live, script: path.join(f.root, "flock.mjs") });
-    await stopPinnedDaemon(f.root, f.paths, { inspect: () => killed ? null : live, kill: () => killed++ });
+    const reusedUnrelated = await stopPinnedDaemon(f.root, f.paths, { inspect: () => unrelated, kill: () => killed++ });
+    assert.deepEqual(reusedUnrelated, {
+      stopped: false, status: "unowned_pid", pid, reason: "reused_or_unowned_pid",
+    });
+    assert.equal(killed, 0);
+    const stoppedOutcome = await stopPinnedDaemon(f.root, f.paths, { inspect: () => killed ? null : live, kill: () => killed++ });
+    assert.deepEqual(stoppedOutcome, {
+      stopped: true, status: "stopped", pid, reason: "pinned_daemon_stopped", start: "created",
+    });
     assert.equal(killed, 1);
     assert.ok(inspectProcess(process.pid)?.start);
   } finally { f.close(); }

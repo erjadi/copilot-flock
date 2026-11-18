@@ -488,22 +488,26 @@ export async function stopPinnedDaemon(root, paths, {
 } = {}) {
   root = canonicalRuntimePath(root);
   const pidPath = path.join(root, "daemon.pid");
-  if (!fs.existsSync(pidPath)) return;
+  if (!fs.existsSync(pidPath)) {
+    return { stopped: false, status: "not_running", pid: null, reason: "no_daemon_pid" };
+  }
   const pid = Number(fs.readFileSync(pidPath, "utf8").trim());
   if (!Number.isSafeInteger(pid) || pid <= 0) throw new Error("Malformed daemon PID; inspect installation before retrying");
   const live = inspect(pid);
-  if (!live) return;
+  if (!live) {
+    return { stopped: false, status: "not_running", pid, reason: "stale_daemon_pid" };
+  }
   const pinPath = path.join(root, "daemon-identity.json");
   if (!fs.existsSync(pinPath)) {
     if (commandIsDaemon(live, paths.scripts)) throw new Error("Legacy daemon is running without a creation-identity pin; retained for safe manual coordination");
-    return; // A reused PID is not evidence that the unrelated process belongs to Flock.
+    return { stopped: false, status: "unowned_pid", pid, reason: "missing_creation_pin_unrelated_process" }; // A reused PID is not evidence that the unrelated process belongs to Flock.
   }
   const pin = JSON.parse(fs.readFileSync(pinPath, "utf8"));
   if (pin.pid !== pid || pin.start !== live.start || pin.executable !== live.executable ||
       pin.command !== live.command || JSON.stringify(pin.argv) !== JSON.stringify(live.argv) ||
       !paths.scripts.includes(canonicalRuntimePath(pin.script)) || !commandIsDaemon(live, [canonicalRuntimePath(pin.script)])) {
     if (commandIsDaemon(live, paths.scripts)) throw new Error("Running daemon does not match its stored creation identity");
-    return;
+    return { stopped: false, status: "unowned_pid", pid, reason: "reused_or_unowned_pid" };
   }
   if (pid === process.pid) throw new Error("Uninstaller cannot terminate its own process");
   if (paths.platform === "linux") checkLinuxCgroup(pid);
@@ -512,7 +516,9 @@ export async function stopPinnedDaemon(root, paths, {
   kill(pid);
   for (let attempt = 0; attempt < 30; attempt++) {
     const after = inspect(pid);
-    if (!after || after.start !== live.start) return;
+    if (!after || after.start !== live.start) {
+      return { stopped: true, status: "stopped", pid, reason: "pinned_daemon_stopped", start: pin.start };
+    }
     await delay(100);
   }
   throw new Error("Daemon did not stop; installation retained");
@@ -1938,7 +1944,7 @@ const EMBEDDED_RUNTIME_MANIFEST_FALLBACK = (() => {
     operationsSha = hashRuntimeModule(fs.readFileSync(path.join(__lifecycleDir, "flock-operations.mjs")));
     supportSha = hashRuntimeModule(fs.readFileSync(path.join(__lifecycleDir, "flock-support.mjs")));
   } catch {}
-  const entrypointSha = "8c671a1421ebf838492027b3f1206102c4cd567a07295e89a1001814221a3391";
+  const entrypointSha = "dd11f9f4a0ddc853afedd28b742b48ccc2c50ec9d80fddd0dd9466240e8082b9";
   const fallback = {
     type: "copilot-flock-runtime-manifest-v1",
     schema: 1,

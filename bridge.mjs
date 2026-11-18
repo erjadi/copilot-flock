@@ -14119,13 +14119,65 @@ export function assertDaemonAutostartAllowed(root = getBridgeHome()) {
 }
 
 export async function stopLocalDaemon({
-  root = getBridgeHome(), paths = lifecyclePaths(), stop = stopPinnedDaemon,
+  root = getBridgeHome(),
+  paths = lifecyclePaths(),
+  stop = stopPinnedDaemon,
+  inspect = inspectProcess,
+  kill,
+  delay,
+  checkLinuxCgroup,
 } = {}) {
-  const controlPath = assertNoLinks(path.join(root, "daemon-control.json"));
-  atomicJson(controlPath, { type: "copilot-flock-daemon-control-v1", manuallyStopped: true,
-    stoppedAt: new Date().toISOString() });
-  await stop(root, paths);
-  return { stopped: true, autostart: false };
+  const canonicalRoot = canonicalRuntimePath(root);
+  const controlPath = assertNoLinks(path.join(canonicalRoot, "daemon-control.json"));
+  atomicJson(controlPath, {
+    type: "copilot-flock-daemon-control-v1",
+    manuallyStopped: true,
+    stoppedAt: new Date().toISOString(),
+  });
+  const outcome = await stop(canonicalRoot, paths, {
+    inspect,
+    ...(kill ? { kill } : {}),
+    ...(delay ? { delay } : {}),
+    ...(checkLinuxCgroup ? { checkLinuxCgroup } : {}),
+  });
+  if (!outcome || typeof outcome !== "object" || typeof outcome.stopped !== "boolean" || typeof outcome.status !== "string") {
+    return {
+      stopped: false,
+      status: "unknown",
+      pid: null,
+      reason: "unverified_stop_outcome",
+      autostart: false,
+    };
+  }
+  if (outcome.stopped === true) {
+    const pidPath = path.join(canonicalRoot, "daemon.pid");
+    const pinPath = path.join(canonicalRoot, "daemon-identity.json");
+    const recordedPid = fs.existsSync(pidPath) ? Number(fs.readFileSync(pidPath, "utf8").trim()) : null;
+    const pin = fs.existsSync(pinPath) ? JSON.parse(fs.readFileSync(pinPath, "utf8")) : null;
+    if (!Number.isSafeInteger(outcome.pid) || outcome.pid <= 0 || !pin || pin.pid !== outcome.pid || !pin.start ||
+        (outcome.start && outcome.start !== pin.start) || (recordedPid !== null && recordedPid !== outcome.pid)) {
+      throw new Error("Daemon stop postcondition failed: missing or mismatched creation identity proof");
+    }
+    const after = inspect(outcome.pid);
+    if (after && after.start === pin.start) {
+      throw new Error("Daemon stop postcondition failed: pinned daemon is still running");
+    }
+    return {
+      stopped: true,
+      status: "stopped",
+      pid: outcome.pid,
+      reason: outcome.reason || "pinned_daemon_stopped",
+      autostart: false,
+    };
+  }
+  const allowedStatuses = new Set(["not_running", "unowned_pid", "unknown"]);
+  return {
+    stopped: false,
+    status: allowedStatuses.has(outcome.status) ? outcome.status : "unknown",
+    pid: Number.isSafeInteger(outcome.pid) && outcome.pid > 0 ? outcome.pid : null,
+    reason: typeof outcome.reason === "string" && outcome.reason ? outcome.reason : "daemon_not_stopped",
+    autostart: false,
+  };
 }
 
 export async function ensureDaemonStarted(cfg, { explicitStart = false } = {}) {

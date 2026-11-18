@@ -142,7 +142,7 @@ test("credential helpers execute inside bounded containment and leave no descend
   }), (error) => error.code === "CREDENTIAL_HELPER_FAILED" && !/secret/.test(error.message));
 });
 
-test("manual daemon stop persists across automatic callers and only explicit start clears it", async (t) => {
+test("manual daemon stop persists across automatic callers, classifies no-daemon/pinned/unowned/noop states, and only explicit start clears it", async (t) => {
   const root = fixture(t);
   const previous = process.env.COPILOT_HOME;
   process.env.COPILOT_HOME = path.join(root, "home");
@@ -152,19 +152,100 @@ test("manual daemon stop persists across automatic callers and only explicit sta
   });
   const runtime = path.join(process.env.COPILOT_HOME, "flock");
   fs.mkdirSync(runtime, { recursive: true });
-  let stops = 0;
+  const script = path.join(runtime, "flock.mjs");
+  const paths = { ...lifecyclePaths({ home: root, copilotHome: process.env.COPILOT_HOME, platform: "win32" }), scripts: [script] };
   const cfg = { skipDaemonEnsure: true, tokenLocalAuth: false };
-  const stopped = await stopLocalDaemon({ root: runtime, stop: async () => { stops++; } });
-  assert.deepEqual(stopped, { stopped: true, autostart: false });
-  assert.equal(stops, 1);
+
+  // 1. No-daemon state: no daemon.pid -> stopped: false, status: "not_running", autostart: false
+  const noDaemon = await stopLocalDaemon({ root: runtime, paths });
+  assert.deepEqual(noDaemon, {
+    stopped: false,
+    status: "not_running",
+    pid: null,
+    reason: "no_daemon_pid",
+    autostart: false,
+  });
   assert.throws(() => assertDaemonAutostartAllowed(runtime), { code: "DAEMON_MANUALLY_STOPPED" });
   await assert.rejects(ensureDaemonStarted(cfg), { code: "DAEMON_MANUALLY_STOPPED" });
   await assert.rejects(runDaemon(cfg), { code: "DAEMON_MANUALLY_STOPPED" });
-  assert.equal(fs.existsSync(path.join(runtime, "daemon.pid")), false);
-  assert.equal(fs.existsSync(path.join(runtime, "daemon-identity.json")), false);
   assert.equal((await ensureDaemonStarted(cfg, { explicitStart: true })).running, true);
   assert.doesNotThrow(() => assertDaemonAutostartAllowed(runtime));
-  await stopLocalDaemon({ root: runtime, stop: async () => { throw new Error("Unverified daemon retained"); } })
+
+  // 2. Guard no-op callback: returns undefined -> stopped: false, status: "unknown", reason: "unverified_stop_outcome"
+  let noopCalls = 0;
+  const noopStop = await stopLocalDaemon({ root: runtime, paths, stop: async () => { noopCalls++; } });
+  assert.equal(noopCalls, 1);
+  assert.deepEqual(noopStop, {
+    stopped: false,
+    status: "unknown",
+    pid: null,
+    reason: "unverified_stop_outcome",
+    autostart: false,
+  });
+  assert.throws(() => assertDaemonAutostartAllowed(runtime), { code: "DAEMON_MANUALLY_STOPPED" });
+
+  // 3. Reused / unowned PID: never signals unrelated process, classifies as unowned_pid with stopped: false
+  const pid = 24680;
+  fs.writeFileSync(path.join(runtime, "daemon.pid"), String(pid));
+  const unrelated = { pid, start: "reused-start", executable: process.execPath, argv: [process.execPath, "other.mjs"] };
+  let killed = 0;
+  const unpinnedUnowned = await stopLocalDaemon({
+    root: runtime, paths, inspect: () => unrelated, kill: () => { killed++; },
+  });
+  assert.equal(killed, 0);
+  assert.deepEqual(unpinnedUnowned, {
+    stopped: false,
+    status: "unowned_pid",
+    pid,
+    reason: "missing_creation_pin_unrelated_process",
+    autostart: false,
+  });
+  const liveDaemon = { pid, start: "daemon-start", executable: process.execPath, argv: [process.execPath, script, "daemon"] };
+  fs.writeFileSync(path.join(runtime, "daemon-identity.json"), JSON.stringify({ ...liveDaemon, script }));
+  const reusedUnowned = await stopLocalDaemon({
+    root: runtime, paths, inspect: () => unrelated, kill: () => { killed++; },
+  });
+  assert.equal(killed, 0);
+  assert.deepEqual(reusedUnowned, {
+    stopped: false,
+    status: "unowned_pid",
+    pid,
+    reason: "reused_or_unowned_pid",
+    autostart: false,
+  });
+
+  // 4. Actual pinned daemon stop + independent postcondition enforcement
+  await assert.rejects(
+    stopLocalDaemon({
+      root: runtime, paths,
+      stop: async () => ({ stopped: true, status: "stopped", pid, reason: "pinned_daemon_stopped", start: "daemon-start" }),
+      inspect: () => liveDaemon,
+    }),
+    /Daemon stop postcondition failed: pinned daemon is still running/
+  );
+  assert.throws(() => assertDaemonAutostartAllowed(runtime), { code: "DAEMON_MANUALLY_STOPPED" });
+
+  const pinnedStopped = await stopLocalDaemon({
+    root: runtime, paths,
+    inspect: () => killed ? null : liveDaemon,
+    kill: (target) => { assert.equal(target, pid); killed++; },
+  });
+  assert.equal(killed, 1);
+  assert.deepEqual(pinnedStopped, {
+    stopped: true,
+    status: "stopped",
+    pid,
+    reason: "pinned_daemon_stopped",
+    autostart: false,
+  });
+  assert.throws(() => assertDaemonAutostartAllowed(runtime), { code: "DAEMON_MANUALLY_STOPPED" });
+
+  // 5. Explicit start clears marker; unproven stop failure retains marker
+  fs.unlinkSync(path.join(runtime, "daemon.pid"));
+  fs.unlinkSync(path.join(runtime, "daemon-identity.json"));
+  assert.equal((await ensureDaemonStarted(cfg, { explicitStart: true })).running, true);
+  assert.doesNotThrow(() => assertDaemonAutostartAllowed(runtime));
+  await stopLocalDaemon({ root: runtime, paths, stop: async () => { throw new Error("Unverified daemon retained"); } })
     .then(() => assert.fail("Unproven stop must fail"), (error) => assert.match(error.message, /Unverified/));
   assert.throws(() => assertDaemonAutostartAllowed(runtime), { code: "DAEMON_MANUALLY_STOPPED" });
 });

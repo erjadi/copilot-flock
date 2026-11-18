@@ -155,7 +155,13 @@ test("manual stop survives MCP host restarts and direct persistence launches wit
   const stopped = JSON.parse(execFileSync(process.execPath, [path.join(repo, "flock.mjs"), "stop-daemon"], {
     env, encoding: "utf8", windowsHide: true, timeout: 10000,
   }));
-  assert.equal(stopped.autostart, false);
+  assert.deepEqual(stopped, {
+    stopped: false,
+    status: "not_running",
+    pid: null,
+    reason: "no_daemon_pid",
+    autostart: false,
+  });
   for (let attempt = 0; attempt < 2; attempt++) {
     const child = spawn(process.execPath, [path.join(repo, "flock.mjs"), "mcp"], {
       env, stdio: ["pipe", "pipe", "pipe"], windowsHide: true,
