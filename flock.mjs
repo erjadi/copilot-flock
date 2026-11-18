@@ -10972,15 +10972,15 @@ function peerKeysConsistentWithMember(member, peer, { nowMs = Date.now() } = {})
     if (!deriveCandidateKeyFingerprints(memberPub).includes(peerFp)) return false;
   }
   if (peer?.presenceAuth !== undefined) {
-    const rawSeen = peer.lastSeenAt ?? peer.respondedAt ?? peer.timestamp ?? peer.presenceAuth.sentAt;
-    const referenceMs = parseBoundedTimestampMs(rawSeen, { nowMs, maxFutureSkewMs: 5000 }) ?? nowMs;
     const ver = verifyPresencePayload(peer, {
       pinnedPublicKey: memberPub || null,
       pinnedFingerprint: memberFp || null,
-      maxSkewMs: 300000,
-      nowMs: referenceMs,
+      maxSkewMs: 3600000,
+      nowMs,
     });
     if (!ver.valid) return false;
+  } else if (peer?.requireSignedPresence === true) {
+    return false;
   }
   return true;
 }
@@ -13833,20 +13833,39 @@ export async function runDaemon(cfg) {
   const myIdentity = inspectProcess(process.pid);
   if (!myIdentity?.start) throw new Error("Cannot pin daemon process creation identity");
   if (fs.existsSync(startupLockPath)) {
-    try {
-      const existingLock = JSON.parse(fs.readFileSync(startupLockPath, "utf8"));
-      const lockLive = existingLock?.identity?.pid ? inspectProcess(existingLock.identity.pid) : null;
+    const before = fs.readFileSync(startupLockPath, "utf8");
+    let existingLock = null;
+    try { existingLock = JSON.parse(before); } catch {}
+    if (existingLock?.type === "copilot-flock-daemon-startup-lock-v1" && existingLock?.identity?.pid) {
+      const lockLive = inspectProcess(existingLock.identity.pid);
       if (lockLive && lockLive.start === existingLock.identity.start && existingLock.identity.pid !== process.pid) {
         return;
       }
+      if (JSON.stringify(inspectProcess(existingLock.identity.pid)) !== JSON.stringify(lockLive) ||
+          !fs.existsSync(startupLockPath) ||
+          fs.readFileSync(assertNoLinks(startupLockPath), "utf8") !== before) {
+        return;
+      }
       fs.unlinkSync(startupLockPath);
-    } catch {}
+    } else {
+      const stat = fs.statSync(startupLockPath);
+      if (Date.now() - stat.mtimeMs < 15000) return;
+      if (fs.readFileSync(assertNoLinks(startupLockPath), "utf8") !== before) return;
+      fs.unlinkSync(startupLockPath);
+    }
   }
   let lockFd = null;
+  let lockText = null;
   try {
     lockFd = fs.openSync(startupLockPath, "wx", 0o600);
-    fs.writeFileSync(lockFd, JSON.stringify({ type: "copilot-flock-daemon-startup-lock-v1", identity: myIdentity }));
+    lockText = JSON.stringify({ type: "copilot-flock-daemon-startup-lock-v1", identity: myIdentity });
+    fs.writeFileSync(lockFd, lockText);
+    fs.fsyncSync(lockFd);
   } catch (error) {
+    if (lockFd !== null) {
+      try { fs.closeSync(lockFd); } catch {}
+      try { fs.unlinkSync(startupLockPath); } catch {}
+    }
     if (error?.code === "EEXIST") return;
     throw error;
   }
@@ -13879,7 +13898,11 @@ export async function runDaemon(cfg) {
   } finally {
     if (lockFd !== null) {
       try { fs.closeSync(lockFd); } catch {}
-      try { fs.unlinkSync(startupLockPath); } catch {}
+      try {
+        if (lockText && fs.existsSync(startupLockPath) && fs.readFileSync(assertNoLinks(startupLockPath), "utf8") === lockText) {
+          fs.unlinkSync(startupLockPath);
+        }
+      } catch {}
     }
   }
   const daemonSnapshot = captureCallerMcpSnapshot(cfg, { surface: "resident-daemon" });
