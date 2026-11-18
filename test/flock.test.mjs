@@ -11963,6 +11963,15 @@ test("presence freshness & security boundaries: admissible knownPeers updates la
   );
   assert.equal(
     resolveAdmissibleKnownPeerEvidence(
+      { machineId: "NEXUS-V2", githubUser: "erjadi", keyFingerprint: nexusKey.fingerprint },
+      [{ machineId: "NEXUS-V2", githubUser: "erjadi", scope: "personal", version: "9.9.9-keyless", lastSeenAt: gracePeerIso }],
+      { nowMs }
+    ),
+    null,
+    "Keyless knownPeers entry must be rejected when member record pins a key or fingerprint"
+  );
+  assert.equal(
+    resolveAdmissibleKnownPeerEvidence(
       { machineId: "DESKTOP-7E16MBO", githubUser: "erjadi" },
       knownPeersList,
       { nowMs }

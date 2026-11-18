@@ -10853,9 +10853,6 @@ function peerKeysConsistentWithMember(member, peer) {
     member?.publicKey || member?.deviceEd25519Pub || member?.specs?.publicKey || ""
   ).trim();
   const peerPub = String(peer?.publicKey || peer?.specs?.publicKey || "").trim();
-  if (memberPub && peerPub) {
-    return memberPub === peerPub;
-  }
   const memberFp = String(
     member?.keyFingerprint || member?.deviceId || member?.specs?.keyFingerprint || ""
   )
@@ -10864,6 +10861,13 @@ function peerKeysConsistentWithMember(member, peer) {
   const peerFp = String(peer?.keyFingerprint || peer?.specs?.keyFingerprint || "")
     .trim()
     .toLowerCase();
+  // When the authoritative member record pins a key or fingerprint, a keyless peer broadcast cannot match it.
+  if ((memberPub || memberFp) && !peerPub && !peerFp) {
+    return false;
+  }
+  if (memberPub && peerPub && memberPub !== peerPub) {
+    return false;
+  }
   if (memberFp && peerFp) {
     if (memberFp === peerFp) return true;
     if (peerPub && deriveCandidateKeyFingerprints(peerPub).includes(memberFp)) return true;
@@ -13724,8 +13728,24 @@ export async function runDaemon(cfg) {
   const pidPath = getDaemonPidPath();
   const statePath = getStatePath();
   fs.writeFileSync(pidPath, String(process.pid), "utf8");
+  try {
+    assertDaemonAutostartAllowed();
+  } catch (error) {
+    try {
+      if (fs.existsSync(pidPath) && Number(fs.readFileSync(pidPath, "utf8").trim()) === process.pid) {
+        fs.unlinkSync(pidPath);
+      }
+    } catch {}
+    throw error;
+  }
   if (cfg.protocol === "broker-free-v34") {
     const daemon = await brokerFreeRuntime(cfg).start();
+    try {
+      assertDaemonAutostartAllowed();
+    } catch (error) {
+      await daemon.close().catch(() => {});
+      throw error;
+    }
     atomicJson(statePath, {
       status: "connected",
       protocol: cfg.protocol,
@@ -13796,6 +13816,7 @@ export async function runDaemon(cfg) {
   process.once("SIGINT", shutdownLegacyDaemon);
 
   while (true) {
+    assertDaemonAutostartAllowed();
     const connectedStartedAt = Date.now();
     let closeDetails = { code: null, reason: null };
     try {
@@ -13855,6 +13876,13 @@ export async function runDaemon(cfg) {
         },
       });
 
+      try {
+        assertDaemonAutostartAllowed();
+      } catch (error) {
+        try { client.close(); } catch {}
+        throw error;
+      }
+
       activeSignalRClient = client;
       logDaemon(`Connected to SignalR hub '${cfg.hub}' as '${cfg.machineId}'`);
       updateStateFile("connected");
@@ -13872,6 +13900,13 @@ export async function runDaemon(cfg) {
         presenceIntervalMs: 45000,
         timeSkipThresholdMs: 10000,
         checkPidSupersession: () => {
+          try {
+            assertDaemonAutostartAllowed();
+          } catch (error) {
+            logDaemon(`Exiting daemon PID ${process.pid}: ${error.message}`);
+            try { activeSignalRClient?.close(); } catch {}
+            process.exit(0);
+          }
           if (fs.existsSync(pidPath)) {
             const activePid = Number(fs.readFileSync(pidPath, "utf8").trim());
             if (activePid && activePid !== process.pid) {
@@ -13931,6 +13966,9 @@ export async function runDaemon(cfg) {
       await new Promise((r) => setTimeout(r, waitMs));
       continue;
     } catch (err) {
+      if (err?.code === "DAEMON_MANUALLY_STOPPED") {
+        throw err;
+      }
       reconnectAttempt++;
       const errDetail = formatErrorDetail(err);
       const baseDelay = Math.min(30000, 3000 * Math.pow(1.6, Math.min(5, reconnectAttempt)));

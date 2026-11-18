@@ -248,6 +248,25 @@ test("manual daemon stop persists across automatic callers, classifies no-daemon
   await stopLocalDaemon({ root: runtime, paths, stop: async () => { throw new Error("Unverified daemon retained"); } })
     .then(() => assert.fail("Unproven stop must fail"), (error) => assert.match(error.message, /Unverified/));
   assert.throws(() => assertDaemonAutostartAllowed(runtime), { code: "DAEMON_MANUALLY_STOPPED" });
+
+  // 6. Sandbox v3 daemon recognition + stop
+  const sandboxDaemon = { pid, start: "sandbox-start", executable: process.execPath, argv: [process.execPath, script, "daemon", "--sandbox", "v3"] };
+  fs.writeFileSync(path.join(runtime, "daemon.pid"), String(pid));
+  fs.writeFileSync(path.join(runtime, "daemon-identity.json"), JSON.stringify({ ...sandboxDaemon, script }));
+  let sandboxKilled = 0;
+  const sandboxStopped = await stopLocalDaemon({
+    root: runtime, paths,
+    inspect: () => sandboxKilled ? null : sandboxDaemon,
+    kill: (target) => { assert.equal(target, pid); sandboxKilled++; },
+  });
+  assert.equal(sandboxKilled, 1);
+  assert.deepEqual(sandboxStopped, {
+    stopped: true,
+    status: "stopped",
+    pid,
+    reason: "pinned_daemon_stopped",
+    autostart: false,
+  });
 });
 
 test("scoped presence never admits responders from an empty collaborator roster or unreadable authority", async (t) => {

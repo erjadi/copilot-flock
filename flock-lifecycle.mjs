@@ -319,7 +319,12 @@ export function pinDaemonIdentity(root, script, inspect = inspectProcess) {
 
 export function commandIsDaemon(identity, scripts, { platform = process.platform } = {}) {
   const argv = identity?.argv || parseWindowsCommandLine(identity?.command);
-  if (!Array.isArray(argv) || argv.length !== 3 || argv[2] !== "daemon") return false;
+  if (!Array.isArray(argv) || argv[2] !== "daemon") return false;
+  const validArgs =
+    argv.length === 3 ||
+    (argv.length === 5 && argv[3] === "--sandbox" && argv[4] === "v3") ||
+    (argv.length === 4 && argv[3] === "--sandbox=v3");
+  if (!validArgs) return false;
   if (platform === "win32") {
     const normalize = (filename) => {
       const resolved = path.win32.resolve(filename);
@@ -1944,7 +1949,7 @@ const EMBEDDED_RUNTIME_MANIFEST_FALLBACK = (() => {
     operationsSha = hashRuntimeModule(fs.readFileSync(path.join(__lifecycleDir, "flock-operations.mjs")));
     supportSha = hashRuntimeModule(fs.readFileSync(path.join(__lifecycleDir, "flock-support.mjs")));
   } catch {}
-  const entrypointSha = "dd11f9f4a0ddc853afedd28b742b48ccc2c50ec9d80fddd0dd9466240e8082b9";
+  const entrypointSha = "c403294bd48b2d7e622213ce0fcfef63196486f5a54014df4fb45ee7379e1109";
   const fallback = {
     type: "copilot-flock-runtime-manifest-v1",
     schema: 1,
