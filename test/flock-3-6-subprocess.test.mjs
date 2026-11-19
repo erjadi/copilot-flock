@@ -102,6 +102,21 @@ function childEnv(home, certPath) {
     APPDATA: path.join(home, "AppData"), NODE_EXTRA_CA_CERTS: certPath };
 }
 
+function prependFixturePath(env, directory, platform = process.platform) {
+  // A copied environment is case-sensitive, but Windows subprocess lookup is not.
+  const key = platform === "win32"
+    ? Object.keys(env).find((name) => name.toUpperCase() === "PATH") ?? "PATH"
+    : "PATH";
+  const delimiter = platform === "win32" ? path.win32.delimiter : path.posix.delimiter;
+  env[key] = [directory, env[key]].filter(Boolean).join(delimiter);
+}
+
+test("Windows subprocess fixtures prepend helper paths without dropping an inherited Path", () => {
+  const env = { Path: "C:\\system-tools;C:\\more-tools" };
+  prependFixturePath(env, "C:\\fixture-helpers", "win32");
+  assert.deepEqual(env, { Path: "C:\\fixture-helpers;C:\\system-tools;C:\\more-tools" });
+});
+
 async function until(predicate, timeout = 30000) {
   const deadline = Date.now() + timeout;
   while (Date.now() < deadline) {
@@ -221,7 +236,7 @@ test("unconfigured and missing-vault MCP subprocesses initialize and submit supp
       fs.writeFileSync(path.join(noHelpers, name), '#!/bin/sh\necho forbidden-helper >> "$COPILOT_HOME/helper-used"\nexit 99\n', { mode: 0o700 });
     }
     const env = childEnv(home, tls.certPath);
-    env.PATH = `${noHelpers}${path.delimiter}${env.PATH}`;
+    prependFixturePath(env, noHelpers);
     const child = spawn(process.execPath, [path.join(repo, "flock.mjs"), "mcp"], { env, stdio: ["pipe", "pipe", "pipe"], windowsHide: true });
     try {
       const rpc = stdioRpc(child);
