@@ -1,4 +1,6 @@
 import test from "node:test";
+import { recordReleaseReviewFailures } from "./release-review-diagnostics.mjs";
+recordReleaseReviewFailures(import.meta.url);
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import { authoritativeFlocks } from "../viewer/flock-roster.mjs";

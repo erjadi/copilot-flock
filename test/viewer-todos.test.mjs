@@ -1,4 +1,6 @@
 import test from "node:test";
+import { recordReleaseReviewFailures } from "./release-review-diagnostics.mjs";
+recordReleaseReviewFailures(import.meta.url);
 import assert from "node:assert/strict";
 import http from "node:http";
 import os from "node:os";

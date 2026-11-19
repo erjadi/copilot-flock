@@ -1,4 +1,6 @@
 import test from "node:test";
+import { recordReleaseReviewFailures } from "./release-review-diagnostics.mjs";
+recordReleaseReviewFailures(import.meta.url);
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
 import { OTHER_HUB, createOtherHubClientControl, runAzureNegativeProbes, classifySignalRClientDenial, withAzureGateCleanup } from "./azure-negative-probes.mjs";

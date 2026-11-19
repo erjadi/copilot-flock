@@ -1,4 +1,6 @@
 import test from "node:test";
+import { recordReleaseReviewFailures } from "./release-review-diagnostics.mjs";
+recordReleaseReviewFailures(import.meta.url);
 import assert from "node:assert/strict";
 import net from "node:net";
 import tls from "node:tls";
