@@ -720,6 +720,26 @@ test(
   let eventWriteError = null;
   let lagInterval = null;
   const eventTimers = [];
+  const fixtureRoot = path.resolve("..");
+  const timingEnabled = process.platform === "win32" && path.basename(process.cwd()) === "fixture" &&
+    path.basename(fixtureRoot).startsWith("flock-vote-");
+  const timeline = [];
+  const frames = new Map();
+  let startTime = null;
+  let timingSummary = null;
+  let failure = null;
+  let check = "fixture setup";
+  const mark = (stage, label) => {
+    if (timingEnabled && startTime !== null && timeline.length < 60) {
+      timeline.push([stage, label, +(performance.now() - startTime).toFixed(2)]);
+    }
+  };
+  const measure = (label, run) => {
+    mark("start", label);
+    const operation = run();
+    mark("returned promise", label);
+    return operation.then((value) => { mark("resolved", label); return value; });
+  };
   try {
     assert.equal(BRIDGE_VERSION, "3.6.1");
 
@@ -826,13 +846,20 @@ test(
 
     // The external runtime's writes must not block the RPC process being measured.
     eventWriter = await fs.promises.open(eventsPath, "a");
-    const appendRuntimeEvent = (event) => {
-      eventWrites = eventWrites.then(() =>
-        eventWriter.appendFile(JSON.stringify(event) + "\n", "utf8"));
+    const appendRuntimeEvent = (event, label) => {
+      mark("append queued", label);
+      eventWrites = eventWrites.then(async () => {
+        mark("append started", label);
+        await eventWriter.appendFile(JSON.stringify(event) + "\n", "utf8");
+        mark("append finished", label);
+      });
       eventWrites.catch((error) => { eventWriteError ||= error; });
     };
     wsServer = await startMockCopilotWsServer((frame) => {
       if (frame.type === "send_message") {
+        const label = frames.size === 0 ? "first frame" : "second frame";
+        frames.set(frame.request_id, label);
+        mark("frame", label);
         // First append an UNRELATED user.message after 15ms to verify it cannot falsely ack our request
         eventTimers.push(setTimeout(() => {
           const unrelated = {
@@ -844,7 +871,7 @@ test(
               content: "Unrelated local user prompt from another window",
             },
           };
-          appendRuntimeEvent(unrelated);
+          appendRuntimeEvent(unrelated, label + " unrelated");
         }, 15));
 
         // Then append the actual matching user.message after 45ms
@@ -860,7 +887,7 @@ test(
               transformedContent: frame.prompt,
             },
           };
-          appendRuntimeEvent(matchedUser);
+          appendRuntimeEvent(matchedUser, label + " matched");
         }, 45));
 
         // And append the assistant reply after 80ms (for wait_for_reply tests)
@@ -876,7 +903,7 @@ test(
               toolRequests: [],
             },
           };
-          appendRuntimeEvent(replyEv);
+          appendRuntimeEvent(replyEv, label + " reply");
         }, 80));
       }
     });
@@ -930,14 +957,16 @@ test(
       const now = performance.now();
       const lag = now - lastTick - 10;
       if (lag > maxTimerLagMs) maxTimerLagMs = lag;
+      if (lag >= 50) mark("timer lag", +lag.toFixed(2));
       lastTick = now;
     }, 10);
-    const tConcurrent0 = performance.now();
+    check = "concurrent RPCs";
+    const tConcurrent0 = startTime = performance.now();
     const [transcriptRes, pingRes, listRes, nonWaitSendRes, waitSendRes] = await Promise.all([
-      handleRpcAction(cfg, transcriptRequest),
-      handleRpcAction(cfg, pingRequest),
-      handleRpcAction(cfg, listRequest),
-      injectLocalSessionMessage({
+      measure("transcript", () => handleRpcAction(cfg, transcriptRequest)),
+      measure("ping", () => handleRpcAction(cfg, pingRequest)),
+      measure("list", () => handleRpcAction(cfg, listRequest)),
+      measure("nonwait", () => injectLocalSessionMessage({
         cfg,
         targetSession: hugeSessionId,
         message: "Non-wait message on 540 MiB log",
@@ -946,8 +975,8 @@ test(
         fromSessionId: "peer-session-1",
         fromSessionName: "Peer Session 1",
         waitForReply: false,
-      }),
-      injectLocalSessionMessage({
+      })),
+      measure("wait", () => injectLocalSessionMessage({
         cfg,
         targetSession: hugeSessionId,
         message: "Wait message on 540 MiB log",
@@ -957,14 +986,18 @@ test(
         fromSessionName: "Peer Session 2",
         waitForReply: true,
         waitTimeoutMs: 5000,
-      }),
+      })),
     ]);
     const totalConcurrentMs = performance.now() - tConcurrent0;
     clearInterval(lagInterval);
+    timingSummary = { totalMs: +totalConcurrentMs.toFixed(2), maxLagMs: +maxTimerLagMs.toFixed(2),
+      nonwaitFrame: frames.get(nonWaitSendRes.requestId), waitFrame: frames.get(waitSendRes.requestId) };
+    check = "mock appends";
     await eventWrites;
     assert.ifError(eventWriteError);
     t.diagnostic(`540 MiB concurrent RPCs: ${totalConcurrentMs.toFixed(2)}ms; max timer lag: ${maxTimerLagMs.toFixed(2)}ms`);
 
+    check = "RPC results";
     assert.equal(transcriptRes.messages.length, 8);
     assert.equal(pingRes.machineId, "TEST-MACHINE");
     assert.equal(listRes.count, 1);
@@ -977,17 +1010,32 @@ test(
     assert.equal(waitSendRes.reply?.completed, true);
     assert.equal(waitSendRes.reply?.content, `Ack for ${waitSendRes.requestId}`);
 
+    check = "concurrent wall time";
     assert.ok(
       totalConcurrentMs < 1500,
       `Expected all concurrent RPCs on 540 MiB log to finish in < 1500ms, took ${totalConcurrentMs.toFixed(2)}ms`
     );
+    check = "event-loop lag";
     assert.ok(
       maxTimerLagMs < 500,
       `Expected event-loop timer lag < 500ms during concurrent 540 MiB operations, got ${maxTimerLagMs.toFixed(2)}ms`
     );
+  } catch (error) {
+    failure = { check, code: /^[A-Z0-9_]{1,60}$/.test(error?.code || "") ? error.code : "TEST_ERROR" };
+    throw error;
   } finally {
     clearInterval(lagInterval);
     for (const timer of eventTimers) clearTimeout(timer);
+    if (timingEnabled) {
+      try {
+        const receipt = path.join(fixtureRoot, "huge-log-stage-timings.json");
+        const entry = JSON.stringify({ test: "bridge.test.mjs: 540 MiB concurrent RPCs", failure, timingSummary, timeline });
+        fs.writeFileSync(receipt + ".tmp", entry, "utf8");
+        fs.renameSync(receipt + ".tmp", receipt);
+      } catch {
+        t.diagnostic("HUGE_LOG_TIMELINE receipt write failed");
+      }
+    }
     try {
       if (wsServer) await wsServer.close();
       await eventWrites;
