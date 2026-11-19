@@ -3994,7 +3994,16 @@ test("legacy flock_status and list_flocks surface offline shared-flock collabora
 
 test("legacy flock_status and list_flocks prevent cross-flock metadata disclosure, prevent stale-member resurrection, and report partial or failed refresh states", async (t) => {
   const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "flock-status-walls-"));
-  t.after(() => fs.rmSync(tempRoot, { recursive: true, force: true }));
+  const previousCopilotHome = process.env.COPILOT_HOME;
+  const copilotHome = path.join(tempRoot, ".copilot");
+  fs.mkdirSync(copilotHome);
+  // Status also reports local runtime updates; do not read the voter's own update metadata.
+  process.env.COPILOT_HOME = copilotHome;
+  t.after(() => {
+    if (previousCopilotHome === undefined) delete process.env.COPILOT_HOME;
+    else process.env.COPILOT_HOME = previousCopilotHome;
+    fs.rmSync(tempRoot, { recursive: true, force: true });
+  });
   const storePath = path.join(tempRoot, "v3-flocks.json");
   const membersPath = path.join(tempRoot, "members.json");
   const ownerFlocksPath = path.join(tempRoot, "owner-flocks.json");
