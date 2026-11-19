@@ -177,45 +177,34 @@ test("PowerShell actual entrypoint fails before local install and preserves dire
   assert.deepEqual(legacy.events.map((event) => event.kind), ["legacy"]);
 });
 
-function ensureBashAvailable() {
-  if (spawnSync("bash", ["-c", "true"], { encoding: "utf8", timeout: 5000 }).status === 0) {
-    return true;
-  }
+function resolveSetupBash() {
   if (process.platform === "win32") {
+    // Node's executable search can select the System32 WSL launcher ahead of PATH.
     const candidates = [
-      "C:\\Program Files\\Git\\bin",
-      "C:\\Program Files\\Git\\usr\\bin",
+      path.join(process.env.ProgramFiles || "C:\\Program Files", "Git", "bin"),
       process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, "Programs", "Git", "bin") : null,
-      process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, "Programs", "Git", "usr", "bin") : null,
     ].filter(Boolean);
     for (const dir of candidates) {
       const bashExe = path.join(dir, "bash.exe");
       if (fs.existsSync(bashExe)) {
-        const nextPath = `${dir}${path.delimiter}${process.env.PATH || ""}`;
-        if (
-          spawnSync(bashExe, ["-c", "true"], {
-            encoding: "utf8",
-            timeout: 5000,
-            env: { ...process.env, PATH: nextPath },
-          }).status === 0
-        ) {
-          process.env.PATH = nextPath;
-          return true;
-        }
+        return bashExe;
       }
     }
   }
-  return false;
+  return "bash";
 }
 
-const bashAvailable = ensureBashAvailable();
 test("Bash syntax and actual managed/direct entrypoint flow with synthetic cloud adapters", (t) => {
-  if (!bashAvailable && process.platform === "win32") {
+  const bash = resolveSetupBash();
+  const probe = spawnSync(bash, ["--noprofile", "--norc", "-c",
+    process.platform === "win32" ? `[[ $OSTYPE == msys* || $OSTYPE == cygwin* ]] && command -v cygpath` : "true"],
+  { encoding: "utf8", timeout: 5000 });
+  if (process.platform === "win32" && probe.error?.code === "ENOENT") {
     t.skip("Bash is not available on this Windows host");
     return;
   }
-  assert.ok(bashAvailable, "Bash is required to exercise the actual setup entrypoint; missing tools must not skip release coverage");
-  assert.equal(spawnSync("bash", ["-n", "setup.sh"], { cwd: root }).status, 0);
+  assert.equal(probe.status, 0, `Setup fixture needs ${process.platform === "win32" ? "Git Bash or Cygwin (not WSL)" : "Bash"}: ${probe.error || probe.stderr}`);
+  assert.equal(spawnSync(bash, ["-n", "setup.sh"], { cwd: root }).status, 0);
   const f = fixture();
   try {
     fs.mkdirSync(path.join(f.directory, "bin"));
@@ -226,7 +215,7 @@ test("Bash syntax and actual managed/direct entrypoint flow with synthetic cloud
 export DEMO_DIR="$(cd "$(dirname "\${BASH_SOURCE[0]}")" && pwd)"
 export PATH="$DEMO_DIR/bin:$PATH"
 if command -v cygpath >/dev/null 2>&1; then export REAL_NODE="$(cygpath -u "$REAL_NODE")"; fi
-exec bash "$DEMO_DIR/setup.sh" "$@"
+exec "$BASH" "$DEMO_DIR/setup.sh" "$@"
 `);
     fs.writeFileSync(path.join(f.directory, "bin", "node"), `#!/usr/bin/env bash
 exec "$REAL_NODE" "$DEMO_DIR/driver.mjs" "$@"
@@ -259,7 +248,7 @@ if (args[0] === "deployment") process.stdout.write(process.env.OUTPUTS);
 `);
     const run = (args, fail = "", skip = false) => {
       if (fs.existsSync(f.journal)) fs.unlinkSync(f.journal);
-      return f.result(spawnSync("bash", ["--noprofile", "--norc", "wrapper.sh", ...args], {
+      return f.result(spawnSync(bash, ["--noprofile", "--norc", "wrapper.sh", ...args], {
         cwd: f.directory, encoding: "utf8", timeout: 30000, env: {
           ...env, GITHUB_USER: "", DISPLAY: "", REAL_NODE: process.execPath, JOURNAL: f.journal,
           SUBSCRIPTION: subscription, MOCK_FAIL: fail,
