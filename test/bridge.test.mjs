@@ -782,6 +782,8 @@ test(
         );
       }
       fs.writeSync(fd, Buffer.from(tailLines.join("\n") + "\n", "utf8"));
+      // Finish the fixture's bulk writeback before measuring concurrent RPCs.
+      fs.fsyncSync(fd);
     } finally {
       fs.closeSync(fd);
     }
