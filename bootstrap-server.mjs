@@ -3029,26 +3029,46 @@ export function createBootstrapServer({
       }
 
       if ((subPath === "/flocks/create" || subPath === "/flocks/invite") && req.method === "POST") {
-        let resolvedInvitedUserId = bodyData.invitedGitHubUserId || null;
         const rawInvitedUser = String(bodyData.invitedUser || callerGitHubUser).replace(/^@/, "").trim().toLowerCase();
-        if (!resolvedInvitedUserId && rawInvitedUser) {
-          if (rawInvitedUser === callerGitHubUser && callerGitHubUserId) {
-            resolvedInvitedUserId = callerGitHubUserId;
-          } else {
-            try {
-              const invitedRes = await apiGet(`/users/${encodeURIComponent(rawInvitedUser)}`, githubToken);
-              if (invitedRes.statusCode === 200 && Number.isSafeInteger(Number(invitedRes.body?.id)) && Number(invitedRes.body.id) > 0) {
-                resolvedInvitedUserId = Number(invitedRes.body.id);
-              }
-            } catch {}
+        let recipient = rawInvitedUser === callerGitHubUser
+          ? { login: callerGitHubUser, id: callerGitHubUserId }
+          : null;
+        if (!recipient && rawInvitedUser) {
+          let lookup;
+          try {
+            lookup = await apiGet(`/users/${encodeURIComponent(rawInvitedUser)}`, githubToken);
+          } catch {
+            sendJson(res, 503, { ok: false, code: "INVITEE_LOOKUP_UNAVAILABLE",
+              error: "GitHub recipient lookup failed. Retry before issuing the invitation." });
+            return;
           }
+          if (lookup.statusCode === 429 || lookup.statusCode >= 500) {
+            sendJson(res, 503, { ok: false, code: "INVITEE_LOOKUP_UNAVAILABLE",
+              error: "GitHub recipient lookup is unavailable. Retry before issuing the invitation." });
+            return;
+          }
+          if (lookup.statusCode === 200) recipient = lookup.body;
+        }
+        const resolvedInvitedUserId = Number(recipient?.id);
+        if (!rawInvitedUser || String(recipient?.login || "").toLowerCase() !== rawInvitedUser ||
+            !Number.isSafeInteger(resolvedInvitedUserId) || resolvedInvitedUserId <= 0) {
+          sendJson(res, 422, { ok: false, code: "INVITEE_ID_UNVERIFIED",
+            error: "Could not verify the recipient's GitHub account. Check the exact handle and whether the inviting account can look it up. No invitation was issued." });
+          return;
+        }
+        const requestedId = bodyData.invitedGitHubUserId;
+        if (requestedId != null && (!/^[1-9]\d*$/.test(String(requestedId)) ||
+            Number(requestedId) !== resolvedInvitedUserId)) {
+          sendJson(res, 422, { ok: false, code: "INVITEE_ID_MISMATCH",
+            error: "The supplied numeric GitHub ID does not match the verified recipient. No invitation was issued." });
+          return;
         }
         const out = await createV3FlockInvite(
           {
             ...bodyData,
             callerGitHubUser,
             callerGitHubUserId,
-            invitedUser: bodyData.invitedUser || callerGitHubUser,
+            invitedUser: rawInvitedUser,
             invitedGitHubUserId: resolvedInvitedUserId,
           },
           { storePath, sandbox: isPreview }

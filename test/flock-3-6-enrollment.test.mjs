@@ -1880,6 +1880,8 @@ test("3.6 unmocked HTTP broker converges owner and newcomer for immediate first 
       if (apiPath === "/users/alice") {
         return { statusCode: 200, body: { login: "alice", id: 2002 } };
       }
+      if (apiPath === "/users/missing") return { statusCode: 404 };
+      if (apiPath === "/users/unavailable") return { statusCode: 503 };
       return {
         statusCode: 200,
         body: {
@@ -1911,18 +1913,32 @@ test("3.6 unmocked HTTP broker converges owner and newcomer for immediate first 
     assert.equal(ownerEnrollment.body.ok, true);
 
     const teamName = `japan-${crypto.randomBytes(4).toString("hex")}`;
+    const beforeInvites = fs.readFileSync(storePath, "utf8");
+    for (const [endpoint, body, status, code] of [
+      ["invite", { invitedUser: "missing", invitedGitHubUserId: 2002 }, 422, "INVITEE_ID_UNVERIFIED"],
+      ["invite", { invitedUser: "alice", invitedGitHubUserId: 2003 }, 422, "INVITEE_ID_MISMATCH"],
+      ["create", { invitedUser: "unavailable" }, 503, "INVITEE_LOOKUP_UNAVAILABLE"],
+    ]) {
+      const rejected = await postJson(`${base}/flocks/${endpoint}`, {
+        targetAddress: `owner/${teamName}`, reissue: true, ...body,
+      }, { authorization: "Bearer ownerToken" });
+      assert.equal(rejected.response.status, status);
+      assert.equal(rejected.body.code, code);
+      assert.equal(rejected.body.enrollmentJson, undefined);
+      assert.equal(fs.readFileSync(storePath, "utf8"), beforeInvites);
+    }
     const inviteResult = await postJson(
       `${base}/flocks/invite`,
       {
         targetAddress: `owner/${teamName}`,
-        invitedUser: "alice",
-        invitedGitHubUserId: 2002,
+        invitedUser: "@Alice",
         allowedScopes: ["work"],
       },
       { authorization: "Bearer ownerToken" }
     );
     assert.equal(inviteResult.response.status, 200);
     const invite = inviteResult.body.enrollmentJson;
+    assert.equal(invite.invitedGitHubUserId, 2002);
 
     const newcomerEnrollBody = signV3EnrollmentRequest({
       deviceId: newcomer.fingerprint,

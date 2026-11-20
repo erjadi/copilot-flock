@@ -129,6 +129,13 @@ default to a 72-hour redemption window; guest vouchers default to 24 hours.
 Post-redemption membership duration starts when each device redeems and is
 tracked independently from voucher expiry.
 
+The hosted broker hotfix (`3.6.1-broker.1`) verifies the recipient's numeric
+GitHub account ID before issuing or replacing a voucher. If the broker cannot
+look up the handle, no new voucher is issued and existing vouchers are left
+alone. Make sure the issuing account can look up the recipient, then reissue
+the invitation; editing the old JSON does not change the stored binding.
+Clients on 3.6.1 can redeem a correctly bound voucher without upgrading.
+
 Scoped client, broadcast REST, and per-peer REST tokens plus refresh nonces are
 stored only in the owner-readable `flock-credentials.json` vault. `config.json`
 and `flocks.json` remain credential-free. Daemon, MCP, installer, readiness, and

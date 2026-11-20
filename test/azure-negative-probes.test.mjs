@@ -25,7 +25,8 @@ test("Azure gate retains both primary authorization and cleanup failures", async
 test("hosted Entra gate requires all disposable endpoint pins and retries only bounded authz/transient outcomes", async () => {
   const config = { disposable: true, serviceBusAuth: "entra-rbac", serviceBusDisableLocalAuth: true,
     signalrEndpoint: fixture.signalrEndpoint, serviceBusEndpoint: fixture.serviceBusEndpoint,
-    bootstrapUrl: "https://fixture.azurewebsites.net", githubUser: "fixture", githubUserId: 1001 };
+    bootstrapUrl: "https://fixture.azurewebsites.net", githubUser: "fixture", githubUserId: 1001,
+    guestGitHubUser: "fixture-guest", guestGitHubUserId: 2002 };
   const pins = { signalr: config.signalrEndpoint, serviceBus: config.serviceBusEndpoint, bootstrap: config.bootstrapUrl };
   validateHostedGate(config, pins);
   for (const change of [{ disposable: false }, { serviceBusDisableLocalAuth: false }, { bootstrapUrl: "https://attacker.invalid" }]) {

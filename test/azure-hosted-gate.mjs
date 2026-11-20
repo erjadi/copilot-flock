@@ -18,6 +18,10 @@ export function validateHostedGate(config, pins) {
   }
   assert.match(config.githubUser, /^[a-z0-9][a-z0-9-]{0,38}$/i);
   assert.ok(Number.isSafeInteger(config.githubUserId) && config.githubUserId > 0);
+  assert.match(config.guestGitHubUser, /^[a-z0-9][a-z0-9_-]{0,38}$/i);
+  assert.notEqual(config.guestGitHubUser.toLowerCase(), config.githubUser.toLowerCase());
+  assert.ok(Number.isSafeInteger(config.guestGitHubUserId) && config.guestGitHubUserId > 0 &&
+    config.guestGitHubUserId !== config.githubUserId, "A distinct, approved GitHub fixture account is required");
 }
 
 export async function pollHostedRbac(attempt, { clock = Date.now, delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
@@ -98,9 +102,9 @@ export async function runHostedEntraGate(t, config, {
     assert.equal(status.msiConfigured, true);
     await enrolled(owner, config.githubUserId, null, maintainerToken);
     const flockId = `${config.githubUser.toLowerCase()}/gate-${crypto.randomUUID().slice(0, 8)}`;
-    const guestId = 1000000000 + crypto.randomInt(1000000000);
+    const guestId = config.guestGitHubUserId;
     const invite = requireOk(await request("/api/v3/flocks/invite", {
-      targetAddress: flockId, invitedUser: `gate-${crypto.randomUUID().slice(0, 8)}`,
+      targetAddress: flockId, invitedUser: config.guestGitHubUser,
       invitedGitHubUserId: guestId, durationMinutes: 10, maxDevices: 1,
       allowedScopes: ["work"], tokenLocalVoucherAuth: true, bootstrapUrl: config.bootstrapUrl,
     }, { token: maintainerToken }), "guest invite");

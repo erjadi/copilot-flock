@@ -202,6 +202,7 @@ const root=fs.mkdtempSync(path.join(os.tmpdir(),"flock-entra-gate-test-"));
 const server=broker.createBootstrapServer({v3StorePath:path.join(root,"v3.json"),membersPath:path.join(root,"members.json"),
  queuePath:path.join(root,"queue.json"),serviceBusTokenProvider:tokenProvider,
  apiGet:async(route)=>route==="/user"?{statusCode:200,body:{login:"demo-owner",id:1001}}:
+ route==="/users/demo-guest"?{statusCode:200,body:{login:"demo-guest",id:2002}}:
  {statusCode:200,body:{full_name:"erjadi/copilot-flock",permissions:{push:true}}}});
 await new Promise(resolve=>server.listen(0,"127.0.0.1",resolve));
 try {
@@ -209,7 +210,8 @@ try {
  const diagnostics=[];
  const config={disposable:true,serviceBusAuth:"entra-rbac",serviceBusDisableLocalAuth:true,
   signalrEndpoint:"https://demo-signalr.service.signalr.net",serviceBusEndpoint:"https://demo-sb.servicebus.windows.net",
-  bootstrapUrl:"https://demo-broker.azurewebsites.net",githubUser:"demo-owner",githubUserId:1001};
+  bootstrapUrl:"https://demo-broker.azurewebsites.net",githubUser:"demo-owner",githubUserId:1001,
+  guestGitHubUser:"demo-guest",guestGitHubUserId:2002};
  await runHostedEntraGate({diagnostic:value=>diagnostics.push(value)},config,{
   pins:{signalr:config.signalrEndpoint,serviceBus:config.serviceBusEndpoint,bootstrap:config.bootstrapUrl},
   maintainerToken:"fixture-maintainer",fetchImpl:(url,options)=>fetch("http://127.0.0.1:"+server.address().port+new URL(url).pathname,options)});

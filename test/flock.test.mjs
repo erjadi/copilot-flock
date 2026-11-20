@@ -326,6 +326,8 @@ test("broker HTTP routes admit signed invited devices without repo write access 
     membersPath: path.join(tempRoot, "members.json"),
     apiGet: async (apiPath, token) => apiPath === "/user"
       ? { statusCode: principals[token] ? 200 : 401, body: principals[token] || {} }
+      : apiPath === "/users/invited-user"
+        ? { statusCode: 200, body: principals.guest }
       : { statusCode: 200, body: { full_name: fullName, owner: { login: "source-owner" }, private: false, permissions: { pull: true, push: false, admin: false } } },
   });
   try {

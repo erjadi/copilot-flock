@@ -316,7 +316,9 @@ For an explicitly approved **hosted** deployment, the same harness accepts a
 private configuration with `serviceBusAuth: "entra-rbac"`, `disposable: true`,
 `serviceBusDisableLocalAuth: true`, `signalrEndpoint`, `serviceBusEndpoint`,
 `bootstrapUrl`, and the verified maintainer's `githubUser` / `githubUserId`.
-All three endpoints must match the independent SignalR, Service Bus and
+Set `guestGitHubUser` / `guestGitHubUserId` to a distinct, approved test
+account that the maintainer can look up through GitHub. All three endpoints
+must match the independent SignalR, Service Bus and
 `COPILOT_FLOCK_LIVE_BOOTSTRAP_ENDPOINT` pins derived from that disposable
 deployment. The isolated runner supplies its existing authorized GitHub token
 through `COPILOT_FLOCK_LIVE_GITHUB_TOKEN`; never publish it or the private
